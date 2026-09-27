@@ -448,6 +448,9 @@ pub struct Session {
     /// history alone must not reopen a window after the user closed it.
     #[serde(default)]
     pub restore_window_on_startup: bool,
+    /// Consecutive mid-turn interruptions; two exhaust the automatic retry budget.
+    #[serde(default)]
+    pub consecutive_interruptions: u8,
     /// Active backend override id, if any (SPEC-1921 FR-102).
     /// `None` means the agent launched against its default upstream
     /// (no env override). Set only for built-in agents that support
@@ -545,7 +548,7 @@ impl Session {
     /// Current persisted session schema version. SPEC-1921 Phase 53 / FR-066.
     /// Bump when adding a new migration in `migrate_legacy_launch_args` and
     /// ensure the new migration is idempotent relative to this value.
-    pub const CURRENT_SCHEMA_VERSION: u32 = 4;
+    pub const CURRENT_SCHEMA_VERSION: u32 = 5;
 
     /// Create a new session with a generated UUID.
     pub fn new(
@@ -590,6 +593,7 @@ impl Session {
             launch_command: String::new(),
             launch_args: Vec::new(),
             restore_window_on_startup: false,
+            consecutive_interruptions: 0,
             backend_id: None,
             windows_shell: None,
             schema_version: Self::CURRENT_SCHEMA_VERSION,
@@ -729,6 +733,7 @@ impl Session {
 
     /// Persist that the latest Stop hook was allowed to complete.
     pub fn record_completed_stop(&mut self) {
+        self.consecutive_interruptions = 0;
         let now = Utc::now();
         self.last_completed_stop_at = Some(now);
         self.updated_at = now;
@@ -737,6 +742,34 @@ impl Session {
             self.last_hook_event_at = Some(now);
         }
         self.update_status(AgentStatus::Idle);
+    }
+
+    /// Record a process death without a completed Stop boundary.
+    /// Persist with the existing Session update transaction before retrying.
+    pub fn record_interruption(&mut self) {
+        self.consecutive_interruptions = self.consecutive_interruptions.saturating_add(1).min(2);
+        if self.consecutive_interruptions == 2 {
+            self.restore_window_on_startup = false;
+        }
+        self.update_status(AgentStatus::Interrupted);
+    }
+
+    /// Carry the retry budget into an exact automatic-resume successor before spawn.
+    pub fn inherit_interruption_count(&mut self, source: &Self) {
+        self.consecutive_interruptions = source.consecutive_interruptions.min(2);
+    }
+
+    /// Keep a stopped Session in history without granting startup restore authority.
+    pub fn record_terminal_stop(&mut self) {
+        self.restore_window_on_startup = false;
+        self.update_status(AgentStatus::Stopped);
+    }
+
+    /// Reset the retry budget only after a manual exact resume reaches Running.
+    pub fn record_manual_resume(&mut self) {
+        self.consecutive_interruptions = 0;
+        self.restore_window_on_startup = true;
+        self.update_status(AgentStatus::Running);
     }
 
     /// Whether the latest hook lifecycle indicates the session did not reach a
@@ -1019,7 +1052,9 @@ impl Session {
         }
 
         if self.schema_version < 3 {
-            if self.worktree_path.exists() {
+            if self.worktree_path.exists()
+                && !matches!(self.status, AgentStatus::Stopped | AgentStatus::Unknown)
+            {
                 self.status = AgentStatus::Interrupted;
             }
             self.schema_version = 3;
@@ -1032,6 +1067,13 @@ impl Session {
             // `Unknown feature flag: goals` (Issue #4127).
             scrub_legacy_codex_feature_enablement(&self.agent_id, &mut self.launch_args, "goals");
             self.schema_version = 4;
+        }
+
+        if self.schema_version < 5 {
+            // Schema 4 -> 5: older Sessions have no interruption streak.
+            // Keep the existing identity, lifecycle evidence, and restore policy.
+            self.consecutive_interruptions = 0;
+            self.schema_version = 5;
         }
     }
 
@@ -6360,6 +6402,84 @@ display_name = "Claude Code"
             !session.exact_auto_resume_candidate(),
             "Codex hook placeholder ids are not valid `codex resume <id>` targets"
         );
+    }
+
+    #[test]
+    fn interruption_count_defaults_when_loading_schema_four() {
+        let mut session = Session::new("/tmp/wt", "work/recovery", AgentId::Codex);
+        session.schema_version = 4;
+        session.status = AgentStatus::Stopped;
+        session.agent_session_id = Some("exact-conversation".into());
+        let mut value = toml::Value::try_from(&session).unwrap();
+        value
+            .as_table_mut()
+            .unwrap()
+            .remove("consecutive_interruptions");
+        let mut loaded: Session = value.try_into().unwrap();
+        assert_eq!(loaded.consecutive_interruptions, 0);
+        loaded.migrate_legacy_launch_args();
+        assert_eq!(loaded.schema_version, 5);
+        assert_eq!(loaded.status, AgentStatus::Stopped);
+        assert_eq!(loaded.agent_session_id, session.agent_session_id);
+        assert_eq!(
+            loaded.restore_window_on_startup,
+            session.restore_window_on_startup
+        );
+        loaded.record_interruption();
+        loaded.migrate_legacy_launch_args();
+        assert_eq!(loaded.consecutive_interruptions, 1);
+    }
+
+    #[test]
+    fn interruption_count_saturates_and_survives_successor_roundtrip() {
+        let mut source = Session::new("/tmp/wt", "work/recovery", AgentId::Codex);
+        source.restore_window_on_startup = true;
+        source.record_interruption();
+        assert_eq!(source.consecutive_interruptions, 1);
+        assert_eq!(source.status, AgentStatus::Interrupted);
+        assert!(source.restore_window_on_startup);
+        let mut successor = Session::new("/tmp/wt", "work/recovery", AgentId::Codex);
+        successor.inherit_interruption_count(&source);
+        let mut successor: Session = toml::from_str(&toml::to_string(&successor).unwrap()).unwrap();
+        assert_eq!(successor.consecutive_interruptions, 1);
+        successor.restore_window_on_startup = true;
+        successor.record_interruption();
+        successor.record_interruption();
+        assert_eq!(successor.consecutive_interruptions, 2);
+        assert!(!successor.restore_window_on_startup);
+    }
+
+    #[test]
+    fn interruption_count_resets_only_on_completed_stop_or_manual_resume() {
+        let mut session = Session::new("/tmp/wt", "work/recovery", AgentId::Codex);
+        session.record_interruption();
+        session.record_hook_event("Stop");
+        assert_eq!(session.consecutive_interruptions, 1);
+        session.record_completed_stop();
+        assert_eq!(session.consecutive_interruptions, 0);
+        assert_eq!(session.status, AgentStatus::Idle);
+        session.record_interruption();
+        session.restore_window_on_startup = true;
+        session.record_terminal_stop();
+        assert_eq!(session.consecutive_interruptions, 1);
+        assert_eq!(session.status, AgentStatus::Stopped);
+        assert!(!session.restore_window_on_startup);
+        session.record_manual_resume();
+        assert_eq!(session.consecutive_interruptions, 0);
+        assert_eq!(session.status, AgentStatus::Running);
+        assert!(session.restore_window_on_startup);
+    }
+
+    #[test]
+    fn migrate_legacy_launch_args_preserves_terminal_and_unknown_status() {
+        let dir = tempfile::tempdir().unwrap();
+        for status in [AgentStatus::Stopped, AgentStatus::Unknown] {
+            let mut session = Session::new(dir.path(), "work/recovery", AgentId::Codex);
+            session.schema_version = 2;
+            session.status = status;
+            session.migrate_legacy_launch_args();
+            assert_eq!(session.status, status);
+        }
     }
 
     #[test]

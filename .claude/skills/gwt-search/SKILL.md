@@ -153,6 +153,18 @@ JSON
 JSON
 ```
 
+## Expected latency
+
+Every `search` call starts a one-shot runner that imports and constructs the
+embedding model (SPEC-1939 FR-384), so every call is cold. Expect up to 25
+seconds per call; the warm remainder without the model load is held to 8
+seconds, and the attempt deadline is 30 seconds. Give each call at least 30
+seconds before treating it as hung, and run preflight queries one after
+another. A typed error (`INDEX_NOT_READY`, `SEARCH_UNAVAILABLE`,
+`INDEX_REPAIR_REQUIRED`) is an answer, not a hang: follow its `retryable` and
+`recovery` fields. Slow calls show up in `perf.summary` as `route:search` and
+`route:search.warm` violations.
+
 ## Empty corpus is a tooling failure, not "no results"
 
 SPEC and Issue searches build their corpus from the GitHub Issue cache
