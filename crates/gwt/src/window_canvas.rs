@@ -39,6 +39,20 @@ impl WindowCanvasState {
         self.persisted.windows.iter().find(|window| window.id == id)
     }
 
+    /// Changes snapshot eligibility without replacing the in-memory window.
+    /// Returns true only when the persist flag changed.
+    pub fn set_persist(&mut self, id: &str, persist: bool) -> bool {
+        let Some(index) = self.window_index(id) else {
+            return false;
+        };
+        let window = &mut self.persisted.windows[index];
+        if window.persist == persist {
+            return false;
+        }
+        window.persist = persist;
+        true
+    }
+
     pub fn set_status(&mut self, id: &str, status: WindowProcessStatus) -> bool {
         let Some(window) = self
             .persisted
@@ -1082,6 +1096,36 @@ mod tests {
         assert!(workspace.dock_window_tab(&branches.id, &file_tree.id));
 
         workspace
+    }
+
+    #[test]
+    fn persist_mutation_retains_window_and_excludes_only_it_from_snapshot() {
+        let mut workspace = WindowCanvasState::from_persisted(empty_workspace_state());
+        let agent = workspace.add_window(WindowPreset::Agent, arrange_bounds());
+        let shell = workspace.add_window(WindowPreset::Shell, arrange_bounds());
+        let original = workspace.persisted().clone();
+
+        assert!(workspace.set_persist(&agent.id, false));
+        let mut retained = agent.clone();
+        retained.persist = false;
+        assert_eq!(workspace.window(&agent.id), Some(&retained));
+        assert_eq!(workspace.window(&shell.id), Some(&shell));
+        assert_eq!(workspace.persistable_state().windows, vec![shell]);
+        assert!(!workspace.set_persist(&agent.id, false));
+
+        assert!(workspace.set_persist(&agent.id, true));
+        assert!(!workspace.set_persist(&agent.id, true));
+        assert_eq!(workspace.persisted(), &original);
+        assert_eq!(workspace.persistable_state(), original);
+    }
+
+    #[test]
+    fn persist_mutation_missing_window_leaves_canvas_unchanged() {
+        let mut workspace = WindowCanvasState::from_persisted(default_workspace_state());
+        let original = workspace.persisted().clone();
+
+        assert!(!workspace.set_persist("missing", false));
+        assert_eq!(workspace.persisted(), &original);
     }
 
     #[test]
