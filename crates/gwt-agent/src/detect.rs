@@ -322,9 +322,21 @@ mod tests {
         // The fixture PATH is injected into the probe only; the process PATH
         // stays untouched so parallel `sh` / `git` spawns keep resolving
         // (Issue #3895).
-        let detected =
-            AgentDetector::detect_by_command_in_env("grok", &[("PATH", temp.path().as_os_str())])
-                .expect("Grok Build fixture must be detected");
+        // Like the absolute-path test below, tolerate transient spawn failures
+        // under load (e.g. EAGAIN on fork; issues #3339 and #4708).
+        let detected = (0..8)
+            .find_map(|_| {
+                AgentDetector::detect_by_command_in_env(
+                    "grok",
+                    &[("PATH", temp.path().as_os_str())],
+                )
+                .or_else(|| {
+                    // test-hygiene: allow-short-duration Retry pacing only; no elapsed-time assertion.
+                    std::thread::sleep(Duration::from_millis(20));
+                    None
+                })
+            })
+            .expect("Grok Build fixture must be detected");
 
         assert_eq!(detected.agent_id, AgentId::GrokBuild);
         assert_eq!(detected.version.as_deref(), Some("1.0.3"));
