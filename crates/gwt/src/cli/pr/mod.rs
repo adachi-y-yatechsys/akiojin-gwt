@@ -2241,12 +2241,22 @@ mod tests {
             .unwrap();
         replacement_plan.created_at += chrono::Duration::seconds(1);
         crate::cli::verification_record::save_plan(worktree.path(), &replacement_plan).unwrap();
+        dispatch_pr_mutation(None, Some((worktree.path(), &guard)), || {
+            dispatched.set(true);
+            Ok(())
+        })
+        .expect("metadata-only plan registration must preserve dispatch eligibility");
+        assert!(dispatched.replace(false));
+
+        replacement_plan.commands = vec!["git --exec-path".to_string()];
+        crate::cli::verification_record::save_plan(worktree.path(), &replacement_plan).unwrap();
         let error = dispatch_pr_mutation(None, Some((worktree.path(), &guard)), || {
             dispatched.set(true);
             Ok(())
         })
         .expect_err("substituted verification plan must block dispatch");
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("commands"), "{error}");
         assert!(!dispatched.get(), "plan replacement must not reach GitHub");
     }
 

@@ -1980,6 +1980,7 @@ mod tests {
                 plan_covered: true,
                 planned_missing: Vec::new(),
                 verification_plan_hash: plan.content_hash,
+                verification_plan_snapshot: None,
                 plan_derived: false,
                 content_hash: String::new(),
             },
