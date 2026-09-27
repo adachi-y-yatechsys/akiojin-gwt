@@ -1813,6 +1813,11 @@ class _FakeEmbeddingModel:
 
 _MODEL_CACHE: Optional[Any] = None
 _MODEL_CACHE_REVISION: Optional[str] = None
+# Issue #4698: milliseconds this process spent importing and constructing the
+# embedding model. The one-shot runner pays it on every search, so the caller
+# subtracts it to hold the warm remainder to its own budget.
+_MODEL_LOAD_MS = 0
+_model_load_clock = time.monotonic
 
 
 def _get_embedding_model(revision: Optional[str] = None) -> Any:
@@ -1821,7 +1826,7 @@ def _get_embedding_model(revision: Optional[str] = None) -> Any:
     Honors GWT_INDEX_FAKE_EMBEDDING=1 to substitute a deterministic
     hash-based fake. Otherwise loads ``intfloat/multilingual-e5-base``.
     """
-    global _MODEL_CACHE, _MODEL_CACHE_REVISION
+    global _MODEL_CACHE, _MODEL_CACHE_REVISION, _MODEL_LOAD_MS
     if _MODEL_CACHE is not None and _MODEL_CACHE_REVISION == revision:
         return _MODEL_CACHE
 
@@ -1830,12 +1835,14 @@ def _get_embedding_model(revision: Optional[str] = None) -> Any:
         _MODEL_CACHE_REVISION = revision
         return _MODEL_CACHE
 
+    started = _model_load_clock()
     from sentence_transformers import SentenceTransformer  # type: ignore
 
     if revision is None:
         _MODEL_CACHE = SentenceTransformer(FILE_INDEX_V2_MODEL_ID)
     else:
         _MODEL_CACHE = SentenceTransformer(FILE_INDEX_V2_MODEL_ID, revision=revision)
+    _MODEL_LOAD_MS += int(round((_model_load_clock() - started) * 1000))
     _MODEL_CACHE_REVISION = revision
     return _MODEL_CACHE
 
@@ -9160,6 +9167,7 @@ def _action_search_multi_v2_pinned(
                 payload[key] = value
     payload["scopes"] = scope_states
     payload["scope_results"] = scope_results
+    payload["model_load_ms"] = _MODEL_LOAD_MS
     if stale_scopes:
         payload["stale_scopes"] = stale_scopes
     return payload

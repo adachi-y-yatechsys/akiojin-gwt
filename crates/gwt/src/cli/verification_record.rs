@@ -316,10 +316,12 @@ pub struct VerificationRunRecord {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub planned_missing: Vec<String>,
     /// Integrity hash of the exact verification-plan snapshot consumed by
-    /// this run. Replacing the plan invalidates the run even when both plans
-    /// happen to contain commands covered by the run.
+    /// this run. Semantic identity is compared separately (#4707).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub verification_plan_hash: String,
+    /// Immutable, integrity-covered input for semantic comparison and diagnostics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification_plan_snapshot: Option<VerificationPlanRecord>,
     /// Whether the exact plan snapshot was derived from changed surfaces.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub plan_derived: bool,
@@ -426,6 +428,42 @@ pub fn compute_plan_hash(plan: &VerificationPlanRecord) -> String {
     format!("{:x}", Sha256::digest(&bytes))
 }
 
+/// Verification meaning excludes registration metadata, which remains protected
+/// by `compute_plan_hash`. Keep this comparison shared by in-flight and delivery
+/// checks; command order and all authority/coverage fields are significant.
+fn changed_plan_fields(
+    before: &VerificationPlanRecord,
+    after: &VerificationPlanRecord,
+) -> Vec<&'static str> {
+    [
+        ("commands", before.commands != after.commands),
+        ("session_id", before.session_id != after.session_id),
+        ("owner_number", before.owner_number != after.owner_number),
+        (
+            "execution_binding",
+            before.execution_binding != after.execution_binding,
+        ),
+        ("derived", before.derived != after.derived),
+        ("surfaces", before.surfaces != after.surfaces),
+        (
+            "generated_outputs",
+            before.generated_outputs != after.generated_outputs,
+        ),
+        ("quarantines", before.quarantines != after.quarantines),
+    ]
+    .into_iter()
+    .filter_map(|(field, changed)| changed.then_some(field))
+    .collect()
+}
+
+fn same_plan_meaning(before: &VerificationPlanRecord, after: &VerificationPlanRecord) -> bool {
+    !before.content_hash.is_empty()
+        && !after.content_hash.is_empty()
+        && plan_integrity_ok(before)
+        && plan_integrity_ok(after)
+        && changed_plan_fields(before, after).is_empty()
+}
+
 /// True when the plan's stored integrity hash matches (or is legacy-empty).
 #[must_use]
 pub fn plan_integrity_ok(plan: &VerificationPlanRecord) -> bool {
@@ -472,13 +510,38 @@ pub fn save_plan(worktree: &Path, plan: &VerificationPlanRecord) -> io::Result<(
             plan.worktree_fingerprint =
                 worktree_fingerprint_excluding(worktree, &plan.generated_outputs)?;
         }
-        save_plan_unleased(worktree, &plan)
+        save_plan_unleased(worktree, &plan).map(|_| ())
     })
 }
 
-fn save_plan_unleased(worktree: &Path, plan: &VerificationPlanRecord) -> io::Result<()> {
+fn save_plan_unleased(
+    worktree: &Path,
+    plan: &VerificationPlanRecord,
+) -> io::Result<VerificationPlanRecord> {
     let mut plan = plan.clone();
     plan.content_hash = compute_plan_hash(&plan);
+    // Old runs have no embedded snapshot to compare. Preserve their exact
+    // plan on an idempotent registration, without modifying the run. Recovery
+    // must still register a new post-block snapshot.
+    if let (Ok(Some(previous)), Ok(Some(run))) = (load_plan(worktree), load(worktree)) {
+        if run.verification_plan_snapshot.is_none()
+            && same_plan_meaning(&previous, &plan)
+            && previous.worktree_fingerprint == plan.worktree_fingerprint
+            && crate::cli::execution_state::load(worktree)?.is_none_or(|execution| {
+                execution.status != crate::cli::execution_state::ExecutionControlStatus::Blocked
+            })
+            && evaluate_evidence_snapshot(
+                worktree,
+                &plan.session_id,
+                plan.owner_number,
+                Some(&previous),
+                &run,
+            )
+            .is_delivery_acceptable()
+        {
+            return Ok(previous);
+        }
+    }
     let serialized = serde_json::to_vec_pretty(&plan)
         .map_err(|err| io::Error::new(ErrorKind::InvalidData, err))?;
     crate::cli::trusted_store::write_with_mirror(
@@ -486,7 +549,8 @@ fn save_plan_unleased(worktree: &Path, plan: &VerificationPlanRecord) -> io::Res
         "verification-plan.json",
         &plan_state_path(worktree),
         &serialized,
-    )
+    )?;
+    Ok(plan)
 }
 
 fn register_plan_for_caller(
@@ -534,7 +598,7 @@ fn register_plan_with_context_unleased(
     context: PlanRegistrationContext,
     authority: &VerificationCallerAuthority,
 ) -> io::Result<VerificationPlanRecord> {
-    let mut plan = VerificationPlanRecord {
+    let plan = VerificationPlanRecord {
         session_id: session_id.to_string(),
         owner_number: authority.owner_number,
         execution_binding: authority.execution_binding.clone(),
@@ -547,9 +611,7 @@ fn register_plan_with_context_unleased(
         created_at: Utc::now(),
         content_hash: String::new(),
     };
-    plan.content_hash = compute_plan_hash(&plan);
-    save_plan_unleased(worktree, &plan)?;
-    Ok(plan)
+    save_plan_unleased(worktree, &plan)
 }
 
 fn derive_and_register_plan_for_caller(
@@ -2217,6 +2279,67 @@ fn identity_gate_escape_suffix(identity_gate_closed: bool) -> &'static str {
     " The Agent Workspace identity gate is closed for this session, so that commit and push are denied before they run. Lift the gate first, one single-segment gwtd command each: (1) `execution.adopt` with `params.reason` to take over this worktree's Execution Control Record, (2) `workspace.ensure` with `params.purpose` + `params.current_focus`, (3) `workspace.update` with the same two fields. Then commit, push, and retry. While the gate is closed you may also run `execution.repair`, `execution.reopen`, `execution.release_prepared`, and `memory.add`, so record what trapped you before escaping."
 }
 
+/// Only the successful PR mutation path calls this with the event returned by
+/// its writer. A kind:pr payload alone is not producer provenance. Keep the
+/// exact canonical bytes outside the checkout, scoped to this worktree.
+pub(crate) fn certify_pr_delivery_event(
+    worktree: &Path,
+    event: &gwt_core::workspace_projection::WorkEvent,
+) -> io::Result<()> {
+    if event.kind != gwt_core::workspace_projection::WorkEventKind::Pr {
+        return Err(io::Error::other("delivery certificate requires a PR event"));
+    }
+    let path = gwt_core::paths::gwt_repo_local_work_event_shard_path(worktree, &event.id);
+    let mut bytes = serde_json::to_vec(event)?;
+    bytes.push(b'\n');
+    if fs::read(&path)? != bytes {
+        return Err(io::Error::other(
+            "PR delivery event changed before certification",
+        ));
+    }
+    let name = format!(
+        "pr-delivery-{}",
+        path.file_name().unwrap().to_string_lossy()
+    );
+    let Some(trusted_dir) = super::trusted_store::trusted_dir_for_worktree(worktree) else {
+        // Legacy/unmanaged repositories without a trusted scope retain their
+        // existing PR behavior and receive no settlement exemption.
+        return Ok(());
+    };
+    // This is a complete per-event write, not shared read-modify-write state.
+    // Ready PR dispatch already holds the non-reentrant trusted-store lease.
+    super::trusted_store::write_to_resolved_dir(&trusted_dir, &name, &bytes)?;
+    let saved = super::trusted_store::read_from_resolved_dir(&trusted_dir, &name)?
+        .ok_or_else(|| io::Error::other("PR delivery certificate disappeared"))?;
+    if saved.as_bytes() != bytes {
+        return Err(io::Error::other(
+            "PR delivery certificate readback mismatch",
+        ));
+    }
+    Ok(())
+}
+
+fn is_certified_pr_delivery_event(worktree: &Path, relative: &[u8]) -> bool {
+    if !is_canonical_bucketed_work_event_shard(relative) {
+        return false;
+    }
+    let Ok(relative) = std::str::from_utf8(relative) else {
+        return false;
+    };
+    let path = worktree.join(relative);
+    if !fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_file()) {
+        return false;
+    }
+    let name = format!(
+        "pr-delivery-{}",
+        path.file_name().unwrap().to_string_lossy()
+    );
+    match (super::trusted_store::read(worktree, &name), fs::read(path)) {
+        (Ok(Some(certified)), Ok(actual)) => certified.as_bytes() == actual,
+        _ => false,
+    }
+}
+
 fn work_event_path_states(worktree: &Path) -> Result<Vec<WorkEventPathState>, ()> {
     let output = gwt_core::process::hidden_command("git")
         .args([
@@ -2242,6 +2365,9 @@ fn work_event_path_states(worktree: &Path) -> Result<Vec<WorkEventPathState>, ()
         }
         let (index, worktree_state) = (bytes[0], bytes[1]);
         if index == b'?' && worktree_state == b'?' {
+            if is_certified_pr_delivery_event(worktree, &bytes[3..]) {
+                continue;
+            }
             states.push(WorkEventPathState::Untracked);
             continue;
         }
@@ -2275,7 +2401,10 @@ fn work_event_path_states(worktree: &Path) -> Result<Vec<WorkEventPathState>, ()
         .stdout
         .split(|byte| *byte == 0)
         .filter(|path| !path.is_empty())
-        .any(is_canonical_bucketed_work_event_shard)
+        .any(|path| {
+            is_canonical_bucketed_work_event_shard(path)
+                && !is_certified_pr_delivery_event(worktree, path)
+        })
     {
         states.push(WorkEventPathState::Untracked);
     }
@@ -3410,6 +3539,9 @@ where
         created_at: Utc::now(),
         plan_covered,
         planned_missing,
+        verification_plan_snapshot: plan_snapshot
+            .clone()
+            .filter(|_| !verification_plan_hash.is_empty()),
         verification_plan_hash,
         plan_derived,
         content_hash: String::new(),
@@ -3448,9 +3580,7 @@ where
         }
         let same_plan = match (plan_snapshot.as_ref(), current_plan.as_ref()) {
             (Some(before), Some(after)) => {
-                !before.content_hash.is_empty()
-                    && before.content_hash == after.content_hash
-                    && plan_integrity_ok(after)
+                same_plan_meaning(before, after)
             }
             (None, None) => true,
             _ => false,
@@ -3526,12 +3656,14 @@ pub enum EvidenceStatus {
     /// The currently registered plan is not the exact immutable plan
     /// snapshot consumed by the run.
     PlanChanged,
+    /// The current plan differs in these named semantic fields.
+    PlanChangedFields(Vec<&'static str>),
 }
 
 impl EvidenceStatus {
     /// Human guidance for the gate message.
     #[must_use]
-    pub fn describe(&self) -> &'static str {
+    pub fn describe(&self) -> String {
         match self {
             Self::Fresh => "verification evidence is fresh",
             Self::FreshWithQuarantine => {
@@ -3565,9 +3697,13 @@ impl EvidenceStatus {
                 "the last verification run does not cover a registered plan — declare the required matrix with `verify.plan` (params.commands), then run it in full through `verify.run`"
             }
             Self::PlanChanged => {
-                "the verification plan changed after the last run — rerun `verify.run` against the current plan"
+                "the verification plan changed after the last run (verification_plan_hash or plan snapshot unavailable) — rerun `verify.run` against the current plan"
             }
-        }
+            Self::PlanChangedFields(fields) => return format!(
+                "the verification plan changed after the last run: {} — register the intended plan and rerun `verify.run`",
+                fields.join(", ")
+            ),
+        }.to_string()
     }
 
     #[must_use]
@@ -3936,12 +4072,46 @@ fn evaluate_evidence_snapshot_inner(
             return EvidenceStatus::WrongGeneration;
         }
     }
+    if let Some(snapshot) = record.verification_plan_snapshot.as_ref() {
+        if record.content_hash.is_empty()
+            || snapshot.content_hash.is_empty()
+            || snapshot.content_hash != record.verification_plan_hash
+            || !plan_integrity_ok(snapshot)
+            || snapshot.session_id != record.session_id
+            || snapshot.owner_number != record.owner_number
+            || snapshot.execution_binding != record.execution_binding
+            || snapshot.derived != record.plan_derived
+        {
+            return EvidenceStatus::Tampered;
+        }
+    }
+    if !record.verification_plan_hash.is_empty() {
+        let Some(plan) = plan else {
+            return EvidenceStatus::PlanChangedFields(vec!["verification_plan (missing)"]);
+        };
+        if let Some(snapshot) = record.verification_plan_snapshot.as_ref() {
+            if plan.content_hash.is_empty() || !plan_integrity_ok(plan) {
+                return EvidenceStatus::PlanChangedFields(vec!["content_hash (integrity)"]);
+            }
+            let changed = changed_plan_fields(snapshot, plan);
+            if !changed.is_empty() {
+                return EvidenceStatus::PlanChangedFields(changed);
+            }
+        } else if plan.content_hash.is_empty()
+            || !plan_integrity_ok(plan)
+            || plan.session_id != session_id
+            || plan.owner_number != record.owner_number
+            || plan.execution_binding != record.execution_binding
+            || plan.worktree_fingerprint.is_empty()
+            || plan.worktree_fingerprint != record.worktree_fingerprint
+            || record.verification_plan_hash != plan.content_hash
+            || record.plan_derived != plan.derived
+        {
+            return EvidenceStatus::PlanChanged;
+        }
+    }
     let generated_outputs = plan
-        .filter(|plan| {
-            !record.verification_plan_hash.is_empty()
-                && plan.content_hash == record.verification_plan_hash
-                && plan_integrity_ok(plan)
-        })
+        .filter(|_| !record.verification_plan_hash.is_empty())
         .map(|plan| validate_generated_outputs(worktree, &plan.generated_outputs))
         .transpose();
     let Ok(generated_outputs) = generated_outputs else {
@@ -3952,6 +4122,18 @@ fn evaluate_evidence_snapshot_inner(
             .unwrap_or_else(|_| "no-git".to_string());
     if record.worktree_fingerprint != current_fingerprint {
         return EvidenceStatus::StaleFingerprint;
+    }
+    // The consumed plan must cover the run's source, but source mutation
+    // during/after execution remains the primary stale-evidence diagnosis.
+    if record
+        .verification_plan_snapshot
+        .as_ref()
+        .is_some_and(|snapshot| {
+            snapshot.worktree_fingerprint.is_empty()
+                || snapshot.worktree_fingerprint != record.worktree_fingerprint
+        })
+    {
+        return EvidenceStatus::PlanChangedFields(vec!["worktree_fingerprint"]);
     }
     // Missing or failing nominated browser evidence cannot be waived by
     // command quarantine or Board adjudication, even with a zero raw exit.
@@ -3975,23 +4157,6 @@ fn evaluate_evidence_snapshot_inner(
     } else {
         return EvidenceStatus::Failing;
     };
-    if !record.verification_plan_hash.is_empty() {
-        let Some(plan) = plan else {
-            return EvidenceStatus::PlanChanged;
-        };
-        if plan.content_hash.is_empty()
-            || !plan_integrity_ok(plan)
-            || plan.session_id != session_id
-            || plan.owner_number != record.owner_number
-            || plan.execution_binding != record.execution_binding
-            || plan.worktree_fingerprint.is_empty()
-            || plan.worktree_fingerprint != record.worktree_fingerprint
-            || record.verification_plan_hash != plan.content_hash
-            || record.plan_derived != plan.derived
-        {
-            return EvidenceStatus::PlanChanged;
-        }
-    }
     if !record.plan_covered {
         return EvidenceStatus::PlanNotCovered;
     }
@@ -4810,6 +4975,7 @@ pub(crate) mod tests {
             plan_covered: true,
             planned_missing: Vec::new(),
             verification_plan_hash: String::new(),
+            verification_plan_snapshot: None,
             plan_derived: false,
             content_hash: String::new(),
         }
@@ -5578,6 +5744,7 @@ mod tests {
             plan_covered: true,
             planned_missing: Vec::new(),
             verification_plan_hash: String::new(),
+            verification_plan_snapshot: None,
             plan_derived: false,
             content_hash: String::new(),
         };
@@ -5951,7 +6118,9 @@ mod tests {
             pr_number: 3854,
         }];
         save_plan(dir.path(), &plan).unwrap();
-        record.verification_plan_hash = load_plan(dir.path()).unwrap().unwrap().content_hash;
+        let plan = load_plan(dir.path()).unwrap().unwrap();
+        record.verification_plan_hash = plan.content_hash.clone();
+        record.verification_plan_snapshot = Some(plan);
         record.content_hash.clear();
         save(dir.path(), &record).unwrap();
 
@@ -6531,6 +6700,9 @@ mod tests {
             || {
                 fs::create_dir_all(dir.path().join("artifacts")).unwrap();
                 fs::write(dir.path().join("artifacts/report.json"), "{}").unwrap();
+                let mut plan = load_plan(dir.path()).unwrap().unwrap();
+                plan.created_at += chrono::Duration::seconds(1);
+                save_plan(dir.path(), &plan).unwrap();
             },
         )
         .unwrap();
@@ -6539,6 +6711,16 @@ mod tests {
             evaluate_evidence(dir.path(), "sess-generated", None),
             EvidenceStatus::Fresh
         );
+
+        let plan = load_plan(dir.path()).unwrap().unwrap();
+        let mut changed = plan.clone();
+        changed.commands = vec!["git --exec-path".to_string()];
+        save_plan(dir.path(), &changed).unwrap();
+        assert_eq!(
+            evaluate_evidence(dir.path(), "sess-generated", None),
+            EvidenceStatus::PlanChangedFields(vec!["commands"])
+        );
+        save_plan(dir.path(), &plan).unwrap();
 
         fs::write(dir.path().join("src.txt"), "v2").unwrap();
         assert_eq!(
@@ -6745,8 +6927,67 @@ mod tests {
         assert!(!record.plan_covered);
     }
 
-    // FR-195 / AS-177: Fresh evidence is bound to the exact plan snapshot
-    // used by the run. Re-registering any plan invalidates the old run.
+    #[test]
+    fn evidence_preserves_pass_after_identical_plan_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let commands = vec!["git --version".to_string()];
+        let authority = snapshot_verification_caller_authority(dir.path(), "sess-1").unwrap();
+        let register = || {
+            register_plan_for_caller(
+                dir.path(),
+                "sess-1",
+                commands.clone(),
+                Vec::new(),
+                Vec::new(),
+                false,
+                &authority,
+            )
+            .unwrap()
+        };
+        register();
+        let (run, _) = run_verification(dir.path(), "sess-1", &commands).unwrap();
+        assert!(run.all_passed);
+        let mut plan = register();
+        assert_eq!(
+            evaluate_evidence(dir.path(), "sess-1", None),
+            EvidenceStatus::Fresh
+        );
+        // Change metadata deterministically; no sleep or clock deadline.
+        plan.created_at += chrono::Duration::seconds(1);
+        save_plan(dir.path(), &plan).unwrap();
+        assert_eq!(
+            evaluate_evidence(dir.path(), "sess-1", None),
+            EvidenceStatus::Fresh
+        );
+        // Registration metadata is not the verification target. The run's
+        // source fingerprint is still checked against the actual worktree.
+        plan.worktree_fingerprint = "registration-metadata".to_string();
+        save_plan(dir.path(), &plan).unwrap();
+        assert_eq!(
+            evaluate_evidence(dir.path(), "sess-1", None),
+            EvidenceStatus::Fresh
+        );
+        assert_eq!(load(dir.path()).unwrap().unwrap(), run);
+    }
+
+    #[test]
+    fn identical_registration_preserves_legacy_pass_without_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut run, _) = plan_and_run(dir.path(), "sess-1", &["git --version".to_string()]);
+        run.verification_plan_snapshot = None;
+        save(dir.path(), &run).unwrap();
+        let previous = load_plan(dir.path()).unwrap().unwrap();
+        let mut plan = previous.clone();
+        plan.created_at += chrono::Duration::seconds(1);
+        save_plan(dir.path(), &plan).unwrap();
+        assert_eq!(load_plan(dir.path()).unwrap().unwrap(), previous);
+        assert_eq!(
+            evaluate_evidence(dir.path(), "sess-1", None),
+            EvidenceStatus::Fresh
+        );
+    }
+
+    // #4707: changed verification content still invalidates the old run.
     #[test]
     fn evidence_rejects_plan_replacement_after_run() {
         let dir = tempfile::tempdir().unwrap();
@@ -6797,9 +7038,12 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(
-            evaluate_evidence(dir.path(), "sess-1", None),
-            EvidenceStatus::PlanChanged
+        let status = evaluate_evidence(dir.path(), "sess-1", None);
+        assert!(!status.is_delivery_acceptable());
+        assert!(
+            status.describe().contains("commands"),
+            "{}",
+            status.describe()
         );
     }
 
@@ -6843,7 +7087,7 @@ mod tests {
         );
         assert_eq!(
             evaluate_evidence(dir.path(), "sess-1", None),
-            EvidenceStatus::PlanChanged
+            EvidenceStatus::PlanChangedFields(vec!["worktree_fingerprint"])
         );
     }
 
