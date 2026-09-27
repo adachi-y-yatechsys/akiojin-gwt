@@ -93,9 +93,9 @@ pub fn is_lock_contended(error: &io::Error) -> bool {
 /// to the operation itself going wrong.
 ///
 /// The kind alone is not enough. A deadline starts life as
-/// [`io::ErrorKind::TimedOut`] — both [`deadline_error`] here and the process
-/// spawner's own deadline error use it — but callers that cross a crate
-/// boundary flatten it: a `git worktree list` deadline becomes
+/// [`io::ErrorKind::TimedOut`] — both this module's own `deadline_error` and
+/// the process spawner's use it — but callers that cross a crate boundary
+/// flatten it: a `git worktree list` deadline becomes
 /// `GwtError::Git(String)` and is then rebuilt with `io::Error::other`, which
 /// reports `ErrorKind::Other`. Matching the message as well keeps the
 /// classification intact across those hops (Issue #4686).
