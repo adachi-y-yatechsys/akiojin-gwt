@@ -1813,6 +1813,8 @@ class _FakeEmbeddingModel:
 
 _MODEL_CACHE: Optional[Any] = None
 _MODEL_CACHE_REVISION: Optional[str] = None
+# Search timing subtracts only initialization performed during that request.
+_MODEL_INIT_SECONDS = 0.0
 
 
 def _get_embedding_model(revision: Optional[str] = None) -> Any:
@@ -1821,23 +1823,25 @@ def _get_embedding_model(revision: Optional[str] = None) -> Any:
     Honors GWT_INDEX_FAKE_EMBEDDING=1 to substitute a deterministic
     hash-based fake. Otherwise loads ``intfloat/multilingual-e5-base``.
     """
-    global _MODEL_CACHE, _MODEL_CACHE_REVISION
+    global _MODEL_CACHE, _MODEL_CACHE_REVISION, _MODEL_INIT_SECONDS
     if _MODEL_CACHE is not None and _MODEL_CACHE_REVISION == revision:
         return _MODEL_CACHE
 
-    if os.environ.get("GWT_INDEX_FAKE_EMBEDDING") == "1":
-        _MODEL_CACHE = _FakeEmbeddingModel()
+    started = time.monotonic()
+    try:
+        if os.environ.get("GWT_INDEX_FAKE_EMBEDDING") == "1":
+            _MODEL_CACHE = _FakeEmbeddingModel()
+        else:
+            from sentence_transformers import SentenceTransformer  # type: ignore
+
+            if revision is None:
+                _MODEL_CACHE = SentenceTransformer(FILE_INDEX_V2_MODEL_ID)
+            else:
+                _MODEL_CACHE = SentenceTransformer(FILE_INDEX_V2_MODEL_ID, revision=revision)
         _MODEL_CACHE_REVISION = revision
         return _MODEL_CACHE
-
-    from sentence_transformers import SentenceTransformer  # type: ignore
-
-    if revision is None:
-        _MODEL_CACHE = SentenceTransformer(FILE_INDEX_V2_MODEL_ID)
-    else:
-        _MODEL_CACHE = SentenceTransformer(FILE_INDEX_V2_MODEL_ID, revision=revision)
-    _MODEL_CACHE_REVISION = revision
-    return _MODEL_CACHE
+    finally:
+        _MODEL_INIT_SECONDS += max(0.0, time.monotonic() - started)
 
 
 class E5EmbeddingFunction:
@@ -9176,6 +9180,8 @@ def action_search_multi_v2(
     match_mode: str = "semantic",
     file_index_protocol: str = "legacy",
 ) -> Dict[str, Any]:
+    started = time.monotonic()
+    model_init_before = _MODEL_INIT_SECONDS
     has_v2_file_scope = any(scope in {"files", "files-docs"} for scope in scopes)
     if file_index_protocol == "v2" and has_v2_file_scope and worktree_hash:
         with _file_index_v2_reader_pin_if_present(
@@ -9183,7 +9189,7 @@ def action_search_multi_v2(
             worktree_hash,
             db_root,
         ):
-            return _action_search_multi_v2_pinned(
+            payload = _action_search_multi_v2_pinned(
                 repo_hash,
                 worktree_hash,
                 project_root,
@@ -9194,17 +9200,25 @@ def action_search_multi_v2(
                 match_mode,
                 file_index_protocol,
             )
-    return _action_search_multi_v2_pinned(
-        repo_hash,
-        worktree_hash,
-        project_root,
-        query,
-        n_results,
-        scopes,
-        db_root,
-        match_mode,
-        file_index_protocol,
-    )
+    else:
+        payload = _action_search_multi_v2_pinned(
+            repo_hash,
+            worktree_hash,
+            project_root,
+            query,
+            n_results,
+            scopes,
+            db_root,
+            match_mode,
+            file_index_protocol,
+        )
+    if payload.get("ok"):
+        model_init = max(0.0, _MODEL_INIT_SECONDS - model_init_before)
+        payload["timing"] = {
+            "model_init_ms": int(model_init * 1000.0),
+            "warm_ms": int(max(0.0, time.monotonic() - started - model_init) * 1000.0),
+        }
+    return payload
 
 
 # ---------------------------------------------------------------------

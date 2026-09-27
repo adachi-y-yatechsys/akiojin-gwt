@@ -79,6 +79,44 @@ class SearchMultiContractTests(unittest.TestCase):
         self._coord_tmp.cleanup()
         runner._MODEL_CACHE = None
 
+    def test_search_timing_excludes_only_uncached_model_initialization(self):
+        clock = [100.0]
+
+        def initialize_model():
+            clock[0] += 3.0
+            return mock.Mock()
+
+        def search(*_):
+            clock[0] += 1.0  # Scope health work is warm work.
+            runner._get_embedding_model().encode(["query: alpha"])
+            clock[0] += 6.0  # Query encoding and scope search are warm work.
+            return {"ok": True, "results": []}
+
+        with (
+            mock.patch.object(runner.time, "monotonic", side_effect=lambda: clock[0]),
+            mock.patch.object(
+                runner, "_FakeEmbeddingModel", side_effect=initialize_model
+            ) as model,
+            mock.patch.object(runner, "_action_search_multi_v2_pinned", side_effect=search),
+        ):
+            cold = runner.action_search_multi_v2(
+                REPO_HASH, None, None, "alpha", 5, ["issues"]
+            )
+            warm = runner.action_search_multi_v2(
+                REPO_HASH, None, None, "alpha", 5, ["issues"]
+            )
+
+        self.assertEqual(
+            cold.get("timing"), {"model_init_ms": 3000, "warm_ms": 7000}
+        )
+        self.assertEqual(
+            warm.get("timing"), {"model_init_ms": 0, "warm_ms": 7000}
+        )
+        for payload in (cold, warm):
+            for value in payload["timing"].values():
+                self.assertIsInstance(value, int)
+        model.assert_called_once()
+
     def _write_cached_issue(self, base: Path, number: int, title: str) -> None:
         issue_dir = base / ".gwt" / "cache" / "issues" / REPO_HASH / str(number)
         issue_dir.mkdir(parents=True)

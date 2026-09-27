@@ -420,6 +420,27 @@ pub(crate) fn search_project_index_attempt(
         search_unavailable_error("project index search completed without a payload")
     })?;
 
+    // Issue #4698: retain the end-to-end cold timer and attribute the runner's
+    // measured interval without model initialization to the existing perf log.
+    // Record only the ready result, not missing/corrupt repair probes.
+    // Older runners omit timing; do not invent a warm measurement for them.
+    if let Some(ms) = payload.pointer("/timing/warm_ms").and_then(Value::as_u64) {
+        crate::perf::record_route(
+            crate::perf::PerfRoute::SearchWarm,
+            Duration::from_millis(ms),
+        );
+    }
+    if let Some(ms) = payload
+        .pointer("/timing/model_init_ms")
+        .and_then(Value::as_u64)
+    {
+        crate::perf::record_route_phase(
+            crate::perf::PerfRoute::Search,
+            "model_init",
+            Duration::from_millis(ms),
+        );
+    }
+
     // FR-387 stale-while-revalidate: verified results return immediately;
     // one refresh is queued per stale scope (the coordinator coalesces
     // concurrent refreshes host-wide into a single flight).

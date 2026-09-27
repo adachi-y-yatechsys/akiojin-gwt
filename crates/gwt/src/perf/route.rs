@@ -27,8 +27,14 @@ pub const DEFAULT_PANE_CREATE_BUDGET_MS: f64 = 5_000.0;
 
 /// Individual ceiling for one index search attempt, in milliseconds.
 ///
-/// Covers the embedding model query and the batched scope search.
-pub const DEFAULT_SEARCH_BUDGET_MS: f64 = 2_000.0;
+/// Cold, end-to-end one-shot attempt, including model import and loading.
+/// Issue #4698 measured 11.152–15.311 seconds; 20 seconds rounds up roughly
+/// 30% headroom above the observed maximum. The 30-second deadline is separate.
+pub const DEFAULT_SEARCH_BUDGET_MS: f64 = 20_000.0;
+
+/// SPEC #1939 NFR-004 / SC-044: warm search p95, excluding model initialization.
+/// The same summary's `worst` value is checked against the 8-second maximum.
+pub const DEFAULT_SEARCH_WARM_BUDGET_MS: f64 = 5_000.0;
 
 /// Individual ceiling for one Work events ingest trigger, in milliseconds.
 ///
@@ -67,6 +73,8 @@ pub enum PerfRoute {
     PromptSend,
     /// One index search attempt.
     Search,
+    /// Runner search interval excluding model import and weight loading.
+    SearchWarm,
     /// One Work events ingest trigger, off the GUI event loop.
     WorkEventsIngest,
     /// Hook health aggregation across every Active Work row of one build.
@@ -75,7 +83,7 @@ pub enum PerfRoute {
 
 impl PerfRoute {
     /// Every instrumented route, in the order `perf.summary` reports them.
-    pub const ALL: [PerfRoute; 9] = [
+    pub const ALL: [PerfRoute; 10] = [
         PerfRoute::Startup,
         PerfRoute::ProjectOpen,
         PerfRoute::ProjectSwitch,
@@ -83,6 +91,7 @@ impl PerfRoute {
         PerfRoute::PaneClose,
         PerfRoute::PromptSend,
         PerfRoute::Search,
+        PerfRoute::SearchWarm,
         PerfRoute::WorkEventsIngest,
         PerfRoute::WorkHookHealth,
     ];
@@ -97,6 +106,7 @@ impl PerfRoute {
             PerfRoute::PaneClose => "pane.close",
             PerfRoute::PromptSend => "prompt.send",
             PerfRoute::Search => "search",
+            PerfRoute::SearchWarm => "search.warm",
             PerfRoute::WorkEventsIngest => "work_events.ingest",
             PerfRoute::WorkHookHealth => "work.hook_health",
         }
@@ -143,6 +153,7 @@ impl PerfRoute {
             PerfRoute::ProjectOpen => DEFAULT_PROJECT_OPEN_BUDGET_MS,
             PerfRoute::PaneCreate => DEFAULT_PANE_CREATE_BUDGET_MS,
             PerfRoute::Search => DEFAULT_SEARCH_BUDGET_MS,
+            PerfRoute::SearchWarm => DEFAULT_SEARCH_WARM_BUDGET_MS,
             PerfRoute::WorkEventsIngest => DEFAULT_WORK_EVENTS_INGEST_BUDGET_MS,
             PerfRoute::WorkHookHealth => DEFAULT_WORK_HOOK_HEALTH_BUDGET_MS,
         }

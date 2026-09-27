@@ -418,6 +418,55 @@ mod tests {
         assert_eq!(violations[0].consecutive_count, Some(3));
     }
 
+    /// Issue #4698: injected durations fix both budgets without waiting for
+    /// a model import or depending on the machine's scheduling latency.
+    #[test]
+    fn search_cold_and_warm_budgets_detect_only_sustained_overages() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _gwt_home = ScopedGwtHome::set(home.path());
+        let mut runtime = PerfRuntime::from_config(&PerfConfig::default()).expect("runtime");
+        let warm = PerfRoute::from_target("route:search.warm").expect("warm search route");
+
+        for (route, budget_ms) in [(PerfRoute::Search, 20_000), (warm, 5_000)] {
+            assert_eq!(route.budget_ms(runtime.budgets()), budget_ms as f64);
+            for _ in 0..3 {
+                runtime.record_route(route, Duration::from_millis(budget_ms));
+            }
+        }
+        assert!(read_all().iter().all(|record| !record.is_violation()));
+
+        // A lone slow warm search must remain visible in `worst`, even when
+        // p95 is healthy and the existing sustained-violation rule is silent.
+        let mut sample = read_all()
+            .into_iter()
+            .find(|record| record.target == "route:search.warm")
+            .expect("warm sample");
+        sample.value = 1_000.0;
+        let mut samples = vec![sample; 100];
+        samples[99].value = 8_000.0;
+        let report = crate::perf::summary::summarize(&samples, runtime.budgets(), None);
+        assert_eq!(report.targets[0].p95, 1_000.0);
+        assert_eq!(report.targets[0].worst, 8_000.0);
+        assert!(report.targets[0].worst <= 8_000.0);
+        samples[99].value = 9_000.0;
+        let report = crate::perf::summary::summarize(&samples, runtime.budgets(), None);
+        assert!(!report.targets[0].over_budget, "p95 remains healthy");
+        assert!(report.targets[0].worst > 8_000.0, "maximum is exceeded");
+
+        for (route, budget_ms) in [(PerfRoute::Search, 20_000), (warm, 5_000)] {
+            for _ in 0..3 {
+                runtime.record_route(route, Duration::from_millis(budget_ms * 2));
+            }
+        }
+        let records = read_all();
+        let violations: Vec<_> = records.iter().filter(|r| r.is_violation()).collect();
+        assert_eq!(violations.len(), 2);
+        assert_eq!(violations[0].target, "route:search");
+        assert_eq!(violations[0].budget, Some(20_000.0));
+        assert_eq!(violations[1].target, "route:search.warm");
+        assert_eq!(violations[1].budget, Some(5_000.0));
+    }
+
     /// Issue #4283 AC-5: the pane-create route records which preparation
     /// phase was dominant, so the next regression is attributed from the perf
     /// stream instead of guessed. Phases are unbudgeted: a slow phase never
