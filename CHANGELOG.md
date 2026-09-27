@@ -1,6 +1,63 @@
 # Changelog
 
 All notable changes to this project will be documented in this file.
+## [9.103.0] - 2026-09-27
+
+### Bug Fixes
+
+- **test:** Transport inventory の CRLF 改行依存を除去
+- **test:** 子孫回収テストの起動と終了を同期する
+- **execute:** PR否定表現で不要なobligationを作らない
+- **execute:** 否定PR句だけでは作業依頼を起動しない
+- **workspace:** Point the container-ambiguity refusal at the operation that clears it
+- **index:** Search の所要時間目標を cold / warm に分けて実測に合わせる
+- **index:** One-shot検索のcoldとwarmの所要時間目標を分離
+- **pm:** Count the family before filing, and report the filing rate
+- **release:** 最新remoteタグと未配信bumpを分離する
+- **workspace:** 切り離したコンテナ参照の復活を防ぐ
+- **worktree:** 低容量GCで未マージキャッシュを後順位回収し無回収を警告
+- **build:** 死亡 Session の build lifecycle を復旧
+- **test:** Managed_assetsのfixture寿命全体でHOMEを隔離する
+- **test:** Docker probeの実時間依存を除去し衛生ゲートを補強
+- **test:** Grok検出fixtureの一時的な起動失敗を再試行
+- **work:** PR配送で生成したshardをStop判定から除外
+- **verify:** 同一plan再登録でPASS証拠を維持する
+- **hook:** Degrade a PM refresh that ran out of the prompt budget
+- **doc:** Drop the intra-doc link from a public item to a private one
+
+### Features
+
+- **agent:** 中断回数のSession基盤と旧停止状態の移行保護を追加
+
+### Miscellaneous Tasks
+
+- **work:** PR #4700の配送記録を保存
+- **work:** #3866の受け入れ監査履歴を記録
+- **work:** #4696のPR紐付け履歴を保存
+- **work:** PR #4705の配送記録を保存
+- **work:** Issue 4685の再開記録を保存する
+- **work:** Issue 4685の再開記録を保存する
+- **work:** PR #4711の配送記録を保存する
+- **work:** #4698 の Work 配送記録を保存
+- **work:** #4703の検証証跡と配送再開を記録
+- **work:** PR #4715の配送記録を保存
+- **work:** 4698のPR追記記録を保存
+- **work:** 低容量GCの受け入れ監査と配送記録を保存
+- **work:** Issue 4695の再開と受け入れ監査を記録
+- **work:** Issue 4695のPR配送記録を保存
+- **work:** Issue-4684 のランタイムシャードを記録
+- **work:** Issue-4684 の完了シャードを記録
+- **work:** 再起動後の作業記録を保全
+- **work:** #4669の再開と検証記録を保存
+- **work:** #4669の受け入れ再確認と再開記録を保存
+- **work:** 遅延反映された復旧待ち記録を保存
+- **work:** 検証plan修正の配送記録を保存
+- **work:** PR #4719の配送記録を保存
+
+### Testing
+
+- **workspace:** Board更新時の切り離し復活経路を検証する
+
 ## [9.102.1] - 2026-09-25
 
 ### Bug Fixes
