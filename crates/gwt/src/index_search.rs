@@ -263,6 +263,7 @@ pub(crate) fn search_project_index_attempt(
     // JSON operation funnel through here, so one guard measures the search
     // route end to end, early returns included.
     let _perf_route = crate::perf::RouteTimer::start(crate::perf::PerfRoute::Search);
+    let route_started = Instant::now();
     // One absolute attempt budget covers runtime ensure/provisioning, its
     // cross-process lock, every health probe, repair polling, and the final
     // runner. Nested callers retain an earlier ambient deadline.
@@ -303,8 +304,12 @@ pub(crate) fn search_project_index_attempt(
     // runner tree, one model load, one query encode.
     let per_scope_limit = per_scope_limit(effective_scopes.len());
     let worktree_hash_arg = file_worktree.as_ref().map(|worktree| worktree.hash.clone());
+    // Issue #4698: every one-shot runner reloads the model; the sum of what
+    // they report is the cold part of this search. A runner that reports
+    // nothing leaves the warm remainder unknown rather than fabricated.
+    let model_load = std::cell::Cell::new(Some(Duration::ZERO));
     let run_batch = || -> Result<Value, IndexSearchAttemptError> {
-        run_batch_scope_search(
+        let payload = run_batch_scope_search(
             &repo_search_root,
             repo_hash.as_str(),
             &effective_scopes,
@@ -312,7 +317,14 @@ pub(crate) fn search_project_index_attempt(
             query,
             per_scope_limit,
             match_mode,
-        )
+        )?;
+        model_load.set(
+            model_load
+                .get()
+                .zip(reported_model_load(&payload))
+                .map(|(sum, load)| sum + load),
+        );
+        Ok(payload)
     };
 
     // Issue #4455 AC-3: the join window only covers a rebuild small enough to
@@ -457,12 +469,27 @@ pub(crate) fn search_project_index_attempt(
     suggestions.sort_by(|left, right| distance_key(left).total_cmp(&distance_key(right)));
     results.truncate(INDEX_SEARCH_LIMIT);
     suggestions.truncate(INDEX_SEARCH_LIMIT);
+    if let Some(model_load) = model_load.get() {
+        crate::perf::record_route(
+            crate::perf::PerfRoute::SearchWarm,
+            route_started.elapsed().saturating_sub(model_load),
+        );
+    }
     Ok(ProjectIndexSearchOutcome {
         results,
         suggestions,
         stale_scopes,
         refresh_queued,
     })
+}
+
+/// Model import and construction time a successful `search-multi` runner
+/// reported (Issue #4698). `None` when the runner did not report it.
+fn reported_model_load(payload: &Value) -> Option<Duration> {
+    payload
+        .get("model_load_ms")
+        .and_then(Value::as_u64)
+        .map(Duration::from_millis)
 }
 
 /// Upper bound on how long an interactive search joins a queued repair before
@@ -1762,6 +1789,22 @@ mod tests {
 
         assert!(outcome.results.is_empty());
         assert!(outcome.suggestions.is_empty());
+    }
+
+    /// Issue #4698 AC-2: the warm remainder is the search total minus the model
+    /// load the one-shot runner reported. A runner that does not report it
+    /// (an older runner) yields no warm sample instead of a fabricated one.
+    #[test]
+    fn warm_search_time_uses_only_a_reported_model_load() {
+        assert_eq!(
+            reported_model_load(&json!({"ok": true, "model_load_ms": 13_263})),
+            Some(Duration::from_millis(13_263))
+        );
+        assert_eq!(reported_model_load(&json!({"ok": true})), None);
+        assert_eq!(
+            reported_model_load(&json!({"ok": true, "model_load_ms": "slow"})),
+            None
+        );
     }
 
     #[test]
