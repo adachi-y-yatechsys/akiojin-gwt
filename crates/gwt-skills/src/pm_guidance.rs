@@ -121,6 +121,24 @@ You own the backlog for its whole life, not just at creation.
   standalone. The reason is that the Issue Monitor launches Issues, not
   spec sections, so work written only into a spec never runs — while a
   standalone Issue splits the area's history away from its owner.
+- Count the family before you register a defect you hit while working.
+  Search for the same failure mode and count how many Issues already
+  describe it, closed ones included. At three or more you are looking at
+  a family, not an incident: the evidence that individual fixes are not
+  holding is the count itself, so adding the next one repeats a move the
+  record already shows failing. Register the work against the family's
+  owning spec — creating that spec if none owns it — and record the new
+  instance there as evidence rather than as its own Issue. On 2026-09-25
+  the PM filed the fifth build-artifact-GC Issue, the seventh wall-clock
+  deadline Issue, and the third "the gate refuses its own valid evidence"
+  Issue, all in one day.
+- Report your own filing rate. A day that closed seven Issues and opened
+  seven has not reduced the backlog, and a digest that lists only the
+  closures reads as progress that did not happen. State both counts, and
+  when they match, say so as a problem to solve rather than a milestone.
+  Defects the fleet trips over while working are worth registering, but
+  they are not what the user asked for: when a day produces nothing but
+  those, the backlog the user cares about stood still.
 - Decompose one user request into independently deliverable Issues.
   Record cross-Issue ordering with dependency markers in the body.
 - Registration template: a clear problem statement, acceptance
@@ -1678,6 +1696,38 @@ mod tests {
         assert!(body.contains("`gwt-search`"), "重複確認の導線が要る");
         assert!(body.contains("before registering anything new"));
         assert!(body.contains("Keep the backlog honest"));
+    }
+
+    /// A PM that registers every defect it trips over keeps the backlog
+    /// flat: on 2026-09-25 it closed seven Issues, opened seven, and left the
+    /// open count exactly where it started, with every new Issue the next
+    /// instance of a failure mode that already had four to six of its own.
+    /// The contract now makes the PM count the family before filing and
+    /// report both numbers, so neither the repetition nor the flat total can
+    /// be reported as progress.
+    #[test]
+    fn contract_makes_the_pm_count_the_family_and_report_its_own_filing_rate() {
+        let body = body();
+        for phrase in [
+            // Counting the family is the step that precedes filing, and the
+            // threshold is written down rather than left to judgement.
+            "Count the family before you register",
+            "count how many Issues already",
+            "closed ones included",
+            "At three or more",
+            // Why the count matters: it is itself the evidence.
+            "the evidence that individual fixes are not",
+            // What to do instead of filing the next duplicate.
+            "Register the work against the family's",
+            "as evidence rather than as its own Issue",
+            // The filing rate is reported, and a flat day is named a problem.
+            "Report your own filing rate",
+            "has not reduced the backlog",
+            "as a problem to solve rather than a milestone",
+            "the backlog the user cares about stood still",
+        ] {
+            assert!(body.contains(phrase), "missing: {phrase}");
+        }
     }
 
     /// Issue #4680 AC-1 / AC-2: the search clause told the PM to run
