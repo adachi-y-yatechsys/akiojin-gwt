@@ -86,21 +86,55 @@ fn refresh_at_safe_boundary(worktree: &Path, nonblocking: bool) -> io::Result<Op
                 .unwrap_or("unknown")
         ))),
         Ok(_) => Ok(None),
-        Err(error)
-            if error
-                .get_ref()
-                .is_some_and(|cause| cause.is::<pm_registry::PmRefreshDeferred>()) =>
-        {
-            Ok(Some(format!(
-                "Resident PM worktree refresh deferred: {error}. \
-                 This prompt did not refresh the worktree; freshness is unverified."
-            )))
-        }
-        Err(error) => {
-            tracing::warn!(%error, "resident PM worktree refresh failed at a safe boundary");
-            Err(error)
-        }
+        Err(error) => match degraded_refresh_context(&error) {
+            Some(context) => {
+                tracing::warn!(%error, "resident PM worktree refresh did not run this prompt");
+                Ok(Some(context))
+            }
+            None => {
+                tracing::warn!(%error, "resident PM worktree refresh failed at a safe boundary");
+                Err(error)
+            }
+        },
     }
+}
+
+/// Which refresh failures are reported to the turn as context instead of
+/// failing the hook closed.
+///
+/// Two failures mean "the refresh did not get to run", not "the worktree is
+/// wrong", so the turn may start without it as long as it is told:
+///
+/// - another holder had the refresh lock (`PmRefreshDeferred`), and
+/// - the refresh ran out of the UserPromptSubmit budget (Issue #4686) —
+///   `git worktree list` overrunning the process deadline, or the managed
+///   asset lock overrunning the file-lock deadline.
+///
+/// The second one used to fall through and fail the hook closed: exit 1, and
+/// the prompt lost its whole Board and runtime state injection with nothing
+/// but an `errors.list` row to say so. Because the hook is fail-closed, the
+/// loss was invisible to the very agent that needed the state.
+///
+/// Everything else still fails. A managed asset that cannot be written is a
+/// real defect and must keep parking the turn.
+fn degraded_refresh_context(error: &io::Error) -> Option<String> {
+    if error
+        .get_ref()
+        .is_some_and(|cause| cause.is::<pm_registry::PmRefreshDeferred>())
+    {
+        return Some(format!(
+            "Resident PM worktree refresh deferred: {error}. \
+             This prompt did not refresh the worktree; freshness is unverified."
+        ));
+    }
+    if gwt_core::operation_deadline::is_deadline_expired(error) {
+        return Some(format!(
+            "Resident PM worktree refresh skipped: {error}. \
+             This prompt did not refresh the worktree; freshness is unverified. \
+             Board and runtime state below may be one turn stale."
+        ));
+    }
+    None
 }
 
 /// UserPromptSubmit entry: refresh before the new model turn can start, then
@@ -366,6 +400,42 @@ mod tests {
     /// The Session the fixture's PM is registered as. It is passed directly
     /// to `handle_at`; no process-global session environment is needed.
     const FIXTURE_PM_SESSION: &str = "pm-session-fixture";
+
+    #[test]
+    fn issue_4686_a_refresh_that_ran_out_of_budget_reports_instead_of_failing_closed() {
+        // The file-lock deadline from the managed asset refresh.
+        let file_lock = io::Error::new(
+            io::ErrorKind::TimedOut,
+            "operation deadline expired during file lock",
+        );
+        let context = degraded_refresh_context(&file_lock)
+            .expect("a budget overrun must not fail the prompt closed");
+        assert!(context.contains("skipped"), "{context}");
+        assert!(
+            context.contains("freshness is unverified"),
+            "the turn must be told what it is missing: {context}"
+        );
+
+        // The process deadline from `git worktree list`, after two crate
+        // boundaries have flattened its kind to `Other`.
+        let worktree_list =
+            io::Error::other("Git error: worktree list: process deadline expired".to_string());
+        assert!(
+            degraded_refresh_context(&worktree_list).is_some(),
+            "a flattened deadline is still a deadline"
+        );
+
+        // A real failure still parks the turn. `managed_asset_failure_blocks_\
+        // pre_turn_and_parks_stop_continuation` depends on this staying fatal.
+        assert!(
+            degraded_refresh_context(&io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "managed asset write refused"
+            ))
+            .is_none(),
+            "only a lack of time is degradable, never a broken worktree"
+        );
+    }
 
     fn set_fixture_gwt_home(home: &tempfile::TempDir) -> ScopedGwtHome {
         let canonical_home = std::fs::canonicalize(home.path()).expect("canonical gwt home");
