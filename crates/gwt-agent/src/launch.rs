@@ -2411,11 +2411,11 @@ mod tests {
     #[test]
     fn build_claude_with_model() {
         let config = AgentLaunchBuilder::new(AgentId::ClaudeCode)
-            .model("claude-opus-4-8")
+            .model("opus")
             .build();
 
         assert!(config.args.contains(&"--model".to_string()));
-        assert!(config.args.contains(&"claude-opus-4-8".to_string()));
+        assert!(config.args.contains(&"opus".to_string()));
     }
 
     #[test]
