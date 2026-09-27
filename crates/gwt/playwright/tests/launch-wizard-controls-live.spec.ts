@@ -282,6 +282,64 @@ test.describe.serial("Launch Wizard setting controls (live backend)", () => {
     expect(consoleErrors).toEqual([]);
   });
 
+  test("Claude model rows preserve versionless labels and alias selections", async ({
+    page,
+  }) => {
+    const pageErrors: string[] = [];
+    const consoleErrors: string[] = [];
+    page.on("pageerror", (error) => pageErrors.push(String(error)));
+    page.on("console", (message) => {
+      if (message.type() === "error") consoleErrors.push(message.text());
+    });
+
+    cleanupLaunchFixture = (await openLiveLaunchWizardForBranch(page)).cleanup;
+    const wizard = page.locator("#wizard-modal");
+    await enterLaunchSettings(page);
+    await selectWizardAgent(page, "claude");
+    await expect(agentSummaryValue(page)).toHaveText("Claude Code");
+
+    const model = wizard.getByLabel("Model", { exact: true });
+    await expect(model.locator("option")).toHaveText([
+      "Default", "Opus", "Fable", "Sonnet", "Haiku",
+    ]);
+    expect(await model.locator("option").evaluateAll((options) =>
+      options.map((option) => (option as HTMLOptionElement).value),
+    )).toEqual(["", "opus", "fable", "sonnet", "haiku"]);
+
+    const range = wizard.locator(".launch-range__input");
+    const auto = wizard.locator('[data-reasoning-auto] input[type="checkbox"]');
+    let opusEffortValues: (string | null)[] = [];
+    for (const alias of ["opus", "fable", "sonnet", "haiku"]) {
+      await model.selectOption(alias);
+      await model.blur();
+      // Wait for backend state after the interaction guard releases on blur.
+      await expect(summaryValue(page, "Model")).toHaveText(alias);
+      if (alias === "opus" || alias === "fable") {
+        await expect(range).toBeVisible();
+        const effortValues = await wizard.locator(".launch-range__tick")
+          .evaluateAll((ticks) => ticks.map((tick) => tick.getAttribute("data-value")));
+        if (alias === "opus") {
+          opusEffortValues = effortValues;
+          expect(effortValues).toEqual(expect.arrayContaining(["xhigh", "max"]));
+        } else {
+          expect(effortValues).toEqual(opusEffortValues);
+        }
+      }
+    }
+    await expect(range).toHaveCount(0);
+    await expect(auto).toHaveCount(0);
+
+    await model.selectOption("");
+    await model.blur();
+    await expect(summaryValue(page, "Model")).toHaveCount(0);
+    await expect(model).toHaveValue("");
+    await expect(range).toBeVisible();
+    await expect(auto).toHaveCount(1);
+    await page.evaluate(() => new Promise(requestAnimationFrame));
+    expect(pageErrors).toEqual([]);
+    expect(consoleErrors).toEqual([]);
+  });
+
   test("Reasoning renders as a slider with a separate Auto toggle", async ({
     page,
   }) => {
