@@ -89,6 +89,27 @@ pub fn is_lock_contended(error: &io::Error) -> bool {
         || error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
 }
 
+/// Whether a failure means "the ambient operation deadline ran out", as opposed
+/// to the operation itself going wrong.
+///
+/// The kind alone is not enough. A deadline starts life as
+/// [`io::ErrorKind::TimedOut`] — both this module's own `deadline_error` and
+/// the process spawner's use it — but callers that cross a crate boundary
+/// flatten it: a `git worktree list` deadline becomes
+/// `GwtError::Git(String)` and is then rebuilt with `io::Error::other`, which
+/// reports `ErrorKind::Other`. Matching the message as well keeps the
+/// classification intact across those hops (Issue #4686).
+///
+/// Use this to decide whether a best-effort step may be skipped. It says the
+/// step ran out of budget, never that the step's subject is broken.
+pub fn is_deadline_expired(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::TimedOut || error.to_string().contains(DEADLINE_EXPIRED_MARKER)
+}
+
+/// The phrase every deadline error carries, in this module and in the process
+/// spawner. [`is_deadline_expired`] matches on it after the kind is lost.
+pub const DEADLINE_EXPIRED_MARKER: &str = "deadline expired";
+
 /// An exclusive file lock with best-effort observational holder diagnostics.
 /// Metadata never grants authority: it may be stale after a crash or unreadable
 /// while a holder updates it. The OS lock alone determines ownership.
@@ -330,7 +351,7 @@ pub fn ensure_remaining(operation: &str) -> io::Result<Option<Instant>> {
 fn deadline_error(operation: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::TimedOut,
-        format!("operation deadline expired during {operation}"),
+        format!("operation {DEADLINE_EXPIRED_MARKER} during {operation}"),
     )
 }
 
@@ -554,5 +575,36 @@ mod tests {
         let _inner = ScopedOperationDeadline::enter(outer_expiry + Duration::from_secs(1));
 
         assert_eq!(current(), Some(outer_expiry));
+    }
+
+    #[test]
+    fn issue_4686_a_deadline_survives_being_flattened_across_a_crate_boundary() {
+        // Born with the kind intact.
+        let direct = deadline_error("file lock");
+        assert_eq!(direct.kind(), io::ErrorKind::TimedOut);
+        assert!(is_deadline_expired(&direct));
+
+        // `WorktreeManager::list` turns the process deadline into
+        // `GwtError::Git(String)`, and `pm_registry` rebuilds it with
+        // `io::Error::other`. Both hops drop `TimedOut`, so the hook that has
+        // to decide "no time" vs "broken" only has the message left.
+        let flattened = io::Error::other(format!(
+            "Git error: worktree list: process {DEADLINE_EXPIRED_MARKER}"
+        ));
+        assert_eq!(flattened.kind(), io::ErrorKind::Other);
+        assert!(
+            is_deadline_expired(&flattened),
+            "a flattened deadline must still read as a deadline"
+        );
+
+        // Real failures are not deadlines, whatever their kind.
+        assert!(!is_deadline_expired(&io::Error::new(
+            io::ErrorKind::NotFound,
+            "managed asset is missing"
+        )));
+        assert!(
+            !is_deadline_expired(&fs2::lock_contended_error()),
+            "contention is another holder, not a lack of time"
+        );
     }
 }
