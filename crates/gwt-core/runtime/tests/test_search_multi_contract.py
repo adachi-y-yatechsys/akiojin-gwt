@@ -524,6 +524,45 @@ class SearchMultiContractTests(unittest.TestCase):
                 f"embedding across scopes (AS-2), calls: {counting.encode.call_args_list}",
             )
 
+    def test_search_multi_reports_model_load_time_for_the_cold_warm_split(self):
+        """Issue #4698 AC-2: the one-shot runner pays the model load on every
+        search; it reports that cost so the caller can hold the cold search and
+        the warm remainder to separate budgets. A deterministic clock stands in
+        for the wall clock: loading the model advances it by exactly 2.5 s."""
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            db_root = base / "index"
+            project = self._seed_file_scopes(base, db_root)
+
+            now = [100.0]
+
+            class _SlowLoadingTransformer(runner._FakeEmbeddingModel):
+                def __init__(self, *_args, **_kwargs):
+                    now[0] += 2.5
+
+            fake_module = mock.MagicMock(SentenceTransformer=_SlowLoadingTransformer)
+            with mock.patch.dict(
+                os.environ, {"GWT_INDEX_FAKE_EMBEDDING": "0"}
+            ), mock.patch.dict(
+                "sys.modules", {"sentence_transformers": fake_module}
+            ), mock.patch.object(
+                runner, "_model_load_clock", lambda: now[0]
+            ), mock.patch.object(
+                runner, "_MODEL_LOAD_MS", 0
+            ):
+                runner._MODEL_CACHE = None
+                payload = runner.action_search_multi_v2(
+                    repo_hash=REPO_HASH,
+                    worktree_hash=WORKTREE_HASH,
+                    project_root=str(project),
+                    query="alpha search",
+                    n_results=5,
+                    scopes=["files", "files-docs"],
+                    db_root=db_root,
+                )
+            self.assertTrue(payload.get("ok"), payload)
+            self.assertEqual(payload.get("model_load_ms"), 2500, payload)
+
     def test_search_multi_dispatch_forwards_explicit_file_index_protocol(self):
         args = argparse.Namespace(
             repo_hash=REPO_HASH,

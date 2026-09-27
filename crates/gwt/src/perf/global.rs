@@ -392,6 +392,30 @@ mod tests {
         assert_eq!(records[1].role.as_deref(), Some("mutation"));
     }
 
+    /// Issue #4698 AC-3 / AC-4: the cold search (model load included) and its
+    /// warm remainder are held to separate budgets. A warm remainder slowed past
+    /// its budget is a violation even while the cold total stays within its own.
+    #[test]
+    fn a_slow_warm_search_violates_its_own_budget_while_the_cold_total_stays_within() {
+        let home = tempfile::tempdir().expect("tempdir");
+        let _gwt_home = ScopedGwtHome::set(home.path());
+        let mut runtime =
+            PerfRuntime::from_config(&PerfConfig::default()).expect("create perf runtime");
+
+        for _ in 0..3 {
+            runtime.record_route(PerfRoute::Search, Duration::from_millis(20_000));
+            runtime.record_route(PerfRoute::SearchWarm, Duration::from_millis(9_000));
+        }
+
+        let violations: Vec<_> = read_all()
+            .into_iter()
+            .filter(|record| record.is_violation())
+            .collect();
+        assert_eq!(violations.len(), 1, "{violations:?}");
+        assert_eq!(violations[0].target, "route:search.warm");
+        assert_eq!(violations[0].budget, Some(8_000.0));
+    }
+
     #[test]
     fn a_sustained_overage_writes_a_violation_next_to_the_samples() {
         let home = tempfile::tempdir().expect("tempdir");
