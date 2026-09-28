@@ -1727,10 +1727,10 @@ fn embedded_web_window_role_badges_identify_every_window_surface() {
             && js.contains(r#"spec: "SPEC""#),
         "expected the three Issue-family presets to carry distinguishable role labels",
     );
-    // SPEC-3671 FR-015: the wire preset is `work`; the surface lists Works.
+    // SPEC-3885: legacy Work presets now open the Issue surface.
     assert!(
-        js.contains(r#"work: "Work""#),
-        "expected the Work surface to be labelled by its wire preset key",
+        js.contains(r#"work: "Issue""#) && js.contains(r#"workspace: "Issue""#),
+        "expected legacy Work presets to identify the Issue surface",
     );
     assert!(
         js.contains("function shouldShowRuntimeStatus(windowData)")
@@ -2357,9 +2357,9 @@ fn embedded_web_knowledge_bridge_surface_uses_cache_backed_contract() {
     );
     assert!(
         html.contains(
-            "if (preset === \"issue\" || preset === \"issue_monitor\" || preset === \"spec\")",
+            "[\"issue\", \"issue_monitor\", \"spec\", \"work\", \"workspace\", \"branches\"].includes(preset)",
         ) && html.contains("return \"issue\";"),
-        "expected legacy SPEC and Issue Monitor presets to open the unified Work Item issue view",
+        "expected legacy SPEC, Issue Monitor and Workspace presets to open the unified Issue view",
     );
 }
 
@@ -3756,15 +3756,13 @@ fn embedded_web_window_surface_enum_aligns_with_js_preset_surface() {
     let pairs: &[(WindowSurface, &str)] = &[
         (WindowSurface::Terminal, "terminal"),
         (WindowSurface::FileTree, "file-tree"),
-        // Branches now redirects to the workspace surface in JS;
-        // the enum variant is kept for backend compatibility but
-        // no longer needs its own JS return path.
+        // Branches and Work redirect to Knowledge in JS. Their enum variants
+        // remain for persisted backend compatibility without a separate UI.
         (WindowSurface::Profile, "profile"),
         (WindowSurface::Board, "board"),
         (WindowSurface::Logs, "logs"),
         (WindowSurface::Knowledge, "knowledge"),
         (WindowSurface::Index, "index"),
-        (WindowSurface::Work, "work"),
         (WindowSurface::AgentKanban, "agent-kanban"),
         (WindowSurface::Console, "console"),
         (WindowSurface::Mock, "mock"),
@@ -3784,8 +3782,10 @@ fn embedded_web_window_surface_enum_aligns_with_js_preset_surface() {
     }
 
     assert!(
-        js.contains("preset === \"branches\"") && js.contains("return \"work\";"),
-        "expected JS `presetSurface()` to route branches preset to work surface",
+        WindowSurface::Work.as_str() == "work"
+            && js.contains("if (preset === \"work\" || preset === \"workspace\") {\n          return \"knowledge\";")
+            && js.contains("if (preset === \"branches\") {\n          return \"knowledge\";"),
+        "expected legacy Work and Branches presets to route to Knowledge while preserving the backend wire value",
     );
     assert!(
         js.contains("preset === \"issue_monitor\"") && js.contains("return \"knowledge\";"),

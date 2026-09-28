@@ -533,7 +533,7 @@ async function installBranchDetailCheckBackend(page) {
 /* Issue #4433 — cleanup progress/result used to be replied to the originating
  * client only, so a WebView reload mid-cleanup left the new client with no
  * events and the UI rendered a failure that never happened. This spec drives
- * the reachable Workspace cleanup surface in a real Chromium (dark + light
+ * the reachable Issue Other cleanup surface in a real Chromium (dark + light
  * projects) and proves the reconnect path.
  */
 test.describe("Issue #4433 branch cleanup reconnect", () => {
@@ -555,6 +555,7 @@ test.describe("Issue #4433 branch cleanup reconnect", () => {
     await installEmbeddedRoutes(page);
     await installWorkspaceCleanupBackend(page);
     await page.goto(APP_URL);
+    await page.locator(".issue-other-summary").click();
 
     await expect(page.locator(".workspace-overview-root")).toBeVisible({
       timeout: 10_000,
@@ -692,6 +693,7 @@ async function installWorkspaceCleanupBackend(page: any) {
         active_works: [
           {
             id: "work-cleanup-one",
+            linked_issue_numbers: [],
             title: "Merged work",
             status_category: "idle",
             lifecycle_state: "paused",

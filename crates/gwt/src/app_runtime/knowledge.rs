@@ -1094,9 +1094,12 @@ pub(crate) fn load_issue_branch_links(
     project_root: &Path,
     issue_link_cache_dir: &Path,
 ) -> HashMap<String, u64> {
-    let Some(repo_hash) = gwt::index_worker::detect_repo_hash(project_root) else {
+    // Active Work rendering uses this cache reader too: resolve the same
+    // origin identity from disk without the index worker's Git subprocess fallback.
+    let Some(identity) = gwt_core::repo_hash::detect_repo_identity(project_root) else {
         return HashMap::new();
     };
+    let repo_hash = identity.hash;
     let path = issue_link_cache_dir
         .join("issue-links")
         .join(format!("{}.json", repo_hash.as_str()));

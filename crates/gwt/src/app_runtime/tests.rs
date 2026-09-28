@@ -78665,6 +78665,7 @@ fn active_work_issue_numbers_include_child_record_session_and_branch_links() {
 #[test]
 fn active_work_issue_numbers_include_registry_sessions_beyond_the_display_cap() {
     let repo = tempfile::tempdir().unwrap();
+    let _gwt_home = ScopedGwtHome::set(repo.path());
     init_repo(repo.path());
     let hash = gwt_core::repo_hash::detect_repo_hash(repo.path()).unwrap();
     let sessions = (1..=12)
