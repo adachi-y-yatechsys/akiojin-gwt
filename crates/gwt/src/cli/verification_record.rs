@@ -2935,23 +2935,33 @@ fn execute_command_with_isolation(
                 gwt_core::process::scrub_git_env(&mut process);
                 process.env_remove("CARGO_TARGET_DIR");
             }
-            process
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped());
             // Issue #4405: this process runs inside the agent tree, whose
             // launch policy lowers priority; the workload must not inherit
             // that. Issue #4409 removes the inheritance at its source by
             // launching from the daemon instead, but this branch is still
             // taken whenever the launcher is already at baseline priority or
             // has declared that it accepts its own.
-            let output = match gwt_core::process_tree::spawn_at_normal_priority(&mut process)
-                .and_then(|spawned| {
-                    let _command_scope =
-                        progress.map(|progress| progress.start(spawned.child.id()));
-                    let priority = spawned.priority.clone();
-                    spawned.wait_with_output().map(|output| (output, priority))
-                }) {
+            let output = (|| -> io::Result<_> {
+                // Issue #4746 (earlier instance #4105): a grandchild can
+                // inherit stdout/stderr beyond the direct child's lifetime.
+                // Files let us wait for that child without waiting for EOF.
+                let stdout = tempfile::NamedTempFile::new()?;
+                let stderr = tempfile::NamedTempFile::new()?;
+                process
+                    .stdin(std::process::Stdio::null())
+                    .stdout(stdout.reopen()?)
+                    .stderr(stderr.reopen()?);
+                let mut spawned = gwt_core::process_tree::spawn_at_normal_priority(&mut process)?;
+                let _command_scope = progress.map(|progress| progress.start(spawned.child.id()));
+                let status = spawned.child.wait()?;
+                let output = std::process::Output {
+                    status,
+                    stdout: captured_output_snapshot(stdout.as_file()),
+                    stderr: captured_output_snapshot(stderr.as_file()),
+                };
+                Ok((output, spawned.priority))
+            })();
+            let output = match output {
                 Ok(output) => output,
                 Err(err) => return Ok(spawn_failure_result(command, &err.to_string())),
             };
@@ -2968,6 +2978,20 @@ fn execute_command_with_isolation(
             Ok((exit_code, tail))
         }
     }
+}
+
+fn captured_output_snapshot(file: &fs::File) -> Vec<u8> {
+    use std::io::Read;
+
+    // A surviving writer may still append. Read only the length observed
+    // after the direct child exited, never chase a growing file to EOF.
+    let read = || -> io::Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        file.take(file.metadata()?.len()).read_to_end(&mut bytes)?;
+        Ok(bytes)
+    };
+    // Capture failure must not replace the already observed child exit code.
+    read().unwrap_or_else(|error| format!("failed to read captured output: {error}\n").into_bytes())
 }
 
 /// Build the request that describes one delegated command to the daemon.
@@ -5670,6 +5694,91 @@ mod tests {
         assert!(!record.all_passed, "{transcript}");
         let persisted = load(dir.path()).unwrap().unwrap();
         assert!(!persisted.commands[1].output_tail.is_empty());
+    }
+
+    // Re-entered in child processes so this regression also runs on Windows.
+    #[test]
+    fn verification_output_holder_fixture() {
+        let Ok(directory) = std::env::var("GWT_VERIFY_OUTPUT_HOLDER") else {
+            return;
+        };
+        let directory = PathBuf::from(directory);
+        if std::env::var_os("GWT_VERIFY_OUTPUT_GRANDCHILD").is_some() {
+            fs::write(directory.join("holding"), "ready").unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while !directory.join("release").exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            fs::write(directory.join("released"), "done").unwrap();
+            return;
+        }
+        // The fixture intentionally exits first; the parent test releases
+        // the grandchild after it observes the verification result.
+        #[allow(clippy::zombie_processes)]
+        let _grandchild = gwt_core::process::hidden_command(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "cli::verification_record::tests::verification_output_holder_fixture",
+                "--nocapture",
+            ])
+            .env("GWT_VERIFY_OUTPUT_GRANDCHILD", "1")
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !directory.join("holding").exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "grandchild did not start"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        println!("direct child stdout");
+        eprintln!("direct child stderr");
+        std::process::exit(7);
+    }
+
+    #[test]
+    fn verification_records_exit_while_grandchild_holds_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let worktree = directory.path().to_path_buf();
+        let executable = std::env::current_exe().unwrap();
+        let command = format!(
+            "GWT_VERIFY_OUTPUT_HOLDER='{}' '{}' --exact \
+             cli::verification_record::tests::verification_output_holder_fixture --nocapture",
+            worktree.display(),
+            executable.display(),
+        );
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let runner = std::thread::spawn(move || {
+            let result = run_verification(&worktree, "sess-output-holder", &[command]);
+            let _ = sender.send(result);
+        });
+        // Release only AFTER observing completion (or the failure deadline).
+        // Thus no sleep duration determines when the grandchild closes output.
+        let result = receiver.recv_timeout(std::time::Duration::from_secs(45));
+        fs::write(directory.path().join("release"), "release").unwrap();
+        runner.join().unwrap();
+        // Keep the release file alive until the grandchild has observed it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !directory.path().join("released").exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "grandchild did not release"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let (record, transcript) = result
+            .expect("verification must finish without waiting for grandchild output EOF")
+            .unwrap();
+        assert_eq!(record.commands[0].exit_code, 7, "{transcript}");
+        let persisted = load(directory.path()).unwrap().unwrap();
+        assert_eq!(persisted.commands[0].exit_code, 7);
+        assert!(persisted.commands[0]
+            .output_tail
+            .contains("direct child stdout"));
+        assert!(persisted.commands[0]
+            .output_tail
+            .contains("direct child stderr"));
     }
 
     // Spawn failures are recorded as failed results, never dropped runs.
