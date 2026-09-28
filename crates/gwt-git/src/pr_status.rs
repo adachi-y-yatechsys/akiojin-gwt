@@ -3496,9 +3496,156 @@ where
     Ok(parse_pr_merge_commit_sha(&output.stdout))
 }
 
+/// Issue #4726: whether GitHub can actually merge a PR as it stands. Only the
+/// two states that no auto-merge can get past on its own are distinguished;
+/// `BLOCKED` / `UNSTABLE` / `UNKNOWN` resolve themselves (checks finish,
+/// GitHub finishes computing) and read as [`PrMergeability::Mergeable`] or
+/// [`PrMergeability::Unknown`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PrMergeability {
+    Mergeable,
+    /// `mergeable == CONFLICTING` or `mergeStateStatus == DIRTY`.
+    Conflicting,
+    /// `mergeStateStatus == BEHIND`: the base moved and the branch must be
+    /// updated before a strict branch protection lets it merge.
+    Behind,
+    #[default]
+    Unknown,
+}
+
+impl PrMergeability {
+    /// Classify GitHub's raw `mergeable` / `mergeStateStatus` pair.
+    pub fn classify(mergeable: &str, merge_state_status: &str) -> Self {
+        let mergeable = mergeable.trim().to_ascii_uppercase();
+        let merge_state_status = merge_state_status.trim().to_ascii_uppercase();
+        if mergeable == "CONFLICTING" || merge_state_status == "DIRTY" {
+            Self::Conflicting
+        } else if merge_state_status == "BEHIND" {
+            Self::Behind
+        } else if mergeable == "MERGEABLE" {
+            Self::Mergeable
+        } else {
+            Self::Unknown
+        }
+    }
+}
+
+/// Issue #4726: the PR lifecycle state (`OPEN` / `CLOSED` / `MERGED`) together
+/// with its mergeability, read in one `gh pr view`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrMergeReadback {
+    /// Upper-cased `state`; empty when GitHub did not report one.
+    pub state: String,
+    pub mergeability: PrMergeability,
+}
+
+impl PrMergeReadback {
+    /// Closed without being merged: nothing will ever merge it.
+    pub fn closed_unmerged(&self) -> bool {
+        self.state == "CLOSED"
+    }
+}
+
+/// Parse `gh pr view --json state,mergeable,mergeStateStatus`.
+pub fn parse_pr_merge_readback(json: &str) -> Option<PrMergeReadback> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let field = |name: &str| {
+        value
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    Some(PrMergeReadback {
+        state: field("state").trim().to_ascii_uppercase(),
+        mergeability: PrMergeability::classify(&field("mergeable"), &field("mergeStateStatus")),
+    })
+}
+
+/// Checked readback of [`PrMergeReadback`] used by the Issue Monitor's
+/// deadline-integral scans (Issue #4726).
+pub fn try_fetch_pr_merge_readback(repo_path: &Path, number: u64) -> Result<PrMergeReadback> {
+    try_fetch_pr_merge_readback_with(repo_path, number, run_gh_command)
+}
+
+fn try_fetch_pr_merge_readback_with<F>(
+    repo_path: &Path,
+    number: u64,
+    mut run_gh: F,
+) -> Result<PrMergeReadback>
+where
+    F: FnMut(&Path, &[&str]) -> Result<GhCliOutput>,
+{
+    let number = number.to_string();
+    let output = run_gh(
+        repo_path,
+        &[
+            "pr",
+            "view",
+            &number,
+            "--json",
+            "state,mergeable,mergeStateStatus",
+        ],
+    )?;
+    if !output.success {
+        return Err(GwtError::Git(format!(
+            "gh pr view mergeable: {}",
+            output.stderr.trim()
+        )));
+    }
+    parse_pr_merge_readback(&output.stdout)
+        .ok_or_else(|| GwtError::Other("gh pr view mergeable JSON: unparseable".to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #4726 AC-1: the two states an armed auto-merge cannot get past on
+    /// its own are told apart from the ones that resolve themselves.
+    #[test]
+    fn merge_readback_distinguishes_conflicting_and_behind() {
+        let read = |json: &str| {
+            try_fetch_pr_merge_readback_with(Path::new("/repo"), 7, |_, args| {
+                assert!(args.contains(&"state,mergeable,mergeStateStatus"));
+                Ok(GhCliOutput {
+                    success: true,
+                    stdout: json.to_string(),
+                    stderr: String::new(),
+                })
+            })
+            .expect("readback")
+        };
+        let conflicting =
+            read(r#"{"state":"OPEN","mergeable":"CONFLICTING","mergeStateStatus":"DIRTY"}"#);
+        assert_eq!(conflicting.mergeability, PrMergeability::Conflicting);
+        assert!(!conflicting.closed_unmerged());
+        assert_eq!(
+            read(r#"{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"BEHIND"}"#)
+                .mergeability,
+            PrMergeability::Behind
+        );
+        assert_eq!(
+            read(r#"{"state":"OPEN","mergeable":"MERGEABLE","mergeStateStatus":"BLOCKED"}"#)
+                .mergeability,
+            PrMergeability::Mergeable
+        );
+        assert_eq!(
+            read(r#"{"state":"OPEN","mergeable":"UNKNOWN","mergeStateStatus":"UNKNOWN"}"#)
+                .mergeability,
+            PrMergeability::Unknown
+        );
+        assert!(read(r#"{"state":"CLOSED","mergeable":"UNKNOWN"}"#).closed_unmerged());
+        assert!(
+            try_fetch_pr_merge_readback_with(Path::new("/repo"), 7, |_, _| Ok(GhCliOutput {
+                success: false,
+                stdout: String::new(),
+                stderr: "rate limited".to_string(),
+            }))
+            .is_err(),
+            "a failed readback is an error, never a mergeable PR"
+        );
+    }
 
     /// Issue #3963 AC-2: the scan reads every open PR in one inventory read
     /// and resolves each candidate branch from that index, so the number of

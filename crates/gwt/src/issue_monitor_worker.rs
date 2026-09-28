@@ -57,6 +57,8 @@ pub enum IssueMonitorScanStage {
     PrDiffReadback,
     StatusCheckReadback,
     MergeCommitReadback,
+    /// Issue #4726: PR state + `mergeable` / `mergeStateStatus`.
+    MergeabilityReadback,
     ClaimCompletionReadback,
     /// Issue #3917: PR body / Issue comment readback for delegation evidence.
     MergedIssueSettlementReadback,
@@ -76,6 +78,7 @@ impl IssueMonitorScanStage {
             Self::PrDiffReadback => "pr-diff-readback",
             Self::StatusCheckReadback => "status-check-readback",
             Self::MergeCommitReadback => "merge-commit-readback",
+            Self::MergeabilityReadback => "mergeability-readback",
             Self::ClaimCompletionReadback => "claim-completion-readback",
             Self::MergedIssueSettlementReadback => "merged-issue-settlement-readback",
             Self::ProposalReturn => "proposal-return",
@@ -1602,7 +1605,9 @@ fn autonomous_eligibility_candidates<'a>(
 ///   token); `Remediate` re-queues (bounded); `Escalate` → NeedsHuman; `WaitForCi`
 ///   waits.
 /// - **Delivering** → watch for the merge; on merge verify `merged_sha ==
-///   reviewed_sha` (TOCTOU layer-4) before completing, else escalate.
+///   reviewed_sha` (TOCTOU layer-4) before completing, else escalate. An
+///   unmerged PR that was closed, went conflicting / behind, or outlived
+///   `merge_watch_timeout_secs` leaves Delivering (Issue #4726).
 ///
 /// No-op unless autonomous mode is on. Review-dispatch requests are queued on the
 /// monitor ([`IssueMonitorState::take_pending_review_dispatches`]) for the GUI to
@@ -1880,14 +1885,26 @@ fn advance_one_autonomous_issue(
                 gwt_git::pr_status::try_fetch_pr_head_sha(repo_path, pr)
             })?
             .unwrap_or_default();
+            // Issue #4726 AC-1: an auto-merge armed on a conflicting / behind
+            // PR never merges, so the gate reads mergeability too.
+            let mergeability =
+                run_budgeted_readback_stage(IssueMonitorScanStage::MergeabilityReadback, || {
+                    gwt_git::pr_status::try_fetch_pr_merge_readback(repo_path, pr)
+                })?
+                .mergeability;
             let body = issues
                 .iter()
                 .find(|issue| issue.number == issue_number)
                 .and_then(|issue| issue.body.clone())
                 .unwrap_or_default();
-            let Some(inputs) =
-                monitor.autonomous_gate_inputs(issue_number, protection, &rollup, &head, &body)
-            else {
+            let Some(inputs) = monitor.autonomous_gate_inputs(
+                issue_number,
+                protection,
+                &rollup,
+                &head,
+                &body,
+                mergeability,
+            ) else {
                 return Ok(()); // verdict not back yet → wait
             };
             // Issue #4544 AC-3: a launch that stopped at a provider permission
@@ -2001,6 +2018,28 @@ fn advance_one_autonomous_issue(
                         ),
                     );
                 }
+            } else {
+                // Issue #4726 AC-2/AC-3: GitHub will not merge a closed,
+                // conflicting or behind PR, and nothing else would ever end
+                // this watch — leave Delivering and release the slot. A failed
+                // readback still reports its degradation, but only after the
+                // timeout has had its say: a readback that keeps failing must
+                // not hold the slot past the merge-watch.
+                let readback = run_budgeted_readback_stage(
+                    IssueMonitorScanStage::MergeabilityReadback,
+                    || gwt_git::pr_status::try_fetch_pr_merge_readback(repo_path, pr),
+                );
+                let expired = monitor.merge_watch_expired(issue_number, now);
+                if let Some(exit) = crate::DeliveringExit::decide(readback.as_ref().ok(), expired) {
+                    tracing::warn!(
+                        issue = issue_number,
+                        pr,
+                        exit = ?exit,
+                        "issue monitor: delivery left the merge-watch unmerged"
+                    );
+                    monitor.exit_delivering(issue_number, pr, exit, now);
+                }
+                readback?;
             }
         }
         _ => {}
