@@ -11789,7 +11789,7 @@ fn evidence_status_name(status: crate::cli::verification_record::EvidenceStatus)
         EvidenceStatus::Unreadable => "unreadable",
         EvidenceStatus::Tampered => "tampered",
         EvidenceStatus::PlanNotCovered => "plan_not_covered",
-        EvidenceStatus::PlanChanged => "plan_changed",
+        EvidenceStatus::PlanChanged | EvidenceStatus::PlanChangedFields(_) => "plan_changed",
     }
 }
 
@@ -13669,13 +13669,20 @@ fn evaluate_execution_reopen_prerequisites(
             "the verification run has no valid integrity hash; rerun verify.run",
         ));
     }
-    let evidence_status = vr::evaluate_evidence_snapshot(
-        worktree,
-        session_id,
-        Some(record.owner_number),
-        Some(&plan),
-        &verification,
-    );
+    // Recovery audits the exact post-block registration, not only its
+    // verification meaning. Metadata-only replacement is safe for delivery
+    // but must not substitute the snapshot named in the recovery audit.
+    let evidence_status = if verification.verification_plan_hash != plan.content_hash {
+        vr::EvidenceStatus::PlanChangedFields(vec!["verification_plan_hash (recovery snapshot)"])
+    } else {
+        vr::evaluate_evidence_snapshot(
+            worktree,
+            session_id,
+            Some(record.owner_number),
+            Some(&plan),
+            &verification,
+        )
+    };
     if evidence_status != vr::EvidenceStatus::Fresh
         && !(allow_current_typed_quarantine
             && evidence_status == vr::EvidenceStatus::FreshWithQuarantine)
@@ -29116,6 +29123,26 @@ exit 1
                 load(derived_a_then_b.path()).unwrap().unwrap().status,
                 ExecutionControlStatus::Blocked
             );
+
+            // Recovery audits the exact post-block snapshot, even though
+            // ordinary delivery accepts metadata-only re-registration.
+            let metadata_only = tempfile::tempdir().unwrap();
+            settle_blocked(metadata_only.path(), "sess-reopen");
+            save_covering_evidence(metadata_only.path(), "sess-reopen", true);
+            let mut plan = crate::cli::verification_record::load_plan(metadata_only.path())
+                .unwrap()
+                .unwrap();
+            plan.created_at += chrono::Duration::seconds(1);
+            crate::cli::verification_record::save_plan(metadata_only.path(), &plan).unwrap();
+            let (code, out) = run_cmd(
+                metadata_only.path(),
+                ExecutionCommand::Reopen {
+                    reason: "replacement registration timestamp".to_string(),
+                },
+            )
+            .unwrap();
+            assert_eq!(code, 2, "{out}");
+            assert!(out.contains("plan changed"), "{out}");
         }
 
         // FR-195 / AS-173: recovery never accepts legacy hashless evidence,

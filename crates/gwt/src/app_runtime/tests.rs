@@ -66300,25 +66300,11 @@ fn pm_refresh_resolves_managed_asset_collisions_from_old_head() {
     assert_eq!(git_stdout(&pm_worktree, &["rev-parse", "HEAD"]), commit_c);
 }
 
-// Issue #4014: this fixture does not reproduce its own precondition on
-// Windows. It forces regeneration to fail by writing a *file* where the
-// managed-asset materializer must create the `gwt-pm` skill *directory*; on
-// Windows the refresh instead returned `Ok(PmWorktreeRefreshOutcome { state:
-// Fresh, .. })`, so HEAD legitimately advanced and the restore assertion
-// failed. Nothing about the product is known to be wrong — the obstruction
-// simply is not an obstruction there, and diagnosing why needs a Windows host.
-//
-// The failure was invisible until #4014 let the `--bin gwt` target run on
-// Windows at all, and it is unrelated to the ConPTY teardown deadlock that
-// Issue owns. Ignoring it here rather than holding the target out of the
-// nightly gate keeps the coverage loss to one variant: the sibling
-// `pm_refresh_restores_old_checkout_when_the_fast_forward_is_blocked` passes
-// on Windows, so restore-on-failure is still proven there through the blocked
-// fast-forward path. Reported to the PM for its own owner.
-#[cfg_attr(
-    windows,
-    ignore = "#4014: the regeneration-failure fixture does not obstruct on Windows; awaiting its own owner"
-)]
+// Issue #4564: the fixture used to write a *file* at `runtime/.claude/skills/
+// gwt-pm`. That only obstructed on Unix, where snapshotting the generated
+// `gwt-pm/SKILL.md` leaf through a file fails with ENOTDIR. Windows reports
+// the same probe as NotFound, after which the prune legitimately removes the
+// stray non-bundled `gwt-*` entry and regeneration succeeds.
 #[test]
 fn pm_refresh_restores_old_checkout_and_assets_when_regeneration_fails() {
     let _env_lock = env_test_lock()
@@ -66367,11 +66353,14 @@ fn assert_pm_refresh_failure_restores_old_checkout_and_assets(
         fs::write(seed.join("UPSTREAM.md"), "incoming upstream bytes\n").unwrap();
         fs::write(pm_worktree.join("UPSTREAM.md"), "untracked PM bytes\n").unwrap();
     } else {
-        let runtime_skills = pm_worktree.parent().unwrap().join("runtime/.claude/skills");
-        fs::create_dir_all(&runtime_skills).unwrap();
-        fs::write(
-            runtime_skills.join("gwt-pm"),
-            "file obstructing skill directory\n",
+        // A directory where the merged hook config must be read and replaced
+        // fails on every platform. It is not a pruned `gwt-*` entry, so the
+        // distribution plan cannot clear it before the writer reaches it.
+        fs::create_dir_all(
+            pm_worktree
+                .parent()
+                .unwrap()
+                .join("runtime/.claude/settings.local.json"),
         )
         .unwrap();
     }
