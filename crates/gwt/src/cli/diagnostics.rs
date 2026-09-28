@@ -29,7 +29,11 @@ pub enum DiagnosticsCommand {
     /// `gwtd diagnostics cpu --json`.
     Cpu { json: bool },
     /// Issue #3778: `errors.list`.
-    ErrorsList { since: Option<String> },
+    ErrorsList {
+        since: Option<String>,
+        scope: errors::ErrorListScope,
+        project_root: Option<String>,
+    },
 }
 
 pub fn parse(args: &[String]) -> Result<DiagnosticsCommand, CliParseError> {
@@ -55,9 +59,19 @@ pub fn run<E: CliEnv>(
             Ok(0)
         }
         DiagnosticsCommand::Cpu { json: false } => Err(unexpected_error("json output is required")),
-        DiagnosticsCommand::ErrorsList { since } => {
-            errors::run(env, errors::ErrorsCommand::List { since }, out)
-        }
+        DiagnosticsCommand::ErrorsList {
+            since,
+            scope,
+            project_root,
+        } => errors::run(
+            env,
+            errors::ErrorsCommand::List {
+                since,
+                scope,
+                project_root,
+            },
+            out,
+        ),
     }
 }
 

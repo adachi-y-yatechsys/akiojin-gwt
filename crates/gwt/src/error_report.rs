@@ -46,14 +46,18 @@ fn report_error_with_publish(
     context: BTreeMap<String, String>,
     publish: bool,
 ) -> Option<ErrorRecord> {
-    let record = ErrorRecord::new(kind, message, target.clone()).with_context(context);
+    let record = ErrorRecord::new(kind, message, target).with_context(context);
+    append_record(record, publish)
+}
+
+fn append_record(record: ErrorRecord, publish: bool) -> Option<ErrorRecord> {
     if recently_recorded(&record) {
         return None;
     }
     match gwt_core::error_ledger::record(record) {
         Ok(recorded) => {
             if publish {
-                publish_recorded(&recorded, target.project_root.as_deref());
+                publish_recorded(&recorded, recorded.target.project_root.as_deref());
             }
             Some(recorded)
         }
@@ -64,39 +68,52 @@ fn report_error_with_publish(
     }
 }
 
-/// Record GUI-visible error events so toast display and the ledger stay aligned.
+/// Explicit provenance carried privately from a GUI error source.
+#[derive(Debug, Clone)]
+pub enum ErrorOrigin {
+    Project(String),
+    Host,
+}
+
 pub fn record_backend_event(event: &BackendEvent) {
-    match event {
+    record_backend_event_with_origin(event, None);
+}
+
+pub fn report_host_error(kind: ErrorKind, message: impl Into<String>) {
+    append_record(ErrorRecord::new_host(kind, message), false);
+}
+
+/// Record an error event without inferring ownership from the current process.
+pub fn record_backend_event_with_origin(event: &BackendEvent, origin: Option<&ErrorOrigin>) {
+    let (message, issue) = match event {
         BackendEvent::IssueMonitorToast {
             level,
             message,
             issue_number,
             ..
-        } if level.eq_ignore_ascii_case("error") => {
-            report_error_and_publish(
-                ErrorKind::LaunchFailure,
-                message,
-                ErrorTarget {
-                    issue: *issue_number,
-                    ..ErrorTarget::default()
-                },
-            );
-        }
+        } if level.eq_ignore_ascii_case("error") => (message, *issue_number),
         BackendEvent::IssueMonitorLaunchFailed {
             issue_number,
             message,
-        } => {
-            report_error_and_publish(
-                ErrorKind::LaunchFailure,
-                message,
-                ErrorTarget {
-                    issue: Some(*issue_number),
-                    ..ErrorTarget::default()
+        } => (message, Some(*issue_number)),
+        _ => return,
+    };
+    let record = match origin {
+        Some(ErrorOrigin::Host) => ErrorRecord::new_host(ErrorKind::LaunchFailure, message),
+        _ => ErrorRecord::new(
+            ErrorKind::LaunchFailure,
+            message,
+            ErrorTarget {
+                issue,
+                project_root: match origin {
+                    Some(ErrorOrigin::Project(root)) => Some(root.clone()),
+                    _ => None,
                 },
-            );
-        }
-        _ => {}
-    }
+                ..ErrorTarget::default()
+            },
+        ),
+    };
+    append_record(record, true);
 }
 
 fn recently_recorded(record: &ErrorRecord) -> bool {
@@ -104,8 +121,12 @@ fn recently_recorded(record: &ErrorRecord) -> bool {
     gwt_core::error_ledger::list_since(Some(since))
         .ok()
         .is_some_and(|rows| {
-            rows.iter()
-                .any(|row| row.kind == record.kind && row.message == record.message)
+            rows.iter().any(|row| {
+                row.kind == record.kind
+                    && row.message == record.message
+                    && row.scope == record.scope
+                    && row.target.project_root == record.target.project_root
+            })
         })
 }
 
@@ -149,6 +170,23 @@ mod tests {
         assert_eq!(listed[0].kind, ErrorKind::LaunchFailure);
         assert_eq!(listed[0].message, "stale generation launch failed");
         assert_eq!(listed[0].target.issue, Some(3778));
+    }
+
+    #[test]
+    fn identical_errors_from_different_projects_are_not_suppressed() {
+        let (_dir, _home) = isolated_home();
+        for root in ["/project-a", "/project-b"] {
+            report_error(
+                ErrorKind::LaunchFailure,
+                "same failure",
+                ErrorTarget {
+                    project_root: Some(root.into()),
+                    ..ErrorTarget::default()
+                },
+            );
+        }
+        let rows = gwt_core::error_ledger::list_since(None).expect("list");
+        assert_eq!(rows.len(), 2);
     }
 
     #[test]

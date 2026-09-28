@@ -8619,6 +8619,7 @@ fn issue_monitor_autonomous_record(
         steering: None,
         review_dispatch_hold: None,
         last_failure_message: None,
+        delivering_since: None,
     }
 }
 
@@ -14526,6 +14527,29 @@ fn app_runtime_custom_agent_cache_refresh_rebroadcasts_open_wizard_state() {
 }
 
 #[test]
+fn issue_monitor_error_notification_keeps_project_in_ledger() {
+    let temp = tempdir().unwrap();
+    let _home = ScopedGwtHome::set(temp.path());
+    let root = temp.path().join("repo");
+    let tab = sample_project_tab("tab-1", "Repo", root.clone(), ProjectKind::NonRepo, &[]);
+    let runtime = sample_runtime(temp.path(), vec![tab], Some("tab-1"));
+    let event = BackendEvent::IssueMonitorLaunchFailed {
+        issue_number: 4735,
+        message: "project notification failure".into(),
+    };
+    let outbound = runtime
+        .issue_monitor_project_notification(Some(&root), event)
+        .unwrap();
+    prepare_outbound_event(&outbound);
+    let rows = gwt_core::error_ledger::list_since(None).unwrap();
+    let row = rows
+        .iter()
+        .find(|row| row.message == "project notification failure")
+        .unwrap();
+    assert_eq!(row.target.project_root.as_deref(), root.to_str());
+}
+
+#[test]
 fn app_runtime_launch_wizard_submit_failure_emits_structured_error_log() {
     let temp = tempdir().expect("tempdir");
     let _gwt_home = ScopedGwtHome::set(temp.path());
@@ -14551,6 +14575,16 @@ fn app_runtime_launch_wizard_submit_failure_emits_structured_error_log() {
             Some(canvas_bounds()),
         );
     });
+
+    let rows = gwt_core::error_ledger::list_since(None).unwrap();
+    let row = rows
+        .iter()
+        .find(|row| row.message == "Agent option is unavailable")
+        .unwrap();
+    assert_eq!(
+        row.target.project_root.as_deref(),
+        Some(repo.to_str().unwrap())
+    );
 
     let event = events
         .iter()
@@ -24071,6 +24105,261 @@ fn fresh_execution_session_replacement_before_work_commit_preserves_predecessor_
         .status,
         gwt::cli::execution_state::ContinuationAttemptStatus::Prepared,
     );
+}
+
+#[test]
+fn fresh_execution_continue_resends_ready_and_commits_work() {
+    let _env_guard = env_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().expect("tempdir");
+    let _home = ScopedGwtHome::set(temp.path());
+    // HTTP workers must resolve the same isolated Session and trusted stores.
+    let _home_env = gwt_core::test_support::ScopedEnvVar::set("HOME", temp.path());
+    let _profile = gwt_core::test_support::ScopedEnvVar::set("USERPROFILE", temp.path());
+    let mut fixture = pending_fresh_execution_fixture(temp.path(), "fresh-continue-ready");
+    run_git(
+        &fixture.repo,
+        &["symbolic-ref", "HEAD", "refs/heads/work/issue-2359"],
+    );
+    let nonce = fixture.runtime.pending_fresh_execution_launches[&fixture.window_id]
+        .readiness_nonce
+        .clone();
+    let tokio = TokioRuntime::new().unwrap();
+    let (proxy, recorded_events) = AppEventProxy::stub();
+    let mut server = crate::embedded_server::EmbeddedServer::start(
+        &tokio,
+        proxy,
+        crate::embedded_server::ClientHub::default(),
+        Arc::clone(&fixture.runtime.pty_writers),
+        AttachmentUploadStore::in_system_temp(),
+    )
+    .unwrap();
+    fixture.issuer = server.agent_capability_issuer();
+    let target = fixture
+        .issuer
+        .issue_prepared(
+            &fixture.repo,
+            &fixture.candidate_session_id,
+            fixture.binding.clone(),
+        )
+        .unwrap();
+    fixture.token = target.token.clone();
+    fixture.runtime.agent_capability_issuer = Some(fixture.issuer.clone());
+    fixture
+        .runtime
+        .agent_capability_tokens
+        .insert(fixture.window_id.clone(), target.token.clone());
+    let url = reqwest::Url::parse(&target.url)
+        .unwrap()
+        .join("/internal/execution-continuation")
+        .unwrap();
+    let request = gwt::AgentExecutionContinuationRequest {
+        schema_version: 1,
+        operation_id: "continue-ready-request".to_string(),
+        readiness_nonce: Some(nonce),
+    };
+    assert!(!format!("{request:?}").contains(request.readiness_nonce.as_deref().unwrap()));
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap();
+    let continue_via_host = |fixture: &mut PendingFreshExecutionFixture| {
+        let send = client
+            .post(url.clone())
+            .bearer_auth(&target.token)
+            .json(&request)
+            .build()
+            .unwrap();
+        let request_client = client.clone();
+        let response = thread::spawn(move || request_client.execute(send).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let event = {
+                let mut events = recorded_events.lock().unwrap();
+                events
+                    .iter()
+                    .position(|event| matches!(event, UserEvent::FreshExecutionReadyResend { .. }))
+                    .map(|index| events.remove(index))
+            };
+            if let Some(UserEvent::FreshExecutionReadyResend {
+                grant,
+                request,
+                reply,
+            }) = event
+            {
+                let (result, _) = fixture
+                    .runtime
+                    .resend_fresh_execution_ready(&grant, &request);
+                reply.send(result).unwrap();
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Host did not dispatch readiness resend"
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+        response.join().unwrap()
+    };
+    let response = continue_via_host(&mut fixture);
+    let status = response.status();
+    let body = response.text().unwrap();
+    assert!(status.is_success(), "{status}: {body}");
+    let receipt: gwt::AgentExecutionContinuationReceipt = serde_json::from_str(&body).unwrap();
+    assert_eq!(receipt.operation_id, "continue-ready-request");
+    assert_eq!(receipt.execution_binding, fixture.binding.identity);
+    assert!(receipt.validated);
+    assert!(fixture
+        .issuer
+        .active_token_is_current(&fixture.token, &fixture.binding));
+    assert_eq!(
+        gwt::cli::execution_state::current_execution_binding(&fixture.repo, fixture.owner).unwrap(),
+        Some(fixture.binding.identity.clone())
+    );
+    let ledger = gwt::cli::execution_state::load_generation_ledger(&fixture.repo, fixture.owner)
+        .unwrap()
+        .unwrap();
+    assert_eq!(ledger.generations.len(), 2);
+    assert_eq!(
+        ledger.generations[0].status,
+        gwt::cli::execution_state::ExecutionControlStatus::Blocked
+    );
+    assert!(!fixture
+        .runtime
+        .pending_fresh_execution_launches
+        .contains_key(&fixture.window_id));
+    let update = client
+        .post(url.join("/internal/workspace-update").unwrap())
+        .bearer_auth(&target.token)
+        .json(&gwt::AgentWorkspaceUpdateRequest {
+            schema_version: gwt::AGENT_WORKSPACE_UPDATE_SCHEMA_VERSION,
+            claimed_session_id: fixture.candidate_session_id.clone(),
+            observation: gwt::AgentRuntimeObservation {
+                cwd: fixture.repo.display().to_string(),
+                git_toplevel: fixture.repo.display().to_string(),
+                repo_hash: fixture.binding.repo_hash.clone(),
+                branch: "work/issue-2359".to_string(),
+            },
+            intent: gwt::AgentWorkspaceUpdateIntent {
+                current_focus: Some("verify fresh authority".to_string()),
+                ..Default::default()
+            },
+        })
+        .send()
+        .unwrap();
+    let status = update.status();
+    let body = update.text().unwrap();
+    assert!(
+        status.is_success(),
+        "workspace.update with the promoted capability: {status}: {body}"
+    );
+    let replay = continue_via_host(&mut fixture);
+    let status = replay.status();
+    let body = replay.text().unwrap();
+    assert!(
+        status.is_success(),
+        "ready response-loss replay: {status}: {body}"
+    );
+    let replay: gwt::AgentExecutionContinuationReceipt = serde_json::from_str(&body).unwrap();
+    assert_eq!(replay.generation_id, receipt.generation_id);
+    assert_eq!(
+        gwt::cli::execution_state::load_generation_ledger(&fixture.repo, fixture.owner)
+            .unwrap()
+            .unwrap()
+            .generations
+            .len(),
+        2
+    );
+    server.shutdown();
+}
+
+#[test]
+fn fresh_execution_continue_repairs_activated_response_loss_before_acknowledging() {
+    let _env_guard = env_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().expect("tempdir");
+    let _home = ScopedGwtHome::set(temp.path());
+    let mut fixture = pending_fresh_execution_fixture(temp.path(), "fresh-continue-response-loss");
+    run_git(
+        &fixture.repo,
+        &["symbolic-ref", "HEAD", "refs/heads/work/issue-2359"],
+    );
+    leave_fresh_execution_activated_before_projection_commit(&mut fixture);
+    let (result, _) = fixture.runtime.resend_fresh_execution_ready(
+        &fixture.issuer.grant_for_test(&fixture.token).unwrap(),
+        &gwt::AgentExecutionContinuationRequest {
+            schema_version: 1,
+            operation_id: "retry-ready-request".to_string(),
+            readiness_nonce: None,
+        },
+    );
+    assert!(result
+        .expect("Active capability retry must repair the matching pending fresh coordinator")
+        .is_some());
+    assert!(!fixture
+        .runtime
+        .pending_fresh_execution_launches
+        .contains_key(&fixture.window_id));
+    assert_eq!(
+        gwt::cli::execution_state::current_execution_binding(&fixture.repo, fixture.owner).unwrap(),
+        Some(fixture.binding.identity)
+    );
+    assert!(!durable_launch_recovery_exists(
+        &fixture.runtime.sessions_dir,
+        &fixture.candidate_session_id
+    ));
+}
+
+#[test]
+fn fresh_execution_continue_refuses_wrong_nonce_without_mutation() {
+    let _env_guard = env_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().expect("tempdir");
+    let _home = ScopedGwtHome::set(temp.path());
+    let mut fixture = pending_fresh_execution_fixture(temp.path(), "fresh-continue-wrong-nonce");
+    run_git(
+        &fixture.repo,
+        &["symbolic-ref", "HEAD", "refs/heads/work/issue-2359"],
+    );
+    let before =
+        gwt::cli::execution_state::load_generation_ledger(&fixture.repo, fixture.owner).unwrap();
+    let diagnosis =
+        gwt::cli::execution_state::diagnose(&fixture.repo, Some(&fixture.candidate_session_id));
+    assert!(
+        !diagnosis
+            .available_recoveries
+            .iter()
+            .any(|operation| operation == "execution.adopt" || operation == "execution.continue"),
+        "Prepared recovery needs Host readiness proof: {diagnosis:?}"
+    );
+    assert_eq!(
+        diagnosis.recovery_hint.as_deref(),
+        Some("prepared_launch_readiness_required")
+    );
+    let (result, events) = fixture.runtime.resend_fresh_execution_ready(
+        &fixture.issuer.grant_for_test(&fixture.token).unwrap(),
+        &gwt::AgentExecutionContinuationRequest {
+            schema_version: 1,
+            operation_id: "continue-ready-request".to_string(),
+            readiness_nonce: Some("wrong-nonce".to_string()),
+        },
+    );
+    assert!(result.is_err());
+    assert!(events.is_empty());
+    assert_eq!(
+        gwt::cli::execution_state::load_generation_ledger(&fixture.repo, fixture.owner).unwrap(),
+        before
+    );
+    assert!(fixture
+        .issuer
+        .prepared_token_is_current(&fixture.token, &fixture.binding));
+    assert!(fixture
+        .runtime
+        .pending_fresh_execution_launches
+        .contains_key(&fixture.window_id));
 }
 
 #[test]
@@ -38234,6 +38523,53 @@ fn app_runtime_startup_recovery_reads_only_restore_candidates_and_defers_the_res
         .any(|session| session.id == "session-stale"));
 }
 
+/// Issue #4730 AC-3: historical rows cannot multiply synchronous Git work.
+#[test]
+fn startup_restore_defers_1500_old_sessions_without_git_spawns() {
+    let temp = tempdir().expect("tempdir");
+    let _gwt_home = ScopedGwtHome::set(temp.path());
+    let repo = temp.path().join("repo");
+    init_git_clone_with_origin(&repo);
+    let tab = sample_project_tab("tab-repo", "Repo", repo.clone(), ProjectKind::Git, &[]);
+    let mut runtime = sample_runtime(temp.path(), vec![tab], Some("tab-repo"));
+    let (spawner, tasks) = BlockingTaskSpawner::queued();
+    runtime.blocking_tasks = spawner;
+    fs::create_dir_all(&runtime.sessions_dir).unwrap();
+    let modified = std::time::SystemTime::now() - Duration::from_secs(3 * 24 * 60 * 60);
+    for index in 0..1500 {
+        let mut session = gwt_agent::Session::new(&repo, "work/history", gwt_agent::AgentId::Codex);
+        session.id = format!("history-{index}");
+        session.last_activity_at = chrono::Utc::now() - chrono::Duration::days(3);
+        let path = runtime.sessions_dir.join(format!("{}.toml", session.id));
+        fs::write(&path, toml::to_string(&session).unwrap()).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+    }
+    let git_spawns = gwt_core::process::thread_git_spawn_count();
+    runtime.queue_startup_auto_resume_sessions(&HashSet::new());
+    assert_eq!(gwt_core::process::thread_git_spawn_count() - git_spawns, 0);
+    assert!(runtime.pending_startup_auto_resume_sessions.is_empty());
+    assert_eq!(
+        tasks.lock().unwrap().len(),
+        1,
+        "one deferred recovery sweep"
+    );
+    assert!(
+        fs::read_dir(&runtime.sessions_dir).unwrap().all(|entry| {
+            entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "toml")
+        }),
+        "historical Sessions must not be locked and parsed before the deferred sweep"
+    );
+}
+
 #[test]
 fn app_runtime_startup_auto_resume_includes_legacy_non_stopped_sessions() {
     let _env_lock = env_test_lock()
@@ -46722,6 +47058,7 @@ fn app_runtime_agent_failed_ack_runs_ui_finalize_without_a_local_write() {
                 steering: None,
                 review_dispatch_hold: None,
                 last_failure_message: None,
+                delivering_since: None,
             }],
             ..gwt::IssueMonitorPrefs::default()
         },
@@ -76193,6 +76530,7 @@ not toml";
         rows[0].kind,
         gwt_core::error_ledger::ErrorKind::OperationRefusal
     );
+    assert_eq!(rows[0].scope, gwt_core::error_ledger::ErrorScope::Host);
     assert!(
         rows[0]
             .message
@@ -76473,7 +76811,13 @@ fn restore_admits_worktree_with_unlanded_commits() {
     let runtime = sample_runtime(temp.path(), vec![], None);
     let mut session = gwt_agent::Session::new(&repo, "work/live", gwt_agent::AgentId::Codex);
     session.agent_session_id = Some("native-live".into());
+    let git_spawns = gwt_core::process::thread_git_spawn_count();
     assert_eq!(runtime.restore_admission(&session, &repo, None), Ok(()));
+    assert_eq!(
+        gwt_core::process::thread_git_spawn_count() - git_spawns,
+        1,
+        "the merge-base restore check must participate in startup Git measurements"
+    );
 }
 
 #[test]

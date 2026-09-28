@@ -1811,7 +1811,8 @@ impl AppRuntime {
                     message: "Project tab not found".to_string(),
                     issue_number: Some(issue_number),
                 },
-            )];
+            )
+            .with_error_project_root(project_root)];
         };
         let Some(context) = self.project_context(&tab_id) else {
             return Vec::new();
@@ -1828,7 +1829,8 @@ impl AppRuntime {
                     message: "Issue Monitor launch requires a Git project".to_string(),
                     issue_number: Some(issue_number),
                 },
-            )];
+            )
+            .with_error_project_root(project_root)];
         }
         if tab.migration_pending {
             return vec![OutboundEvent::reply(
@@ -1840,7 +1842,8 @@ impl AppRuntime {
                         .to_string(),
                     issue_number: Some(issue_number),
                 },
-            )];
+            )
+            .with_error_project_root(project_root)];
         }
 
         let project_root = tab.project_root.clone();
@@ -1856,7 +1859,8 @@ impl AppRuntime {
                             message: error,
                             issue_number: Some(issue_number),
                         },
-                    )];
+                    )
+                    .with_error_project_root(&project_root)];
                 }
             };
         let previous_profiles = self.issue_monitor_previous_profiles(&project_root);
@@ -1902,7 +1906,8 @@ impl AppRuntime {
                     message: error,
                     issue_number: Some(issue_number),
                 },
-            )],
+            )
+            .with_error_project_root(&project_root)],
         }
     }
 
@@ -2001,7 +2006,8 @@ impl AppRuntime {
                     message: "Project tab not found".to_string(),
                     issue_number: None,
                 },
-            )];
+            )
+            .with_error_project_root(&context.project_root)];
         };
         if tab.kind != gwt::ProjectKind::Git {
             return vec![OutboundEvent::reply(
@@ -2012,7 +2018,8 @@ impl AppRuntime {
                     message: "Issue Monitor settings require a Git project".to_string(),
                     issue_number: None,
                 },
-            )];
+            )
+            .with_error_project_root(&context.project_root)];
         }
         if tab.migration_pending {
             return vec![OutboundEvent::reply(
@@ -2025,7 +2032,8 @@ impl AppRuntime {
                             .to_string(),
                     issue_number: None,
                 },
-            )];
+            )
+            .with_error_project_root(&context.project_root)];
         }
 
         let project_root = tab.project_root.clone();
@@ -2507,7 +2515,7 @@ impl AppRuntime {
                             ),
                             issue_number: Some(issue_number),
                         },
-                    ));
+                    ).with_error_project_root(&context.project_root));
                 } else {
                     recovery_events.extend(self.issue_monitor_launch_failed_delivery_events(
                         Some(project_root),

@@ -8462,6 +8462,7 @@ exit 0
                 steering: None,
                 review_dispatch_hold: None,
                 last_failure_message: None,
+                delivering_since: None,
             }],
             ..crate::IssueMonitorPrefs::default()
         };
@@ -8571,6 +8572,7 @@ exit 0
                 steering: None,
                 review_dispatch_hold: None,
                 last_failure_message: None,
+                delivering_since: None,
             }],
             ..crate::IssueMonitorPrefs::default()
         };
@@ -12618,6 +12620,7 @@ exit 0
                     steering: None,
                     review_dispatch_hold: None,
                     last_failure_message: None,
+                    delivering_since: None,
                 }],
                 ..crate::IssueMonitorPrefs::default()
             },
@@ -13108,6 +13111,7 @@ exit 1
                     steering: None,
                     review_dispatch_hold: None,
                     last_failure_message: None,
+                    delivering_since: None,
                 }],
                 ..crate::IssueMonitorPrefs::default()
             },
@@ -15737,6 +15741,7 @@ exit 1
                 steering: None,
                 review_dispatch_hold: None,
                 last_failure_message: None,
+                delivering_since: None,
             }],
             ..crate::IssueMonitorPrefs::default()
         };
@@ -15803,6 +15808,7 @@ exit 1
                 steering: None,
                 review_dispatch_hold: None,
                 last_failure_message: None,
+                delivering_since: None,
             }],
             ..crate::IssueMonitorPrefs::default()
         };
@@ -15922,6 +15928,7 @@ exit 1
                     steering: None,
                     review_dispatch_hold: None,
                     last_failure_message: None,
+                    delivering_since: None,
                 },
                 crate::AutonomousIssueRecord {
                     issue_number: 8,
@@ -15941,6 +15948,7 @@ exit 1
                     steering: None,
                     review_dispatch_hold: None,
                     last_failure_message: None,
+                    delivering_since: None,
                 },
             ],
             ..crate::IssueMonitorPrefs::default()
@@ -16010,6 +16018,7 @@ exit 1
                 steering: None,
                 review_dispatch_hold: None,
                 last_failure_message: None,
+                delivering_since: None,
             }],
             ..crate::IssueMonitorPrefs::default()
         };
@@ -16717,6 +16726,7 @@ exit 1
                 steering: None,
                 review_dispatch_hold: None,
                 last_failure_message: None,
+                delivering_since: None,
             }],
             ..crate::IssueMonitorPrefs::default()
         };
@@ -16769,9 +16779,12 @@ exit 1
         ));
 
         assert!(monitor.pending_effects().is_empty());
+        // Issue #3944 AC-3 / #4726: the moved HEAD requeued the Issue for a
+        // re-review. The compensating disarm succeeding while the mode is ON
+        // must not then park it as if the kill switch had fired.
         assert_eq!(
             monitor.autonomous_record(42).map(|record| record.phase),
-            Some(crate::AutonomousPhase::NeedsHuman)
+            Some(crate::AutonomousPhase::Idle)
         );
     }
 
@@ -16858,6 +16871,7 @@ exit 1
                 steering: None,
                 review_dispatch_hold: None,
                 last_failure_message: None,
+                delivering_since: None,
             }],
             ..crate::IssueMonitorPrefs::default()
         };
@@ -16994,6 +17008,7 @@ exit 1
                 steering: None,
                 review_dispatch_hold: None,
                 last_failure_message: None,
+                delivering_since: None,
             }],
             ..crate::IssueMonitorPrefs::default()
         };
@@ -17349,6 +17364,7 @@ exit 1
             steering: None,
             review_dispatch_hold: None,
             last_failure_message: None,
+            delivering_since: None,
         };
         let disk_same_key = record(42, crate::AutonomousPhase::Implementing, 1);
         let local_same_key = record(42, crate::AutonomousPhase::Reviewing, 2);
@@ -17585,6 +17601,7 @@ exit 1
                     steering: None,
                     review_dispatch_hold: None,
                     last_failure_message: None,
+                    delivering_since: None,
                 }],
                 ..crate::IssueMonitorPrefs::default()
             },
@@ -18602,6 +18619,7 @@ exit 1
                     steering: None,
                     review_dispatch_hold: None,
                     last_failure_message: None,
+                    delivering_since: None,
                 }],
                 ..crate::IssueMonitorPrefs::default()
             },
@@ -18893,6 +18911,7 @@ exit 1
             steering: None,
             review_dispatch_hold: None,
             last_failure_message: None,
+            delivering_since: None,
         };
         crate::save_issue_monitor_prefs(
             &prefs_path,
