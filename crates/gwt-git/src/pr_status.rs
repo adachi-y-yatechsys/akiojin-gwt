@@ -69,11 +69,11 @@ impl PrStatus {
 /// [`PrInventoryOptions::stale_after_hours`] (Issue #3868 AC-5).
 pub const PR_STALE_AFTER_HOURS: i64 = 72;
 
-/// Consecutive `pr.list` observations with identical real data after which a
-/// row is `escalation_due` (Issue #3868 AC-6). Counted from the second
-/// observation, so the default flags a PR on its fourth unchanged cycle. One
-/// `pr.list` read is one observation, so the PM reads the inventory once per
-/// resident cycle.
+/// Consecutive unchanged `pr.list` observations needed for cycle escalation.
+/// Counted from the second observation. Reads may be only minutes apart, so
+/// reaching this count also requires at least one hour of dwell. PENDING CI
+/// gets the full stale window because check transitions do not bump GitHub's
+/// PR `updatedAt` (Issue #4553).
 pub const PR_ESCALATE_AFTER_UNCHANGED_CYCLES: u32 = 3;
 
 /// The PM fallback attached to rows whose `default_action` cannot be executed
@@ -175,7 +175,8 @@ pub fn agent_visual_check(body: &str) -> AgentVisualCheck {
 pub struct PrInventoryOptions {
     /// Hours without an `updated_at` bump before a row is `stale`.
     pub stale_after_hours: i64,
-    /// Unchanged consecutive observations before a row is `escalation_due`.
+    /// Unchanged observations needed for escalation, subject to the dwell gate:
+    /// one hour normally, or `stale_after_hours` (at least one) for PENDING CI.
     pub escalate_after_cycles: u32,
     /// Bypass the TTL cache: the caller needs the live state for a decision.
     /// Default `false` (periodic, non-essential read). SPEC #4093 FR-008: a
@@ -453,8 +454,8 @@ pub struct PrInventoryItem {
     pub unchanged_cycles: u32,
     #[serde(default = "default_escalate_after_cycles")]
     pub escalate_after_cycles: u32,
-    /// `stale` or `unchanged_cycles >= escalate_after_cycles`: the row must
-    /// reach the human with what was done or why nothing could be done.
+    /// Stale, or enough unchanged observations after the dwell gate (one hour,
+    /// extended to the stale window for PENDING CI): the row needs attention.
     #[serde(default)]
     pub escalation_due: bool,
     /// Issue #4217 FR-005: whether this PR's body postpones the owner's visual
@@ -548,8 +549,16 @@ impl PrInventoryHistory {
                 0
             };
             item.escalate_after_cycles = options.escalate_after_cycles;
-            item.escalation_due =
-                item.stale || item.unchanged_cycles >= options.escalate_after_cycles;
+            let minimum_dwell_hours = if item.ci_status.eq_ignore_ascii_case("PENDING") {
+                options.stale_after_hours.max(1)
+            } else {
+                1
+            };
+            item.escalation_due = item.stale
+                || (item.unchanged_cycles >= options.escalate_after_cycles
+                    && item
+                        .dwell_hours
+                        .is_some_and(|hours| hours >= minimum_dwell_hours));
             next.insert(
                 item.number,
                 PrInventoryHistoryEntry {
@@ -5660,6 +5669,45 @@ mod tests {
     }
 
     #[test]
+    fn history_does_not_escalate_a_young_pr_from_cycles_alone() {
+        let mut history = PrInventoryHistory::default();
+        let options = PrInventoryOptions::default();
+        let mut items = vec![sample_item(
+            4552,
+            "2026-09-01T11:56:00Z",
+            "MERGEABLE",
+            "SUCCESS",
+        )];
+        for _ in 0..10 {
+            history.observe(&mut items, now_3868(), &options);
+            assert!(!items[0].escalation_due);
+        }
+        assert!(items[0].unchanged_cycles >= options.escalate_after_cycles);
+    }
+
+    #[test]
+    fn history_gives_pending_ci_more_time_than_completed_ci() {
+        let mut history = PrInventoryHistory::default();
+        let options = PrInventoryOptions::default();
+        let mut items = vec![sample_item(
+            4532,
+            "2026-09-01T10:00:00Z",
+            "MERGEABLE",
+            "PENDING",
+        )];
+        for _ in 0..10 {
+            history.observe(&mut items, now_3868(), &options);
+            assert!(!items[0].escalation_due, "pending CI gets the stale window");
+        }
+        items[0].ci_status = "SUCCESS".to_string();
+        history.observe(&mut items, now_3868(), &options);
+        assert!(
+            items[0].escalation_due,
+            "completed CI with two hours of dwell"
+        );
+    }
+
+    #[test]
     fn history_counts_unchanged_cycles_and_flags_escalation_at_the_threshold() {
         let mut history = PrInventoryHistory::default();
         let options = PrInventoryOptions {
@@ -5697,7 +5745,7 @@ mod tests {
         assert_eq!(items[0].unchanged_cycles, 2);
         assert!(
             items[0].escalation_due,
-            "threshold reached → immediate escalation"
+            "cycle threshold and minimum dwell reached → escalation"
         );
 
         let mut items = vec![sample_item(

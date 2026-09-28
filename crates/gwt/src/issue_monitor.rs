@@ -3517,6 +3517,52 @@ pub struct IssueMonitorAgentStatus {
     /// still read empty.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_surge: Option<IssueMonitorFailureSurge>,
+    /// Issue #4249 FR-004: the one gate keeping the queue from launching, or
+    /// `null` when a launch is admissible. Always serialized, so a missing
+    /// field means a publisher that predates it and reads as `unknown`.
+    #[serde(default = "unknown_stall_reason")]
+    pub stall_reason: Option<IssueMonitorStallReason>,
+    /// Issue #4249 FR-004: the GUI action that lifts `stall_reason`, present
+    /// only when no JSON operation can.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gui_action: Option<String>,
+}
+
+/// Issue #4249 FR-004 / AC-5: which admission gate holds the Issue Monitor
+/// queue, in the order the scan applies them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IssueMonitorStallReason {
+    Disabled,
+    GuiDisconnected,
+    LaunchProfileMissing,
+    /// GitHub credentials are missing, so every claim fails.
+    GithubAuthRequired,
+    UpdateDrain,
+    QuotaHold,
+    MaxActiveSaturated,
+    /// Every queued Issue is waiting out its retry backoff.
+    RetryBackoff,
+    QueueEmpty,
+    /// No live monitor answered, or it predates this field.
+    Unknown,
+}
+
+impl IssueMonitorStallReason {
+    /// The GUI action that lifts this gate, when no JSON operation can.
+    /// `issue.monitor.config.set` refuses `enabled:true` by design.
+    pub fn gui_action(self) -> Option<&'static str> {
+        match self {
+            Self::Disabled => Some("Issue Monitor panel: Start"),
+            Self::GuiDisconnected => Some("Open the gwt window for this project"),
+            Self::LaunchProfileMissing => Some("Issue Monitor panel: Agent settings"),
+            _ => None,
+        }
+    }
+}
+
+fn unknown_stall_reason() -> Option<IssueMonitorStallReason> {
+    Some(IssueMonitorStallReason::Unknown)
 }
 
 /// Issue #4207 AC-5: how many rows are failing, and by which mechanism.
@@ -10585,7 +10631,53 @@ impl IssueMonitorState {
     /// Issue #4037 AC-2: the one admission gate every launch path consults.
     /// A raised update drain holds admission exactly like a provider hold.
     fn launch_admission_is_held_at(&self, now: &str) -> bool {
-        self.update_drain.is_some() || self.saved_profile_provider_is_held_at(now)
+        self.launch_admission_hold_at(now).is_some()
+    }
+
+    fn launch_admission_hold_at(&self, now: &str) -> Option<IssueMonitorStallReason> {
+        if self.update_drain.is_some() {
+            Some(IssueMonitorStallReason::UpdateDrain)
+        } else if self.saved_profile_provider_is_held_at(now) {
+            Some(IssueMonitorStallReason::QuotaHold)
+        } else {
+            None
+        }
+    }
+
+    /// Issue #4249 FR-004: the first gate that keeps a claim from being
+    /// planned at `now`, from the same predicates the claim planner and the
+    /// runtime's profile/auth gates consult.
+    pub fn stall_reason_at(&self, now: &str) -> Option<IssueMonitorStallReason> {
+        use IssueMonitorStallReason as Reason;
+        if !self.config.enabled {
+            return Some(Reason::Disabled);
+        }
+        if !self.gui_connected {
+            return Some(Reason::GuiDisconnected);
+        }
+        if !self.has_launch_profile() {
+            return Some(Reason::LaunchProfileMissing);
+        }
+        if self.launch_auth_required {
+            return Some(Reason::GithubAuthRequired);
+        }
+        if let Some(hold) = self.launch_admission_hold_at(now) {
+            return Some(hold);
+        }
+        let (available, candidates) = self.claim_probe_plan(self.config.max_active.max(1));
+        if available == 0 {
+            return Some(Reason::MaxActiveSaturated);
+        }
+        if candidates.is_empty() {
+            return Some(Reason::QueueEmpty);
+        }
+        if !candidates
+            .iter()
+            .any(|issue_number| self.retry_ready_for_saved_profile(*issue_number, now))
+        {
+            return Some(Reason::RetryBackoff);
+        }
+        None
     }
 
     /// Issue #4037 AC-1: the update drain, if raised.
@@ -10889,6 +10981,7 @@ impl IssueMonitorState {
     fn agent_status_without_scan_at(&self, now: &str) -> IssueMonitorAgentStatus {
         let status = self.status_view_with_quota_hold(now, self.provider_quota_hold_at(now));
         let failure_surge = self.failure_surge();
+        let stall_reason = self.stall_reason_at(now);
         IssueMonitorAgentStatus {
             // Issue #4413: this is the live driver talking about itself. Only
             // a reader that failed to reach one may downgrade the provenance.
@@ -11037,6 +11130,10 @@ impl IssueMonitorState {
             spotlight: None,
             build_artifact_gc: None,
             failure_surge,
+            stall_reason,
+            gui_action: stall_reason
+                .and_then(IssueMonitorStallReason::gui_action)
+                .map(str::to_string),
         }
     }
 
@@ -17551,6 +17648,8 @@ mod tests {
                 idle_window_counts: BTreeMap::new(),
                 review_windows: Vec::new(),
                 failure_surge: None,
+                stall_reason: Some(IssueMonitorStallReason::GuiDisconnected),
+                gui_action: Some("Open the gwt window for this project".to_string()),
             }
         );
     }
@@ -19844,6 +19943,141 @@ mod tests {
             Some("codex"),
             "without work tags routing is off and pool order stands"
         );
+    }
+
+    /// Issue #4249 AC-5 / T-124..T-127: `stall_reason` names the one gate
+    /// holding the queue, and agrees with the claim planner the scan runs.
+    #[test]
+    fn stall_reason_names_the_gate_that_holds_the_queue_and_agrees_with_admission() {
+        let now = "2026-09-28T03:00:00Z";
+        let unscanned = || {
+            let mut monitor = IssueMonitorState::with_prefs(
+                IssueMonitorConfig {
+                    enabled: true,
+                    max_active: 1,
+                    ..IssueMonitorConfig::default()
+                },
+                IssueMonitorPrefs {
+                    enabled: true,
+                    max_active_agents: 1,
+                    launch_profile: Some(test_launch_profile("codex")),
+                    ..IssueMonitorPrefs::default()
+                },
+            );
+            monitor.set_gui_connected(true);
+            monitor
+        };
+        let admissible = || {
+            let mut monitor = unscanned();
+            scan_issue_monitor_candidates(&mut monitor, &[issue(42), issue(43)], now);
+            monitor
+        };
+        let reason_and_claims = |monitor: &IssueMonitorState| {
+            let reason = monitor.agent_status_at(now).stall_reason;
+            let claims =
+                monitor
+                    .clone()
+                    .prepare_claim_effects_with_probe("host/session", now, 1, |_| false);
+            (reason, claims)
+        };
+
+        assert_eq!(reason_and_claims(&admissible()), (None, 1));
+
+        // T-127: every gate the claim planner applies refuses the claim that
+        // `stall_reason` says is held, so the two can never disagree.
+        let mut disabled = admissible();
+        disabled.config.enabled = false;
+        let mut detached = admissible();
+        detached.set_gui_connected(false);
+        let mut drained = admissible();
+        drained.set_update_drain(IssueMonitorUpdateDrainReason::Manual, "9.0.0", now);
+        let mut held = admissible();
+        held.provider_quota_holds =
+            BTreeMap::from([("codex".to_string(), "2026-09-28T04:00:00Z".to_string())]);
+        let mut saturated = admissible();
+        saturated
+            .next_launch_request(now)
+            .expect("the only slot is taken");
+        let mut backoff = admissible();
+        for number in [42, 43] {
+            backoff.autonomous_record_mut(number).retry_not_before =
+                Some("2026-09-28T04:00:00Z".to_string());
+        }
+        let empty = unscanned();
+        for (monitor, expected) in [
+            (disabled, IssueMonitorStallReason::Disabled),
+            (detached, IssueMonitorStallReason::GuiDisconnected),
+            (drained, IssueMonitorStallReason::UpdateDrain),
+            (held, IssueMonitorStallReason::QuotaHold),
+            (saturated, IssueMonitorStallReason::MaxActiveSaturated),
+            (backoff, IssueMonitorStallReason::RetryBackoff),
+            (empty, IssueMonitorStallReason::QueueEmpty),
+        ] {
+            assert_eq!(reason_and_claims(&monitor), (Some(expected), 0));
+        }
+
+        // The runtime gates claims on a saved profile and GitHub auth before
+        // this planner runs; `stall_reason` reports them in the same order.
+        let mut unprofiled = IssueMonitorState::with_prefs(
+            IssueMonitorConfig {
+                enabled: true,
+                ..IssueMonitorConfig::default()
+            },
+            IssueMonitorPrefs {
+                enabled: true,
+                ..IssueMonitorPrefs::default()
+            },
+        );
+        unprofiled.set_gui_connected(true);
+        assert_eq!(
+            unprofiled.agent_status_at(now).stall_reason,
+            Some(IssueMonitorStallReason::LaunchProfileMissing)
+        );
+        let mut unauthenticated = admissible();
+        unauthenticated.record_launch_auth_required(now);
+        assert_eq!(
+            unauthenticated.agent_status_at(now).stall_reason,
+            Some(IssueMonitorStallReason::GithubAuthRequired)
+        );
+    }
+
+    /// Issue #4249 FR-004: a GUI-only gate names the GUI action that lifts it;
+    /// a gate the PM can lift through a JSON operation names none.
+    #[test]
+    fn stall_reason_names_a_gui_action_only_for_gui_only_gates() {
+        let now = "2026-09-28T03:00:00Z";
+        let status = IssueMonitorState::with_prefs(
+            IssueMonitorConfig::default(),
+            IssueMonitorPrefs::default(),
+        )
+        .agent_status_at(now);
+        assert_eq!(status.stall_reason, Some(IssueMonitorStallReason::Disabled));
+        assert!(status
+            .gui_action
+            .as_deref()
+            .is_some_and(|action| action.contains("Start")));
+        assert_eq!(IssueMonitorStallReason::QuotaHold.gui_action(), None);
+        assert_eq!(
+            IssueMonitorStallReason::MaxActiveSaturated.gui_action(),
+            None
+        );
+    }
+
+    /// Issue #4249: a publication from a monitor that predates `stall_reason`
+    /// reads as `unknown`, never as "nothing is holding the queue".
+    #[test]
+    fn a_status_without_stall_reason_reads_as_unknown() {
+        let mut value = serde_json::to_value(
+            IssueMonitorState::with_prefs(
+                IssueMonitorConfig::default(),
+                IssueMonitorPrefs::default(),
+            )
+            .agent_status_at("2026-09-28T03:00:00Z"),
+        )
+        .expect("serialize");
+        value.as_object_mut().unwrap().remove("stall_reason");
+        let status: IssueMonitorAgentStatus = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(status.stall_reason, Some(IssueMonitorStallReason::Unknown));
     }
 
     #[test]
