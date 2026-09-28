@@ -1,6 +1,7 @@
 //! Read-only endpoint selection for daemon subscriptions.
 //!
-//! Exact caller scope always wins. A same-repository sibling is eligible only
+//! The live project authority wins. Without one, exact caller scope wins.
+//! A same-repository sibling is eligible only
 //! when exact evidence is absent or definitely dead, and only one compatible
 //! live sibling exists.
 
@@ -212,6 +213,23 @@ where
     F: Fn(u32) -> bool,
 {
     let exact_path = requested_scope.endpoint_path(gwt_home);
+    if let Some(owner) = crate::daemon_publisher::resolve_live_project_authority(
+        gwt_home,
+        requested_scope,
+        &is_process_alive,
+    )
+    .map_err(|error| {
+        ResolutionFailure::invalid_evidence(requested_scope, exact_path.clone(), error)
+    })? {
+        if owner.protocol_version != expected_protocol_version {
+            return Err(ResolutionFailure::invalid_evidence(
+                requested_scope,
+                exact_path,
+                "project owner protocol mismatch",
+            ));
+        }
+        return Ok(PreparedResolution::Exact(owner));
+    }
     let exact_outcome = match fs::read(&exact_path) {
         Ok(payload) => {
             let endpoint: DaemonEndpoint = serde_json::from_slice(&payload).map_err(|_| {
@@ -658,6 +676,74 @@ mod tests {
             is_process_alive,
             |_| ProbeOutcome::Reachable,
         )
+    }
+
+    #[test]
+    fn project_authority_wins_over_a_live_local_endpoint() {
+        let fixture = Fixture::new();
+        let exact = fixture.endpoint("caller", 11);
+        let owner = fixture.endpoint("owner", std::process::id());
+        fixture.persist(&exact);
+        fixture.persist(&owner);
+        let prefs = fixture
+            .gwt_home
+            .join("projects/repo-1/project-state/issue-monitor.json");
+        crate::save_issue_monitor_prefs(&prefs, &crate::IssueMonitorPrefs::default()).unwrap();
+        crate::persist_issue_monitor_authority_fence(
+            &prefs,
+            &crate::IssueMonitorAuthorityFence::current_process(),
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_assuming_reachable(
+                &fixture.gwt_home,
+                &fixture.caller,
+                DAEMON_PROTOCOL_VERSION,
+                |_| true,
+            )
+            .unwrap(),
+            owner
+        );
+    }
+
+    #[test]
+    fn routing_rejects_uncertain_fence_even_with_live_exact_endpoint() {
+        let fixture = Fixture::new();
+        fixture.persist(&fixture.endpoint("caller", 11));
+        let prefs = fixture
+            .gwt_home
+            .join("projects/repo-1/project-state/issue-monitor.json");
+        crate::save_issue_monitor_prefs(&prefs, &crate::IssueMonitorPrefs::default()).unwrap();
+        crate::persist_legacy_issue_monitor_shutdown_revoke_fence(&prefs).unwrap();
+        assert!(
+            matches!(
+                crate::daemon_publisher::resolve_project_daemon_bootstrap(
+                    &fixture.gwt_home,
+                    &fixture.caller,
+                    None,
+                    &|_| false,
+                )
+                .unwrap(),
+                gwt_core::daemon::DaemonBootstrapAction::Spawn { .. }
+            ),
+            "startup remains eligible for existing lease-guarded recovery"
+        );
+        let fence_path = crate::issue_monitor_authority_fence_path(&prefs);
+        for malformed in [false, true] {
+            if malformed {
+                fs::write(&fence_path, b"not-json").unwrap();
+            }
+            assert!(
+                resolve_assuming_reachable(
+                    &fixture.gwt_home,
+                    &fixture.caller,
+                    DAEMON_PROTOCOL_VERSION,
+                    |_| true
+                )
+                .is_err(),
+                "uncertain fence must not select a live local endpoint (malformed={malformed})"
+            );
+        }
     }
 
     #[test]
