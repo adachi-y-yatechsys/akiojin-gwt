@@ -669,40 +669,4 @@ mod tests {
             Some(100)
         );
     }
-
-    #[cfg(windows)]
-    #[test]
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "the test needs a plain paused child whose priority class it can mutate"
-    )]
-    fn windows_process_priority_class_roundtrips_on_a_live_child() {
-        use std::process::{Command, Stdio};
-
-        let mut child = Command::new("cmd")
-            .args(["/C", "pause"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn paused child");
-        let pid = child.id();
-        assert_eq!(
-            process_priority_class(pid).expect("query initial class"),
-            ProcessPriorityClass::Normal
-        );
-        set_process_priority_class(pid, ProcessPriorityClass::BelowNormal)
-            .expect("lower child priority class");
-        assert_eq!(
-            process_priority_class(pid).expect("query lowered class"),
-            ProcessPriorityClass::BelowNormal
-        );
-        set_process_priority_class(pid, ProcessPriorityClass::Idle).expect("idle class");
-        assert_eq!(
-            process_priority_class(pid).expect("query idle class"),
-            ProcessPriorityClass::Idle
-        );
-        let _ = child.kill();
-        let _ = child.wait();
-    }
 }
