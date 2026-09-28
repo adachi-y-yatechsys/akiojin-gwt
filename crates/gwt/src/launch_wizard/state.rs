@@ -1488,7 +1488,8 @@ impl LaunchWizardState {
 
     fn apply_saved_model(&mut self, model: Option<&str>) {
         let Some(model) = model else {
-            if self.current_agent_supports_freetext_model() {
+            if self.effective_agent_id() == "claude" || self.current_agent_supports_freetext_model()
+            {
                 self.model.clear();
             }
             return;
@@ -1498,15 +1499,18 @@ impl LaunchWizardState {
             self.model = model.to_string();
         } else if self.current_agent_supports_freetext_model() {
             self.model = model.trim().to_string();
-        } else if let Some(fallback) = options.first() {
+        } else if let Some(fallback) = model_display_options(self.effective_agent_id()).first() {
             // Issue #3962 AC-5: the saved model left this agent's catalog
             // (`gpt-5.4` after the 2026-09-05 Codex snapshot). Never fail the
-            // launch over it — `sync_selected_agent_options` falls back to the
-            // default row, and this hint tells the user the launch is no longer
-            // using what they saved.
+            // launch over it. Claude restoration must replace any previously
+            // selected alias, even when that alias is still in the catalog.
+            if self.effective_agent_id() == "claude" {
+                self.model = fallback.stored_value.to_string();
+            }
             self.model_fallback_notice = Some(format!(
-                "{} no longer offers {model}; using {fallback} instead.",
+                "{} no longer offers {model}; using {} instead.",
                 self.current_agent_display_name(),
+                fallback.label,
             ));
         }
     }
@@ -4344,5 +4348,35 @@ mod tests {
         assert_eq!(view.selected_agent_id, "claude");
         assert_eq!(view.agent_options.len(), 2);
         assert_eq!(view.selected_runtime_target, "docker");
+    }
+    #[test]
+    fn claude_quick_start_default_clears_previous_model_selection() {
+        for saved in [None, Some("Default (Opus 4.8)"), Some("unknown-model")] {
+            let mut entry = quick_start_entry(
+                "claude-saved",
+                "claude",
+                None,
+                None,
+                gwt_agent::LaunchRuntimeTarget::Host,
+                None,
+            );
+            entry.model = saved.map(str::to_string);
+            let mut state = LaunchWizardState::open_with(
+                context(branch("feature/gui"), "feature/gui"),
+                sample_agent_options(),
+                vec![entry],
+            );
+            state.set_agent_id("claude");
+            state.set_model("opus");
+            assert!(state.prepare_quick_start_launch(0, QuickStartLaunchMode::StartNew, false));
+
+            let config = state.build_launch_config().expect("Claude launch config");
+            assert!(
+                config.model.is_none(),
+                "saved model {saved:?}: {:?}",
+                config.model
+            );
+            assert!(!config.args.iter().any(|arg| arg == "--model"));
+        }
     }
 }
