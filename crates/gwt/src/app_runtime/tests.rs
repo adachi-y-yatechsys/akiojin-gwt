@@ -66703,6 +66703,142 @@ fn pm_refresh_resolves_managed_asset_collisions_from_old_head() {
     assert_eq!(git_stdout(&pm_worktree, &["rev-parse", "HEAD"]), commit_c);
 }
 
+/// SPEC #4486 AC-1/AC-2: a Claude Code plugin layout tracks `.claude/` entries
+/// as links into the same checkout, including directory links and multi-hop
+/// chains. Advancing the PM onto such a base and advancing again must stay
+/// fresh, keep every link a link, leave the link targets untouched, and still
+/// register the PM launch.
+#[cfg(unix)]
+#[test]
+fn pm_refresh_stays_fresh_across_tracked_in_worktree_plugin_symlinks() {
+    use std::os::unix::fs::symlink;
+    let _env_lock = env_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().expect("tempdir");
+    let _home = ScopedEnvVar::set("HOME", temp.path());
+    let _userprofile = ScopedEnvVar::set("USERPROFILE", temp.path());
+    let _gwt_home = ScopedGwtHome::set(temp.path().join(".gwt"));
+    let repo = temp.path().join("repo");
+    let origin = init_git_clone_with_origin(&repo);
+    let seed = temp.path().join("seed");
+    let pm_worktree = create_detached_pm_worktree_fixture(&repo);
+    gwt::pm_registry::refresh_pm_worktree_for_repo_path(&repo).expect("seed PM worktree");
+
+    let plugin = ".claude-plugin/plugins/tool";
+    let files = [
+        (format!("{plugin}/agents/helper.md"), "helper agent\n"),
+        (format!("{plugin}/commands/status.md"), "status command\n"),
+        (
+            format!("{plugin}/skills/tool-usage/SKILL.md"),
+            "usage skill\n",
+        ),
+    ];
+    for (relative, body) in &files {
+        fs::create_dir_all(seed.join(relative).parent().unwrap()).unwrap();
+        fs::write(seed.join(relative), body).unwrap();
+    }
+    let links = [
+        (
+            ".agents/skills/tool-usage",
+            "../../.claude-plugin/plugins/tool/skills/tool-usage",
+        ),
+        // Multi-hop: .claude -> .agents -> .claude-plugin, all inside the checkout.
+        (
+            ".claude/skills/tool-usage",
+            "../../.agents/skills/tool-usage",
+        ),
+        // A project link that happens to use the gwt- prefix is still project-owned.
+        (
+            ".claude/skills/gwt-tool-extra",
+            "../../.agents/skills/tool-usage",
+        ),
+        (
+            ".claude/agents/helper.md",
+            "../../.claude-plugin/plugins/tool/agents/helper.md",
+        ),
+        (
+            ".claude/commands/status.md",
+            "../../.claude-plugin/plugins/tool/commands/status.md",
+        ),
+    ];
+    for (relative, target) in links {
+        fs::create_dir_all(seed.join(relative).parent().unwrap()).unwrap();
+        symlink(target, seed.join(relative)).unwrap();
+    }
+    run_git(&seed, &["add", "--all"]);
+    run_git(
+        &seed,
+        &["commit", "-qm", "add plugin layout with in-tree links"],
+    );
+    run_git(&seed, &["push", origin.to_str().unwrap(), "develop"]);
+    let commit_b = git_stdout(&seed, &["rev-parse", "HEAD"]);
+
+    let outcome = gwt::pm_registry::refresh_pm_worktree_for_repo_path(&repo)
+        .expect("refresh must return its freshness");
+    assert!(
+        outcome.is_fresh(),
+        "in-worktree plugin links must not block PM refresh: {outcome:?}"
+    );
+    assert_eq!(git_stdout(&pm_worktree, &["rev-parse", "HEAD"]), commit_b);
+
+    let commit_c = advance_origin_develop_by_one_commit(&repo, &origin);
+    let repeated = gwt::pm_registry::refresh_pm_worktree_for_repo_path(&repo).unwrap();
+    assert!(
+        repeated.is_fresh(),
+        "a second refresh across the plugin links must stay fresh: {repeated:?}"
+    );
+    assert_eq!(git_stdout(&pm_worktree, &["rev-parse", "HEAD"]), commit_c);
+
+    for (relative, target) in links {
+        assert_eq!(
+            fs::read_link(pm_worktree.join(relative)).unwrap(),
+            PathBuf::from(target),
+            "project link {relative} must stay a link"
+        );
+    }
+    for (relative, body) in &files {
+        assert_eq!(
+            fs::read_to_string(pm_worktree.join(relative)).unwrap(),
+            *body
+        );
+    }
+    assert_eq!(
+        git_stdout(
+            &pm_worktree,
+            &[
+                "status",
+                "--porcelain",
+                "--",
+                ".claude",
+                ".agents",
+                ".claude-plugin"
+            ]
+        ),
+        "",
+        "PM refresh must not modify project-owned plugin files"
+    );
+    let prefs_path = gwt::pm_registry::pm_prefs_path_for_repo_path(&repo);
+    assert_eq!(
+        gwt::pm_registry::load_pm_prefs(&prefs_path)
+            .unwrap()
+            .worktree_freshness
+            .map(|state| state.state),
+        Some(gwt::pm_registry::PmWorktreeFreshnessState::Fresh)
+    );
+
+    let tab = sample_project_tab("tab-1", "Repo", repo.clone(), ProjectKind::Git, &[]);
+    let (mut runtime, _events) = sample_runtime_with_events(temp.path(), vec![tab], Some("tab-1"));
+    runtime.register_pm_after_launch(&repo, "pm-plugin-links", "claude", &pm_worktree);
+    assert_eq!(
+        gwt::pm_registry::load_pm_prefs(&prefs_path)
+            .unwrap()
+            .registration
+            .map(|registration| registration.session_id),
+        Some("pm-plugin-links".to_string())
+    );
+}
+
 // Issue #4564: the fixture used to write a *file* at `runtime/.claude/skills/
 // gwt-pm`. That only obstructed on Unix, where snapshotting the generated
 // `gwt-pm/SKILL.md` leaf through a file fails with ENOTDIR. Windows reports
