@@ -6286,6 +6286,7 @@ impl AppRuntime {
         client_id: &str,
         title: String,
         launch: bool,
+        auto_merge: bool,
     ) -> Vec<OutboundEvent> {
         let title = title.trim().to_string();
         if title.is_empty() {
@@ -6332,7 +6333,11 @@ impl AppRuntime {
             }
         };
 
-        let labels: Vec<String> = Vec::new();
+        let labels: Vec<String> = if auto_merge {
+            vec!["auto-merge".to_string()]
+        } else {
+            Vec::new()
+        };
         let body = quick_issue_body(&title);
         let snapshot = match client.create_issue(&title, &body, &labels) {
             Ok(snapshot) => snapshot,
@@ -9179,9 +9184,11 @@ impl AppRuntime {
             // Internal agent-listener command. Browser-scoped requests are
             // deliberately inert; the authenticated route below owns it.
             FrontendEvent::AgentIssueMonitorScanNow { .. } => Vec::new(),
-            FrontendEvent::QuickRegisterIssue { title, launch } => {
-                self.quick_register_issue_events(context, &client_id, title, launch)
-            }
+            FrontendEvent::QuickRegisterIssue {
+                title,
+                launch,
+                auto_merge,
+            } => self.quick_register_issue_events(context, &client_id, title, launch, auto_merge),
             FrontendEvent::IssueMonitorLaunchNow {
                 issue_number,
                 linked_issue_kind,
@@ -10251,9 +10258,9 @@ impl AppRuntime {
         for status in statuses.values() {
             match status {
                 WindowProcessStatus::Running => aggregate.running_count += 1,
-                WindowProcessStatus::Waiting | WindowProcessStatus::Stopped => {
-                    aggregate.block_count += 1
-                }
+                WindowProcessStatus::Waiting
+                | WindowProcessStatus::Stopped
+                | WindowProcessStatus::Interrupted => aggregate.block_count += 1,
                 WindowProcessStatus::Error => {
                     aggregate.block_count += 1;
                     aggregate.error_count += 1;

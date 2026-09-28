@@ -353,9 +353,14 @@ Linux, `Ctrl+Shift+C` also copies the current terminal selection.
 
 Open `Issue` from Add Window to browse cached GitHub Issues and manage the Issue
 Monitor in one surface. Each row shows its execution state, queue position, and
-any exclusion reason; the toolbar controls queue concurrency, monitor state,
-Autonomous mode, and Quick issue registration. The legacy `issue_monitor`
-preset also opens this canonical Issue surface.
+any exclusion reason. The toolbar has two bands: the Issue band (search,
+filters, `＋ New` to register an Issue from a popover, and `↻` whose tooltip
+shows the cached count and refresh time) and the Monitor band (state pill,
+Active / Queue, Autonomous, Max, Start monitor / Stop, and `⚙` whose tooltip
+shows the Agent settings). Monitor errors turn the pill into `⚠ Error` and are
+read in the notification center. The detail pane leads with the Issue's
+acceptance-criteria progress and one state-specific action band. The legacy
+`issue_monitor` preset also opens this canonical Issue surface.
 
 The monitor watches the project's open GitHub Issues and turns them into agent
 work. In the default (human-gated) mode it scans candidates into the Issue
