@@ -168,7 +168,7 @@ pub use issue_monitor::{
     AutonomousHandoffDeliveryPreparation, AutonomousHandoffResumption, AutonomousIssueRecord,
     AutonomousPendingQuestion, AutonomousPhase, AutonomousReviewDispatch,
     AutonomousSteeringRequest, AutonomousWaitDeclaration, AutonomousWaitInvalidation,
-    AutonomousWaitOutcome, EligibilityDecision, IssueMonitorAgentStatus,
+    AutonomousWaitOutcome, DeliveringExit, EligibilityDecision, IssueMonitorAgentStatus,
     IssueMonitorAuthorityFence, IssueMonitorAuthorityFenceState, IssueMonitorAuthorityLease,
     IssueMonitorCandidateSource, IssueMonitorClaimIdentity, IssueMonitorConfig,
     IssueMonitorControlReceipt, IssueMonitorEffectAttemptKey, IssueMonitorEffectPayload,

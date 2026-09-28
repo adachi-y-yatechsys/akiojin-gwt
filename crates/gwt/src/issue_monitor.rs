@@ -4766,6 +4766,47 @@ pub struct AutonomousIssueRecord {
     /// unchanging refusal are attempts that proved the refusal deterministic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_failure_message: Option<String>,
+    /// Issue #4726 (FR-018 merge-watch): RFC3339 of the first scan that
+    /// watched this record in `Delivering` — the anchor for
+    /// `merge_watch_timeout_secs`. Cleared whenever the phase leaves
+    /// `Delivering`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivering_since: Option<String>,
+}
+
+/// Issue #4726: why a `Delivering` record stops watching for its merge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveringExit {
+    /// The PR was closed without being merged.
+    ClosedUnmerged,
+    /// GitHub will not merge the PR as it stands (conflicting / behind).
+    Unmergeable(&'static str),
+    /// The PR stayed unmerged past `merge_watch_timeout_secs`.
+    MergeWatchTimeout,
+}
+
+impl DeliveringExit {
+    /// The exit a fresh PR readback forces, if any. A mergeable or still
+    /// unknown PR keeps being watched.
+    pub fn from_readback(readback: &gwt_git::pr_status::PrMergeReadback) -> Option<Self> {
+        if readback.closed_unmerged() {
+            return Some(Self::ClosedUnmerged);
+        }
+        crate::issue_monitor_gate::unmergeable_reason(readback.mergeability).map(Self::Unmergeable)
+    }
+
+    /// The exit for one Delivering scan of an unmerged PR. A known cause from
+    /// the readback wins; otherwise an expired watch exits on its own — also
+    /// when the readback failed, so a readback that keeps failing cannot hold
+    /// the record (and its launch slot) past `merge_watch_timeout_secs`.
+    pub fn decide(
+        readback: Option<&gwt_git::pr_status::PrMergeReadback>,
+        watch_expired: bool,
+    ) -> Option<Self> {
+        readback
+            .and_then(Self::from_readback)
+            .or_else(|| watch_expired.then_some(Self::MergeWatchTimeout))
+    }
 }
 
 /// Issue #3844: what a launched agent declared it is waiting for.
@@ -5119,6 +5160,7 @@ impl AutonomousIssueRecord {
             steering: None,
             review_dispatch_hold: None,
             last_failure_message: None,
+            delivering_since: None,
         }
     }
 }
@@ -7416,7 +7458,11 @@ impl IssueMonitorState {
 
     /// SPEC #3200 T-022: set the lifecycle phase of an issue's current attempt.
     pub fn set_autonomous_phase(&mut self, issue_number: u64, phase: AutonomousPhase) {
-        self.autonomous_record_mut(issue_number).phase = phase;
+        let record = self.autonomous_record_mut(issue_number);
+        record.phase = phase;
+        if phase != AutonomousPhase::Delivering {
+            record.delivering_since = None;
+        }
         if phase != AutonomousPhase::Reviewing {
             self.forget_review_window(issue_number);
         }
@@ -7694,7 +7740,8 @@ impl IssueMonitorState {
     /// phases are excluded because they self-heal without a liveness signal:
     /// `Reviewing` is resumed on a daemon restart (see
     /// [`resume_inflight_reviews_after_restart`](Self::resume_inflight_reviews_after_restart)),
-    /// and `Delivering` re-polls the persisted PR for its merge commit. Terminal
+    /// and `Delivering` is governed by its merge-watch (merge commit,
+    /// mergeability, `merge_watch_timeout_secs` — Issue #4726). Terminal
     /// phases are excluded too. Issues with no heartbeat yet are conservatively
     /// NOT judged stuck (no liveness data). Issue #3844: a record whose agent
     /// declared a wait (see [`Self::declare_autonomous_wait`]) is skipped
@@ -11832,6 +11879,7 @@ impl IssueMonitorState {
     ) {
         let record = self.autonomous_record_mut(issue_number);
         record.phase = AutonomousPhase::Reviewing;
+        record.delivering_since = None;
         record.pr_number = Some(pr_number);
         record.reviewed_sha = Some(reviewed_sha.into());
         record.review_passed = None;
@@ -12043,7 +12091,75 @@ impl IssueMonitorState {
     /// SPEC #3200: transition Reviewing→Delivering once the strong gate passes
     /// (the auto-merge is being armed).
     pub fn begin_delivering(&mut self, issue_number: u64) {
+        // Every delivery starts a fresh merge-watch, whatever path last wrote
+        // the phase (Issue #4726).
+        self.autonomous_record_mut(issue_number).delivering_since = None;
         self.set_autonomous_phase(issue_number, AutonomousPhase::Delivering);
+    }
+
+    /// Issue #4726 AC-3 (FR-018): whether a `Delivering` record has watched
+    /// its PR for longer than `merge_watch_timeout_secs`. The first call for a
+    /// delivery anchors the watch at `now`, so a record persisted by an older
+    /// daemon starts its window on the first scan that reads it.
+    pub fn merge_watch_expired(&mut self, issue_number: u64, now: &str) -> bool {
+        let timeout = self.autonomous_tuning.merge_watch_timeout_secs as i64;
+        let record = self.autonomous_record_mut(issue_number);
+        if record.phase != AutonomousPhase::Delivering {
+            return false;
+        }
+        let since = record
+            .delivering_since
+            .get_or_insert_with(|| now.to_string());
+        rfc3339_elapsed_secs(since, now).is_some_and(|elapsed| elapsed >= timeout)
+    }
+
+    /// Issue #4726 AC-2..AC-4: take a `Delivering` record off the merge-watch.
+    /// Every exit releases the launch slot:
+    ///
+    /// - closed unmerged ⇒ `NeedsHuman` — a person stopped the work, and a
+    ///   relaunch would silently undo that;
+    /// - conflicting / behind ⇒ disarm the auto-merge and requeue a bounded
+    ///   attempt that updates the branch (the disarm keeps the armed merge
+    ///   from landing whatever the relaunched agent pushes before re-review);
+    /// - merge-watch timeout ⇒ the same disarm + requeue, plus a steering
+    ///   request so the PM sees that a delivery stalled for an unknown reason.
+    pub fn exit_delivering(
+        &mut self,
+        issue_number: u64,
+        pr_number: u64,
+        exit: DeliveringExit,
+        now: &str,
+    ) {
+        let reason = match exit {
+            DeliveringExit::ClosedUnmerged => {
+                self.escalate_to_needs_human(
+                    issue_number,
+                    NeedsHumanKind::UserChoiceRequired,
+                    format!(
+                        "PR #{pr_number} was closed without merging; reopen it, or decide whether the Issue should be relaunched"
+                    ),
+                );
+                return;
+            }
+            DeliveringExit::Unmergeable(reason) => {
+                format!("PR #{pr_number}: {reason}; auto-merge disarmed, relaunching to update the branch")
+            }
+            DeliveringExit::MergeWatchTimeout => format!(
+                "merge-watch timeout: PR #{pr_number} stayed unmerged past merge_watch_timeout_secs ({}s); auto-merge disarmed, relaunching",
+                self.autonomous_tuning.merge_watch_timeout_secs
+            ),
+        };
+        ensure_auto_merge_disarm_effect(
+            &mut self.pending_effects,
+            self.effect_authority_epoch,
+            &format!("merge-watch:{issue_number}:{pr_number}"),
+            issue_number,
+            pr_number,
+        );
+        self.record_autonomous_failure(issue_number, reason.clone(), now);
+        if exit == DeliveringExit::MergeWatchTimeout {
+            self.request_autonomous_steering(issue_number, reason, now);
+        }
     }
 
     /// SPEC #3200 FR-034 (codex #3217 review): announce a SUCCESSFUL auto-merge
@@ -12061,7 +12177,8 @@ impl IssueMonitorState {
     /// SPEC #3200 FR-009..FR-016: assemble the strong-gate inputs for an issue
     /// under review, from the record (reviewed SHA + review verdict + acceptance
     /// snapshot) and freshly-fetched signals (branch protection, CI rollup JSON,
-    /// the current HEAD SHA, the current Issue body). Returns `None` when the
+    /// the current HEAD SHA, the current Issue body, and — Issue #4726 — the
+    /// PR's mergeability). Returns `None` when the
     /// review verdict has not yet arrived (gate not ready ⇒ caller waits).
     pub fn autonomous_gate_inputs(
         &self,
@@ -12070,6 +12187,7 @@ impl IssueMonitorState {
         ci_rollup_json: &str,
         current_head_sha: &str,
         current_issue_body: &str,
+        mergeability: gwt_git::pr_status::PrMergeability,
     ) -> Option<crate::issue_monitor_gate::AutonomousGateInputs> {
         use crate::issue_monitor_gate::{classify_acceptance_criteria, classify_ci_rollup};
         use crate::issue_monitor_review::ReviewGateOutcome;
@@ -12101,6 +12219,7 @@ impl IssueMonitorState {
             acceptance_unchanged,
             reviewed_sha,
             head_sha: current_head_sha.to_string(),
+            mergeability,
         })
     }
 
@@ -13165,6 +13284,17 @@ impl IssueMonitorState {
         disarmed: bool,
     ) {
         if self.issue_is_closed(issue_number) {
+            return;
+        }
+        if disarmed && self.config.enabled && self.autonomous_mode {
+            // Issue #4726: with the mode ON this disarm compensated a
+            // remediation (merge-watch exit, moved HEAD) that already
+            // requeued the Issue. Parking it here would strand that retry.
+            self.push_unconditional_notice(
+                "info",
+                issue_number,
+                format!("Issue #{issue_number}: auto-merge on PR #{pr_number} disarmed"),
+            );
             return;
         }
         if disarmed {
@@ -18407,6 +18537,7 @@ mod tests {
             steering: None,
             review_dispatch_hold: None,
             last_failure_message: None,
+            delivering_since: None,
         };
         let disk = IssueMonitorPrefs {
             launch_profile: Some(profile.clone()),
@@ -18529,6 +18660,7 @@ mod tests {
             steering: None,
             review_dispatch_hold: None,
             last_failure_message: None,
+            delivering_since: None,
         };
         save_issue_monitor_prefs(
             &path,
@@ -18597,6 +18729,7 @@ mod tests {
                 steering: None,
                 review_dispatch_hold: None,
                 last_failure_message: None,
+                delivering_since: None,
             }],
             ..IssueMonitorPrefs::default()
         };
@@ -18665,6 +18798,7 @@ mod tests {
             steering: None,
             review_dispatch_hold: None,
             last_failure_message: None,
+            delivering_since: None,
         };
         let older_disk = IssueMonitorPrefs {
             legacy_git_launch_failure_migration_version: 0,
@@ -18722,6 +18856,7 @@ mod tests {
             steering: None,
             review_dispatch_hold: None,
             last_failure_message: None,
+            delivering_since: None,
         };
         let mut stale = IssueMonitorState::with_prefs(
             IssueMonitorConfig::default(),
@@ -29042,8 +29177,9 @@ mod tests {
 
     #[test]
     fn stuck_detection_ignores_pipeline_in_flight() {
-        // SPEC #3200 T-044: once review / Deliver is in flight, the merge-watch
-        // timeout governs — a stale agent heartbeat must NOT reclaim the slot.
+        // SPEC #3200 T-044: once review / Deliver is in flight, the review and
+        // merge-watch paths govern — a stale agent heartbeat must NOT reclaim
+        // the slot.
         let mut monitor = stuck_monitor(42, "2026-06-29T00:00:00Z");
         monitor.set_autonomous_phase(42, AutonomousPhase::Reviewing);
         assert!(
@@ -30516,11 +30652,203 @@ mod tests {
         }
     }
 
+    fn delivering_monitor() -> IssueMonitorState {
+        let mut monitor = launched_monitor(7, "tab-1::agent-7");
+        monitor.set_autonomous_mode(true);
+        monitor.set_enabled(true);
+        monitor.set_autonomous_phase(7, AutonomousPhase::Implementing);
+        monitor.begin_review(7, 99, "abc123");
+        monitor.record_review_verdict(7, true);
+        monitor.begin_delivering(7);
+        assert_eq!(
+            monitor.active_count(),
+            1,
+            "the delivering launch holds a slot"
+        );
+        monitor
+    }
+
+    fn merge_watch_disarm_prepared(monitor: &IssueMonitorState) -> bool {
+        monitor.pending_effects().iter().any(|effect| {
+            matches!(
+                effect.payload,
+                IssueMonitorEffectPayload::DisarmAutoMerge {
+                    issue_number: 7,
+                    pr_number: 99,
+                    ..
+                }
+            )
+        })
+    }
+
+    #[test]
+    fn delivering_exit_is_read_from_the_pr_merge_readback() {
+        use gwt_git::pr_status::{PrMergeReadback, PrMergeability};
+        let readback = |state: &str, mergeability| PrMergeReadback {
+            state: state.to_string(),
+            mergeability,
+        };
+        assert_eq!(
+            DeliveringExit::from_readback(&readback("CLOSED", PrMergeability::Unknown)),
+            Some(DeliveringExit::ClosedUnmerged)
+        );
+        for mergeability in [PrMergeability::Conflicting, PrMergeability::Behind] {
+            assert!(matches!(
+                DeliveringExit::from_readback(&readback("OPEN", mergeability)),
+                Some(DeliveringExit::Unmergeable(_))
+            ));
+        }
+        for mergeability in [PrMergeability::Mergeable, PrMergeability::Unknown] {
+            assert_eq!(
+                DeliveringExit::from_readback(&readback("OPEN", mergeability)),
+                None,
+                "{mergeability:?} keeps watching the merge"
+            );
+        }
+    }
+
+    #[test]
+    fn unmergeable_delivering_pr_disarms_requeues_and_frees_the_slot() {
+        // Issue #4726 AC-2/AC-4: an armed auto-merge on a conflicting / behind
+        // PR never merges. The record must leave Delivering, the auto-merge
+        // must be disarmed (a relaunched agent will push to the branch), and
+        // the launch slot must be released.
+        let mut monitor = delivering_monitor();
+        monitor.exit_delivering(
+            7,
+            99,
+            DeliveringExit::Unmergeable("PR has merge conflicts with its base branch"),
+            "2026-07-02T01:00:00Z",
+        );
+        assert_eq!(
+            monitor.autonomous_record(7).map(|record| record.phase),
+            Some(AutonomousPhase::Idle)
+        );
+        assert_eq!(monitor.active_count(), 0, "AC-4: the slot is released");
+        assert_eq!(
+            monitor.queued_issue_numbers(),
+            vec![7],
+            "requeued to remediate"
+        );
+        assert!(merge_watch_disarm_prepared(&monitor), "auto-merge disarmed");
+
+        // The disarm succeeding while the mode is ON is a remediation, not the
+        // kill switch: it must not park the requeued Issue as NeedsHuman.
+        monitor.record_kill_switch_disarm_result(7, 99, true);
+        assert_eq!(
+            monitor.autonomous_record(7).map(|record| record.phase),
+            Some(AutonomousPhase::Idle)
+        );
+        assert_eq!(monitor.queued_issue_numbers(), vec![7]);
+    }
+
+    #[test]
+    fn closed_unmerged_delivering_pr_parks_for_a_human_and_frees_the_slot() {
+        // Issue #4726 AC-2/AC-4: someone closed the PR. Relaunching would
+        // reopen work a person stopped, so the Issue waits for that person.
+        let mut monitor = delivering_monitor();
+        monitor.exit_delivering(
+            7,
+            99,
+            DeliveringExit::ClosedUnmerged,
+            "2026-07-02T01:00:00Z",
+        );
+        let record = monitor.autonomous_record(7).expect("record");
+        assert_eq!(record.phase, AutonomousPhase::NeedsHuman);
+        assert_eq!(
+            record.needs_human_kind,
+            Some(NeedsHumanKind::UserChoiceRequired)
+        );
+        assert_eq!(monitor.active_count(), 0, "AC-4: the slot is released");
+    }
+
+    #[test]
+    fn merge_watch_timeout_escalates_to_the_pm_and_frees_the_slot() {
+        // Issue #4726 AC-3/AC-4: `merge_watch_timeout_secs` is read. The watch
+        // is anchored on the first Delivering scan; past the timeout the
+        // record leaves Delivering with a steering request and a notice.
+        let mut monitor = delivering_monitor();
+        monitor.autonomous_tuning.merge_watch_timeout_secs = 3600;
+        assert!(!monitor.merge_watch_expired(7, "2026-07-02T00:00:00Z"));
+        assert!(!monitor.merge_watch_expired(7, "2026-07-02T00:59:00Z"));
+        assert!(monitor.merge_watch_expired(7, "2026-07-02T01:01:00Z"));
+
+        let _ = monitor.take_autonomous_notices();
+        monitor.exit_delivering(
+            7,
+            99,
+            DeliveringExit::MergeWatchTimeout,
+            "2026-07-02T01:01:00Z",
+        );
+        let record = monitor.autonomous_record(7).expect("record");
+        assert_eq!(record.phase, AutonomousPhase::Idle);
+        assert!(
+            record
+                .steering
+                .as_ref()
+                .is_some_and(|steering| steering.reason.contains("merge-watch timeout")),
+            "the PM is asked to steer: {:?}",
+            record.steering
+        );
+        assert!(
+            monitor
+                .take_autonomous_notices()
+                .iter()
+                .any(|notice| notice.message.contains("merge-watch timeout")),
+            "the escalation is visible as a notice"
+        );
+        assert_eq!(monitor.active_count(), 0, "AC-4: the slot is released");
+        assert!(merge_watch_disarm_prepared(&monitor), "auto-merge disarmed");
+
+        // Leaving Delivering drops the anchor: the next delivery starts a
+        // fresh watch instead of timing out on its first scan.
+        monitor.set_autonomous_phase(7, AutonomousPhase::Delivering);
+        assert!(!monitor.merge_watch_expired(7, "2026-07-02T05:00:00Z"));
+    }
+
+    #[test]
+    fn a_re_review_starts_the_next_delivery_on_a_fresh_merge_watch() {
+        // Issue #4726 (review): `begin_review` writes the phase directly, so a
+        // Delivering → Reviewing → Delivering cycle must not carry the old
+        // anchor into the next delivery and time it out on its first scan.
+        let mut monitor = delivering_monitor();
+        monitor.autonomous_tuning.merge_watch_timeout_secs = 3600;
+        assert!(!monitor.merge_watch_expired(7, "2026-07-02T00:00:00Z"));
+        monitor.begin_review(7, 99, "def456");
+        monitor.record_review_verdict(7, true);
+        monitor.begin_delivering(7);
+        assert!(!monitor.merge_watch_expired(7, "2026-07-02T05:00:00Z"));
+    }
+
+    #[test]
+    fn merge_watch_timeout_applies_even_when_the_readback_failed() {
+        // Issue #4726 (review): a readback that keeps failing must not keep a
+        // Delivering record — and its slot — past the timeout.
+        use gwt_git::pr_status::{PrMergeReadback, PrMergeability};
+        assert_eq!(
+            DeliveringExit::decide(None, true),
+            Some(DeliveringExit::MergeWatchTimeout)
+        );
+        assert_eq!(DeliveringExit::decide(None, false), None);
+        let conflicting = PrMergeReadback {
+            state: "OPEN".to_string(),
+            mergeability: PrMergeability::Conflicting,
+        };
+        assert!(
+            matches!(
+                DeliveringExit::decide(Some(&conflicting), true),
+                Some(DeliveringExit::Unmergeable(_))
+            ),
+            "a known cause beats the generic timeout"
+        );
+    }
+
     #[test]
     fn resume_after_restart_leaves_delivering_and_other_phases_untouched() {
-        // Delivering self-heals on its own (its watch polls the persisted pr_number
-        // for the merge commit) and has an armed GitHub auto-merge, so it must NOT
-        // be re-driven. Idle/Implementing/terminal phases are also left alone.
+        // Delivering is driven by its own merge-watch (merge commit, Issue #4726
+        // mergeability exits, merge_watch_timeout_secs) and has an armed GitHub
+        // auto-merge, so a restart must NOT re-drive it. Idle/Implementing/
+        // terminal phases are also left alone.
         let mut monitor = autonomous_state();
         monitor.set_autonomous_phase(1, AutonomousPhase::Delivering);
         monitor.set_autonomous_phase(2, AutonomousPhase::Implementing);
@@ -30533,7 +30861,7 @@ mod tests {
         assert_eq!(
             monitor.autonomous_record(1).map(|r| r.phase),
             Some(AutonomousPhase::Delivering),
-            "Delivering is left to its own merge-watch self-heal"
+            "Delivering is left to its merge-watch, not re-driven on restart"
         );
         assert_eq!(
             monitor.autonomous_record(2).map(|r| r.phase),
@@ -30907,7 +31235,14 @@ mod tests {
 
         // All conditions hold at the reviewed SHA ⇒ gate Pass.
         let inputs = monitor
-            .autonomous_gate_inputs(7, bp.clone(), rollup, "abc123", body)
+            .autonomous_gate_inputs(
+                7,
+                bp.clone(),
+                rollup,
+                "abc123",
+                body,
+                gwt_git::pr_status::PrMergeability::Mergeable,
+            )
             .expect("gate ready");
         assert_eq!(evaluate_autonomous_gate(&inputs), GateDecision::Pass);
 
@@ -30919,6 +31254,7 @@ mod tests {
                 rollup,
                 "abc123",
                 "## Acceptance Criteria\n- [ ] AC-2: new\n",
+                gwt_git::pr_status::PrMergeability::Mergeable,
             )
             .expect("gate ready");
         assert!(matches!(
@@ -30928,7 +31264,14 @@ mod tests {
 
         // HEAD advanced past reviewed SHA ⇒ TOCTOU ⇒ gate Fail.
         let advanced = monitor
-            .autonomous_gate_inputs(7, bp, rollup, "def456", body)
+            .autonomous_gate_inputs(
+                7,
+                bp,
+                rollup,
+                "def456",
+                body,
+                gwt_git::pr_status::PrMergeability::Mergeable,
+            )
             .expect("gate ready");
         assert!(matches!(
             evaluate_autonomous_gate(&advanced),
@@ -30945,7 +31288,14 @@ mod tests {
         };
         assert!(
             monitor
-                .autonomous_gate_inputs(7, bp, "[]", "abc123", "body")
+                .autonomous_gate_inputs(
+                    7,
+                    bp,
+                    "[]",
+                    "abc123",
+                    "body",
+                    gwt_git::pr_status::PrMergeability::Mergeable
+                )
                 .is_none(),
             "gate not ready while review is in flight",
         );
