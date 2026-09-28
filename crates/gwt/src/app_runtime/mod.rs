@@ -10251,9 +10251,9 @@ impl AppRuntime {
         for status in statuses.values() {
             match status {
                 WindowProcessStatus::Running => aggregate.running_count += 1,
-                WindowProcessStatus::Waiting | WindowProcessStatus::Stopped => {
-                    aggregate.block_count += 1
-                }
+                WindowProcessStatus::Waiting
+                | WindowProcessStatus::Stopped
+                | WindowProcessStatus::Interrupted => aggregate.block_count += 1,
                 WindowProcessStatus::Error => {
                     aggregate.block_count += 1;
                     aggregate.error_count += 1;
