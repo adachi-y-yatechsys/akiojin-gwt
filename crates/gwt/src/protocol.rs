@@ -908,6 +908,10 @@ pub enum FrontendEvent {
         title: String,
         #[serde(default)]
         launch: bool,
+        /// SPEC #3885 T-033 (FR-022): the "+ New" popover's auto-merge
+        /// checkbox; `true` creates the Issue with the `auto-merge` label.
+        #[serde(default)]
+        auto_merge: bool,
     },
     IssueMonitorLaunchNow {
         issue_number: u64,
