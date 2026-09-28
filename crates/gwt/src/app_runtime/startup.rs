@@ -1129,16 +1129,16 @@ impl AppRuntime {
             project_root,
             &session.id,
             &session.worktree_path,
-        ) && gwt_core::process::hidden_command("git")
-            .args([
+        ) && gwt_core::process::run_git_logged(
+            &[
                 "merge-base",
                 "--is-ancestor",
                 "HEAD",
                 "refs/remotes/origin/develop",
-            ])
-            .current_dir(&session.worktree_path)
-            .output()
-            .is_ok_and(|output| output.status.success())
+            ],
+            Some(&session.worktree_path),
+        )
+        .is_ok_and(|output| output.status.success())
         {
             if self.restore_placeholder_is_known_empty(session, window_id) {
                 return Err(RestoreRefusal::EmptyLandedWorktree);

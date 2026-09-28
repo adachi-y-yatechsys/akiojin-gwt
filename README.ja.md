@@ -332,9 +332,12 @@ Linux では `Ctrl+Shift+C` でも現在の選択をコピーできます。
 
 Add Window から `Issue` を開くと、キャッシュ済み GitHub Issue の閲覧と Issue
 Monitor の操作を単一サーフェスで行えます。各行には実行状態、キュー位置、除外理由が
-表示され、ツールバーから同時実行数、monitor の起動状態、Autonomous モード、Quick
-issue 登録を操作できます。従来の `issue_monitor` preset もこの正本 Issue
-サーフェスを開きます。
+表示されます。ツールバーは 2 段で、1 段目は Issue 帯（検索、フィルタ、ポップオーバー
+から Issue を登録する `＋ New`、cached 件数と更新時刻を tooltip に出す `↻`）、2 段目は
+Monitor 帯（状態ピル、Active / Queue、Autonomous、Max、Start monitor / Stop、Agent
+settings を tooltip に出す `⚙`）です。監視エラーは状態ピルが `⚠ Error` になり、本文は
+通知センターで読みます。詳細ペインは受け入れ基準の進捗と状態別の操作帯を先頭に表示
+します。従来の `issue_monitor` preset もこの正本 Issue サーフェスを開きます。
 
 Monitor はプロジェクトの open な GitHub Issue を監視し、エージェント作業に変換します。
 既定（human-gated）モードでは候補を Issue キューに取り込み、行の `Launch now` を
