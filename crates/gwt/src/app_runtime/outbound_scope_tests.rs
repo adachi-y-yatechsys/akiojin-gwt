@@ -125,16 +125,17 @@ fn global_broadcast_direct_all_construction_inventory() {
     let mut inventory = BTreeMap::new();
     collect(&root, &root, &pattern, &mut inventory);
     // Scan every Rust source, including newly added files. The only production
-    // constructions are the two audited constructors in app_runtime/mod.rs.
+    // constructions are the two audited constructors in project_transport.rs.
     // Existing test-only constructions/patterns are inventoried explicitly:
-    // embedded_server: broadcast_runtime_hook_event and transport_all;
+    // embedded_server: broadcast_runtime_hook_event;
+    // project_transport: transport_all;
     // main: transport_all and the update_available_event assertion pattern.
     // New test fixtures also require deliberate review of this inventory.
     assert_eq!(
         inventory,
         BTreeMap::from([
-            ("app_runtime/mod.rs".into(), 2),
-            ("embedded_server.rs".into(), 2),
+            ("project_transport.rs".into(), 3),
+            ("embedded_server.rs".into(), 1),
             ("main.rs".into(), 2),
         ]),
         "new direct All targets must use the audited global constructors"
