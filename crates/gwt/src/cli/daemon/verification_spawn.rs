@@ -13,7 +13,9 @@
 //! connection closes, and when the daemon shuts down. The group is the child's
 //! own, so the daemon is never inside its own blast radius (AC-7).
 
-use gwt_core::daemon::{VerificationSpawnAccepted, VerificationSpawnRequest};
+use gwt_core::daemon::{
+    VerificationSpawnAccepted, VerificationSpawnFinished, VerificationSpawnRequest,
+};
 // Every reader of this lives on a Unix-only path — `spawn` and the reason it
 // records — so on Windows the import itself is what `-D warnings` catches.
 #[cfg(unix)]
@@ -57,17 +59,22 @@ impl VerificationChild {
     /// stays allocated while any member exists, and the just-exited child is
     /// still a zombie member until `wait` collects it, so killing the group at
     /// this point cannot land on a recycled group id.
-    pub fn wait(mut self) -> (i32, bool) {
-        let exit_code = match self.child.wait() {
-            Ok(status) => status.code().unwrap_or(-1),
-            Err(_) => -1,
-        };
+    pub fn wait(mut self) -> VerificationSpawnFinished {
+        let status = self.child.wait().ok();
+        let exit_code = status.and_then(|status| status.code()).unwrap_or(-1);
+        // Issue #4528: a wait failure also reads `-1`, so only a status that
+        // actually names a signal marks the command as killed from outside.
+        let signal = status.and_then(crate::cli::verification_record::terminating_signal);
         // Descendants outlive the runner often enough to be the normal case:
         // a `cargo test` that exits while a test binary is still winding down
         // is exactly the shape that hung the full suite in #3845.
         let reclaimed_survivors = reclaim_group(self.process_group);
         self.reaped.store(true, std::sync::atomic::Ordering::SeqCst);
-        (exit_code, reclaimed_survivors)
+        VerificationSpawnFinished {
+            exit_code,
+            reclaimed_survivors,
+            signal,
+        }
     }
 }
 
@@ -407,7 +414,7 @@ mod tests {
         assert!(alive(child_pid), "child should be running");
         drop(handle);
 
-        let (exit_code, _) = waiter.join().expect("waiter thread");
+        let exit_code = waiter.join().expect("waiter thread").exit_code;
         assert_eq!(
             exit_code, -1,
             "a SIGKILLed child reports no exit code of its own"
@@ -423,7 +430,7 @@ mod tests {
         let dir = temp_dir("inert");
         let child = spawn(&request(&dir, "/bin/sh", &["-c", "exit 0"])).expect("spawn");
         let handle = child.reclaim_handle();
-        let (exit_code, _) = child.wait();
+        let exit_code = child.wait().exit_code;
 
         assert_eq!(exit_code, 0);
         assert!(
@@ -459,7 +466,7 @@ mod tests {
             &["-c", "echo out; echo err 1>&2; exit 7"],
         ))
         .expect("spawn");
-        let (exit_code, _) = child.wait();
+        let exit_code = child.wait().exit_code;
 
         assert_eq!(exit_code, 7);
         assert_eq!(
@@ -470,6 +477,19 @@ mod tests {
             std::fs::read_to_string(dir.join("stderr.log")).expect("stderr"),
             "err\n"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #4528: a daemon-hosted child killed from outside reports the
+    /// signal, so the caller can tell it apart from a failing command.
+    #[test]
+    fn waiting_reports_the_terminating_signal() {
+        let dir = temp_dir("signal");
+        let child = spawn(&request(&dir, "/bin/sh", &["-c", "kill -KILL $$"])).expect("spawn");
+        let finished = child.wait();
+
+        assert_eq!(finished.exit_code, -1);
+        assert_eq!(finished.signal, Some(9));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -522,7 +542,7 @@ mod tests {
             ("GWT_4409_MARKER".to_string(), "from-caller".to_string()),
         ];
         let child = spawn(&req).expect("spawn");
-        let (exit_code, _) = child.wait();
+        let exit_code = child.wait().exit_code;
 
         assert_eq!(exit_code, 0);
         assert_eq!(
