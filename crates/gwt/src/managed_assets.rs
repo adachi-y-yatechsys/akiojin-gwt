@@ -2767,6 +2767,45 @@ mod tests {
     }
 
     #[test]
+    fn a_managed_asset_write_failure_names_its_route_and_its_path() {
+        // #4486 AC-6: the reason that reaches `worktree_freshness.failure_reason`
+        // has to distinguish the failing path and the failing route (read /
+        // backup / write / delete). Before this, a bare `std::io::Error` carried
+        // neither, so the reason named only the operation that happened to wrap
+        // it ("failed to distribute gwt managed assets: No such file or
+        // directory") — enough to know something broke, not enough to know what
+        // to fix.
+        let temp = tempfile::tempdir().unwrap();
+        let _home = gwt_core::test_support::ScopedGwtHome::set(temp.path());
+        let worktree = temp.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        // `.claude` as a regular file makes every write beneath it fail on every
+        // platform, while still being detected as an existing managed target.
+        let blocker = worktree.join(".claude");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+
+        let error = super::refresh_existing_managed_gwt_assets_for_worktree(&worktree)
+            .expect_err("writing beneath a file must fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("managed asset write failed at"),
+            "the reason must name the write route, got: {message}"
+        );
+        assert!(
+            message.contains(&blocker.display().to_string()),
+            "the reason must name the failing path, got: {message}"
+        );
+        // The route words are distinguishable, so a reader can tell a write
+        // failure from a read, a backup, or a delete.
+        for other in ["read failed at", "backup failed at", "delete failed at"] {
+            assert!(
+                !message.contains(other),
+                "a write failure must not also claim {other}, got: {message}"
+            );
+        }
+    }
+
+    #[test]
     fn materialize_into_missing_worktree_fails_with_clear_attribution() {
         let temp = tempfile::tempdir().unwrap();
         let _home = gwt_core::test_support::ScopedGwtHome::set(temp.path());
