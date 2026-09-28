@@ -4748,6 +4748,19 @@ impl DeliveringExit {
         }
         crate::issue_monitor_gate::unmergeable_reason(readback.mergeability).map(Self::Unmergeable)
     }
+
+    /// The exit for one Delivering scan of an unmerged PR. A known cause from
+    /// the readback wins; otherwise an expired watch exits on its own — also
+    /// when the readback failed, so a readback that keeps failing cannot hold
+    /// the record (and its launch slot) past `merge_watch_timeout_secs`.
+    pub fn decide(
+        readback: Option<&gwt_git::pr_status::PrMergeReadback>,
+        watch_expired: bool,
+    ) -> Option<Self> {
+        readback
+            .and_then(Self::from_readback)
+            .or_else(|| watch_expired.then_some(Self::MergeWatchTimeout))
+    }
 }
 
 /// Issue #3844: what a launched agent declared it is waiting for.
@@ -11769,6 +11782,7 @@ impl IssueMonitorState {
     ) {
         let record = self.autonomous_record_mut(issue_number);
         record.phase = AutonomousPhase::Reviewing;
+        record.delivering_since = None;
         record.pr_number = Some(pr_number);
         record.reviewed_sha = Some(reviewed_sha.into());
         record.review_passed = None;
@@ -11980,6 +11994,9 @@ impl IssueMonitorState {
     /// SPEC #3200: transition Reviewing→Delivering once the strong gate passes
     /// (the auto-merge is being armed).
     pub fn begin_delivering(&mut self, issue_number: u64) {
+        // Every delivery starts a fresh merge-watch, whatever path last wrote
+        // the phase (Issue #4726).
+        self.autonomous_record_mut(issue_number).delivering_since = None;
         self.set_autonomous_phase(issue_number, AutonomousPhase::Delivering);
     }
 
@@ -30544,6 +30561,43 @@ mod tests {
         // fresh watch instead of timing out on its first scan.
         monitor.set_autonomous_phase(7, AutonomousPhase::Delivering);
         assert!(!monitor.merge_watch_expired(7, "2026-07-02T05:00:00Z"));
+    }
+
+    #[test]
+    fn a_re_review_starts_the_next_delivery_on_a_fresh_merge_watch() {
+        // Issue #4726 (review): `begin_review` writes the phase directly, so a
+        // Delivering → Reviewing → Delivering cycle must not carry the old
+        // anchor into the next delivery and time it out on its first scan.
+        let mut monitor = delivering_monitor();
+        monitor.autonomous_tuning.merge_watch_timeout_secs = 3600;
+        assert!(!monitor.merge_watch_expired(7, "2026-07-02T00:00:00Z"));
+        monitor.begin_review(7, 99, "def456");
+        monitor.record_review_verdict(7, true);
+        monitor.begin_delivering(7);
+        assert!(!monitor.merge_watch_expired(7, "2026-07-02T05:00:00Z"));
+    }
+
+    #[test]
+    fn merge_watch_timeout_applies_even_when_the_readback_failed() {
+        // Issue #4726 (review): a readback that keeps failing must not keep a
+        // Delivering record — and its slot — past the timeout.
+        use gwt_git::pr_status::{PrMergeReadback, PrMergeability};
+        assert_eq!(
+            DeliveringExit::decide(None, true),
+            Some(DeliveringExit::MergeWatchTimeout)
+        );
+        assert_eq!(DeliveringExit::decide(None, false), None);
+        let conflicting = PrMergeReadback {
+            state: "OPEN".to_string(),
+            mergeability: PrMergeability::Conflicting,
+        };
+        assert!(
+            matches!(
+                DeliveringExit::decide(Some(&conflicting), true),
+                Some(DeliveringExit::Unmergeable(_))
+            ),
+            "a known cause beats the generic timeout"
+        );
     }
 
     #[test]

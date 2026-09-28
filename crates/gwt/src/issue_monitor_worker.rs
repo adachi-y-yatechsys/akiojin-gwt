@@ -2021,17 +2021,16 @@ fn advance_one_autonomous_issue(
             } else {
                 // Issue #4726 AC-2/AC-3: GitHub will not merge a closed,
                 // conflicting or behind PR, and nothing else would ever end
-                // this watch — leave Delivering and release the slot.
+                // this watch — leave Delivering and release the slot. A failed
+                // readback still reports its degradation, but only after the
+                // timeout has had its say: a readback that keeps failing must
+                // not hold the slot past the merge-watch.
                 let readback = run_budgeted_readback_stage(
                     IssueMonitorScanStage::MergeabilityReadback,
                     || gwt_git::pr_status::try_fetch_pr_merge_readback(repo_path, pr),
-                )?;
-                let exit = crate::DeliveringExit::from_readback(&readback).or_else(|| {
-                    monitor
-                        .merge_watch_expired(issue_number, now)
-                        .then_some(crate::DeliveringExit::MergeWatchTimeout)
-                });
-                if let Some(exit) = exit {
+                );
+                let expired = monitor.merge_watch_expired(issue_number, now);
+                if let Some(exit) = crate::DeliveringExit::decide(readback.as_ref().ok(), expired) {
                     tracing::warn!(
                         issue = issue_number,
                         pr,
@@ -2040,6 +2039,7 @@ fn advance_one_autonomous_issue(
                     );
                     monitor.exit_delivering(issue_number, pr, exit, now);
                 }
+                readback?;
             }
         }
         _ => {}
