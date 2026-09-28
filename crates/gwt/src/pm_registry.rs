@@ -315,6 +315,77 @@ pub struct PmWorktreeFreshness {
     pub failure_reason: Option<String>,
 }
 
+/// Why the PM ensure gate refused to start a PM, for the cases a Restart
+/// cannot clear (#4486 AC-7).
+///
+/// The gate has several early returns. Most are transient or intentional — an
+/// `auto_start` opt-out, a pane close still finalizing, the crash-loop backoff
+/// floor — and the explicit Restart path deliberately bypasses them. These
+/// three are different: the condition lives outside the gate, so pressing
+/// Restart runs the same refusal again and nothing changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PmStartBlockKind {
+    /// The tab is not a migration-clear Git project.
+    MigrationPending,
+    /// `pm.json` could not be read, so the gate cannot know what to start.
+    PrefsUnreadable,
+    /// Issue #3607: another project store in this repository already owns the
+    /// PM. The singleton is per repository, and the other store's `pm.json`
+    /// is invisible from here.
+    AnotherStoreOwnsThePm,
+}
+
+impl PmStartBlockKind {
+    /// What the operator has to do. A block is only useful if it names the
+    /// next action; "the PM did not start" alone sends people back to the
+    /// Restart button that cannot help them.
+    pub const fn required_operation(self) -> &'static str {
+        match self {
+            Self::MigrationPending => {
+                "Finish the project migration for this tab, then reopen the project."
+            }
+            Self::PrefsUnreadable => {
+                "Repair or remove the project store's pm.json, then reopen the project."
+            }
+            Self::AnotherStoreOwnsThePm => {
+                "Stop the PM held by the other project store with `pm.stop`, \
+                 passing the session id listed in `repository_registrations`."
+            }
+        }
+    }
+}
+
+/// A PM start refusal a Restart cannot clear, with what to do about it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PmStartBlock {
+    pub kind: PmStartBlockKind,
+    /// Always `true` for every current variant, and serialized anyway: a
+    /// reader must not have to know the variant list to tell a permanent
+    /// block from a transient one, and a future transient variant should not
+    /// silently inherit "permanent" from its neighbours.
+    pub permanent: bool,
+    /// Whether pressing Restart re-runs the same refusal. `false` would mean
+    /// the button is worth offering; today no variant qualifies.
+    pub restart_clears_it: bool,
+    pub reason: String,
+    pub required_operation: String,
+    pub observed_at: String,
+}
+
+impl PmStartBlock {
+    pub fn new(kind: PmStartBlockKind, reason: impl Into<String>) -> Self {
+        Self {
+            kind,
+            permanent: true,
+            restart_clears_it: false,
+            reason: reason.into(),
+            required_operation: kind.required_operation().to_string(),
+            observed_at: pm_refresh_checked_at(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PmPrefs {
     #[serde(default)]
@@ -323,6 +394,11 @@ pub struct PmPrefs {
     pub settings: PmSettings,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_freshness: Option<PmWorktreeFreshness>,
+    /// #4486 AC-7: the last start refusal a Restart cannot clear. Cleared
+    /// whenever the gate reaches a live or spawning PM, so a stale block can
+    /// never outlive the condition that caused it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_block: Option<PmStartBlock>,
 }
 
 /// Outcome of a singleton registration attempt (FR-001).
@@ -4939,6 +5015,11 @@ pub struct PmStatusReport {
     pub stale_hint: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree_freshness: Option<PmWorktreeFreshness>,
+    /// #4486 AC-7: why the PM is not running, when the reason is one a
+    /// Restart cannot clear. `None` means either the PM is fine or the last
+    /// refusal was transient — in both cases Restart is worth offering.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_block: Option<PmStartBlock>,
     /// FR-014: the PM never occupies an Issue Monitor implementation slot.
     /// Always 0; kept explicit so operators can see the accounting rule.
     /// The global resource cap engine itself remains SPEC #3200's
@@ -5094,8 +5175,35 @@ pub fn pm_status_report_for_caller(
         session_record_present: record_present,
         stale_hint: record_present.map(|present| !present),
         worktree_freshness: prefs.worktree_freshness.clone(),
+        start_block: prefs.start_block.clone(),
         repository_registrations: Vec::new(),
     }
+}
+
+/// #4486 AC-7: persist a start refusal a Restart cannot clear.
+///
+/// Writing the same block twice keeps the first `observed_at`, so the report
+/// says when the condition began rather than when it was last re-observed —
+/// the gate re-runs on every ensure, and a clock that resets each time would
+/// hide how long the PM has been down.
+pub fn record_pm_start_block(prefs_path: &Path, block: PmStartBlock) -> io::Result<()> {
+    mutate_pm_prefs(prefs_path, |prefs| match prefs.start_block.as_ref() {
+        Some(existing) if existing.kind == block.kind => {}
+        _ => prefs.start_block = Some(block.clone()),
+    })?;
+    Ok(())
+}
+
+/// #4486 AC-7: drop a recorded block once the gate gets past it.
+///
+/// Called on every path that reaches a live, resumed, or spawning PM. A block
+/// that outlived its cause would send an operator after a condition that is
+/// no longer there.
+pub fn clear_pm_start_block(prefs_path: &Path) -> io::Result<()> {
+    mutate_pm_prefs(prefs_path, |prefs| {
+        prefs.start_block = None;
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -5239,6 +5347,155 @@ mod tests {
             .expect("prior bytes remain in a same-parent recovery file");
         assert_eq!(fs::read(&recovery).expect("recovery bytes"), b"{}\n");
         assert!(error.to_string().contains(&recovery.display().to_string()));
+    }
+
+    /// #4486 AC-7: every block must name a distinct, non-empty next action.
+    /// A block whose `required_operation` is missing or shared with another
+    /// kind sends the operator back to the Restart button it exists to warn
+    /// them away from.
+    #[test]
+    fn every_start_block_kind_names_its_own_required_operation() {
+        let kinds = [
+            PmStartBlockKind::MigrationPending,
+            PmStartBlockKind::PrefsUnreadable,
+            PmStartBlockKind::AnotherStoreOwnsThePm,
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for kind in kinds {
+            let operation = kind.required_operation();
+            assert!(!operation.trim().is_empty(), "{kind:?} has no next action");
+            assert!(
+                seen.insert(operation),
+                "{kind:?} repeats another kind's next action: {operation}"
+            );
+            let block = PmStartBlock::new(kind, "reason");
+            assert!(block.permanent, "{kind:?} must report itself as permanent");
+            assert!(
+                !block.restart_clears_it,
+                "{kind:?} must say a Restart does not clear it"
+            );
+            assert_eq!(block.required_operation, operation);
+        }
+        assert!(
+            PmStartBlockKind::AnotherStoreOwnsThePm
+                .required_operation()
+                .contains("repository_registrations"),
+            "the cross-store block must point at the field holding the session id \
+             that `pm.stop` needs"
+        );
+    }
+
+    /// #4486 AC-7: the block reaches `pm.status`, and the wire form is
+    /// snake_case so a reader can branch on the kind.
+    #[test]
+    fn a_recorded_start_block_reaches_the_status_report() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let prefs_path = dir.path().join("project/project-state/pm.json");
+        record_pm_start_block(
+            &prefs_path,
+            PmStartBlock::new(
+                PmStartBlockKind::AnotherStoreOwnsThePm,
+                "another project store already owns the resident PM",
+            ),
+        )
+        .expect("record the block");
+
+        let prefs = load_pm_prefs(&prefs_path).expect("read back PM prefs");
+        let status = pm_status_report(&prefs, |_| false);
+        let block = status.start_block.expect("pm.status start block");
+        assert_eq!(block.kind, PmStartBlockKind::AnotherStoreOwnsThePm);
+        assert!(block.permanent);
+        assert!(!block.restart_clears_it);
+        assert!(block.reason.contains("another project store"));
+        assert!(block.required_operation.contains("pm.stop"));
+
+        let wire = serde_json::to_value(&block).expect("serialize");
+        assert_eq!(wire["kind"], "another_store_owns_the_pm");
+        assert_eq!(wire["restart_clears_it"], false);
+        assert_eq!(
+            wire["permanent"], true,
+            "permanent is serialized even though every current variant is true, \
+             so a reader never has to know the variant list"
+        );
+    }
+
+    /// #4486 AC-7: the ensure gate re-runs on every attempt, so re-recording the
+    /// same kind must keep the first `observed_at`. A clock that reset each
+    /// time would hide how long the PM has been down.
+    #[test]
+    fn re_recording_the_same_block_keeps_when_the_condition_began() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let prefs_path = dir.path().join("project/project-state/pm.json");
+        let first = PmStartBlock {
+            observed_at: "2026-01-01T00:00:00Z".to_string(),
+            ..PmStartBlock::new(PmStartBlockKind::PrefsUnreadable, "pm.json unreadable")
+        };
+        record_pm_start_block(&prefs_path, first).expect("record once");
+        let later = PmStartBlock {
+            observed_at: "2026-06-01T00:00:00Z".to_string(),
+            ..PmStartBlock::new(
+                PmStartBlockKind::PrefsUnreadable,
+                "pm.json still unreadable",
+            )
+        };
+        record_pm_start_block(&prefs_path, later).expect("record again");
+
+        let prefs = load_pm_prefs(&prefs_path).expect("read back PM prefs");
+        let block = prefs.start_block.expect("block");
+        assert_eq!(
+            block.observed_at, "2026-01-01T00:00:00Z",
+            "the report must say when the condition began, not when it was last re-observed"
+        );
+
+        // A *different* kind is a different condition, so it replaces.
+        let other = PmStartBlock {
+            observed_at: "2026-09-01T00:00:00Z".to_string(),
+            ..PmStartBlock::new(PmStartBlockKind::MigrationPending, "migration pending")
+        };
+        record_pm_start_block(&prefs_path, other).expect("record a different kind");
+        let prefs = load_pm_prefs(&prefs_path).expect("read back PM prefs");
+        let block = prefs.start_block.expect("block");
+        assert_eq!(block.kind, PmStartBlockKind::MigrationPending);
+        assert_eq!(block.observed_at, "2026-09-01T00:00:00Z");
+    }
+
+    /// #4486 AC-7: a block must not outlive its cause. The gate clears it on
+    /// every path that reaches a live, resumed, or spawning PM; a stale block
+    /// would send an operator after a condition that is no longer there.
+    #[test]
+    fn clearing_a_start_block_removes_it_from_the_status_report() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let prefs_path = dir.path().join("project/project-state/pm.json");
+        record_pm_start_block(
+            &prefs_path,
+            PmStartBlock::new(PmStartBlockKind::MigrationPending, "migration pending"),
+        )
+        .expect("record");
+        clear_pm_start_block(&prefs_path).expect("clear");
+
+        let prefs = load_pm_prefs(&prefs_path).expect("read back PM prefs");
+        assert!(prefs.start_block.is_none());
+        let status = pm_status_report(&prefs, |_| false);
+        assert!(
+            status.start_block.is_none(),
+            "a cleared block must not be reported"
+        );
+        let wire = serde_json::to_value(&status).expect("serialize");
+        assert!(
+            wire.get("start_block").is_none(),
+            "an absent block is omitted from the wire form, not sent as null"
+        );
+    }
+
+    /// Legacy `pm.json` written before this field existed must still load.
+    #[test]
+    fn prefs_without_a_start_block_field_load_as_none() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let prefs_path = dir.path().join("project/project-state/pm.json");
+        std::fs::create_dir_all(prefs_path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&prefs_path, br#"{"settings":{}}"#).expect("seed legacy prefs");
+        let prefs = load_pm_prefs(&prefs_path).expect("load legacy prefs");
+        assert!(prefs.start_block.is_none());
     }
 
     #[test]
