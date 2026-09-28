@@ -146,6 +146,8 @@ pub(crate) fn describe_for_lease(worktree: &Path) -> (String, Option<i32>) {
 /// What a delegated command produced.
 pub(crate) struct DelegatedRun {
     pub exit_code: i32,
+    /// The signal that killed the child, when the daemon reports one.
+    pub signal: Option<i32>,
     pub accepted: VerificationSpawnAccepted,
     /// The daemon had to kill descendants that outlived the runner.
     pub reclaimed_survivors: bool,
@@ -317,6 +319,7 @@ pub(crate) fn run<G>(
                 DaemonFrame::VerificationFinished(finished) => {
                     return Ok(DelegatedRun {
                         exit_code: finished.exit_code,
+                        signal: finished.signal,
                         accepted,
                         reclaimed_survivors: finished.reclaimed_survivors,
                     })
