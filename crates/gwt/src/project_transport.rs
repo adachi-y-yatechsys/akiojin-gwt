@@ -318,7 +318,7 @@ pub struct AccessLogRecord {
 /// In-memory ring of access log entries. Cloning yields a handle to the same
 /// underlying buffer (Arc-wrapped) so the embedded server, middleware and
 /// tests observe the same recordings. The ring is capped at
-/// [`ACCESS_LOG_RING_CAPACITY`] entries; older records are evicted FIFO so
+/// `ACCESS_LOG_RING_CAPACITY` entries; older records are evicted FIFO so
 /// memory stays bounded under long-running browser-server sessions.
 #[derive(Clone, Default)]
 pub struct AccessLogSink {

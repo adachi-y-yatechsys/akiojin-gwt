@@ -263,6 +263,7 @@ fn gwt_input_trace_markers_exclude_payload_lengths_and_raw_errors() {
     for (source_name, source) in [
         ("embedded_server.rs", include_str!("../embedded_server.rs")),
         ("app_runtime/pty_io.rs", include_str!("pty_io.rs")),
+        ("pane_runtime.rs", include_str!("../pane_runtime.rs")),
     ] {
         for (index, tail) in source
             .split("target: \"gwt_input_trace\"")
@@ -315,11 +316,14 @@ fn backend_gwt_input_trace_markers_use_stage_local_exact_allowlists() {
                     "close_finalizer_registry_deregister_poisoned",
                     vec!["outcome", "stage", "window_id"],
                 ),
-                (
-                    "reader_pane_lock",
-                    vec!["lock_wait_us", "parse_us", "stage", "window_id"],
-                ),
             ]),
+        ),
+        (
+            "pane_runtime.rs",
+            HashMap::from([(
+                "reader_pane_lock",
+                vec!["lock_wait_us", "parse_us", "stage", "window_id"],
+            )]),
         ),
         (
             "embedded_server.rs",
@@ -359,6 +363,7 @@ fn backend_gwt_input_trace_markers_use_stage_local_exact_allowlists() {
     for (source_name, source) in [
         ("embedded_server.rs", include_str!("../embedded_server.rs")),
         ("app_runtime/pty_io.rs", include_str!("pty_io.rs")),
+        ("pane_runtime.rs", include_str!("../pane_runtime.rs")),
     ] {
         let mut actual = HashMap::new();
         for tail in source.split("target: \"gwt_input_trace\"").skip(1) {
