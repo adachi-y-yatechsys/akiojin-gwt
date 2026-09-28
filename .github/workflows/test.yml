@@ -334,7 +334,7 @@ jobs:
       - name: Run real Claude probe caller regressions
         shell: bash
         run: |
-          cargo test -p gwt-core --lib real_bun_global_placeholder_fixture
+          cargo test -p gwt-core --test windows_claude_user_agent
           cargo test -p gwt-agent --lib real_bun_global_placeholder_fixture
           cargo test -p gwt-agent --lib package_runner_resolution_failure_still_emits_an_end_summary
           cargo test -p gwt --bin gwt real_bun_global_placeholder_fixture
