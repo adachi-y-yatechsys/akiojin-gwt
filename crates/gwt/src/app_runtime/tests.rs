@@ -50258,6 +50258,7 @@ fn app_runtime_quick_register_issue_creates_issue_cache_and_inbox_entry() {
         FrontendEvent::QuickRegisterIssue {
             title: "Investigate Intake registration".to_string(),
             launch: false,
+            auto_merge: false,
         },
     );
 
@@ -50312,6 +50313,47 @@ fn app_runtime_quick_register_issue_creates_issue_cache_and_inbox_entry() {
         .expect("registered issue appears in monitor inbox");
     assert_eq!(item.issue.title, "Investigate Intake registration");
     assert_eq!(item.state, gwt::MonitorInboxState::Queued);
+}
+
+// SPEC #3885 T-033 (FR-022): the "+ New" popover's auto-merge checkbox labels
+// the Issue at creation time.
+#[test]
+fn app_runtime_quick_register_issue_applies_the_auto_merge_label() {
+    let _env_lock = env_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().expect("tempdir");
+    let _home = ScopedEnvVar::set("HOME", temp.path());
+    let _userprofile = ScopedEnvVar::set("USERPROFILE", temp.path());
+
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    init_repo(&repo);
+
+    let fake_client = Arc::new(FakeIssueClient::new());
+    let tab = sample_project_tab("tab-1", "Repo", repo.clone(), ProjectKind::Git, &[]);
+    let mut runtime = sample_runtime(temp.path(), vec![tab], Some("tab-1"));
+    runtime.issue_client_factory = Arc::new({
+        let fake_client = Arc::clone(&fake_client);
+        move |_owner, _repo| {
+            let client: Arc<dyn IssueClient> = fake_client.clone();
+            Ok(client)
+        }
+    });
+
+    runtime.handle_frontend_event(
+        "client-1".to_string(),
+        FrontendEvent::QuickRegisterIssue {
+            title: "Ship the popover".to_string(),
+            launch: false,
+            auto_merge: true,
+        },
+    );
+
+    let cached = Cache::new(issue_cache_root(&repo))
+        .load_entry(IssueNumber(1))
+        .expect("quick issue written to cache");
+    assert_eq!(cached.snapshot.labels, vec!["auto-merge".to_string()]);
 }
 
 struct PermissionDeniedCreateIssueClient;
@@ -50414,6 +50456,7 @@ fn app_runtime_quick_register_issue_permission_error_includes_reason_and_fallbac
         FrontendEvent::QuickRegisterIssue {
             title: "Investigate Intake registration".to_string(),
             launch: false,
+            auto_merge: false,
         },
     );
 
