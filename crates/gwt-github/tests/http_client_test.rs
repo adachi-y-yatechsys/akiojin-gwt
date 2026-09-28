@@ -1136,6 +1136,10 @@ fn owner_mutation_classifies_connection_refusal_as_pre_submit_network_failure() 
     )
     .expect("loopback endpoints");
 
+    // Windows can take about two seconds to report a refused connection.
+    // Let that error arrive within the total budget instead of racing the
+    // shared helper's one-second connect timeout.
+    let deadline = ResolutionDeadline::new(Duration::from_secs(5), Duration::from_secs(5));
     let error = client
         .create_owner_issue(
             &RepositoryIdentity::gwt_upstream(),
@@ -1144,14 +1148,14 @@ fn owner_mutation_classifies_connection_refusal_as_pre_submit_network_failure() 
                 body: "Body".to_string(),
                 labels: Vec::new(),
             },
-            &owner_deadline(),
+            &deadline,
         )
         .expect_err("connection refusal must be pre-submit");
 
-    assert!(matches!(
-        error,
-        OwnerMutationError::PreSubmit(ApiError::Network(_))
-    ));
+    assert!(
+        matches!(error, OwnerMutationError::PreSubmit(ApiError::Network(_))),
+        "{error:?}"
+    );
 }
 
 /// Blocks until the caller's deadline has provably expired.

@@ -163,6 +163,18 @@ impl HolderActivity {
         self.parent_gone && self.workload_processes == 0 && !self.advancing()
     }
 
+    /// Issue #4746: an in-tree driver can remain blocked after every child
+    /// exited while its requester is still alive. Keep delegated silence
+    /// unknown: its work may be outside the process trees we found. This
+    /// reading only permits a second observation during explicit release.
+    pub(crate) fn reclaimable(&self) -> bool {
+        self.orphaned()
+            || (self.old_enough()
+                && !self.delegated
+                && self.workload_processes == 0
+                && !self.advancing())
+    }
+
     /// Barely scheduled on a saturated host: runnable, just not getting a
     /// turn. It is still moving, so it is never called hung.
     pub(crate) fn starved(&self) -> bool {
@@ -191,6 +203,8 @@ impl HolderActivity {
     pub(crate) fn state(&self) -> &'static str {
         if self.orphaned() {
             "orphaned"
+        } else if self.reclaimable() {
+            "reclaimable"
         } else if self.undecidable() {
             "unknown"
         } else if self.starved() {
@@ -213,6 +227,14 @@ impl HolderActivity {
                  own is left running — in its tree or under the daemon — over the last \
                  {window:.1}s. Nobody is waiting for this run and it will not release the lease \
                  before the TTL; reclaim it with `verify.lease.release` and a reason"
+            );
+        }
+        if self.reclaimable() {
+            return format!(
+                "holder reclaimable: held {held}, its in-tree commands have all exited and \
+                 the driver gained no CPU beyond scheduler noise over the last {window:.1}s. \
+                 `verify.lease.release` with a reason re-checks that the workload remains \
+                 absent before reclaiming the lease"
             );
         }
         if self.undecidable() {
@@ -801,6 +823,20 @@ mod tests {
 
         assert!(!activity.delegated, "{activity:?}");
         assert_eq!(activity.state(), "stalled");
+    }
+
+    #[test]
+    fn an_empty_stalled_driver_is_reclaimable_while_its_parent_lives() {
+        let samples = [agent(), sample(21468, Some(AGENT_PID), 11_120)];
+        let idle = activity(&samples, &samples, 7_260_000, Some(30.0));
+
+        assert!(!idle.orphaned());
+        assert_eq!(idle.state(), "reclaimable", "{idle:?}");
+        assert!(idle.describe().contains("verify.lease.release"));
+        assert_eq!(
+            activity(&samples, &samples, 100, None).state(),
+            "progressing"
+        );
     }
 
     /// Issue #4633 AC-5: the reading behind the "progressing" report for a
