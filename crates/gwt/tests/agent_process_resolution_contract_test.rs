@@ -78,7 +78,7 @@ fn codex_hook_discovery_reuses_the_single_canonical_host_health_result() {
     for mutation in [
         "refresh_managed_gwt_assets_for_agent_with_codex_hook_discovery_mode(",
         "maybe_register_codex_managed_hook_trust_for_launch(",
-        "gwt_agent::Session::new(",
+        "initialize_launch_session(",
     ] {
         assert!(
             health
@@ -88,6 +88,9 @@ fn codex_hook_discovery_reuses_the_single_canonical_host_health_result() {
             "canonical health must precede launch mutation {mutation}"
         );
     }
+    let initializer = fs::read_to_string(repo_root().join("crates/gwt/src/session_launch.rs"))
+        .expect("read extracted Session initializer");
+    assert!(function_source(&initializer, "initialize_launch_session").contains("Session::new("));
 }
 
 fn function_source<'a>(source: &'a str, name: &str) -> &'a str {

@@ -443,50 +443,14 @@ pub(crate) struct PendingStartupAutoResumeSession {
     pub(crate) workspace_resume_context: Option<WorkspaceResumeContext>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ClientScope {
-    Hub,
-    Project(gwt_core::repo_hash::ProjectKey),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DispatchTarget {
-    All,
-    // Explicit Hub recipients are part of the routing contract; producers migrate separately.
-    #[allow(dead_code)]
-    Hub,
-    Project(gwt_core::repo_hash::ProjectKey),
-    Client(ClientId),
-}
-
-#[derive(Debug, Clone)]
-pub(crate) enum KnowledgeWireMetadata {
-    SemanticRetry(gwt::KnowledgeSemanticRetry),
-    NonSemanticError,
-}
+#[cfg(test)]
+pub use gwt::project_transport::KnowledgeWireMetadata;
+pub use gwt::project_transport::{ClientScope, DispatchTarget, OutboundEvent};
 
 #[derive(Debug, Clone)]
 pub(crate) struct RecoveryCenterAction {
     pub(crate) generation: u64,
     pub(crate) board_entry_id: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct OutboundEvent {
-    pub(crate) target: DispatchTarget,
-    pub(crate) event: BackendEvent,
-    /// SPEC #1939 FR-407 / SPEC #3170 FR-098: private wire-only metadata for
-    /// semantic retry directives and explicitly non-semantic search errors.
-    /// Keeping it outside the public `BackendEvent` preserves the baseline
-    /// Rust construction/destructuring shape.
-    pub(crate) knowledge_wire_metadata: Option<KnowledgeWireMetadata>,
-    /// Issue #4095: pane stream position for `terminal_output` (the chunk's
-    /// own position) and `terminal_snapshot` (the position the snapshot was
-    /// serialized at). Never serialized; the client queue uses it to skip
-    /// streamed chunks that a queued snapshot already contains.
-    pub(crate) terminal_stream_seq: Option<u64>,
-    /// Error provenance only; never serialized or inferred from dispatch targets.
-    pub(crate) error_origin: Option<gwt::error_report::ErrorOrigin>,
 }
 
 #[derive(Debug)]
@@ -537,154 +501,6 @@ fn run_agent_dispatch_test_hook(slot: &'static std::thread::LocalKey<AgentDispat
             hook();
         }
     });
-}
-
-impl OutboundEvent {
-    pub(crate) fn project(
-        project_key: gwt_core::repo_hash::ProjectKey,
-        event: BackendEvent,
-    ) -> Self {
-        Self {
-            target: DispatchTarget::Project(project_key),
-            event,
-            knowledge_wire_metadata: None,
-            terminal_stream_seq: None,
-            error_origin: None,
-        }
-    }
-
-    pub(crate) fn hub(event: BackendEvent) -> Self {
-        let mut outbound = Self::reply("", event);
-        outbound.target = DispatchTarget::Hub;
-        outbound
-    }
-
-    pub(crate) fn broadcast(event: BackendEvent) -> Self {
-        // Process diagnostics, account state, host settings, and the updater
-        // are the complete global inventory. System settings live in the
-        // user's global config; autostart describes the user's OS registration.
-        // Their request handlers still reply only to the requesting client:
-        // permission to broadcast does not turn a request reply into a broadcast.
-        // Project and Hub payloads need an owner.
-        assert!(
-            matches!(
-                &event,
-                BackendEvent::ProcessLine { .. }
-                    | BackendEvent::LogEntryAppended { .. }
-                    | BackendEvent::RuntimeHealth { .. }
-                    | BackendEvent::ProviderUsage { .. }
-                    | BackendEvent::BoardAuthStatus { .. }
-                    | BackendEvent::SystemSettings { .. }
-                    | BackendEvent::SystemSettingsUpdated { .. }
-                    | BackendEvent::SystemSettingsError { .. }
-                    | BackendEvent::AutostartStatus { .. }
-                    | BackendEvent::AutostartError { .. }
-                    | BackendEvent::UpdateState(_)
-                    | BackendEvent::UpdateProgress { .. }
-                    | BackendEvent::UpdateReady { .. }
-                    | BackendEvent::UpdateAutoApply { .. }
-                    | BackendEvent::UpdateApplyPendingPersisted { .. }
-                    | BackendEvent::UpdateApplyError { .. }
-            ),
-            "project-owned events require an explicit dispatch scope"
-        );
-        Self {
-            target: DispatchTarget::All,
-            event,
-            knowledge_wire_metadata: None,
-            terminal_stream_seq: None,
-            error_origin: None,
-        }
-    }
-
-    /// Host update notifications share the toast wire shape, but never carry
-    /// an Issue owner. Keep this exception separate from project broadcasts:
-    /// allowing IssueMonitorToast in broadcast would also admit project toasts.
-    /// Callers supply only host update text; the constructor fixes the owner to None.
-    pub(crate) fn global_update_notice(
-        level: impl Into<String>,
-        message: impl Into<String>,
-    ) -> Self {
-        Self {
-            target: DispatchTarget::All,
-            event: BackendEvent::IssueMonitorToast {
-                notification_transition: None,
-                level: level.into(),
-                message: message.into(),
-                issue_number: None,
-            },
-            knowledge_wire_metadata: None,
-            terminal_stream_seq: None,
-            error_origin: Some(gwt::error_report::ErrorOrigin::Host),
-        }
-    }
-
-    pub(crate) fn with_error_project_root(mut self, root: &Path) -> Self {
-        self.error_origin = Some(gwt::error_report::ErrorOrigin::Project(
-            root.display().to_string(),
-        ));
-        self
-    }
-
-    pub(crate) fn reply(client_id: impl Into<ClientId>, event: BackendEvent) -> Self {
-        Self {
-            target: DispatchTarget::Client(client_id.into()),
-            event,
-            knowledge_wire_metadata: None,
-            terminal_stream_seq: None,
-            error_origin: None,
-        }
-    }
-
-    pub(crate) fn reply_with_knowledge_semantic_retry(
-        client_id: impl Into<ClientId>,
-        event: BackendEvent,
-        semantic_retry: Option<gwt::KnowledgeSemanticRetry>,
-    ) -> Self {
-        assert!(
-            matches!(event, BackendEvent::KnowledgeSearchResults { .. }),
-            "knowledge semantic retry metadata requires KnowledgeSearchResults"
-        );
-        Self {
-            target: DispatchTarget::Client(client_id.into()),
-            event,
-            knowledge_wire_metadata: semantic_retry.map(KnowledgeWireMetadata::SemanticRetry),
-            terminal_stream_seq: None,
-            error_origin: None,
-        }
-    }
-
-    pub(crate) fn reply_with_nonsemantic_knowledge_error(
-        client_id: impl Into<ClientId>,
-        event: BackendEvent,
-    ) -> Self {
-        assert!(
-            matches!(
-                event,
-                BackendEvent::KnowledgeError {
-                    request_id: Some(_),
-                    query: Some(_),
-                    ..
-                }
-            ),
-            "non-semantic knowledge error metadata requires a correlated KnowledgeError"
-        );
-        Self {
-            target: DispatchTarget::Client(client_id.into()),
-            event,
-            knowledge_wire_metadata: Some(KnowledgeWireMetadata::NonSemanticError),
-            terminal_stream_seq: None,
-            error_origin: None,
-        }
-    }
-
-    /// Attach the pane stream position of a `terminal_output` /
-    /// `terminal_snapshot` event (Issue #4095). Private to the process; the
-    /// client queue reads it, the wire never carries it.
-    pub(crate) fn with_terminal_stream_seq(mut self, seq: Option<u64>) -> Self {
-        self.terminal_stream_seq = seq;
-        self
-    }
 }
 
 pub fn build_frontend_sync_events(
@@ -1483,7 +1299,7 @@ pub struct AppRuntime {
     /// (`scan_now`, `daemon.subscribe`) was permanently unavailable. The
     /// supervisor is driven from the scheduled tick, which makes the restart
     /// of a crashed daemon fall out of the same idempotent call.
-    pub(crate) daemon_supervisor: gwt::daemon_supervisor::DaemonSupervisor,
+    pub(crate) daemon_supervisor: Arc<gwt::daemon_supervisor::DaemonSupervisor>,
     /// Prepared producing continuations keyed by their pending/active window.
     /// The entry remains until an authenticated SessionStart finalizes the
     /// generation + Work transaction and promotes the same bearer.
@@ -3427,7 +3243,7 @@ impl AppRuntime {
             issue_monitor_materializer_id: uuid::Uuid::new_v4().to_string(),
             issue_monitor_fallback_commit_timeout: ISSUE_MONITOR_FALLBACK_COMMIT_TIMEOUT,
             issue_monitor_provider_auth_probe: gwt::issue_monitor::provider_auth_state_from_env,
-            daemon_supervisor: gwt::daemon_supervisor::DaemonSupervisor::gwtd(),
+            daemon_supervisor: Arc::new(gwt::daemon_supervisor::DaemonSupervisor::gwtd()),
             pending_continue_work: HashMap::new(),
             pending_fresh_execution_launches: HashMap::new(),
             pending_auto_resume_sources: HashMap::new(),
@@ -6925,7 +6741,19 @@ impl AppRuntime {
     /// control lane instead of stopping the monitor. AC-5's staleness
     /// projection is what makes the degraded state visible to a reader.
     pub(crate) fn ensure_runtime_daemon_for(&self, project_root: &Path) {
-        match self.daemon_supervisor.ensure_running(project_root) {
+        let reservation = match self.daemon_supervisor.reserve_ensure(project_root) {
+            Ok(Some(reservation)) => reservation,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(%error, project_root = %project_root.display(), "could not reserve daemon supervision");
+                return;
+            }
+        };
+        let supervisor = Arc::clone(&self.daemon_supervisor);
+        let project_root = project_root.to_path_buf();
+        if let Err(error) = self.blocking_tasks.try_spawn(move || {
+            let _reservation = reservation;
+            match supervisor.ensure_running(&project_root) {
             Ok(gwt::daemon_supervisor::DaemonEnsureOutcome::Spawned { pid }) => {
                 tracing::info!(
                     pid,
@@ -6939,6 +6767,9 @@ impl AppRuntime {
                 project_root = %project_root.display(),
                 "could not start the runtime daemon; the Issue Monitor stays on the local fallback"
             ),
+        }
+        }) {
+            tracing::warn!(%error, "could not enqueue daemon supervision");
         }
     }
 
@@ -9878,7 +9709,10 @@ impl AppRuntime {
             request_id,
             own_window_id,
             ticket,
-            self.proxy.clone(),
+            Arc::new({
+                let proxy = self.proxy.clone();
+                move |ticket| proxy.send(UserEvent::CommitAgentSelfClose { ticket })
+            }),
         );
         if let Err(acceptance) = responder.send(acceptance) {
             let ticket = acceptance.disarm();
