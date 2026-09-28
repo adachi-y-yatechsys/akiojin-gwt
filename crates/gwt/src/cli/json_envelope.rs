@@ -1198,6 +1198,7 @@ fn parse(input: &str) -> Result<ParsedEnvelope, CliParseError> {
             id: required_string(params, "id")?,
             text: required_string(params, "text")?,
         }),
+        "pm.capabilities" => CliCommand::Pm(crate::cli::pm::PmCommand::Capabilities),
         "pm.status" => CliCommand::Pm(crate::cli::pm::PmCommand::Status {
             project_root: optional_string(params, "project_root")?,
         }),
@@ -4831,6 +4832,20 @@ mod tests {
             }
             other => panic!("unexpected command: {other:?}"),
         }
+    }
+
+    // Issue #4249 FR-003: the PM self-description is a read-only diagnostic.
+    #[test]
+    fn pm_capabilities_parses_and_stays_read_only() {
+        assert!(matches!(
+            ok("pm.capabilities", json!({})),
+            CliCommand::Pm(crate::cli::pm::PmCommand::Capabilities)
+        ));
+        assert!(
+            crate::cli::hook::workflow_policy::is_read_only_json_envelope_operation(
+                "pm.capabilities"
+            )
+        );
     }
 
     // Issue #3607: PM stop/deregister parse variants.

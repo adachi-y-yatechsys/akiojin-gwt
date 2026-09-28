@@ -38,6 +38,94 @@ pub enum PmCommand {
         project_root: Option<String>,
         session_id: Option<String>,
     },
+    /// `pm.capabilities` (Issue #4249 FR-003) — what the PM can do through
+    /// JSON operations, and the owner action for everything it cannot.
+    Capabilities,
+}
+
+/// Why the PM cannot perform a capability itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityGapReason {
+    /// The operation exists but refuses these parameters by design.
+    Permission,
+    /// No operation exists for it yet.
+    MissingOperation,
+}
+
+/// One row of `pm.capabilities`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Capability {
+    pub operation: String,
+    /// The parameters this row is about; `None` means the operation as a whole.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<serde_json::Value>,
+    pub executable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<CapabilityGapReason>,
+    /// What the owner does instead, when the PM cannot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_action: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CapabilitiesReport {
+    pub schema_version: u32,
+    pub capabilities: Vec<Capability>,
+}
+
+/// The things the PM cannot do. Only these are declared by hand; every
+/// executable row comes from the dispatch catalog, and the test fails when a
+/// missing operation lands or a permission row names an unknown operation.
+const CAPABILITY_GAPS: &[(&str, &str, CapabilityGapReason, &str)] = &[
+    (
+        "issue.monitor.config.set",
+        r#"{"enabled":true}"#,
+        CapabilityGapReason::Permission,
+        "Issue Monitor panel: Start",
+    ),
+    (
+        "issue.monitor.config.set",
+        r#"{"autonomous_mode":true}"#,
+        CapabilityGapReason::Permission,
+        "Issue Monitor panel: Autonomous switch -> On",
+    ),
+    (
+        "actions.dispatch",
+        "",
+        CapabilityGapReason::MissingOperation,
+        "GitHub Actions: Run workflow on the target workflow (e.g. prepare-release.yml)",
+    ),
+    (
+        "pr.close",
+        "",
+        CapabilityGapReason::MissingOperation,
+        "GitHub: Close pull request",
+    ),
+];
+
+pub(crate) fn capabilities_report() -> CapabilitiesReport {
+    let executable = crate::cli::operation_catalog::canonical_names().map(|name| Capability {
+        operation: name.to_string(),
+        params: None,
+        executable: true,
+        reason: None,
+        owner_action: None,
+    });
+    let gaps = CAPABILITY_GAPS
+        .iter()
+        .map(|(operation, params, reason, owner_action)| Capability {
+            operation: (*operation).to_string(),
+            params: (!params.is_empty())
+                .then(|| serde_json::from_str(params).expect("capability params are JSON")),
+            executable: false,
+            reason: Some(*reason),
+            owner_action: Some((*owner_action).to_string()),
+        });
+    CapabilitiesReport {
+        schema_version: 1,
+        capabilities: executable.chain(gaps).collect(),
+    }
 }
 
 /// Result of a `pm.stop`.
@@ -92,6 +180,17 @@ pub(super) fn run<E: CliEnv>(
                     "failed to serialize pm.status report: {error}"
                 )))
             })?;
+            out.push_str(&rendered);
+            out.push('\n');
+            Ok(0)
+        }
+        PmCommand::Capabilities => {
+            let rendered =
+                serde_json::to_string_pretty(&capabilities_report()).map_err(|error| {
+                    SpecOpsError::from(ApiError::Unexpected(format!(
+                        "failed to serialize pm.capabilities report: {error}"
+                    )))
+                })?;
             out.push_str(&rendered);
             out.push('\n');
             Ok(0)
@@ -223,6 +322,66 @@ mod tests {
     use super::*;
     use gwt_core::test_support::{ScopedEnvVar, ScopedGwtHome};
     use std::fs;
+
+    /// Issue #4249 AC-4 / T-121 / T-122: every dispatched operation is listed
+    /// as executable, straight from the catalog, and each thing the PM cannot
+    /// do carries why and the owner action that does it.
+    #[test]
+    fn capabilities_derive_from_the_catalog_and_explain_every_gap() {
+        let report = capabilities_report();
+        for name in crate::cli::operation_catalog::canonical_names() {
+            assert!(
+                report
+                    .capabilities
+                    .iter()
+                    .any(|entry| entry.operation == name
+                        && entry.params.is_none()
+                        && entry.executable),
+                "{name} is dispatched, so the PM can call it"
+            );
+        }
+        let dispatched = |name: &str| {
+            crate::cli::operation_catalog::canonical_names().any(|known| known == name)
+        };
+        let gaps = report
+            .capabilities
+            .iter()
+            .filter(|entry| !entry.executable)
+            .collect::<Vec<_>>();
+        assert!(!gaps.is_empty());
+        for gap in gaps {
+            assert!(gap.owner_action.as_deref().is_some_and(|a| !a.is_empty()));
+            match gap.reason {
+                Some(CapabilityGapReason::Permission) => assert!(
+                    dispatched(&gap.operation) && gap.params.is_some(),
+                    "{} is refused by parameter, not missing",
+                    gap.operation
+                ),
+                // A missing operation that lands must leave this list.
+                Some(CapabilityGapReason::MissingOperation) => assert!(
+                    !dispatched(&gap.operation),
+                    "{} is dispatched now; drop it from the missing list",
+                    gap.operation
+                ),
+                None => panic!("{} is not executable without a reason", gap.operation),
+            }
+        }
+
+        let autonomous_on = report
+            .capabilities
+            .iter()
+            .find(|entry| {
+                entry.operation == "issue.monitor.config.set"
+                    && entry.params == Some(serde_json::json!({"autonomous_mode": true}))
+            })
+            .expect("autonomous_mode ON is described");
+        assert!(!autonomous_on.executable);
+        assert_eq!(autonomous_on.reason, Some(CapabilityGapReason::Permission));
+        assert!(autonomous_on
+            .owner_action
+            .as_deref()
+            .is_some_and(|action| action.contains("Autonomous")));
+    }
 
     /// Issue #3607 AC-4: two project stores over one repository, the shape the
     /// incident produced. The `.git` / `commondir` pair is written by hand so
