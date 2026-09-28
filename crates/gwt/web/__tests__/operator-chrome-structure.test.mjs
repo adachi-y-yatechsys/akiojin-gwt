@@ -15,7 +15,7 @@ const runtimeCpuUnitsPattern =
   /aggregate CPU.*logical-core-normalized host share.*process rows.*1 core\s*=\s*100%/i;
 // Issue #3365 — the renderWorkspace key/skip lifecycle lives in this module.
 const workspaceRenderSyncSource = readFileSync(
-  resolve(here, "../workspace-render-sync.js"),
+  resolve(here, "../issue-render-sync.js"),
   "utf8",
 );
 // SPEC-3064 Phase 3 (E5): the Launch Wizard surface (state, interaction
@@ -80,7 +80,7 @@ const windowTabsRendererSource = readFileSync(
 const branchCleanupSource = readFileSync(resolve(here, "../branch-cleanup-modal.js"), "utf8");
 const branchListStateSource = readFileSync(resolve(here, "../branch-list-state.js"), "utf8");
 const windowDockingSource = readFileSync(resolve(here, "../window-docking.js"), "utf8");
-const workspaceOverviewPath = resolve(here, "../workspace-kanban-surface.js");
+const workspaceOverviewPath = resolve(here, "../issue-other-surface.js");
 const workspaceOverviewSource = existsSync(workspaceOverviewPath)
   ? readFileSync(workspaceOverviewPath, "utf8")
   : "";
@@ -251,7 +251,7 @@ test("SPEC-3038 Command Rail retires the legacy sidebar entirely", () => {
 
 // SPEC-3245 Stage E: the deprecated Intake launch entry is removed while the
 // normal Workspace route stays available.
-test("command rail and palette omit deprecated launch entries while preserving Open Workspace", () => {
+test("command rail and palette omit deprecated launch entries while preserving Open Issues", () => {
   assert.equal(
     document.querySelector('.op-rail .op-rail__item[data-cmd="start-work"]'),
     null,
@@ -285,7 +285,7 @@ test("command rail and palette omit deprecated launch entries while preserving O
   assert.match(
     operatorShellSource,
     /id:\s*"open-branches"/,
-    "Open Workspace entry must remain available",
+    "Open Issues entry must remain available",
   );
 });
 
@@ -928,7 +928,7 @@ test("Workspace Overview is separate from live-only Active Work", () => {
   );
   assert.match(
     appSource,
-    /function\s+openWorkspaceOverview\(\)\s*\{[\s\S]{0,300}?focusOrSpawnPreset\("work"\)/,
+    /function\s+openWorkspaceOverview\(\)\s*\{[\s\S]{0,300}?focusOrSpawnPreset\("issue"\)/,
     "expected Workspace Overview to open the Work window instead of a drawer",
   );
   assert.match(
@@ -941,22 +941,22 @@ test("Workspace Overview is separate from live-only Active Work", () => {
 test("Workspace Overview uses the Quiet Work list filter + Detail layout", () => {
   assert.ok(
     workspaceOverviewSource.length > 0,
-    "expected Workspace Overview renderer to live in workspace-kanban-surface.js",
+    "expected Workspace Overview renderer to live in issue-other-surface.js",
   );
   assert.match(
     appSource,
-    /from\s+"\/workspace-kanban-surface\.js"/,
+    /from\s+"\/issue-other-surface\.js"/,
     "expected app.js to import the Workspace Overview surface module",
   );
   assert.match(
     appSource,
-    /presetSurface\(preset\)[\s\S]+preset\s*===\s*"work"[\s\S]+return\s+"work"/,
+    /presetSurface\(preset\)[\s\S]+preset\s*===\s*"work"[\s\S]+return\s+"knowledge"/,
     "expected Work to be a first-class window surface",
   );
   for (const token of [
     "workspace-overview-root",
     "workspace-overview-list-pane",
-    "workspace-overview-filter-bar",
+    "issue-other-summary",
     "workspace-overview-list",
     "workspace-overview-detail-pane",
   ]) {
@@ -1729,7 +1729,7 @@ test("empty canvas shows a first-window call to action (SPEC-3038 AS-4.5)", () =
   );
   assert.ok(
     empty.querySelector("#canvas-empty-open-workspace"),
-    "expected an Open Workspace (Execute) action",
+    "expected an Open Issues (Execute) action",
   );
   assert.ok(
     empty.querySelector("#canvas-empty-add-window"),
@@ -1746,7 +1746,7 @@ test("empty canvas shows a first-window call to action (SPEC-3038 AS-4.5)", () =
     /canvas-empty-intake/,
     "deprecated Intake action wiring must be removed",
   );
-  assert.match(appSource, /canvas-empty-open-workspace/, "Open Workspace action must be wired");
+  assert.match(appSource, /canvas-empty-open-workspace/, "Open Issues action must be wired");
   assert.match(appSource, /canvas-empty-add-window/, "Add window action must be wired");
 });
 
@@ -3948,15 +3948,15 @@ test("Rail item buttons reset UA chrome so Windows WebView2 stops drawing defaul
 // labels" rule (US-49): the W-13 three-layer model names the place "Workspace"
 // (Workspace = place / Work = launch / Session = conversation), so surface
 // entry points say "Workspace" while launch-level rows keep "Work".
-test("FR-392: surface entry points are labelled 'Workspace' (3-layer model)", () => {
+test("SPEC-3885: surface entry points open Issues and Other", () => {
   const railLabel = document.querySelector(
     "#op-workspace-overview-entry .op-rail__flyout-label",
   );
   assert.ok(railLabel, "expected rail Workspace entry to exist");
-  assert.equal(railLabel.textContent.trim(), "Workspace");
+  assert.equal(railLabel.textContent.trim(), "Issues");
 
   const sidebarAria = document.querySelector("#op-workspace-overview-entry");
-  assert.equal(sidebarAria.getAttribute("aria-label"), "Workspace");
+  assert.equal(sidebarAria.getAttribute("aria-label"), "Issues");
 
   // SPEC-3671 FR-015 supersedes FR-392 for the ADD WINDOW card only: the card
   // opens the surface that lists Works (launches), and its window title already
@@ -4279,7 +4279,7 @@ test("viewport-only workspace_state skips unchanged window reconciliation", () =
   // retries instead of freezing behind the diff skip).
   assert.match(
     appSource,
-    /import\s*\{\s*createWorkspaceRenderSync\s*\}\s*from\s*"\/workspace-render-sync\.js"/,
+    /import\s*\{\s*createWorkspaceRenderSync\s*\}\s*from\s*"\/issue-render-sync\.js"/,
     "app.js must import the render-key sync guard",
   );
   assert.match(

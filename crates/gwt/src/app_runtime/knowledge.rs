@@ -1033,7 +1033,7 @@ fn apply_knowledge_bridge_related_works(
     }
 }
 
-fn issue_number_for_work_item(
+pub(super) fn issue_number_for_work_item(
     item: &gwt_core::workspace_projection::WorkItem,
     session_index: &HashMap<&str, &gwt_agent::Session>,
     issue_by_branch: &HashMap<String, u64>,
@@ -1067,7 +1067,7 @@ fn issue_number_for_unambiguous_work_item_branch(
     issue_number_for_branch(Some(branch), issue_by_branch)
 }
 
-fn issue_number_for_session(
+pub(super) fn issue_number_for_session(
     session: &gwt_agent::Session,
     issue_by_branch: &HashMap<String, u64>,
 ) -> Option<u64> {
@@ -1076,7 +1076,7 @@ fn issue_number_for_session(
         .or_else(|| issue_number_for_branch(Some(session.branch.as_str()), issue_by_branch))
 }
 
-fn issue_number_for_branch(
+pub(crate) fn issue_number_for_branch(
     branch: Option<&str>,
     issue_by_branch: &HashMap<String, u64>,
 ) -> Option<u64> {
@@ -1090,13 +1090,16 @@ fn issue_number_for_branch(
         .or_else(|| issue_by_branch.get(&normalize_branch_name(branch)).copied())
 }
 
-fn load_issue_branch_links(
+pub(crate) fn load_issue_branch_links(
     project_root: &Path,
     issue_link_cache_dir: &Path,
 ) -> HashMap<String, u64> {
-    let Some(repo_hash) = gwt::index_worker::detect_repo_hash(project_root) else {
+    // Active Work rendering uses this cache reader too: resolve the same
+    // origin identity from disk without the index worker's Git subprocess fallback.
+    let Some(identity) = gwt_core::repo_hash::detect_repo_identity(project_root) else {
         return HashMap::new();
     };
+    let repo_hash = identity.hash;
     let path = issue_link_cache_dir
         .join("issue-links")
         .join(format!("{}.json", repo_hash.as_str()));
