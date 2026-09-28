@@ -433,7 +433,7 @@ fn windows_ci_runs_the_real_resolver_pty_and_caller_regression_targets() {
     assert!(!workflow.contains("cargo test -p gwt-core terminal::pty"));
     for command in [
         "cargo test -p gwt-core --test windows_process_resolver --test process_adapter_parity",
-        "cargo test -p gwt-core --lib real_bun_global_placeholder_fixture",
+        "cargo test -p gwt-core --test windows_claude_user_agent",
         "cargo test -p gwt-agent --lib real_bun_global_placeholder_fixture",
         "cargo test -p gwt-agent --lib package_runner_resolution_failure_still_emits_an_end_summary",
         "cargo test -p gwt --bin gwt real_bun_global_placeholder_fixture",
