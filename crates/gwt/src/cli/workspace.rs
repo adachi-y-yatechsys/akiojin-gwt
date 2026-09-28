@@ -5449,6 +5449,7 @@ pub(crate) mod tests {
             &repo,
             session_id,
             crate::AgentExecutionContinuationRequest {
+                readiness_nonce: None,
                 schema_version: crate::AGENT_EXECUTION_CONTINUATION_SCHEMA_VERSION,
                 operation_id: "foreign-active-exact-unbound-e2e".to_string(),
             },
