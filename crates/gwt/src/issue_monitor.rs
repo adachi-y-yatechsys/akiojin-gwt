@@ -7761,7 +7761,7 @@ impl IssueMonitorState {
             .iter()
             .find(|observed| issue_monitor_window_ids_match(window_id, &observed.window_id))?;
         let last_output_at = observed.last_output_at.as_deref()?;
-        if !rfc3339_elapsed_secs(last_output_at, now).is_some_and(|silent| silent >= timeout) {
+        if rfc3339_elapsed_secs(last_output_at, now).is_none_or(|silent| silent < timeout) {
             return None;
         }
         let heartbeat = self
@@ -16271,8 +16271,8 @@ impl IssueMonitorState {
             let Some(issue_number) = observed.issue_number else {
                 continue;
             };
-            if !issue_monitor_qualified_window_id(&observed.window_id)
-                .is_some_and(|(tab, _)| tab == snapshot.project_tab_id)
+            if issue_monitor_qualified_window_id(&observed.window_id)
+                .is_none_or(|(tab, _)| tab != snapshot.project_tab_id)
                 || !self.window_observation_covers_launch(
                     issue_number,
                     &observed.window_id,

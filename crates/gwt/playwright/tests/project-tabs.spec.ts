@@ -85,8 +85,10 @@ test.describe("Project tabs", () => {
       await expect(terminal.locator(".xterm-helper-textarea")).toBeFocused();
       const command = "printf 'GWT_%s\\n' 'SCOPED_4536'\r";
       await page.keyboard.type(command);
+      // Windows shells can elicit cursor-position and focus replies before
+      // typing; those protocol frames share the terminal_input transport.
       await expect.poll(() => inputFrames.filter((frame) => frame.id === id)
-        .map((frame) => frame.data).join("")).toBe(command);
+        .map((frame) => frame.data).join("")).toContain(command);
       expect(inputFrames.filter((frame) => frame.id === id)
         .every((frame) => frame.scope === projectKey)).toBe(true);
       await expect.poll(() => terminalOutputs.get(id) ?? "", { timeout: 15_000 }).toContain("GWT_SCOPED_4536");

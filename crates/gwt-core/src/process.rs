@@ -63,6 +63,19 @@ pub fn run_command_with_env(cmd: &str, args: &[&str], env: &[(String, String)]) 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static GIT_SPAWN_COUNTER: AtomicU64 = AtomicU64::new(1);
+static GIT_COMMAND_OBSERVER: std::sync::OnceLock<fn(u64)> = std::sync::OnceLock::new();
+
+/// Observe logged Git completions on any thread; the argument is wall time in ms.
+/// The first observer remains installed for the lifetime of the process.
+pub fn set_git_command_observer(observer: fn(u64)) {
+    let _ = GIT_COMMAND_OBSERVER.set(observer);
+}
+
+pub(crate) fn notify_git_command_finished(duration_ms: u64) {
+    if let Some(observer) = GIT_COMMAND_OBSERVER.get() {
+        observer(duration_ms);
+    }
+}
 
 fn next_git_spawn_id() -> u64 {
     note_thread_git_spawn();
@@ -71,6 +84,12 @@ fn next_git_spawn_id() -> u64 {
 
 thread_local! {
     static THREAD_GIT_SPAWN_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static THREAD_GIT_DURATION_MS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Cumulative wall time of synchronous logged Git commands on this thread.
+pub fn thread_git_duration_ms() -> u64 {
+    THREAD_GIT_DURATION_MS.with(std::cell::Cell::get)
 }
 
 /// Record one git subprocess spawned by the current thread.
@@ -147,6 +166,7 @@ pub fn run_git_logged(
     };
 
     let duration_ms = started_at.elapsed().as_millis() as u64;
+    THREAD_GIT_DURATION_MS.with(|total| total.set(total.get().saturating_add(duration_ms)));
     push_command_summary_to_hub(
         crate::process_console::ProcessKind::Git,
         spawn_id,
@@ -233,6 +253,7 @@ pub fn run_git_logged_with_stdin(
     };
 
     let duration_ms = started_at.elapsed().as_millis() as u64;
+    THREAD_GIT_DURATION_MS.with(|total| total.set(total.get().saturating_add(duration_ms)));
     push_command_summary_to_hub(
         crate::process_console::ProcessKind::Git,
         spawn_id,
@@ -288,6 +309,9 @@ pub fn push_command_summary_to_hub(
     exit_code: Option<i32>,
     duration_ms: u64,
 ) {
+    if kind == crate::process_console::ProcessKind::Git {
+        notify_git_command_finished(duration_ms);
+    }
     let hub = crate::process_console::global();
     let exit = match exit_code {
         Some(code) => code.to_string(),
