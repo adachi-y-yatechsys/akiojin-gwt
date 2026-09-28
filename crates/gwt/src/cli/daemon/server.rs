@@ -39,7 +39,7 @@ use std::{
 use gwt_core::daemon::{
     persist_endpoint, resolve_daemon_socket_path, validate_handshake, ClientFrame, DaemonEndpoint,
     DaemonFrame, DaemonSocketPlacement, DaemonStatus, IpcHandshakeRequest, IpcHandshakeResponse,
-    RuntimeScope, VerificationSpawnFinished, DAEMON_PROTOCOL_VERSION,
+    RuntimeScope, DAEMON_PROTOCOL_VERSION,
 };
 use gwt_github::{client::http::HttpIssueClient, client::ApiError, SpecOpsError};
 use tokio::{
@@ -5146,13 +5146,8 @@ async fn handle_connection(
                         verification_reclaim = Some(child.reclaim_handle());
                         let finished_tx = out_tx.clone();
                         tokio::task::spawn_blocking(move || {
-                            let (exit_code, reclaimed_survivors) = child.wait();
-                            let _ = finished_tx.send(DaemonFrame::VerificationFinished(
-                                VerificationSpawnFinished {
-                                    exit_code,
-                                    reclaimed_survivors,
-                                },
-                            ));
+                            let _ =
+                                finished_tx.send(DaemonFrame::VerificationFinished(child.wait()));
                         });
                         if out_tx
                             .send(DaemonFrame::VerificationAccepted(accepted))

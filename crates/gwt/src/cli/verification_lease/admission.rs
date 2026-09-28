@@ -110,7 +110,7 @@ impl Admission {
         }
     }
 
-    #[cfg(test)]
+    /// Recorded on the run as its provenance (Issue #4528).
     pub(crate) fn lease_id(&self) -> Option<&str> {
         Some(&self.lease_id)
     }
