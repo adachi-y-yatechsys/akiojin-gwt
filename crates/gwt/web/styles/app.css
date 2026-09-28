@@ -1410,6 +1410,53 @@ body {
   display: none !important;
 }
 
+/* SPEC-3885: Other belongs to the Issue list, not an independent window. */
+.issue-other-group {
+  position: static;
+  display: block;
+  flex: 0 0 auto;
+  width: 100%;
+  margin-top: var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  color: var(--color-text);
+  background: var(--color-surface);
+}
+
+.issue-other-summary {
+  padding: var(--space-3);
+  cursor: pointer;
+  font-family: var(--font-body);
+  color: var(--color-text-muted);
+}
+
+.issue-other-group > .workspace-overview-shell {
+  grid-template-columns: minmax(0, 1fr);
+  max-height: 480px;
+  overflow: auto;
+}
+
+.issue-other-group .workspace-overview-list-pane {
+  border-right: 0;
+  overflow: visible;
+}
+
+.issue-other-group .workspace-overview-detail-pane {
+  font-family: var(--font-body);
+  border-top: 1px solid var(--color-border);
+  overflow: visible;
+}
+
+.issue-lane-filter {
+  max-width: 160px;
+  padding: var(--space-1) var(--space-2);
+  font-family: var(--font-body);
+  color: var(--color-text);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+}
+
 .workspace-overview-list-pane {
   overflow-y: auto;
 }

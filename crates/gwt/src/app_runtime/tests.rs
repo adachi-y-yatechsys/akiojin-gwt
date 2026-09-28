@@ -30647,6 +30647,10 @@ fn active_work_item_view_lifecycle_state_back_compat_default() {
     });
     let view: gwt::ActiveWorkItemView =
         serde_json::from_value(legacy).expect("deserialize legacy active work item");
+    assert_eq!(
+        serde_json::to_value(&view).unwrap()["linked_issue_numbers"],
+        serde_json::json!([])
+    );
     assert_eq!(view.lifecycle_state, "active");
     assert_eq!(view.closed_at, None);
 }
@@ -60506,6 +60510,7 @@ fn attach_registry_sessions_caps_total_agents_on_the_wire() {
         })
         .collect();
     let mut works = vec![gwt::ActiveWorkItemView {
+        linked_issue_numbers: Vec::new(),
         id: "work-develop-7ea5aa57".to_string(),
         title: "develop".to_string(),
         status_category: "idle".to_string(),
@@ -60596,6 +60601,7 @@ fn attach_registry_sessions_keeps_latest_entry_per_agent_identity() {
     }
 
     let mut works = vec![gwt::ActiveWorkItemView {
+        linked_issue_numbers: Vec::new(),
         id: "work-develop-7ea5aa57".to_string(),
         title: "develop".to_string(),
         status_category: "idle".to_string(),
@@ -60819,6 +60825,7 @@ fn workspace_test_work(
     works: Vec<gwt::ActiveWorkspaceWorkView>,
 ) -> gwt::ActiveWorkItemView {
     gwt::ActiveWorkItemView {
+        linked_issue_numbers: Vec::new(),
         id: "work-shared".to_string(),
         title: "work/shared".to_string(),
         status_category: "idle".to_string(),
@@ -61202,6 +61209,7 @@ fn attach_registry_sessions_recomputes_agent_counters_after_identity_collapse() 
     }
 
     let mut works = vec![gwt::ActiveWorkItemView {
+        linked_issue_numbers: Vec::new(),
         id: "work-develop-7ea5aa57".to_string(),
         title: "develop".to_string(),
         status_category: "active".to_string(),
@@ -61298,6 +61306,7 @@ fn attach_registry_sessions_drops_ghost_agents_without_identity_or_sessions() {
     }
 
     let mut works = vec![gwt::ActiveWorkItemView {
+        linked_issue_numbers: Vec::new(),
         id: "work-work-x-12345678".to_string(),
         title: "work/x".to_string(),
         status_category: "idle".to_string(),
@@ -61424,6 +61433,7 @@ fn attach_registry_sessions_dedupes_agents_sharing_a_conversation() {
     }
 
     let mut works = vec![gwt::ActiveWorkItemView {
+        linked_issue_numbers: Vec::new(),
         id: "work-work-x-12345678".to_string(),
         title: "work/x".to_string(),
         status_category: "idle".to_string(),
@@ -61560,6 +61570,7 @@ fn attach_registry_sessions_filters_agents_from_other_workspace_rows() {
     session_index.insert(other_session.id.as_str(), &other_session);
 
     let mut works = vec![gwt::ActiveWorkItemView {
+        linked_issue_numbers: Vec::new(),
         id: "work-work-issue-206-a0668517".to_string(),
         title: "contribution docs PR".to_string(),
         status_category: "idle".to_string(),
@@ -61806,6 +61817,7 @@ fn resume_branch_index_accepts_existing_worktree_without_branch_evidence() {
 #[test]
 fn active_works_are_sorted_by_latest_update_descending() {
     let row = |id: &str, branch: &str, updated_at: &str| gwt::ActiveWorkItemView {
+        linked_issue_numbers: Vec::new(),
         id: id.to_string(),
         title: branch.to_string(),
         status_category: "idle".to_string(),
@@ -61884,6 +61896,7 @@ fn active_works_are_sorted_by_latest_update_descending() {
 #[test]
 fn mark_merged_active_works_flags_cache_and_pr_state() {
     let row = |branch: Option<&str>, pr_state: Option<&str>| gwt::ActiveWorkItemView {
+        linked_issue_numbers: Vec::new(),
         id: "w".to_string(),
         title: "t".to_string(),
         status_category: "idle".to_string(),
@@ -61954,6 +61967,7 @@ fn dirty_worktree_pr_state_merged_does_not_flag_or_cleanup() {
     fs::write(repo.join("local-change.txt"), "current edits\n").expect("write dirty file");
 
     let mut works = vec![gwt::ActiveWorkItemView {
+        linked_issue_numbers: Vec::new(),
         id: "w-dirty".to_string(),
         title: "Dirty work".to_string(),
         status_category: "idle".to_string(),
@@ -63305,6 +63319,7 @@ fn assign_and_merge_workspace_groups_unifies_same_branch_rows() {
         lifecycle: &str,
     ) -> gwt::ActiveWorkItemView {
         gwt::ActiveWorkItemView {
+            linked_issue_numbers: Vec::new(),
             id: id.to_string(),
             title: id.to_string(),
             status_category: "idle".to_string(),
@@ -63369,6 +63384,8 @@ fn assign_and_merge_workspace_groups_unifies_same_branch_rows() {
         ),
     ];
 
+    works[0].linked_issue_numbers = vec![3885];
+    works[1].linked_issue_numbers = vec![3885, 4556];
     super::assign_and_merge_workspace_groups(&mut works, &root);
 
     assert_eq!(
@@ -63383,6 +63400,7 @@ fn assign_and_merge_workspace_groups_unifies_same_branch_rows() {
                 || work.branch.as_deref() == Some("work/x")
         })
         .expect("grouped row");
+    assert_eq!(group.linked_issue_numbers, vec![3885, 4556]);
     assert_eq!(
         group.id, "work-session-bbbb",
         "newest row is the representative"
@@ -63513,6 +63531,7 @@ fn legacy_workspace_lifecycle_does_not_create_an_implicit_close_target() {
 fn mark_remote_only_flags_fetched_branches_without_local_worktree() {
     fn row(id: &str, branch: Option<&str>, worktree: Option<&str>) -> gwt::ActiveWorkItemView {
         gwt::ActiveWorkItemView {
+            linked_issue_numbers: Vec::new(),
             id: id.to_string(),
             title: id.to_string(),
             status_category: "idle".to_string(),
@@ -63595,6 +63614,7 @@ fn mark_merged_classifies_done_equivalent_for_stale_merged_rows() {
         updated_at: &str,
     ) -> gwt::ActiveWorkItemView {
         gwt::ActiveWorkItemView {
+            linked_issue_numbers: Vec::new(),
             id: id.to_string(),
             title: id.to_string(),
             status_category: "idle".to_string(),
@@ -63672,6 +63692,7 @@ fn mark_merged_classifies_done_equivalent_for_stale_merged_rows() {
 #[test]
 fn mark_cleanup_candidates_exposes_no_changes_reason_without_merged_badge() {
     let mut works = vec![gwt::ActiveWorkItemView {
+        linked_issue_numbers: Vec::new(),
         id: "w-no-changes".to_string(),
         title: "No changes".to_string(),
         status_category: "idle".to_string(),
@@ -63753,6 +63774,7 @@ fn mark_cleanup_candidates_sets_blocked_reason_for_live_agent_and_process() {
     fs::create_dir_all(&live_process_worktree).expect("create live process worktree");
     let mut works = vec![
         gwt::ActiveWorkItemView {
+            linked_issue_numbers: Vec::new(),
             id: "w-live-agent".to_string(),
             title: "Live agent".to_string(),
             status_category: "active".to_string(),
@@ -63785,6 +63807,7 @@ fn mark_cleanup_candidates_sets_blocked_reason_for_live_agent_and_process() {
             updated_at: String::new(),
         },
         gwt::ActiveWorkItemView {
+            linked_issue_numbers: Vec::new(),
             id: "w-live-process".to_string(),
             title: "Live process".to_string(),
             status_category: "idle".to_string(),
@@ -63963,6 +63986,7 @@ fn apply_work_summary_external_sources_prefers_pr_then_ai_then_commit_subject() 
     );
 
     let base = |branch: &str, work_summary: Option<&str>| gwt::ActiveWorkItemView {
+        linked_issue_numbers: Vec::new(),
         id: branch.to_string(),
         title: branch.to_string(),
         status_category: "idle".to_string(),
@@ -78214,3 +78238,65 @@ include!("pm_project_state_tests.rs");
 include!("project_owned_state_tests.rs");
 
 include!("project_aggregate_tests.rs");
+
+#[test]
+fn active_work_issue_numbers_include_child_record_session_and_branch_links() {
+    let mut session = gwt_agent::Session::new("/repo", "work/shared", gwt_agent::AgentId::Codex);
+    session.id = "linked-session".to_string();
+    session.linked_issue_number = Some(33);
+    let agent = workspace_test_agent_with_conversation(
+        "linked-session",
+        "2026-09-01T00:00:00Z",
+        "conversation",
+    );
+    let mut child = workspace_test_child("child-work", vec![agent]);
+    child.owner = Some("Issue #22".to_string());
+    let mut work = workspace_test_work(vec![], vec![child]);
+    work.branch = Some("origin/work/shared".to_string());
+    work.owner = Some("SPEC #11".to_string());
+    let record = serde_json::from_value(serde_json::json!({
+        "id": "child-work", "title": "Child", "owner": "Issue #55", "status_category": "idle",
+        "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+    }))
+    .unwrap();
+    let mut rows = vec![work];
+    super::workspace_views::attach_active_work_issue_numbers(
+        &mut rows,
+        &[record],
+        &[session],
+        None,
+        &std::collections::HashMap::from([("work/shared".to_string(), 44)]),
+    );
+    assert_eq!(rows[0].linked_issue_numbers, vec![11, 22, 33, 44, 55]);
+    // The metadata remains usable without any Knowledge/Issue page loaded.
+    assert_eq!(
+        serde_json::to_value(&rows[0]).unwrap()["linked_issue_numbers"],
+        serde_json::json!([11, 22, 33, 44, 55])
+    );
+}
+
+#[test]
+fn active_work_issue_numbers_include_registry_sessions_beyond_the_display_cap() {
+    let repo = tempfile::tempdir().unwrap();
+    init_repo(repo.path());
+    let hash = gwt_core::repo_hash::detect_repo_hash(repo.path()).unwrap();
+    let sessions = (1..=12)
+        .map(|number| {
+            let mut session =
+                gwt_agent::Session::new(repo.path(), "work/shared", gwt_agent::AgentId::Codex);
+            session.id = format!("session-{number}");
+            session.repo_hash = Some(hash.as_str().to_string());
+            session.linked_issue_number = Some(number);
+            session
+        })
+        .collect::<Vec<_>>();
+    let mut rows = vec![workspace_test_work(vec![], vec![])];
+    super::workspace_views::attach_active_work_issue_numbers(
+        &mut rows,
+        &[],
+        &sessions,
+        Some(hash),
+        &std::collections::HashMap::new(),
+    );
+    assert_eq!(rows[0].linked_issue_numbers, (1..=12).collect::<Vec<_>>());
+}

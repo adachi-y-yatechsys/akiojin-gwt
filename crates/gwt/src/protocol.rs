@@ -1662,6 +1662,9 @@ pub struct ActiveWorkspaceWorkView {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ActiveWorkItemView {
+    /// Complete Issue association, independent of paginated Knowledge results.
+    #[serde(default)]
+    pub linked_issue_numbers: Vec<u64>,
     pub id: String,
     pub title: String,
     pub status_category: String,
@@ -4329,6 +4332,7 @@ mod tests {
                 managed_hook_health: None,
                 active_work_count: 1,
                 active_works: vec![super::ActiveWorkItemView {
+                    linked_issue_numbers: Vec::new(),
                     id: "work-1".to_string(),
                     title: "Implement Start Work".to_string(),
                     status_category: "active".to_string(),

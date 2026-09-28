@@ -71,7 +71,7 @@ fn launch_wizard_surface_js() -> &'static str {
 }
 
 fn workspace_kanban_surface_js() -> &'static str {
-    root_js_module_source("/workspace-kanban-surface.js")
+    root_js_module_source("/issue-other-surface.js")
 }
 
 fn styles_components_css() -> &'static str {
@@ -128,7 +128,7 @@ fn frontend_bundle_source() -> &'static str {
         "\n",
         include_str!("../web/agent-kanban-surface.js"),
         "\n",
-        include_str!("../web/workspace-kanban-surface.js"),
+        include_str!("../web/issue-other-surface.js"),
         "\n",
         include_str!("../web/update-cta.js"),
         "\n",

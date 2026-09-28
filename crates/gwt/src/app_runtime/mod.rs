@@ -269,6 +269,7 @@ use frontend_action_log::log_frontend_user_action;
 use knowledge::knowledge_error_event;
 #[cfg(test)]
 use knowledge::KnowledgeRefreshTask;
+pub(crate) use knowledge::{issue_number_for_branch, load_issue_branch_links};
 pub use knowledge::{KnowledgeLoadRequest, KnowledgeSearchRequest, ProjectIndexSearchRequest};
 #[cfg(test)]
 pub(crate) use launch::AgentLaunchCompletion;

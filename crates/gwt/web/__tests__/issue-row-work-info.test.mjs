@@ -16,7 +16,7 @@ import { parseHTML } from "linkedom";
 import {
   attentionForWorkspace,
   formatLifecycleStateLabel,
-} from "../workspace-kanban-surface.js";
+} from "../issue-other-surface.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const appSource = readFileSync(resolve(here, "../app.js"), "utf8");
@@ -87,7 +87,7 @@ function workRow(overrides = {}) {
   };
 }
 
-async function makeFixture({ projection = null } = {}) {
+async function makeFixture({ projection = null, renderOtherWork } = {}) {
   const mod = await importSurfaceModule();
   const { document, window } = parseHTML(
     "<!doctype html><html><head></head><body></body></html>",
@@ -125,6 +125,7 @@ async function makeFixture({ projection = null } = {}) {
     windowRoleBadgeLabel: () => "Agent",
     windowizeIssuePreviewWindow() {},
     getActiveWorkProjection: () => projection,
+    renderOtherWork,
     workAttentionFor: attentionForWorkspace,
     formatWorkLifecycleLabel: formatLifecycleStateLabel,
     continueWork: (workId, bounds) => {
@@ -153,6 +154,34 @@ function applyEntries(surface, load, entries) {
     refresh_enabled: true,
   });
 }
+
+test("Issue lane filter applies Work lanes and renders Other after the Issue rows", async (t) => {
+  const otherCalls = [];
+  const projection = { active_works: [
+    workRow({ id: "running" }),
+    workRow({ id: "paused", lifecycle_state: "paused", status_category: "idle", active_agents: 0 }),
+  ] };
+  const fixture = await makeFixture({ projection, renderOtherWork: (parent, id, options) => {
+    otherCalls.push({ parent, id, options });
+    parent.appendChild(createNode(parent.ownerDocument, "details", "issue-other-group", "Other"));
+  } });
+  t.after(() => fixture.surface.clearKnowledgeBridgeState("win-1"));
+  applyEntries(fixture.surface, fixture.load, [
+    knowledgeEntry(1, [{ id: "running" }]),
+    knowledgeEntry(2, [{ id: "paused" }]),
+  ]);
+  const filter = fixture.body.querySelector("[data-issue-lane-filter]");
+  assert.ok(filter, "all five former Workspace lanes are available in Issue");
+  assert.deepEqual(Array.from(filter.options).map(option => option.value),
+    ["all", "running", "paused", "needs_attention", "remote", "closed"]);
+  // linkedom's select.value has no setter; Chromium exercises native selection in E2E.
+  Object.defineProperty(filter, "value", { value: "paused", configurable: true });
+  filter.dispatchEvent(new fixture.window.Event("change"));
+  assert.equal(fixture.body.querySelectorAll(".knowledge-row").length, 1);
+  assert.match(fixture.body.querySelector(".knowledge-row").textContent, /Issue 2/);
+  assert.equal(otherCalls.at(-1).options.laneFilter, "paused");
+  assert.equal(fixture.body.querySelector(".knowledge-list").lastElementChild.className, "issue-other-group");
+});
 
 test("issueWorkRowForEntry joins the Issue row to the active Work projection", async () => {
   const { issueWorkRowForEntry } = await importSurfaceModule();
@@ -285,7 +314,7 @@ test("Clean Up stays disabled while the backend reports a cleanup blocker", asyn
 test("app.js feeds the Issue surface from the shared Work projection and helpers", () => {
   assert.match(
     appSource,
-    /attentionForWorkspace[\s\S]*from "\/workspace-kanban-surface\.js"/,
+    /attentionForWorkspace[\s\S]*from "\/issue-other-surface\.js"/,
     "the shared Work attention rules are imported, not re-derived",
   );
   assert.match(
