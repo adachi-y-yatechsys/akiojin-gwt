@@ -974,6 +974,7 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
+        assert!(child.try_wait().unwrap().is_none(), "holder must be alive");
         let result = SystemReclaimer::new(worktree.path()).terminate(child.id(), false);
         let deadline = Instant::now() + Duration::from_secs(10);
         let exited = loop {
