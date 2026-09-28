@@ -69552,6 +69552,7 @@ fn pm_close_completion_stays_with_owner_and_is_dropped_after_owner_closes() {
         running_reasoning: None,
         is_running: false,
         agent_options: Vec::new(),
+        start_block: None,
     };
 
     let after_switch = runtime.handle_window_close_finalized(
