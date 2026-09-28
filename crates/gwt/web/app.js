@@ -3701,6 +3701,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
               "stopped",
               "exited",
               "error",
+              "interrupted",
             );
             chip.classList.add(runtimeState);
             // SPEC-2356 — Living Telemetry: project the runtime state onto a stable

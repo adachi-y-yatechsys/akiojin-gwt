@@ -37,6 +37,7 @@ bash scripts/run-node-tests-with-linkedom.sh \
   crates/gwt/web/__tests__/issue-row-state-model.test.mjs \
   crates/gwt/web/__tests__/issue-window-composite.test.mjs \
   crates/gwt/web/__tests__/issue-window-split.test.mjs \
+  crates/gwt/web/__tests__/issue-window-redesign.test.mjs \
   crates/gwt/web/__tests__/surface-naming.test.mjs \
   crates/gwt/web/__tests__/issue-other-surface.test.mjs \
   crates/gwt/web/__tests__/launch-pending-controller.test.mjs \
