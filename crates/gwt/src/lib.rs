@@ -1,6 +1,10 @@
 pub mod agent_backend_dispatch;
+pub mod agent_capability;
 pub(crate) mod agent_project_state;
 pub mod agent_resource_policy;
+pub mod pane_runtime;
+pub mod session_finalizer;
+pub mod session_launch;
 #[doc(hidden)]
 pub use agent_project_state::validated_project_state_root_for_session_recovery;
 pub mod autonomous_handoff;
@@ -50,6 +54,8 @@ pub mod preset;
 pub mod process;
 pub mod profile_dispatch;
 pub mod project_open_control;
+pub mod project_runtime;
+pub mod project_transport;
 pub mod protocol;
 pub mod pty_start_gate;
 pub mod recovery_delivery;

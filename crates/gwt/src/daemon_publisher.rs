@@ -91,23 +91,6 @@ enum EndpointAbsenceEvidence {
     Uncertain(String),
 }
 
-fn authority_fence_allows_fallback(project_root: &Path) -> Result<(), String> {
-    let prefs_path = crate::issue_monitor_prefs_path_for_repo_path(project_root);
-    match crate::load_issue_monitor_authority_fence(&prefs_path) {
-        Ok(crate::IssueMonitorAuthorityFenceState::Missing) => Ok(()),
-        Ok(crate::IssueMonitorAuthorityFenceState::LegacyShutdownRevoke) => {
-            Err("Issue Monitor authority fence retains pending crash recovery".to_string())
-        }
-        Ok(crate::IssueMonitorAuthorityFenceState::Active(fence)) => Err(format!(
-            "Issue Monitor authority fence is owned by daemon pid {}",
-            fence.pid
-        )),
-        Err(error) => Err(format!(
-            "Issue Monitor authority fence is malformed or unreadable: {error}"
-        )),
-    }
-}
-
 fn authority_owned_endpoint(
     gwt_home: &Path,
     requested_scope: &RuntimeScope,
@@ -200,6 +183,160 @@ fn authority_owned_endpoint(
     }
 }
 
+#[derive(Clone, Copy)]
+enum AuthorityResolutionPurpose {
+    Route,
+    RecoverUnderLease,
+}
+
+enum ProjectAuthorityResolution {
+    Missing,
+    Live(DaemonEndpoint),
+    Recover,
+}
+
+pub(crate) fn resolve_live_project_authority(
+    gwt_home: &Path,
+    scope: &RuntimeScope,
+    is_process_alive: &dyn Fn(u32) -> bool,
+) -> Result<Option<DaemonEndpoint>, String> {
+    match resolve_project_authority(
+        gwt_home,
+        scope,
+        is_process_alive,
+        AuthorityResolutionPurpose::Route,
+    )? {
+        ProjectAuthorityResolution::Live(endpoint) => Ok(Some(endpoint)),
+        ProjectAuthorityResolution::Missing => Ok(None),
+        ProjectAuthorityResolution::Recover => {
+            Err("Issue Monitor authority fence retains pending crash recovery".to_string())
+        }
+    }
+}
+
+fn resolve_project_authority(
+    gwt_home: &Path,
+    scope: &RuntimeScope,
+    is_process_alive: &dyn Fn(u32) -> bool,
+    purpose: AuthorityResolutionPurpose,
+) -> Result<ProjectAuthorityResolution, String> {
+    let prefs_path = gwt_home
+        .join("projects")
+        .join(&scope.repo_hash)
+        .join("project-state/issue-monitor.json");
+    let fence = crate::load_issue_monitor_authority_fence(&prefs_path)
+        .map_err(|error| format!("project daemon authority is malformed or unreadable: {error}"))?;
+    if let (
+        AuthorityResolutionPurpose::RecoverUnderLease,
+        crate::IssueMonitorAuthorityFenceState::Active(fence),
+    ) = (purpose, &fence)
+    {
+        // v2 identity is the process-lifetime kernel lease, not a reusable PID.
+        if fence.version == 2 {
+            // This probe also takes prefs.lock. Bound contention while the
+            // supervisor owns its child table; an outer deadline stays shorter.
+            let _deadline = gwt_core::operation_deadline::ScopedOperationDeadline::enter(
+                gwt_core::operation_deadline::now() + Duration::from_secs(1),
+            );
+            match crate::issue_monitor::acquire_issue_monitor_daemon_lease(&prefs_path) {
+                Ok(lease) => {
+                    drop(lease);
+                    return Ok(ProjectAuthorityResolution::Recover);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    return authority_owned_endpoint(gwt_home, scope, fence, &|pid| {
+                        is_process_alive(pid)
+                    })
+                    .map(ProjectAuthorityResolution::Live);
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "project daemon authority lease probe failed: {error}"
+                    ))
+                }
+            }
+        }
+    }
+    match fence {
+        crate::IssueMonitorAuthorityFenceState::Missing => Ok(ProjectAuthorityResolution::Missing),
+        crate::IssueMonitorAuthorityFenceState::Active(fence) if is_process_alive(fence.pid) => {
+            authority_owned_endpoint(gwt_home, scope, &fence, &|pid| is_process_alive(pid))
+                .map(ProjectAuthorityResolution::Live)
+        }
+        crate::IssueMonitorAuthorityFenceState::Active(_)
+        | crate::IssueMonitorAuthorityFenceState::LegacyShutdownRevoke => {
+            match purpose {
+                // The server must acquire the existing authority lease before
+                // binding; selecting recovery here does not grant ownership.
+                AuthorityResolutionPurpose::RecoverUnderLease => {
+                    Ok(ProjectAuthorityResolution::Missing)
+                }
+                AuthorityResolutionPurpose::Route => {
+                    Err("Issue Monitor authority fence retains pending crash recovery".to_string())
+                }
+            }
+        }
+    }
+}
+
+/// Resolve bootstrap through the project's existing authority before inspecting
+/// the caller's endpoint slot. Dead-owner and legacy recovery still require
+/// the server's existing authority lease before it can bind.
+pub(crate) fn resolve_project_daemon_bootstrap(
+    gwt_home: &Path,
+    scope: &RuntimeScope,
+    expected_version: Option<&str>,
+    is_process_alive: &dyn Fn(u32) -> bool,
+) -> Result<DaemonBootstrapAction, String> {
+    match resolve_project_authority(
+        gwt_home,
+        scope,
+        is_process_alive,
+        AuthorityResolutionPurpose::RecoverUnderLease,
+    )? {
+        ProjectAuthorityResolution::Live(endpoint) => {
+            return Ok(
+                if expected_version.is_some_and(|version| endpoint.daemon_version != version) {
+                    DaemonBootstrapAction::RetireStaleVersion { endpoint }
+                } else {
+                    DaemonBootstrapAction::Reuse(endpoint)
+                },
+            );
+        }
+        ProjectAuthorityResolution::Recover => {
+            // Do not reselect the stale exact descriptor: its PID may now name
+            // an unrelated process. The new server re-acquires the lease.
+            return Ok(DaemonBootstrapAction::Spawn {
+                endpoint_path: scope.endpoint_path(gwt_home),
+            });
+        }
+        ProjectAuthorityResolution::Missing => {}
+    }
+    match expected_version {
+        Some(version) => gwt_core::daemon::resolve_bootstrap_action_for_version(
+            gwt_home,
+            scope,
+            DAEMON_PROTOCOL_VERSION,
+            version,
+            is_process_alive,
+        ),
+        None => {
+            resolve_bootstrap_action(gwt_home, scope, DAEMON_PROTOCOL_VERSION, is_process_alive)
+        }
+    }
+    .map_err(|error| format!("daemon bootstrap resolution failed: {error}"))
+}
+
+/// Resolve the single project daemon using its existing Monitor authority.
+/// The returned scope belongs to the owner, which may be another worktree.
+/// Uncertain ownership is an error, never permission to choose another owner.
+pub fn resolve_project_daemon_endpoint(
+    project_root: &Path,
+) -> Result<Option<DaemonEndpoint>, String> {
+    resolve_issue_monitor_endpoint_with_liveness(project_root, &is_alive)
+        .map_err(|error| error.to_string())
+}
+
 fn resolve_issue_monitor_endpoint_with_liveness(
     project_root: &Path,
     is_process_alive: &impl Fn(u32) -> bool,
@@ -209,18 +346,14 @@ fn resolve_issue_monitor_endpoint_with_liveness(
     let scope = RuntimeScope::from_project_root(project_root, RuntimeTarget::Host)
         .map_err(|error| OutcomeUnknown(format!("scope resolution failed: {error}")))?;
     let gwt_home = paths::gwt_home();
-    let authority_fence = crate::load_issue_monitor_authority_fence(
-        &crate::issue_monitor_prefs_path_for_repo_path(project_root),
-    );
-    if let Ok(crate::IssueMonitorAuthorityFenceState::Active(fence)) = &authority_fence {
-        return authority_owned_endpoint(&gwt_home, &scope, fence, is_process_alive)
-            .map(Some)
-            .map_err(OutcomeUnknown);
+    if let Some(endpoint) = resolve_live_project_authority(&gwt_home, &scope, is_process_alive)
+        .map_err(OutcomeUnknown)?
+    {
+        return Ok(Some(endpoint));
     }
 
     let endpoint_path = scope.endpoint_path(&gwt_home);
     let absence_evidence = endpoint_absence_evidence(&endpoint_path, is_process_alive);
-    let fence_evidence = authority_fence_allows_fallback(project_root);
     let action = resolve_bootstrap_action(&gwt_home, &scope, DAEMON_PROTOCOL_VERSION, |pid| {
         is_process_alive(pid)
     })
@@ -233,12 +366,7 @@ fn resolve_issue_monitor_endpoint_with_liveness(
             "daemon endpoint belongs to another gwt version".to_string(),
         )),
         DaemonBootstrapAction::Spawn { .. } => match absence_evidence {
-            EndpointAbsenceEvidence::Missing | EndpointAbsenceEvidence::DefinitelyDead => {
-                match fence_evidence {
-                    Ok(()) => Ok(None),
-                    Err(reason) => Err(OutcomeUnknown(reason)),
-                }
-            }
+            EndpointAbsenceEvidence::Missing | EndpointAbsenceEvidence::DefinitelyDead => Ok(None),
             EndpointAbsenceEvidence::Uncertain(reason) => Err(OutcomeUnknown(reason)),
         },
     }
@@ -507,17 +635,8 @@ pub fn publish_event_with_timeout(
     payload: Value,
     timeout: Duration,
 ) -> Result<(), String> {
-    let scope = RuntimeScope::from_project_root(project_root, RuntimeTarget::Host)
-        .map_err(|err| format!("scope resolution failed: {err}"))?;
-    let gwt_home = paths::gwt_home();
-    let action = resolve_bootstrap_action(&gwt_home, &scope, DAEMON_PROTOCOL_VERSION, is_alive)
-        .map_err(|err| format!("bootstrap resolve failed: {err}"))?;
-    let endpoint = match action {
-        DaemonBootstrapAction::Reuse(ep) => ep,
-        DaemonBootstrapAction::Spawn { .. } | DaemonBootstrapAction::RetireStaleVersion { .. } => {
-            return Err("daemon not running".to_string())
-        }
-    };
+    let endpoint = resolve_project_daemon_endpoint(project_root)?
+        .ok_or_else(|| "daemon not running".to_string())?;
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1016,6 +1135,22 @@ mod tests {
 
     #[test]
     fn active_authority_fence_routes_control_to_sibling_worktree_endpoint() {
+        assert_publish_routes_to_sibling(|root, payload, timeout| {
+            publish_issue_monitor_control_with_timeout(root, payload, timeout)
+                .map_err(|error| format!("{error:?}"))
+        });
+    }
+
+    #[test]
+    fn active_authority_fence_routes_events_to_sibling_worktree_endpoint() {
+        assert_publish_routes_to_sibling(|root, payload, timeout| {
+            publish_event_with_timeout(root, "board", payload, timeout)
+        });
+    }
+
+    fn assert_publish_routes_to_sibling(
+        publish: impl FnOnce(&std::path::Path, serde_json::Value, Duration) -> Result<(), String>,
+    ) {
         let _env_lock = crate::env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1062,12 +1197,12 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let server_stop = Arc::clone(&stop);
         let server = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + Duration::from_secs(1);
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
             while !server_stop.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
                 let (stream, _) = match listener.accept() {
                     Ok(accepted) => accepted,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(1));
+                        std::thread::sleep(Duration::from_millis(100));
                         continue;
                     }
                     Err(error) => panic!("accept sibling publisher: {error}"),
@@ -1112,15 +1247,15 @@ mod tests {
             }
         });
 
-        let result = publish_issue_monitor_control_with_timeout(
+        let result = publish(
             project.path(),
             json!({"enabled": false}),
-            Duration::from_millis(500),
+            Duration::from_secs(5),
         );
         stop.store(true, Ordering::Release);
         server.join().expect("sibling daemon joins");
 
-        result.expect("control routes to authority-owning sibling daemon");
+        result.expect("publish routes to authority-owning sibling daemon");
     }
 
     #[test]
@@ -1193,6 +1328,46 @@ mod tests {
             std::fs::read(fence_path).expect("reload malformed fence"),
             malformed
         );
+    }
+
+    #[test]
+    fn routing_rejects_uncertain_fence_even_with_live_exact_endpoint() {
+        let _env_lock = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let project = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let _home_guard = ScopedEnvVar::set("HOME", home.path());
+        let _userprofile_guard = ScopedEnvVar::set("USERPROFILE", home.path());
+        let scope = RuntimeScope::from_project_root(project.path(), RuntimeTarget::Host).unwrap();
+        let endpoint = DaemonEndpoint::new(
+            scope.clone(),
+            std::process::id(),
+            home.path().join("live.sock").display().to_string(),
+            "token".into(),
+            "test".into(),
+        );
+        persist_endpoint(
+            &scope.endpoint_path(&gwt_core::paths::gwt_home()),
+            &endpoint,
+        )
+        .unwrap();
+        let prefs = crate::issue_monitor_prefs_path_for_repo_path(project.path());
+        crate::save_issue_monitor_prefs(&prefs, &crate::IssueMonitorPrefs::default()).unwrap();
+        crate::persist_legacy_issue_monitor_shutdown_revoke_fence(&prefs).unwrap();
+        let fence_path = crate::issue_monitor_authority_fence_path(&prefs);
+        for malformed in [false, true] {
+            if malformed {
+                std::fs::write(&fence_path, b"not-json").unwrap();
+            }
+            let before = std::fs::read(&fence_path).unwrap();
+            assert!(
+                super::resolve_issue_monitor_endpoint_with_liveness(project.path(), &|_| true)
+                    .is_err(),
+                "uncertain fence must not route to a live local endpoint (malformed={malformed})"
+            );
+            assert_eq!(std::fs::read(&fence_path).unwrap(), before);
+        }
     }
 
     #[test]

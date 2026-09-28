@@ -27,8 +27,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use gwt_core::daemon::{
-    resolve_bootstrap_action, ClientFrame, DaemonBootstrapAction, DaemonEndpoint, DaemonFrame,
-    DaemonStatus, RuntimeScope, RuntimeTarget, DAEMON_PROTOCOL_VERSION,
+    ClientFrame, DaemonBootstrapAction, DaemonEndpoint, DaemonFrame, DaemonStatus, RuntimeScope,
+    RuntimeTarget, DAEMON_PROTOCOL_VERSION,
 };
 use gwt_github::{client::ApiError, SpecOpsError};
 
@@ -157,13 +157,22 @@ fn canonical_project_root(path: PathBuf) -> PathBuf {
 fn report_status<E: CliEnv>(env: &mut E, out: &mut String) -> Result<i32, SpecOpsError> {
     let scope = resolve_scope(env)?;
     let gwt_home = gwt_core::paths::gwt_home();
-    let action = resolve_bootstrap_action(
+    let action = match crate::daemon_publisher::resolve_live_project_authority(
         &gwt_home,
         &scope,
-        DAEMON_PROTOCOL_VERSION,
-        is_process_alive_pid,
+        &is_process_alive_pid,
     )
-    .map_err(|err| config_error(err.to_string()))?;
+    .map_err(config_error)?
+    {
+        Some(endpoint) => DaemonBootstrapAction::Reuse(endpoint),
+        None => gwt_core::daemon::resolve_bootstrap_action(
+            &gwt_home,
+            &scope,
+            DAEMON_PROTOCOL_VERSION,
+            is_process_alive_pid,
+        )
+        .map_err(|error| config_error(error.to_string()))?,
+    };
 
     match action {
         // Issue #4038: the version-agnostic resolver never names a stale
@@ -410,13 +419,13 @@ fn start_daemon<E: CliEnv>(env: &mut E, out: &mut String) -> Result<i32, SpecOps
     let scope = resolve_scope(env)?;
     let gwt_home = gwt_core::paths::gwt_home();
     sweep_past_generation_endpoints(&scope.daemon_dir(&gwt_home));
-    let action = resolve_bootstrap_action(
+    let action = crate::daemon_publisher::resolve_project_daemon_bootstrap(
         &gwt_home,
         &scope,
-        DAEMON_PROTOCOL_VERSION,
-        is_process_alive_pid,
+        None,
+        &is_process_alive_pid,
     )
-    .map_err(|err| config_error(err.to_string()))?;
+    .map_err(config_error)?;
 
     match action {
         DaemonBootstrapAction::Reuse(endpoint)
