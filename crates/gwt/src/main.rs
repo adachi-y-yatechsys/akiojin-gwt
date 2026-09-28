@@ -2,7 +2,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    io::{self, Read},
+    io,
     path::{Path, PathBuf},
     sync::{mpsc as std_mpsc, Arc, Mutex, OnceLock, RwLock},
     thread::{self, JoinHandle},
@@ -25,7 +25,7 @@ use gwt::{
     FrontendEvent, KnowledgeKind, LaunchWizardState, LiveSessionEntry, ShellLaunchConfig,
     UiTracePayload, WindowCanvasState, WindowGeometry, WindowPreset, WindowProcessStatus, APP_NAME,
 };
-use gwt_terminal::{Pane, PaneStatus, PtyHandle};
+use gwt_terminal::{Pane, PtyHandle};
 use tao::{
     event::Event,
     event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy},
@@ -1277,10 +1277,7 @@ fn spawn_board_daemon_subscriber(
     context: app_runtime::ProjectContext,
     proxy: AppEventProxy,
 ) -> Option<gwt::daemon_subscriber::DaemonSubscriber> {
-    use gwt_core::daemon::{
-        resolve_bootstrap_action, DaemonBootstrapAction, RuntimeScope, RuntimeTarget,
-        DAEMON_PROTOCOL_VERSION,
-    };
+    use gwt_core::daemon::{RuntimeScope, RuntimeTarget};
 
     let project_root = context.project_root.clone();
 
@@ -1304,23 +1301,8 @@ fn spawn_board_daemon_subscriber(
     // endpoint would loop forever on handshake rejection.
     let resolver_project_root = project_root.clone();
     let resolver = move || -> Result<gwt_core::daemon::DaemonEndpoint, String> {
-        let scope = RuntimeScope::from_project_root(&resolver_project_root, RuntimeTarget::Host)
-            .map_err(|err| format!("scope: {err}"))?;
-        let gwt_home = gwt_core::paths::gwt_home();
-        let action = resolve_bootstrap_action(
-            &gwt_home,
-            &scope,
-            DAEMON_PROTOCOL_VERSION,
-            is_subscriber_pid_alive,
-        )
-        .map_err(|err| format!("bootstrap: {err}"))?;
-        match action {
-            DaemonBootstrapAction::Reuse(ep) => Ok(ep),
-            DaemonBootstrapAction::Spawn { .. }
-            | DaemonBootstrapAction::RetireStaleVersion { .. } => {
-                Err("daemon not running".to_string())
-            }
-        }
+        gwt::daemon_publisher::resolve_project_daemon_endpoint(&resolver_project_root)?
+            .ok_or_else(|| "daemon not running".to_string())
     };
 
     let proxy_for_callback = proxy;
@@ -1506,10 +1488,6 @@ fn issue_monitor_daemon_user_event(
         _ => None,
     }
 }
-
-// Liveness probe shared with `cli::daemon` and `daemon_publisher`;
-// see `gwt::process::is_process_alive`.
-use gwt::process::is_process_alive as is_subscriber_pid_alive;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DockerBundleMounts {
@@ -4009,7 +3987,7 @@ mod tests {
             // Issue #3676 AC-2: fail-open in tests so ambient credential
             // state never decides a launch.
             issue_monitor_provider_auth_probe: |_| gwt::issue_monitor::ProviderAuthState::Unknown,
-            daemon_supervisor: gwt::daemon_supervisor::DaemonSupervisor::disabled(),
+            daemon_supervisor: Arc::new(gwt::daemon_supervisor::DaemonSupervisor::disabled()),
             pending_workspace_resume_contexts: HashMap::new(),
             pending_continue_work: HashMap::new(),
             pending_fresh_execution_launches: HashMap::new(),
