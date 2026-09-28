@@ -1338,6 +1338,11 @@ impl FinalizedAgentCapabilityLaunch<'_> {
         // PTY and burns the Issue Monitor retry budget. A heal failure is
         // logged and the strict read reports the real state.
         heal_lost_generation_publication_best_effort(worktree, owner);
+        super::continuation::reconcile_unindexed_prepared_fresh_launches(
+            sessions_dir,
+            worktree,
+            owner,
+        )?;
         let mut current_binding =
             gwt::cli::execution_state::current_execution_binding(worktree, owner)
                 .map_err(|error| error.to_string())?;
@@ -7284,6 +7289,144 @@ mod agent_endpoint_env_tests {
                 .generation_id,
             "the successor must own a new generation, not the holder's"
         );
+    }
+
+    #[test]
+    fn fresh_launch_retries_three_abandoned_prepared_candidates_without_receipts() {
+        let _env_lock = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = tempfile::tempdir().expect("home");
+        let _home = ScopedEnvVar::set("HOME", home.path());
+        let _userprofile = ScopedEnvVar::set("USERPROFILE", home.path());
+        let mut launch = persisted_execution_launch(home.path());
+        let issuer = AgentCapabilityIssuer::for_test(
+            "http://127.0.0.1:45123/internal/hook-live",
+            "ws://127.0.0.1:46234/ws",
+            "ws://127.0.0.1:45123/internal/pane-ws",
+        );
+        let install = |session: &mut gwt_agent::Session| {
+            FinalizedAgentCapabilityLaunch {
+                issuer: Some(&issuer),
+                sessions_dir: &launch.sessions_dir,
+                session,
+                project_root: &launch.project,
+                worktree: &launch.project,
+                producing_owner: Some(launch.owner),
+                prepared_continuation: None,
+                rebound_continuation: None,
+                execution_entrypoint: "$gwt-execute #2359",
+                runtime_target: gwt_agent::LaunchRuntimeTarget::Host,
+                container_runtime: None,
+                permission_decision: None,
+            }
+            .install(&mut HashMap::new())
+        };
+        install(&mut launch.session).expect("genesis");
+        std::fs::remove_file(gwt_agent::runtime_state_path(
+            &launch.sessions_dir,
+            &launch.session.id,
+        ))
+        .expect("old holder Host disappeared");
+        let new_candidate = || {
+            let mut session = gwt_agent::Session::new(
+                &launch.project,
+                "work/issue-2359",
+                gwt_agent::AgentId::Codex,
+            );
+            session.project_state_root = Some(launch.project.clone());
+            session.linked_issue_number = Some(launch.owner.number);
+            session.update_status(gwt_agent::AgentStatus::Running);
+            session
+        };
+        let mut candidate = new_candidate();
+        install(&mut candidate).expect("first candidate");
+        for failure in 0..3 {
+            let attempt =
+                gwt::cli::execution_state::prepared_fresh_linked_owner_launch_for_session(
+                    &launch.project,
+                    launch.owner,
+                    &candidate.id,
+                )
+                .expect("read attempt")
+                .expect("Prepared attempt");
+            let mut handshake = gwt::cli::execution_state::claim_prepared_session_launch(
+                &launch.project,
+                launch.owner,
+                &launch.sessions_dir,
+                &candidate,
+            )
+            .expect("claim candidate")
+            .expect("handshake");
+            clear_durable_launch_recovery(&launch.sessions_dir, &candidate.id)
+                .expect("simulate lost receipt");
+            let mut next = new_candidate();
+            if failure == 0 {
+                let candidate_path = launch.sessions_dir.join(format!("{}.toml", candidate.id));
+                let before = std::fs::read(&candidate_path).expect("live candidate bytes");
+                install(&mut next).expect("independent launch beside live Prepared candidate");
+                assert_eq!(
+                    std::fs::read(&candidate_path).expect("preserved live candidate"),
+                    before
+                );
+                assert_eq!(
+                    gwt::cli::execution_state::continuation_attempt_for_operation(
+                        &launch.project,
+                        launch.owner,
+                        &attempt.request.operation_id,
+                    )
+                    .expect("read live attempt")
+                    .expect("live attempt")
+                    .status,
+                    gwt::cli::execution_state::ContinuationAttemptStatus::Prepared,
+                );
+                next = new_candidate();
+            }
+            handshake.host_pid = i32::MAX as u32;
+            handshake.host_started_at = 1;
+            std::fs::write(
+                gwt_agent::active_launch_handshake_path(&launch.sessions_dir, &candidate.id),
+                serde_json::to_vec_pretty(&handshake).expect("serialize dead Host proof"),
+            )
+            .expect("persist exact dead Host handshake");
+            let prepared_work =
+                gwt_core::workspace_projection::transact_workspace_state_with_commit(
+                    &launch.project,
+                    &attempt.request.operation_id,
+                    |_projection, _work_items, _| Ok(((), Vec::new())),
+                    || {
+                        Err(gwt_core::error::GwtError::Other(
+                            "simulate Host exit before Work commit".to_string(),
+                        ))
+                    },
+                );
+            assert!(prepared_work.is_err());
+            install(&mut next).expect("next launch must release the exact abandoned candidate");
+            assert_eq!(
+                gwt::cli::execution_state::continuation_attempt_for_operation(
+                    &launch.project,
+                    launch.owner,
+                    &attempt.request.operation_id,
+                )
+                .expect("read aborted attempt")
+                .expect("attempt")
+                .status,
+                gwt::cli::execution_state::ContinuationAttemptStatus::Aborted,
+            );
+            assert_eq!(
+                gwt_core::workspace_projection::workspace_state_external_commit_resolution(
+                    &launch.project,
+                    &attempt.request.operation_id,
+                )
+                .expect("read rejected Work transaction"),
+                gwt_core::workspace_projection::ExternalWorkspaceCommitResolution::Rejected,
+            );
+            assert!(!launch
+                .sessions_dir
+                .join(format!("{}.toml", candidate.id))
+                .exists());
+            candidate = next;
+        }
     }
 
     /// Issue #3759: the owner ledger is committed before the worktree-scoped

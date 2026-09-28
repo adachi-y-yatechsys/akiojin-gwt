@@ -71,6 +71,10 @@ impl AgentCapabilityGrant {
     pub fn principal(&self) -> &AgentSessionPrincipal {
         &self.principal
     }
+
+    pub fn matches_token(&self, token: &str) -> bool {
+        self.token == token
+    }
 }
 
 impl std::fmt::Debug for AgentCapabilityGrant {

@@ -8838,6 +8838,90 @@ where
     })
 }
 
+/// Recover a Prepared launch without a receipt only with exact proof that
+/// its launching Host and child are gone. Keep the proof until a replacement
+/// recovery receipt is durable so interrupted cleanup remains discoverable.
+#[allow(clippy::too_many_arguments)]
+pub fn abort_abandoned_prepared_successor_with(
+    worktree: &Path,
+    owner: ExecutionOwnerKey,
+    request: &SuccessorRequest,
+    sessions_dir: &Path,
+    expected: &gwt_agent::SessionExecutionIdentity,
+    before_abort: impl FnOnce() -> io::Result<()>,
+    after_abort: impl FnOnce() -> io::Result<()>,
+) -> io::Result<bool> {
+    validate_successor_request(request)?;
+    if request.initial_session_id != expected.session_id
+        || expected.execution_binding.owner_kind != owner.kind.as_str()
+        || expected.execution_binding.owner_number != owner.number
+    {
+        return Ok(false);
+    }
+    with_generation_owner_lease(worktree, owner, |context| {
+        if dunce::canonicalize(&expected.worktree_path).ok().as_ref() != Some(&context.worktree)
+            || !prepared_execution_binding_matches(
+                worktree,
+                owner,
+                &expected.session_id,
+                &expected.execution_binding.identity,
+            )?
+        {
+            return Ok(false);
+        }
+        let result = gwt_agent::remove_session_if_execution_identity_matches_or_missing_with(
+            sessions_dir,
+            &expected.session_id,
+            expected,
+            || {
+                let refuse = || {
+                    io::Error::new(
+                        ErrorKind::WouldBlock,
+                        "Prepared candidate has no exact abandoned launch proof",
+                    )
+                };
+                // This read also requires the exact durable Session to exist.
+                let handshake = gwt_agent::read_session_active_launch_handshake_under_lease(
+                    sessions_dir,
+                    expected,
+                )?
+                .ok_or_else(refuse)?;
+                let started_at = crate::process::host_process_start_time(handshake.host_pid);
+                if started_at == Some(handshake.host_started_at)
+                    || (started_at.is_none()
+                        && crate::process::is_host_process_alive(handshake.host_pid))
+                    || matches!(handshake.phase,
+                        gwt_agent::SessionActiveLaunchPhase::ChildSpawned { child_pid, child_started_at }
+                            if crate::process::exact_pty_process_tree_is_alive(child_pid, child_started_at))
+                    || exact_session_runtime_fences_active_launch(sessions_dir, expected)?
+                {
+                    return Err(refuse());
+                }
+                before_abort()?;
+                abort_successor_in_context(
+                    context,
+                    request,
+                    "launching Host exited before Prepared candidate activation",
+                )?;
+                after_abort()?;
+                if !gwt_agent::clear_session_active_launch_handshake_under_lease(
+                    sessions_dir,
+                    &handshake,
+                )? {
+                    return Err(io::Error::other(
+                        "abandoned launch handshake changed during cleanup",
+                    ));
+                }
+                Ok(())
+            },
+        );
+        match result {
+            Err(error) if error.kind() == ErrorKind::WouldBlock => Ok(false),
+            other => other,
+        }
+    })
+}
+
 /// Abort one Prepared successor only while its candidate Session remains
 /// genuinely absent. The owner lease and Session lease are held together so
 /// a same-id Session cannot materialize between the absence check and commit.
@@ -12752,6 +12836,49 @@ fn finalize_projection_recovery_probes(
     snapshot
 }
 
+fn recovery_context_has_prepared_binding(
+    context: &crate::agent_project_state::ExecutionRecoveryContext,
+) -> bool {
+    let session = context.session();
+    if session.runtime_target != gwt_agent::LaunchRuntimeTarget::Host {
+        return false;
+    }
+    let Some(binding) = session.execution_binding.as_ref() else {
+        return false;
+    };
+    let kind = match binding.owner_kind.as_str() {
+        "spec" => ExecutionOwnerKind::Spec,
+        "issue" => ExecutionOwnerKind::Issue,
+        _ => return false,
+    };
+    let owner = ExecutionOwnerKey {
+        kind,
+        number: binding.owner_number,
+    };
+    let owner_launch = load_generation_ledger(context.worktree(), owner)
+        .ok()
+        .flatten()
+        .is_some_and(|ledger| {
+            ledger
+                .continuation_attempts
+                .iter()
+                .rev()
+                .find(|attempt| attempt.request.initial_session_id == session.id)
+                .is_some_and(|attempt| {
+                    attempt.status == ContinuationAttemptStatus::Prepared
+                        && is_owner_launch_successor_attempt(attempt)
+                })
+        });
+    owner_launch
+        && prepared_execution_binding_matches(
+            context.worktree(),
+            owner,
+            &session.id,
+            &binding.identity,
+        )
+        .unwrap_or(false)
+}
+
 fn finalize_recovery_probes(
     worktree: &Path,
     session_id: Option<&str>,
@@ -12795,7 +12922,10 @@ fn finalize_recovery_probes(
         .map(invalid_execution_recovery_scope_probe)
         .collect()
     };
-    let probes = probes
+    let prepared_launch = recovery_context
+        .and_then(|context| context.as_ref().ok())
+        .is_some_and(recovery_context_has_prepared_binding);
+    let mut probes = probes
         .into_iter()
         .chain(verification_recovery_probes(
             worktree,
@@ -12803,6 +12933,24 @@ fn finalize_recovery_probes(
             snapshot.ecr_status,
         ))
         .collect::<Vec<_>>();
+    if prepared_launch {
+        // Durable Prepared identity cannot prove the Host still holds the
+        // matching pending coordinator or the caller's original readiness nonce.
+        // Do not promise adoption or continuation admission from disk alone.
+        for probe in &mut probes {
+            if matches!(
+                probe.operation.as_str(),
+                "execution.adopt" | "execution.continue" | "execution.reopen"
+            ) {
+                *probe = crate::cli::governance::RecoveryProbe::unavailable(
+                    &probe.operation,
+                    protected_recovery_metadata(Some(crate::cli::governance::GovernanceCause::NotReady), true),
+                    "prepared_launch_requires_authenticated_readiness_resend; run execution.continue in the original launched Session",
+                );
+            }
+        }
+        snapshot.binding_cause = "prepared_launch_readiness_pending".to_string();
+    }
     for probe in &probes {
         snapshot
             .available_recoveries
@@ -12830,7 +12978,11 @@ fn finalize_recovery_probes(
         }
     }
     snapshot.recovery_probes = probes;
-    snapshot.recovery_hint = execution_recovery_hint(&snapshot);
+    snapshot.recovery_hint = if prepared_launch {
+        Some("prepared_launch_readiness_required".to_string())
+    } else {
+        execution_recovery_hint(&snapshot)
+    };
     snapshot
 }
 
@@ -15433,6 +15585,11 @@ fn run_impl<E: CliEnv>(
             }
         };
         let request = crate::AgentExecutionContinuationRequest {
+            readiness_nonce: recovery_context
+                .as_ref()
+                .and_then(|context| context.as_ref().ok())
+                .filter(|context| recovery_context_has_prepared_binding(context))
+                .and_then(|_| std::env::var(gwt_agent::GWT_CONTINUE_WORK_READY_NONCE_ENV).ok()),
             schema_version: crate::AGENT_EXECUTION_CONTINUATION_SCHEMA_VERSION,
             operation_id: operation_id.clone(),
         };

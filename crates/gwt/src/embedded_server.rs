@@ -89,6 +89,15 @@ impl ServerState {
             self.agent_capabilities.clone(),
             self.host_instance_id.clone(),
             Arc::new(move |event| match event {
+                TransportEvent::FreshExecutionReadyResend {
+                    grant,
+                    request,
+                    reply,
+                } => state.proxy.send(UserEvent::FreshExecutionReadyResend {
+                    grant,
+                    request,
+                    reply,
+                }),
                 TransportEvent::RuntimeHook(event) => {
                     state.proxy.send(UserEvent::RuntimeHook(event))
                 }
