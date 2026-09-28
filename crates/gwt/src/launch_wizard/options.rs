@@ -1041,6 +1041,7 @@ pub(super) fn window_status_wire(status: crate::WindowProcessStatus) -> &'static
         crate::WindowProcessStatus::Waiting => "waiting",
         crate::WindowProcessStatus::Stopped => "stopped",
         crate::WindowProcessStatus::Error => "error",
+        crate::WindowProcessStatus::Interrupted => "interrupted",
     }
 }
 

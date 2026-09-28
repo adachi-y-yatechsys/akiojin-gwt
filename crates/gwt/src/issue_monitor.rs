@@ -16263,7 +16263,8 @@ impl IssueMonitorState {
                     WindowState::Running
                     | WindowState::Starting
                     | WindowState::Idle
-                    | WindowState::Waiting => IssueMonitorRuntimeConsistency::Consistent,
+                    | WindowState::Waiting
+                    | WindowState::Interrupted => IssueMonitorRuntimeConsistency::Consistent,
                 }),
             },
         }
@@ -16358,8 +16359,12 @@ impl IssueMonitorState {
                             (IssueMonitorIdleKind::StuckUnknown, true, None)
                         }
                     }
+                    // Interruption retains ownership while exact recovery is pending.
                     // Running / Starting / Waiting are never idle (AC-6).
-                    WindowState::Running | WindowState::Starting | WindowState::Waiting => continue,
+                    WindowState::Running
+                    | WindowState::Starting
+                    | WindowState::Waiting
+                    | WindowState::Interrupted => continue,
                 },
             };
             // Issue #4131: a dead binding whose execution never settled is
@@ -17251,11 +17256,15 @@ fn expiry_from_now_lexical(now: &str, ttl_secs: u64) -> String {
         .unwrap_or_else(|_| now.to_string())
 }
 
-/// Issue #4084: a pane whose process can still make progress or answer.
+/// A pane that can make progress or retains ownership for exact recovery.
 fn idle_window_is_alive(status: WindowState) -> bool {
     matches!(
         status,
-        WindowState::Running | WindowState::Starting | WindowState::Idle | WindowState::Waiting
+        WindowState::Running
+            | WindowState::Starting
+            | WindowState::Idle
+            | WindowState::Waiting
+            | WindowState::Interrupted
     )
 }
 
@@ -33182,6 +33191,32 @@ mod tests {
         assert!(outcome.released.is_empty());
     }
 
+    #[test]
+    fn interrupted_pane_is_non_terminal_and_retains_its_slot() {
+        let mut monitor = launched_cohort(&[(42, "tab-1::agent")]);
+        monitor.record_window_snapshot(idle_snapshot(
+            IDLE_NOW,
+            vec![idle_observation(
+                "tab-1::agent",
+                Some(42),
+                WindowState::Interrupted,
+                false,
+            )],
+        ));
+        assert_eq!(
+            monitor.runtime_consistency_at(42, IDLE_NOW).consistency,
+            Some(IssueMonitorRuntimeConsistency::Consistent)
+        );
+        let outcome = monitor.reconcile_idle_windows(
+            &settlements(&[(42, IssueMonitorExecutionSettlement::Active)]),
+            IDLE_NOW,
+        );
+        assert!(outcome.released.is_empty());
+        assert!(outcome.requeued.is_empty());
+        assert!(outcome.pane_closes.is_empty());
+        assert_eq!(monitor.active_issue_numbers(), vec![42]);
+    }
+
     /// SPEC #3590 FR-003: only a live launch occupies a slot. A bound pane in
     /// Error is `Terminal` in the row's own runtime consistency, yet a PTY
     /// reader failure reports it without a confirmed exit, so no
@@ -34234,6 +34269,16 @@ mod tests {
             monitor.review_windows()[0].window_id.as_deref(),
             Some("tab-1::review-41")
         );
+        // Interruption keeps the review's ownership and occupied slot.
+        monitor.record_window_snapshot(idle_snapshot(
+            "2026-09-07T04:20:45Z",
+            vec![
+                idle_observation("tab-1::impl-41", Some(41), WindowState::Running, false),
+                idle_observation("tab-1::review-41", Some(41), WindowState::Interrupted, true),
+            ],
+        ));
+        assert_eq!(monitor.review_windows().len(), 1);
+        assert_eq!(monitor.occupied_slot_count(), 2);
         monitor.record_window_snapshot(idle_snapshot(
             "2026-09-07T04:21:00Z",
             vec![idle_observation(

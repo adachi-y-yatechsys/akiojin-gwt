@@ -1748,6 +1748,7 @@ fn status_label(status: WindowState) -> &'static str {
         WindowState::Waiting => "waiting",
         WindowState::Stopped => "stopped",
         WindowState::Error => "error",
+        WindowState::Interrupted => "interrupted",
     }
 }
 
