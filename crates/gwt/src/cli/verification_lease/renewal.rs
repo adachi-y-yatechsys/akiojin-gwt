@@ -186,7 +186,7 @@ impl QueuePressure {
         {
             *self = Self::default();
         }
-        if !pending.is_some_and(|pending| pending >= PENDING_THRESHOLD) {
+        if pending.is_none_or(|pending| pending < PENDING_THRESHOLD) {
             *self = Self::default();
             return false;
         }

@@ -38381,6 +38381,53 @@ fn app_runtime_startup_recovery_reads_only_restore_candidates_and_defers_the_res
         .any(|session| session.id == "session-stale"));
 }
 
+/// Issue #4730 AC-3: historical rows cannot multiply synchronous Git work.
+#[test]
+fn startup_restore_defers_1500_old_sessions_without_git_spawns() {
+    let temp = tempdir().expect("tempdir");
+    let _gwt_home = ScopedGwtHome::set(temp.path());
+    let repo = temp.path().join("repo");
+    init_git_clone_with_origin(&repo);
+    let tab = sample_project_tab("tab-repo", "Repo", repo.clone(), ProjectKind::Git, &[]);
+    let mut runtime = sample_runtime(temp.path(), vec![tab], Some("tab-repo"));
+    let (spawner, tasks) = BlockingTaskSpawner::queued();
+    runtime.blocking_tasks = spawner;
+    fs::create_dir_all(&runtime.sessions_dir).unwrap();
+    let modified = std::time::SystemTime::now() - Duration::from_secs(3 * 24 * 60 * 60);
+    for index in 0..1500 {
+        let mut session = gwt_agent::Session::new(&repo, "work/history", gwt_agent::AgentId::Codex);
+        session.id = format!("history-{index}");
+        session.last_activity_at = chrono::Utc::now() - chrono::Duration::days(3);
+        let path = runtime.sessions_dir.join(format!("{}.toml", session.id));
+        fs::write(&path, toml::to_string(&session).unwrap()).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+    }
+    let git_spawns = gwt_core::process::thread_git_spawn_count();
+    runtime.queue_startup_auto_resume_sessions(&HashSet::new());
+    assert_eq!(gwt_core::process::thread_git_spawn_count() - git_spawns, 0);
+    assert!(runtime.pending_startup_auto_resume_sessions.is_empty());
+    assert_eq!(
+        tasks.lock().unwrap().len(),
+        1,
+        "one deferred recovery sweep"
+    );
+    assert!(
+        fs::read_dir(&runtime.sessions_dir).unwrap().all(|entry| {
+            entry
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "toml")
+        }),
+        "historical Sessions must not be locked and parsed before the deferred sweep"
+    );
+}
+
 #[test]
 fn app_runtime_startup_auto_resume_includes_legacy_non_stopped_sessions() {
     let _env_lock = env_test_lock()
@@ -50409,6 +50456,7 @@ fn app_runtime_quick_register_issue_creates_issue_cache_and_inbox_entry() {
         FrontendEvent::QuickRegisterIssue {
             title: "Investigate Intake registration".to_string(),
             launch: false,
+            auto_merge: false,
         },
     );
 
@@ -50463,6 +50511,47 @@ fn app_runtime_quick_register_issue_creates_issue_cache_and_inbox_entry() {
         .expect("registered issue appears in monitor inbox");
     assert_eq!(item.issue.title, "Investigate Intake registration");
     assert_eq!(item.state, gwt::MonitorInboxState::Queued);
+}
+
+// SPEC #3885 T-033 (FR-022): the "+ New" popover's auto-merge checkbox labels
+// the Issue at creation time.
+#[test]
+fn app_runtime_quick_register_issue_applies_the_auto_merge_label() {
+    let _env_lock = env_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().expect("tempdir");
+    let _home = ScopedEnvVar::set("HOME", temp.path());
+    let _userprofile = ScopedEnvVar::set("USERPROFILE", temp.path());
+
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    init_repo(&repo);
+
+    let fake_client = Arc::new(FakeIssueClient::new());
+    let tab = sample_project_tab("tab-1", "Repo", repo.clone(), ProjectKind::Git, &[]);
+    let mut runtime = sample_runtime(temp.path(), vec![tab], Some("tab-1"));
+    runtime.issue_client_factory = Arc::new({
+        let fake_client = Arc::clone(&fake_client);
+        move |_owner, _repo| {
+            let client: Arc<dyn IssueClient> = fake_client.clone();
+            Ok(client)
+        }
+    });
+
+    runtime.handle_frontend_event(
+        "client-1".to_string(),
+        FrontendEvent::QuickRegisterIssue {
+            title: "Ship the popover".to_string(),
+            launch: false,
+            auto_merge: true,
+        },
+    );
+
+    let cached = Cache::new(issue_cache_root(&repo))
+        .load_entry(IssueNumber(1))
+        .expect("quick issue written to cache");
+    assert_eq!(cached.snapshot.labels, vec!["auto-merge".to_string()]);
 }
 
 struct PermissionDeniedCreateIssueClient;
@@ -50565,6 +50654,7 @@ fn app_runtime_quick_register_issue_permission_error_includes_reason_and_fallbac
         FrontendEvent::QuickRegisterIssue {
             title: "Investigate Intake registration".to_string(),
             launch: false,
+            auto_merge: false,
         },
     );
 
@@ -76557,7 +76647,13 @@ fn restore_admits_worktree_with_unlanded_commits() {
     let runtime = sample_runtime(temp.path(), vec![], None);
     let mut session = gwt_agent::Session::new(&repo, "work/live", gwt_agent::AgentId::Codex);
     session.agent_session_id = Some("native-live".into());
+    let git_spawns = gwt_core::process::thread_git_spawn_count();
     assert_eq!(runtime.restore_admission(&session, &repo, None), Ok(()));
+    assert_eq!(
+        gwt_core::process::thread_git_spawn_count() - git_spawns,
+        1,
+        "the merge-base restore check must participate in startup Git measurements"
+    );
 }
 
 #[test]
