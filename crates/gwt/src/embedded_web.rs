@@ -94,7 +94,7 @@ root_js_modules! {
     "window-docking.js" => "findTitlebarDockTarget",
     "board-surface.js" => "boardEntryMentionsSelf",
     "agent-kanban-surface.js" => "createAgentKanbanSurface",
-    "workspace-kanban-surface.js" => "createWorkspaceKanbanSurface",
+    "issue-other-surface.js" => "createIssueOtherSurface",
     "workspace-resume-picker-modal.js" => "createWorkspaceResumePickerController",
     "update-cta.js" => "createUpdateCtaController",
     "terminal-context-menu.js" => "createTerminalContextMenuController",
@@ -129,7 +129,7 @@ root_js_modules! {
     // Issue #3365 — render-key lifecycle with per-window exception isolation
     // (a failed sync retries on the next workspace_state instead of freezing
     // the minimap / window list / telemetry behind a committed key).
-    "workspace-render-sync.js" => "createWorkspaceRenderSync",
+    "issue-render-sync.js" => "createWorkspaceRenderSync",
     // Issue #3365 — user-visible degradation notice for swallowed
     // render/receive failures.
     "render-degradation-banner.js" => "createRenderDegradationBanner",

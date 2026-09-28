@@ -1,6 +1,7 @@
 //! `errors.list` JSON operation (Issue #3778).
 
 use chrono::{DateTime, Utc};
+use gwt_core::error_ledger::{ErrorRecord, ErrorScope};
 use gwt_github::{client::ApiError, SpecOpsError};
 use serde::Serialize;
 
@@ -8,7 +9,49 @@ use crate::cli::{CliEnv, CliParseError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ErrorsCommand {
-    List { since: Option<String> },
+    List {
+        since: Option<String>,
+        scope: ErrorListScope,
+        project_root: Option<String>,
+    },
+}
+
+/// Explicit ledger selection; the default query excludes shared and unowned faults.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ErrorListScope {
+    #[default]
+    Project,
+    Host,
+    Unknown,
+    All,
+}
+
+impl ErrorListScope {
+    pub(crate) fn parse(raw: &str) -> Result<Self, CliParseError> {
+        match raw {
+            "project" => Ok(Self::Project),
+            "host" => Ok(Self::Host),
+            "unknown" => Ok(Self::Unknown),
+            "all" => Ok(Self::All),
+            _ => Err(CliParseError::InvalidValue {
+                flag: "scope",
+                reason: "must be project, host, unknown, or all",
+            }),
+        }
+    }
+
+    fn includes(self, record: &ErrorRecord, project_root: Option<&str>) -> bool {
+        if let Some(root) = project_root {
+            return record.scope == ErrorScope::Project
+                && record.target.project_root.as_deref() == Some(root);
+        }
+        match self {
+            Self::Project => record.scope == ErrorScope::Project,
+            Self::Host => record.scope == ErrorScope::Host,
+            Self::Unknown => record.scope == ErrorScope::Unknown,
+            Self::All => true,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -26,7 +69,11 @@ pub fn run<E: CliEnv>(
 ) -> Result<i32, SpecOpsError> {
     let _ = env;
     match command {
-        ErrorsCommand::List { since } => {
+        ErrorsCommand::List {
+            since,
+            scope,
+            project_root,
+        } => {
             let cutoff = since
                 .as_deref()
                 .map(parse_since)
@@ -34,6 +81,10 @@ pub fn run<E: CliEnv>(
                 .map_err(|err| SpecOpsError::from(ApiError::Network(err.to_string())))?;
             let errors = gwt_core::error_ledger::list_since(cutoff)
                 .map_err(|err| SpecOpsError::from(ApiError::Network(err.to_string())))?;
+            let errors: Vec<_> = errors
+                .into_iter()
+                .filter(|record| scope.includes(record, project_root.as_deref()))
+                .collect();
             let payload = ErrorsListPayload {
                 schema_version: gwt_core::error_ledger::SCHEMA_VERSION,
                 since,
@@ -93,6 +144,8 @@ mod tests {
             &mut env,
             ErrorsCommand::List {
                 since: Some("2026-08-01T00:00:00Z".into()),
+                scope: ErrorListScope::All,
+                project_root: None,
             },
             &mut out,
         )

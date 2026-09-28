@@ -14527,6 +14527,29 @@ fn app_runtime_custom_agent_cache_refresh_rebroadcasts_open_wizard_state() {
 }
 
 #[test]
+fn issue_monitor_error_notification_keeps_project_in_ledger() {
+    let temp = tempdir().unwrap();
+    let _home = ScopedGwtHome::set(temp.path());
+    let root = temp.path().join("repo");
+    let tab = sample_project_tab("tab-1", "Repo", root.clone(), ProjectKind::NonRepo, &[]);
+    let runtime = sample_runtime(temp.path(), vec![tab], Some("tab-1"));
+    let event = BackendEvent::IssueMonitorLaunchFailed {
+        issue_number: 4735,
+        message: "project notification failure".into(),
+    };
+    let outbound = runtime
+        .issue_monitor_project_notification(Some(&root), event)
+        .unwrap();
+    prepare_outbound_event(&outbound);
+    let rows = gwt_core::error_ledger::list_since(None).unwrap();
+    let row = rows
+        .iter()
+        .find(|row| row.message == "project notification failure")
+        .unwrap();
+    assert_eq!(row.target.project_root.as_deref(), root.to_str());
+}
+
+#[test]
 fn app_runtime_launch_wizard_submit_failure_emits_structured_error_log() {
     let temp = tempdir().expect("tempdir");
     let _gwt_home = ScopedGwtHome::set(temp.path());
@@ -14552,6 +14575,16 @@ fn app_runtime_launch_wizard_submit_failure_emits_structured_error_log() {
             Some(canvas_bounds()),
         );
     });
+
+    let rows = gwt_core::error_ledger::list_since(None).unwrap();
+    let row = rows
+        .iter()
+        .find(|row| row.message == "Agent option is unavailable")
+        .unwrap();
+    assert_eq!(
+        row.target.project_root.as_deref(),
+        Some(repo.to_str().unwrap())
+    );
 
     let event = events
         .iter()
@@ -24075,6 +24108,261 @@ fn fresh_execution_session_replacement_before_work_commit_preserves_predecessor_
 }
 
 #[test]
+fn fresh_execution_continue_resends_ready_and_commits_work() {
+    let _env_guard = env_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().expect("tempdir");
+    let _home = ScopedGwtHome::set(temp.path());
+    // HTTP workers must resolve the same isolated Session and trusted stores.
+    let _home_env = gwt_core::test_support::ScopedEnvVar::set("HOME", temp.path());
+    let _profile = gwt_core::test_support::ScopedEnvVar::set("USERPROFILE", temp.path());
+    let mut fixture = pending_fresh_execution_fixture(temp.path(), "fresh-continue-ready");
+    run_git(
+        &fixture.repo,
+        &["symbolic-ref", "HEAD", "refs/heads/work/issue-2359"],
+    );
+    let nonce = fixture.runtime.pending_fresh_execution_launches[&fixture.window_id]
+        .readiness_nonce
+        .clone();
+    let tokio = TokioRuntime::new().unwrap();
+    let (proxy, recorded_events) = AppEventProxy::stub();
+    let mut server = crate::embedded_server::EmbeddedServer::start(
+        &tokio,
+        proxy,
+        crate::embedded_server::ClientHub::default(),
+        Arc::clone(&fixture.runtime.pty_writers),
+        AttachmentUploadStore::in_system_temp(),
+    )
+    .unwrap();
+    fixture.issuer = server.agent_capability_issuer();
+    let target = fixture
+        .issuer
+        .issue_prepared(
+            &fixture.repo,
+            &fixture.candidate_session_id,
+            fixture.binding.clone(),
+        )
+        .unwrap();
+    fixture.token = target.token.clone();
+    fixture.runtime.agent_capability_issuer = Some(fixture.issuer.clone());
+    fixture
+        .runtime
+        .agent_capability_tokens
+        .insert(fixture.window_id.clone(), target.token.clone());
+    let url = reqwest::Url::parse(&target.url)
+        .unwrap()
+        .join("/internal/execution-continuation")
+        .unwrap();
+    let request = gwt::AgentExecutionContinuationRequest {
+        schema_version: 1,
+        operation_id: "continue-ready-request".to_string(),
+        readiness_nonce: Some(nonce),
+    };
+    assert!(!format!("{request:?}").contains(request.readiness_nonce.as_deref().unwrap()));
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap();
+    let continue_via_host = |fixture: &mut PendingFreshExecutionFixture| {
+        let send = client
+            .post(url.clone())
+            .bearer_auth(&target.token)
+            .json(&request)
+            .build()
+            .unwrap();
+        let request_client = client.clone();
+        let response = thread::spawn(move || request_client.execute(send).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let event = {
+                let mut events = recorded_events.lock().unwrap();
+                events
+                    .iter()
+                    .position(|event| matches!(event, UserEvent::FreshExecutionReadyResend { .. }))
+                    .map(|index| events.remove(index))
+            };
+            if let Some(UserEvent::FreshExecutionReadyResend {
+                grant,
+                request,
+                reply,
+            }) = event
+            {
+                let (result, _) = fixture
+                    .runtime
+                    .resend_fresh_execution_ready(&grant, &request);
+                reply.send(result).unwrap();
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Host did not dispatch readiness resend"
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+        response.join().unwrap()
+    };
+    let response = continue_via_host(&mut fixture);
+    let status = response.status();
+    let body = response.text().unwrap();
+    assert!(status.is_success(), "{status}: {body}");
+    let receipt: gwt::AgentExecutionContinuationReceipt = serde_json::from_str(&body).unwrap();
+    assert_eq!(receipt.operation_id, "continue-ready-request");
+    assert_eq!(receipt.execution_binding, fixture.binding.identity);
+    assert!(receipt.validated);
+    assert!(fixture
+        .issuer
+        .active_token_is_current(&fixture.token, &fixture.binding));
+    assert_eq!(
+        gwt::cli::execution_state::current_execution_binding(&fixture.repo, fixture.owner).unwrap(),
+        Some(fixture.binding.identity.clone())
+    );
+    let ledger = gwt::cli::execution_state::load_generation_ledger(&fixture.repo, fixture.owner)
+        .unwrap()
+        .unwrap();
+    assert_eq!(ledger.generations.len(), 2);
+    assert_eq!(
+        ledger.generations[0].status,
+        gwt::cli::execution_state::ExecutionControlStatus::Blocked
+    );
+    assert!(!fixture
+        .runtime
+        .pending_fresh_execution_launches
+        .contains_key(&fixture.window_id));
+    let update = client
+        .post(url.join("/internal/workspace-update").unwrap())
+        .bearer_auth(&target.token)
+        .json(&gwt::AgentWorkspaceUpdateRequest {
+            schema_version: gwt::AGENT_WORKSPACE_UPDATE_SCHEMA_VERSION,
+            claimed_session_id: fixture.candidate_session_id.clone(),
+            observation: gwt::AgentRuntimeObservation {
+                cwd: fixture.repo.display().to_string(),
+                git_toplevel: fixture.repo.display().to_string(),
+                repo_hash: fixture.binding.repo_hash.clone(),
+                branch: "work/issue-2359".to_string(),
+            },
+            intent: gwt::AgentWorkspaceUpdateIntent {
+                current_focus: Some("verify fresh authority".to_string()),
+                ..Default::default()
+            },
+        })
+        .send()
+        .unwrap();
+    let status = update.status();
+    let body = update.text().unwrap();
+    assert!(
+        status.is_success(),
+        "workspace.update with the promoted capability: {status}: {body}"
+    );
+    let replay = continue_via_host(&mut fixture);
+    let status = replay.status();
+    let body = replay.text().unwrap();
+    assert!(
+        status.is_success(),
+        "ready response-loss replay: {status}: {body}"
+    );
+    let replay: gwt::AgentExecutionContinuationReceipt = serde_json::from_str(&body).unwrap();
+    assert_eq!(replay.generation_id, receipt.generation_id);
+    assert_eq!(
+        gwt::cli::execution_state::load_generation_ledger(&fixture.repo, fixture.owner)
+            .unwrap()
+            .unwrap()
+            .generations
+            .len(),
+        2
+    );
+    server.shutdown();
+}
+
+#[test]
+fn fresh_execution_continue_repairs_activated_response_loss_before_acknowledging() {
+    let _env_guard = env_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().expect("tempdir");
+    let _home = ScopedGwtHome::set(temp.path());
+    let mut fixture = pending_fresh_execution_fixture(temp.path(), "fresh-continue-response-loss");
+    run_git(
+        &fixture.repo,
+        &["symbolic-ref", "HEAD", "refs/heads/work/issue-2359"],
+    );
+    leave_fresh_execution_activated_before_projection_commit(&mut fixture);
+    let (result, _) = fixture.runtime.resend_fresh_execution_ready(
+        &fixture.issuer.grant_for_test(&fixture.token).unwrap(),
+        &gwt::AgentExecutionContinuationRequest {
+            schema_version: 1,
+            operation_id: "retry-ready-request".to_string(),
+            readiness_nonce: None,
+        },
+    );
+    assert!(result
+        .expect("Active capability retry must repair the matching pending fresh coordinator")
+        .is_some());
+    assert!(!fixture
+        .runtime
+        .pending_fresh_execution_launches
+        .contains_key(&fixture.window_id));
+    assert_eq!(
+        gwt::cli::execution_state::current_execution_binding(&fixture.repo, fixture.owner).unwrap(),
+        Some(fixture.binding.identity)
+    );
+    assert!(!durable_launch_recovery_exists(
+        &fixture.runtime.sessions_dir,
+        &fixture.candidate_session_id
+    ));
+}
+
+#[test]
+fn fresh_execution_continue_refuses_wrong_nonce_without_mutation() {
+    let _env_guard = env_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().expect("tempdir");
+    let _home = ScopedGwtHome::set(temp.path());
+    let mut fixture = pending_fresh_execution_fixture(temp.path(), "fresh-continue-wrong-nonce");
+    run_git(
+        &fixture.repo,
+        &["symbolic-ref", "HEAD", "refs/heads/work/issue-2359"],
+    );
+    let before =
+        gwt::cli::execution_state::load_generation_ledger(&fixture.repo, fixture.owner).unwrap();
+    let diagnosis =
+        gwt::cli::execution_state::diagnose(&fixture.repo, Some(&fixture.candidate_session_id));
+    assert!(
+        !diagnosis
+            .available_recoveries
+            .iter()
+            .any(|operation| operation == "execution.adopt" || operation == "execution.continue"),
+        "Prepared recovery needs Host readiness proof: {diagnosis:?}"
+    );
+    assert_eq!(
+        diagnosis.recovery_hint.as_deref(),
+        Some("prepared_launch_readiness_required")
+    );
+    let (result, events) = fixture.runtime.resend_fresh_execution_ready(
+        &fixture.issuer.grant_for_test(&fixture.token).unwrap(),
+        &gwt::AgentExecutionContinuationRequest {
+            schema_version: 1,
+            operation_id: "continue-ready-request".to_string(),
+            readiness_nonce: Some("wrong-nonce".to_string()),
+        },
+    );
+    assert!(result.is_err());
+    assert!(events.is_empty());
+    assert_eq!(
+        gwt::cli::execution_state::load_generation_ledger(&fixture.repo, fixture.owner).unwrap(),
+        before
+    );
+    assert!(fixture
+        .issuer
+        .prepared_token_is_current(&fixture.token, &fixture.binding));
+    assert!(fixture
+        .runtime
+        .pending_fresh_execution_launches
+        .contains_key(&fixture.window_id));
+}
+
+#[test]
 fn fresh_execution_wrong_session_start_nonce_aborts_candidate_and_preserves_blocked_predecessor() {
     let _env_guard = env_test_lock()
         .lock()
@@ -30648,6 +30936,10 @@ fn active_work_item_view_lifecycle_state_back_compat_default() {
     });
     let view: gwt::ActiveWorkItemView =
         serde_json::from_value(legacy).expect("deserialize legacy active work item");
+    assert_eq!(
+        serde_json::to_value(&view).unwrap()["linked_issue_numbers"],
+        serde_json::json!([])
+    );
     assert_eq!(view.lifecycle_state, "active");
     assert_eq!(view.closed_at, None);
 }
@@ -60598,6 +60890,7 @@ fn attach_registry_sessions_caps_total_agents_on_the_wire() {
         })
         .collect();
     let mut works = vec![gwt::ActiveWorkItemView {
+        linked_issue_numbers: Vec::new(),
         id: "work-develop-7ea5aa57".to_string(),
         title: "develop".to_string(),
         status_category: "idle".to_string(),
@@ -60688,6 +60981,7 @@ fn attach_registry_sessions_keeps_latest_entry_per_agent_identity() {
     }
 
     let mut works = vec![gwt::ActiveWorkItemView {
+        linked_issue_numbers: Vec::new(),
         id: "work-develop-7ea5aa57".to_string(),
         title: "develop".to_string(),
         status_category: "idle".to_string(),
@@ -60911,6 +61205,7 @@ fn workspace_test_work(
     works: Vec<gwt::ActiveWorkspaceWorkView>,
 ) -> gwt::ActiveWorkItemView {
     gwt::ActiveWorkItemView {
+        linked_issue_numbers: Vec::new(),
         id: "work-shared".to_string(),
         title: "work/shared".to_string(),
         status_category: "idle".to_string(),
@@ -61294,6 +61589,7 @@ fn attach_registry_sessions_recomputes_agent_counters_after_identity_collapse() 
     }
 
     let mut works = vec![gwt::ActiveWorkItemView {
+        linked_issue_numbers: Vec::new(),
         id: "work-develop-7ea5aa57".to_string(),
         title: "develop".to_string(),
         status_category: "active".to_string(),
@@ -61390,6 +61686,7 @@ fn attach_registry_sessions_drops_ghost_agents_without_identity_or_sessions() {
     }
 
     let mut works = vec![gwt::ActiveWorkItemView {
+        linked_issue_numbers: Vec::new(),
         id: "work-work-x-12345678".to_string(),
         title: "work/x".to_string(),
         status_category: "idle".to_string(),
@@ -61516,6 +61813,7 @@ fn attach_registry_sessions_dedupes_agents_sharing_a_conversation() {
     }
 
     let mut works = vec![gwt::ActiveWorkItemView {
+        linked_issue_numbers: Vec::new(),
         id: "work-work-x-12345678".to_string(),
         title: "work/x".to_string(),
         status_category: "idle".to_string(),
@@ -61652,6 +61950,7 @@ fn attach_registry_sessions_filters_agents_from_other_workspace_rows() {
     session_index.insert(other_session.id.as_str(), &other_session);
 
     let mut works = vec![gwt::ActiveWorkItemView {
+        linked_issue_numbers: Vec::new(),
         id: "work-work-issue-206-a0668517".to_string(),
         title: "contribution docs PR".to_string(),
         status_category: "idle".to_string(),
@@ -61898,6 +62197,7 @@ fn resume_branch_index_accepts_existing_worktree_without_branch_evidence() {
 #[test]
 fn active_works_are_sorted_by_latest_update_descending() {
     let row = |id: &str, branch: &str, updated_at: &str| gwt::ActiveWorkItemView {
+        linked_issue_numbers: Vec::new(),
         id: id.to_string(),
         title: branch.to_string(),
         status_category: "idle".to_string(),
@@ -61976,6 +62276,7 @@ fn active_works_are_sorted_by_latest_update_descending() {
 #[test]
 fn mark_merged_active_works_flags_cache_and_pr_state() {
     let row = |branch: Option<&str>, pr_state: Option<&str>| gwt::ActiveWorkItemView {
+        linked_issue_numbers: Vec::new(),
         id: "w".to_string(),
         title: "t".to_string(),
         status_category: "idle".to_string(),
@@ -62046,6 +62347,7 @@ fn dirty_worktree_pr_state_merged_does_not_flag_or_cleanup() {
     fs::write(repo.join("local-change.txt"), "current edits\n").expect("write dirty file");
 
     let mut works = vec![gwt::ActiveWorkItemView {
+        linked_issue_numbers: Vec::new(),
         id: "w-dirty".to_string(),
         title: "Dirty work".to_string(),
         status_category: "idle".to_string(),
@@ -63397,6 +63699,7 @@ fn assign_and_merge_workspace_groups_unifies_same_branch_rows() {
         lifecycle: &str,
     ) -> gwt::ActiveWorkItemView {
         gwt::ActiveWorkItemView {
+            linked_issue_numbers: Vec::new(),
             id: id.to_string(),
             title: id.to_string(),
             status_category: "idle".to_string(),
@@ -63461,6 +63764,8 @@ fn assign_and_merge_workspace_groups_unifies_same_branch_rows() {
         ),
     ];
 
+    works[0].linked_issue_numbers = vec![3885];
+    works[1].linked_issue_numbers = vec![3885, 4556];
     super::assign_and_merge_workspace_groups(&mut works, &root);
 
     assert_eq!(
@@ -63475,6 +63780,7 @@ fn assign_and_merge_workspace_groups_unifies_same_branch_rows() {
                 || work.branch.as_deref() == Some("work/x")
         })
         .expect("grouped row");
+    assert_eq!(group.linked_issue_numbers, vec![3885, 4556]);
     assert_eq!(
         group.id, "work-session-bbbb",
         "newest row is the representative"
@@ -63605,6 +63911,7 @@ fn legacy_workspace_lifecycle_does_not_create_an_implicit_close_target() {
 fn mark_remote_only_flags_fetched_branches_without_local_worktree() {
     fn row(id: &str, branch: Option<&str>, worktree: Option<&str>) -> gwt::ActiveWorkItemView {
         gwt::ActiveWorkItemView {
+            linked_issue_numbers: Vec::new(),
             id: id.to_string(),
             title: id.to_string(),
             status_category: "idle".to_string(),
@@ -63687,6 +63994,7 @@ fn mark_merged_classifies_done_equivalent_for_stale_merged_rows() {
         updated_at: &str,
     ) -> gwt::ActiveWorkItemView {
         gwt::ActiveWorkItemView {
+            linked_issue_numbers: Vec::new(),
             id: id.to_string(),
             title: id.to_string(),
             status_category: "idle".to_string(),
@@ -63764,6 +64072,7 @@ fn mark_merged_classifies_done_equivalent_for_stale_merged_rows() {
 #[test]
 fn mark_cleanup_candidates_exposes_no_changes_reason_without_merged_badge() {
     let mut works = vec![gwt::ActiveWorkItemView {
+        linked_issue_numbers: Vec::new(),
         id: "w-no-changes".to_string(),
         title: "No changes".to_string(),
         status_category: "idle".to_string(),
@@ -63845,6 +64154,7 @@ fn mark_cleanup_candidates_sets_blocked_reason_for_live_agent_and_process() {
     fs::create_dir_all(&live_process_worktree).expect("create live process worktree");
     let mut works = vec![
         gwt::ActiveWorkItemView {
+            linked_issue_numbers: Vec::new(),
             id: "w-live-agent".to_string(),
             title: "Live agent".to_string(),
             status_category: "active".to_string(),
@@ -63877,6 +64187,7 @@ fn mark_cleanup_candidates_sets_blocked_reason_for_live_agent_and_process() {
             updated_at: String::new(),
         },
         gwt::ActiveWorkItemView {
+            linked_issue_numbers: Vec::new(),
             id: "w-live-process".to_string(),
             title: "Live process".to_string(),
             status_category: "idle".to_string(),
@@ -64055,6 +64366,7 @@ fn apply_work_summary_external_sources_prefers_pr_then_ai_then_commit_subject() 
     );
 
     let base = |branch: &str, work_summary: Option<&str>| gwt::ActiveWorkItemView {
+        linked_issue_numbers: Vec::new(),
         id: branch.to_string(),
         title: branch.to_string(),
         status_category: "idle".to_string(),
@@ -76218,6 +76530,7 @@ not toml";
         rows[0].kind,
         gwt_core::error_ledger::ErrorKind::OperationRefusal
     );
+    assert_eq!(rows[0].scope, gwt_core::error_ledger::ErrorScope::Host);
     assert!(
         rows[0]
             .message
@@ -78312,3 +78625,66 @@ include!("pm_project_state_tests.rs");
 include!("project_owned_state_tests.rs");
 
 include!("project_aggregate_tests.rs");
+
+#[test]
+fn active_work_issue_numbers_include_child_record_session_and_branch_links() {
+    let mut session = gwt_agent::Session::new("/repo", "work/shared", gwt_agent::AgentId::Codex);
+    session.id = "linked-session".to_string();
+    session.linked_issue_number = Some(33);
+    let agent = workspace_test_agent_with_conversation(
+        "linked-session",
+        "2026-09-01T00:00:00Z",
+        "conversation",
+    );
+    let mut child = workspace_test_child("child-work", vec![agent]);
+    child.owner = Some("Issue #22".to_string());
+    let mut work = workspace_test_work(vec![], vec![child]);
+    work.branch = Some("origin/work/shared".to_string());
+    work.owner = Some("SPEC #11".to_string());
+    let record = serde_json::from_value(serde_json::json!({
+        "id": "child-work", "title": "Child", "owner": "Issue #55", "status_category": "idle",
+        "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+    }))
+    .unwrap();
+    let mut rows = vec![work];
+    super::workspace_views::attach_active_work_issue_numbers(
+        &mut rows,
+        &[record],
+        &[session],
+        None,
+        &std::collections::HashMap::from([("work/shared".to_string(), 44)]),
+    );
+    assert_eq!(rows[0].linked_issue_numbers, vec![11, 22, 33, 44, 55]);
+    // The metadata remains usable without any Knowledge/Issue page loaded.
+    assert_eq!(
+        serde_json::to_value(&rows[0]).unwrap()["linked_issue_numbers"],
+        serde_json::json!([11, 22, 33, 44, 55])
+    );
+}
+
+#[test]
+fn active_work_issue_numbers_include_registry_sessions_beyond_the_display_cap() {
+    let repo = tempfile::tempdir().unwrap();
+    let _gwt_home = ScopedGwtHome::set(repo.path());
+    init_repo(repo.path());
+    let hash = gwt_core::repo_hash::detect_repo_hash(repo.path()).unwrap();
+    let sessions = (1..=12)
+        .map(|number| {
+            let mut session =
+                gwt_agent::Session::new(repo.path(), "work/shared", gwt_agent::AgentId::Codex);
+            session.id = format!("session-{number}");
+            session.repo_hash = Some(hash.as_str().to_string());
+            session.linked_issue_number = Some(number);
+            session
+        })
+        .collect::<Vec<_>>();
+    let mut rows = vec![workspace_test_work(vec![], vec![])];
+    super::workspace_views::attach_active_work_issue_numbers(
+        &mut rows,
+        &[],
+        &sessions,
+        Some(hash),
+        &std::collections::HashMap::new(),
+    );
+    assert_eq!(rows[0].linked_issue_numbers, (1..=12).collect::<Vec<_>>());
+}

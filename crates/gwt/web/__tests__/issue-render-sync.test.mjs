@@ -18,7 +18,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createWorkspaceRenderSync } from "../workspace-render-sync.js";
+import { createWorkspaceRenderSync } from "../issue-render-sync.js";
 
 function renderArgs(overrides = {}) {
   return {

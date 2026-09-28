@@ -140,21 +140,18 @@
                 <span aria-hidden="true">⚙</span>
               </button>
             </div>
-            <!-- SPEC-3245 Stage E: the deprecated Intake launch entry is removed;
-                 Workspace remains the normal route into existing work. -->
-            <!-- FR-392 (SPEC-2359 W-15): surface entry points say "Workspace"
-                 (Workspace = place / Work = launch / Session = conversation). -->
+            <!-- SPEC-3885: Issue is the shared entry for Issue and Other work. -->
             <button
               class="op-rail__item"
               type="button"
               id="op-workspace-overview-entry"
-              aria-label="Workspace"
+              aria-label="Issues"
               aria-keyshortcuts="Meta+G"
-              title="Workspace"
+              title="Issues"
             >
               <span class="op-rail__icon" aria-hidden="true">◆</span>
               <span class="op-rail__flyout" aria-hidden="true">
-                <span class="op-rail__flyout-label">Workspace</span>
+                <span class="op-rail__flyout-label">Issues</span>
                 <kbd class="op-rail__kbd">⌘ G</kbd>
               </span>
             </button>
@@ -305,11 +302,11 @@
             <p class="canvas-empty-state__kicker"><span aria-hidden="true">▸</span> OPERATOR READY</p>
             <h2 class="canvas-empty-state__title">No windows on canvas</h2>
             <p class="canvas-empty-state__copy">
-              Open an existing Workspace or add a surface window.
+              Open Issues to continue work, or add a surface window.
             </p>
             <div class="canvas-empty-state__actions">
               <button class="wizard-button primary" id="canvas-empty-open-workspace" type="button">
-                Open Workspace
+                Open Issues
               </button>
               <button class="wizard-button" id="canvas-empty-add-window" type="button">
                 Add window
@@ -501,7 +498,7 @@
               <kbd class="op-kbd">⌘ B</kbd>
             </div>
             <div class="op-hotkey-card__row">
-              <span>Workspace surface</span>
+              <span>Issue surface</span>
               <kbd class="op-kbd">⌘ G</kbd>
             </div>
             <div class="op-hotkey-card__row">

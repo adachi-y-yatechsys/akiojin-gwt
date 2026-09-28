@@ -1449,7 +1449,8 @@ fn issue_monitor_daemon_user_event(
             Some(UserEvent::Dispatch(vec![OutboundEvent::project(
                 gwt_core::paths::resolve_project_scope(project_root).hash,
                 toast,
-            )]))
+            )
+            .with_error_project_root(project_root)]))
         }
         "launch_request" => {
             let issue_number = payload.get("issue_number")?.as_u64()?;
@@ -1807,6 +1808,13 @@ enum UserEvent {
         pm_status: Option<BackendEvent>,
         monitor_result: WindowCloseMonitorResult,
     },
+    FreshExecutionReadyResend {
+        grant: AgentCapabilityGrant,
+        request: gwt::AgentExecutionContinuationRequest,
+        reply: std::sync::mpsc::Sender<
+            Result<Option<gwt::AgentExecutionContinuationReceipt>, gwt::AgentWorkspaceUpdateError>,
+        >,
+    },
     RuntimeHook(gwt::RuntimeHookEvent),
     DaemonRuntimeHook(gwt::RuntimeHookEvent),
     DaemonRuntimeApprovalOverlay {
@@ -2101,6 +2109,7 @@ mod tests {
             event,
             knowledge_wire_metadata: None,
             terminal_stream_seq: None,
+            error_origin: None,
         }
     }
 
@@ -10518,6 +10527,11 @@ fn main() -> std::io::Result<()> {
                     monitor_result,
                 ));
             }
+            Event::UserEvent(UserEvent::FreshExecutionReadyResend { grant, request, reply }) => {
+                let (result, events) = app.resend_fresh_execution_ready(&grant, &request);
+                clients.dispatch(events);
+                let _ = reply.send(result);
+            }
             Event::UserEvent(UserEvent::RuntimeHook(event)) => {
                 let events = app.handle_runtime_hook_event(event);
                 clients.dispatch(events);
@@ -10582,7 +10596,7 @@ fn main() -> std::io::Result<()> {
                             level: "error".to_string(),
                             message,
                             issue_number: None,
-                        }))
+                        }).with_error_project_root(&project_root))
                     })
                     .collect::<Vec<_>>();
                 events.extend(app.issue_monitor_scheduled_scan_complete_events(
