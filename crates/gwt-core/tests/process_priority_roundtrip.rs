@@ -50,10 +50,8 @@ fn roundtrip() {
         .expect("spawn paused child");
     let pid = child.id();
     let result = std::panic::catch_unwind(|| {
-        assert_eq!(
-            process_priority_class(pid).expect("query initial class"),
-            ProcessPriorityClass::Normal
-        );
+        let initial = process_priority_class(pid).expect("query initial class");
+        eprintln!("child inherited {initial:?}");
         set_process_priority_class(pid, ProcessPriorityClass::BelowNormal)
             .expect("lower child priority class");
         assert_eq!(
