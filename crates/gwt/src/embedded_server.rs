@@ -979,6 +979,10 @@ impl AgentCapabilityGrant {
     pub(crate) fn principal(&self) -> &AgentSessionPrincipal {
         &self.principal
     }
+
+    pub(crate) fn matches_token(&self, token: &str) -> bool {
+        self.token == token
+    }
 }
 
 impl std::fmt::Debug for AgentCapabilityGrant {
@@ -3962,6 +3966,38 @@ async fn execution_continuation_handler(
     };
     let project_root = grant.principal().canonical_project_root().to_path_buf();
     let session_id = grant.principal().session_id().to_string();
+    if let Err(error) = request.validate() {
+        return workspace_update_error_response(workspace_update_error_status(error.code), error);
+    }
+    if grant.principal().execution_binding().is_some() {
+        let (reply, response) = std::sync::mpsc::channel();
+        state.proxy.send(UserEvent::FreshExecutionReadyResend {
+            grant: grant.clone(),
+            request: request.clone(),
+            reply,
+        });
+        match tokio::task::spawn_blocking(move || response.recv_timeout(Duration::from_secs(25)))
+            .await
+        {
+            Ok(Ok(Ok(Some(receipt)))) => return Json(receipt).into_response(),
+            Ok(Ok(Ok(None))) => {}
+            Ok(Ok(Err(error))) => {
+                return workspace_update_error_response(
+                    workspace_update_error_status(error.code),
+                    error,
+                )
+            }
+            _ => {
+                return workspace_update_error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    AgentWorkspaceUpdateError::new(
+                        AgentWorkspaceUpdateErrorCode::Internal,
+                        "Host readiness coordinator is unavailable; retry execution.continue",
+                    ),
+                )
+            }
+        }
+    }
     let mutation_project_root = project_root.clone();
     let operation = tokio::task::spawn_blocking(move || {
         gwt::continue_authenticated_execution(&mutation_project_root, &session_id, request)
