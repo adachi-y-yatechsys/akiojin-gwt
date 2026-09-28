@@ -210,7 +210,6 @@ pub(super) struct PreparedOutbound {
 const KNOWLEDGE_SEMANTIC_RETRY_INITIAL_DELAY_MS: u64 = 5_000;
 
 fn prepare_outbound(event: &gwt::BackendEvent) -> PreparedOutbound {
-    gwt::error_report::record_backend_event(event);
     let kind = event.event_kind();
     let (coalesce_key, repair_pane_id, terminal_pane) = match event {
         gwt::BackendEvent::TerminalOutput { id, .. } => (None, Some(id.clone()), Some(id.clone())),
@@ -236,6 +235,10 @@ fn prepare_outbound(event: &gwt::BackendEvent) -> PreparedOutbound {
 /// Serialize private Knowledge wire metadata without changing the public
 /// `BackendEvent` construction/destructuring shape.
 pub(super) fn prepare_outbound_event(outbound: &OutboundEvent) -> PreparedOutbound {
+    gwt::error_report::record_backend_event_with_origin(
+        &outbound.event,
+        outbound.error_origin.as_ref(),
+    );
     let mut prepared = prepare_outbound(&outbound.event);
     prepared.stream_seq = outbound.terminal_stream_seq;
     let Some(metadata) = outbound.knowledge_wire_metadata.as_ref() else {
@@ -5075,6 +5078,7 @@ pub fn broadcast_runtime_hook_event(clients: &ClientHub, event: RuntimeHookEvent
         event: gwt::BackendEvent::RuntimeHookEvent { event },
         knowledge_wire_metadata: None,
         terminal_stream_seq: None,
+        error_origin: None,
     }]);
 }
 
@@ -5086,6 +5090,7 @@ mod tests {
             event,
             knowledge_wire_metadata: None,
             terminal_stream_seq: None,
+            error_origin: None,
         }
     }
 
@@ -9617,6 +9622,7 @@ mod tests {
                     event: lossless_error("scope"),
                     knowledge_wire_metadata: None,
                     terminal_stream_seq: None,
+                    error_origin: None,
                 },
             };
             hub.dispatch(vec![outbound]);
@@ -10232,6 +10238,62 @@ mod tests {
     }
 
     #[test]
+    fn outbound_error_origin_stays_in_ledger_not_wire() {
+        use gwt_core::{
+            error_ledger::{self, ErrorScope},
+            test_support::ScopedGwtHome,
+        };
+        let home = tempfile::tempdir().unwrap();
+        let _home = ScopedGwtHome::set(home.path());
+        let event = BackendEvent::IssueMonitorToast {
+            notification_transition: None,
+            level: "error".into(),
+            message: "project launch error".into(),
+            issue_number: Some(4735),
+        };
+        let outbound = OutboundEvent::reply("client", event.clone())
+            .with_error_project_root(std::path::Path::new("/project-a"));
+        let prepared = prepare_outbound_event(&outbound);
+        assert_eq!(
+            prepared.payload.as_ref(),
+            serde_json::to_string(&event).unwrap()
+        );
+        prepare_outbound_event(&OutboundEvent::global_update_notice(
+            "error",
+            "host update error",
+        ));
+        prepare_outbound_event(&OutboundEvent::reply(
+            "client",
+            BackendEvent::IssueMonitorLaunchFailed {
+                issue_number: 4735,
+                message: "unknown launch error".into(),
+            },
+        ));
+        let rows = error_ledger::list_since(None).unwrap();
+        assert_eq!(rows.len(), 3);
+        let project = rows
+            .iter()
+            .find(|row| row.message == "project launch error")
+            .unwrap();
+        assert_eq!(project.scope, ErrorScope::Project);
+        assert_eq!(project.target.project_root.as_deref(), Some("/project-a"));
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.message == "host update error")
+                .unwrap()
+                .scope,
+            ErrorScope::Host
+        );
+        assert_eq!(
+            rows.iter()
+                .find(|row| row.message == "unknown launch error")
+                .unwrap()
+                .scope,
+            ErrorScope::Unknown
+        );
+    }
+
+    #[test]
     fn prepare_outbound_ignores_invalid_private_metadata_defensively() {
         let outbound = OutboundEvent {
             target: crate::DispatchTarget::Client("knowledge-client".to_string()),
@@ -10246,6 +10308,7 @@ mod tests {
                 crate::app_runtime::KnowledgeWireMetadata::SemanticRetry(semantic_retry_directive()),
             ),
             terminal_stream_seq: None,
+            error_origin: None,
         };
         let prepared = prepare_outbound_event(&outbound);
         let value: serde_json::Value =

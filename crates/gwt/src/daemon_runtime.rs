@@ -1339,11 +1339,7 @@ fn emit_live_event_fail_open(diagnostic_event: Option<&str>, event: RuntimeHookE
         ErrorTarget {
             issue: linked_issue,
             session_id: event.gwt_session_id.clone(),
-            project_root: event.project_root.clone().or_else(|| {
-                std::env::current_dir()
-                    .ok()
-                    .map(|dir| dir.display().to_string())
-            }),
+            project_root: event.project_root.clone(),
             ..ErrorTarget::default()
         },
         context,
@@ -1801,6 +1797,24 @@ mod tests {
             message: None,
             occurred_at: "2026-08-15T00:00:00Z".to_string(),
         }
+    }
+
+    #[test]
+    fn live_forward_failure_without_project_does_not_borrow_process_cwd() {
+        let _lock = env_test_lock();
+        let home = tempfile::tempdir().unwrap();
+        let _home = gwt_core::test_support::ScopedGwtHome::set(home.path());
+        let _url = ScopedEnvVar::set(GWT_HOOK_FORWARD_URL_ENV, "unsupported://local");
+        let _token = ScopedEnvVar::set(GWT_HOOK_FORWARD_TOKEN_ENV, "test-token");
+        let mut event = hook_live_test_event("Stop", None);
+        event.project_root = None;
+
+        emit_live_event_fail_open(Some("Stop"), event);
+
+        let rows = gwt_core::error_ledger::list_since(None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].scope, gwt_core::error_ledger::ErrorScope::Unknown);
+        assert!(rows[0].target.project_root.is_none());
     }
 
     fn short_hook_live_retry_policy() -> HookLiveRetryPolicy {

@@ -14527,6 +14527,29 @@ fn app_runtime_custom_agent_cache_refresh_rebroadcasts_open_wizard_state() {
 }
 
 #[test]
+fn issue_monitor_error_notification_keeps_project_in_ledger() {
+    let temp = tempdir().unwrap();
+    let _home = ScopedGwtHome::set(temp.path());
+    let root = temp.path().join("repo");
+    let tab = sample_project_tab("tab-1", "Repo", root.clone(), ProjectKind::NonRepo, &[]);
+    let runtime = sample_runtime(temp.path(), vec![tab], Some("tab-1"));
+    let event = BackendEvent::IssueMonitorLaunchFailed {
+        issue_number: 4735,
+        message: "project notification failure".into(),
+    };
+    let outbound = runtime
+        .issue_monitor_project_notification(Some(&root), event)
+        .unwrap();
+    prepare_outbound_event(&outbound);
+    let rows = gwt_core::error_ledger::list_since(None).unwrap();
+    let row = rows
+        .iter()
+        .find(|row| row.message == "project notification failure")
+        .unwrap();
+    assert_eq!(row.target.project_root.as_deref(), root.to_str());
+}
+
+#[test]
 fn app_runtime_launch_wizard_submit_failure_emits_structured_error_log() {
     let temp = tempdir().expect("tempdir");
     let _gwt_home = ScopedGwtHome::set(temp.path());
@@ -14552,6 +14575,16 @@ fn app_runtime_launch_wizard_submit_failure_emits_structured_error_log() {
             Some(canvas_bounds()),
         );
     });
+
+    let rows = gwt_core::error_ledger::list_since(None).unwrap();
+    let row = rows
+        .iter()
+        .find(|row| row.message == "Agent option is unavailable")
+        .unwrap();
+    assert_eq!(
+        row.target.project_root.as_deref(),
+        Some(repo.to_str().unwrap())
+    );
 
     let event = events
         .iter()
@@ -76218,6 +76251,7 @@ not toml";
         rows[0].kind,
         gwt_core::error_ledger::ErrorKind::OperationRefusal
     );
+    assert_eq!(rows[0].scope, gwt_core::error_ledger::ErrorScope::Host);
     assert!(
         rows[0]
             .message
