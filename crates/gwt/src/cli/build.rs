@@ -2026,6 +2026,7 @@ mod tests {
                 owner_number: Some(3248),
                 execution_binding: binding,
                 worktree_fingerprint: plan.worktree_fingerprint.clone(),
+                verified_head: None,
                 commands: vec![crate::cli::verification_record::VerificationCommandResult {
                     headed_e2e: None,
                     command: command.clone(),
