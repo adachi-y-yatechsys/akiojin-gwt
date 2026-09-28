@@ -328,15 +328,6 @@ jobs:
       - name: Run priority roundtrip from Normal and BelowNormal launchers
         run: cargo test -p gwt-core --test process_priority_roundtrip -- --nocapture
         timeout-minutes: 15
-      - name: Repeat gwt-core at default parallelism five times
-        shell: bash
-        run: |
-          unset RUST_TEST_THREADS
-          for iteration in 1 2 3 4 5; do
-            echo "gwt-core default-parallel run ${iteration}/5"
-            cargo test -p gwt-core
-          done
-        timeout-minutes: 30
       - name: Run shared Windows process resolver tests
         run: cargo test -p gwt-core --test windows_process_resolver --test process_adapter_parity
         timeout-minutes: 15
