@@ -389,6 +389,14 @@ jobs:
           cargo test -p gwt --lib process::tests -- --test-threads=1
           cargo test -p gwt-core --lib daemon_pipe_name -- --test-threads=1
         timeout-minutes: 20
+      # Issue #4746: Windows uses the in-process verification runner, and
+      # reclaiming an exited workload's stalled driver needs native taskkill.
+      - name: Run Windows verification completion and reclaim regressions
+        shell: bash
+        run: |
+          cargo test -p gwt --lib cli::verification_record::tests::verification_records_exit_while_grandchild_holds_output -- --exact --test-threads=1
+          cargo test -p gwt --lib cli::verification_lease:: -- --test-threads=1
+        timeout-minutes: 15
       # Issue #4078 AC-4: the wait declaration is the only way a Windows agent
       # can tell the Issue Monitor its silence is a wait rather than a stall.
       # Both the acceptance of a declaration and its durable prefs fallback are
