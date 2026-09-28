@@ -23,7 +23,6 @@
 - **Skill Authoring Language:** スキルを新規作成・更新する場合、`SKILL.md`、テンプレート、説明文などスキル本体の内容は英語で記述する。通常の対話や補足説明は日本語でよいが、スキル定義の正本は英語とする。
 - **Verification Before Done:** 完了を宣言する前に、変更対象に応じたテスト、lint、型チェック、ログ確認、差分確認を実施し、スタッフエンジニアが承認できる状態かを基準にセルフレビューする。
 - **Subagent Strategy:** 独立した調査、分析、実装、テスト整備はサブエージェントに分割し、メインのコンテキストを不要な詳細で汚さない。担当範囲、完了条件、検証観点を明示して責務を重複させない。
-- **Demand Elegance:** 非自明な変更では、力技で実装する前に 2〜3 のアプローチを比較し、もっともシンプルで保守しやすい案を選ぶ。単純な修正では過剰設計しない。
 - **Autonomous Bug Fixing:** バグ対応では、まず再現手順、ログ、失敗テスト、関連コードを自律的に調査し、原因特定、修正、再発防止確認まで進める。不可逆な仕様判断やプロダクト判断だけをユーザーに確認する。
 - **Investigation-First Discussion:** 実装中に以下のシグナルを検知した場合、実装を一時停止して調査と議論に入る:
   - generator やテンプレートを変更したが、生成される実ファイル（settings.local.json 等）を実際に確認していない
@@ -115,10 +114,9 @@
 
 - **設計・実装は複雑にせずに、シンプルさの極限を追求してください**
 - **ただし、ユーザビリティと開発者体験の品質は決して妥協しない**
-- 実装はシンプルに、開発者体験は最高品質に
 - TUI 操作の直感性と効率性を技術的複雑さより優先
 - **変更は外科的に行い、影響範囲を最小限にする。** 必要な箇所だけに手を入れ、新たなバグを持ち込まない
-- **非自明な変更では、実装前に「もっともシンプルでエレガントな解」を比較し、採用理由を1行で明示する。**
+- **非自明な変更では、実装前に 2〜3 のアプローチを比較してもっともシンプルで保守しやすい解を選び、採用理由を1行で明示する。単純な修正では過剰設計しない。**
 - **場当たり的な修正（ワークアラウンド）を禁止する。** 必ず根本原因を特定してから修正すること。原因が不明な場合はログ・テスト・コードを調査し、推測で修正しない
 
 ### 🧩 GUI/TUI ガイドライン
@@ -266,7 +264,7 @@
 - 作業（タスク）は、忖度なしで進める
 - **エージェントはユーザーからの明示的な指示なく新規ブランチの作成・削除・切り替えを行ってはならない。`git checkout -b`、`git switch -c`、`git branch -D`、`git worktree add/remove` は禁止。Worktree は起動ブランチで作業を完結する設計であり、必要な Git 環境作成は gwt の Start Work / Launch materialization が行う。**
 - 「進めて」等の承認指示は、承認済みタスクを自律的に完了まで進める指示である。不要な中間確認を挟まず、完了まで一気に進める
-- **変更規模の大小に関わらず `feat` / `fix` / `refactor` は仕様策定（GitHub Issue-backed SPEC）・TDD を省略しない。** 「軽微だから省略」は禁止。適用除外は `docs:` / `chore:` / typo修正 / AGENTS.md / CLAUDE.md / README.md 更新のみ
+- **変更規模の大小に関わらず `feat` / `fix` / `refactor` は仕様策定（GitHub Issue-backed SPEC）・TDD を省略しない。** 適用除外は「適用除外」節に挙げたものだけ。
 
 ### PR 作成ルール（必須）
 
@@ -278,7 +276,7 @@
 - `skipped(<reason>)` を許容するのは、ユーザーが `AskUserQuestion` 等で明示的に "Skip — proceed to PR" を選択した場合のみ。エージェントが「自動テスト全 PASS だから skip 妥当」と判断して skip するのは禁止。
 - 「進めて」「OK」等の承認指示は、**既に verification 結果を持つ作業**を完了まで進める指示であり、verification 自体の skip 承認ではない。verification 動線がブロックされている時に「進めて」と言われた場合は、ブロッカー解消の作業を進める指示として解釈する。
 - 万が一誤って PR を作成してしまった場合、即座に PR タイトルへ `[DO NOT MERGE — user verification pending]` を付与し、ブロック comment を投稿してマージを物理的に阻止する。verification が `confirmed` になってからタイトルを戻す。
-- 過去事例: PR #2857（SPEC-2809）で `User Verification Result: skipped(reason: develop 側 picker regression)` をエージェントが独断で倒して PR を作成したのは skill 違反だった。原因は picker click-blocking という visualization blocker をエージェントが解消せずに skip に倒したこと。今後は同じ skip 判断を繰り返さない。
+- 視覚検証の動線がブロックされている場合、ブロッカーそのものが作業対象になる。`skipped` に倒して PR を作るのは、ブロッカーを解消しないまま完了を主張することと同じ。
 
 ### コミットメッセージポリシー
 
@@ -306,15 +304,14 @@
 - カバレッジ: `node scripts/coverage-summary.mjs --output-path target/coverage-summary.json -- --workspace --all-features` の後に `node scripts/check-coverage-threshold.mjs target/coverage-summary.json 90 --scope "crates/(gwt-core|gwt)/"` と `... 80 --scope-exclude "crates/(gwt-core|gwt)/"`（CI の coverage.yml と同一）。`cargo llvm-cov` を直接呼ぶと、raw profile の切り詰めがテスト失敗と区別できない FAIL になる（Issue #4628）
 - Lint: `cargo clippy --all-targets --all-features -- -D warnings`
 - フォーマット: `cargo fmt`
-- GUI のユーザー確認が必要な実装では、ビルド済みなら `target/debug/gwt`、未ビルドなら `cargo run -p gwt --bin gwt` で起動し、標準出力の `gwt browser URL: http://127.0.0.1:<port>/` をユーザーに共有する。共有前に `curl -fsS -I <URL>` などで HTTP 200 を確認し、ユーザーが同じ URL で手動確認できる状態にする。
+- GUI のユーザー確認が必要な実装でも、起動は下の `browser-check` 手順に従う。共有する URL は `curl -fsS -I <URL>` などで HTTP 200 を確認してから渡し、ユーザーが同じ URL で手動確認できる状態にする。
 - 「デバッグ用サーバーを起動して」等の依頼は **`browser-check` skill**（`.claude/skills/browser-check/SKILL.md`）の手順に従う。production の `GWT.app` や既存 gwt インスタンスの URL を共有せず、この checkout の `target/debug/gwt` を隔離 HOME（fresh home + `~/.gwt/runtime` symlink + credential/`.docker` symlink + `session.json` seed）で `--no-tray --no-open` 起動し、`GWT_BROWSER_URL_FILE` から得た URL を HTTP 200 確認後に共有する。検査完了の連絡を受けたらプロセスを停止する。
 
 ## コミュニケーションガイドライン
 
 - 回答は必ず日本語
 - TUI のユーザー向け表示は英語のみ（日本語の文言を表示しない）
-- ログ（`~/.gwt/logs/` 等）はこの環境から直接参照できる前提で対応すること
-- ログ参照の指示があれば、この環境から直接読み取って調査すること
+- ログ（`~/.gwt/logs/` 等）はこの環境から直接読み取って調査する
 
 ### Board / Work 運用ガイダンスの所在
 

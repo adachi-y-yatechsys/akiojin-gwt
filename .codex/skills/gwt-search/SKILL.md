@@ -1,6 +1,6 @@
 ---
 name: gwt-search
-description: "Mandatory preflight before gwt-discussion, gwt-register-issue, and gwt-fix-issue. Use proactively before creating any SPEC or Issue owner or before reusing an existing one. Searches SPEC Issues, GitHub Issues, project files, and post-mortem memory via ChromaDB. Triggers: 'search', 'find related', 'check duplicates', '過去 memory を引いて'."
+description: "Mandatory preflight before gwt-discussion, gwt-register-issue, and any visible owner routing decision. Use proactively before creating any SPEC or Issue owner or before reusing an existing one. Searches SPEC Issues, GitHub Issues, project files, and post-mortem memory via ChromaDB. Triggers: 'search', 'find related', 'check duplicates', '過去 memory を引いて'."
 ---
 
 # Unified Search
