@@ -15,7 +15,7 @@ import { parseHTML } from "linkedom";
 import {
   attentionForWorkspace,
   formatLifecycleStateLabel,
-} from "../workspace-kanban-surface.js";
+} from "../issue-other-surface.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const appCss = readFileSync(resolve(here, "../styles/app.css"), "utf8");
@@ -763,6 +763,9 @@ test("after Windowize the row shows the agent as on the canvas and offers focus"
 // AC-10 / T-006: the new row and terminal CSS is Operator tokens only.
 test("Issue row state CSS uses Operator tokens only", () => {
   const selectors = [
+    ".issue-other-group",
+    ".issue-other-summary",
+    ".issue-lane-filter",
     ".knowledge-row-badge",
     ".knowledge-row-secondary",
     ".knowledge-row-secondary-item",
