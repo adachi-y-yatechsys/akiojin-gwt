@@ -41,6 +41,7 @@ test("label mapping equals the expected English labels", () => {
     waiting: "Waiting",
     stopped: "Stopped",
     error: "Error",
+    interrupted: "Interrupted",
   });
 });
 
