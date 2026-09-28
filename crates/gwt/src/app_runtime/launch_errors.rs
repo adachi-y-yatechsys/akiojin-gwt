@@ -244,7 +244,7 @@ impl AppRuntime {
                     .manual_holder_intent
                     .as_ref()
                     .map(|intent| intent.predecessor.session_id.clone()),
-                project_root: None,
+                project_root: Some(session.project_context.project_root.display().to_string()),
             },
         );
     }
@@ -593,7 +593,7 @@ impl AppRuntime {
                 "Issue Monitor could not confirm the exact answered-session submit{durable_note}: {detail}"
             ),
             issue_number: Some(issue_number),
-        })]
+        }).with_error_project_root(&context.project_root)]
     }
 
     pub(super) fn user_facing_launch_error_detail(detail: &str) -> String {

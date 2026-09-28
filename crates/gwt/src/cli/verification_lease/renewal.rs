@@ -456,7 +456,11 @@ mod tests {
         let mut output = String::new();
         crate::cli::diagnostics::errors::run(
             &mut env,
-            crate::cli::diagnostics::errors::ErrorsCommand::List { since: None },
+            crate::cli::diagnostics::errors::ErrorsCommand::List {
+                since: None,
+                scope: crate::cli::diagnostics::errors::ErrorListScope::All,
+                project_root: None,
+            },
             &mut output,
         )
         .unwrap();

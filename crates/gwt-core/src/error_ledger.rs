@@ -48,9 +48,20 @@ pub struct ErrorTarget {
     pub project_root: Option<String>,
 }
 
+/// Ownership of an error; unknown never borrows the reader's current project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorScope {
+    Project,
+    Host,
+    Unknown,
+}
+
 /// One append-only error row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "ErrorRecordWire")]
 pub struct ErrorRecord {
+    pub scope: ErrorScope,
     pub schema_version: u32,
     pub id: String,
     pub recorded_at: DateTime<Utc>,
@@ -65,16 +76,78 @@ pub struct ErrorRecord {
     pub context: BTreeMap<String, String>,
 }
 
+// Missing scope is a legacy row. Infer only from its recorded locator.
+#[derive(Deserialize)]
+struct ErrorRecordWire {
+    schema_version: u32,
+    id: String,
+    recorded_at: DateTime<Utc>,
+    kind: ErrorKind,
+    message: String,
+    #[serde(default)]
+    target: ErrorTarget,
+    #[serde(default)]
+    context: BTreeMap<String, String>,
+    #[serde(default)]
+    scope: Option<ErrorScope>,
+}
+
+fn has_project_root(target: &ErrorTarget) -> bool {
+    target
+        .project_root
+        .as_deref()
+        .is_some_and(|root| !root.trim().is_empty())
+}
+
+impl TryFrom<ErrorRecordWire> for ErrorRecord {
+    type Error = &'static str;
+
+    fn try_from(row: ErrorRecordWire) -> Result<Self, Self::Error> {
+        let scope = row.scope.unwrap_or(if has_project_root(&row.target) {
+            ErrorScope::Project
+        } else {
+            ErrorScope::Unknown
+        });
+        if scope == ErrorScope::Project && !has_project_root(&row.target) {
+            return Err("project error requires target.project_root");
+        }
+        Ok(Self {
+            scope,
+            schema_version: row.schema_version,
+            id: row.id,
+            recorded_at: row.recorded_at,
+            kind: row.kind,
+            message: row.message,
+            target: row.target,
+            context: row.context,
+        })
+    }
+}
+
 impl ErrorRecord {
     pub fn new(kind: ErrorKind, message: impl Into<String>, target: ErrorTarget) -> Self {
+        let target = sanitize_target(target);
         Self {
+            scope: if has_project_root(&target) {
+                ErrorScope::Project
+            } else {
+                ErrorScope::Unknown
+            },
             schema_version: SCHEMA_VERSION,
             id: uuid::Uuid::new_v4().to_string(),
             recorded_at: Utc::now(),
             kind,
             message: sanitize_error_message(&message.into()),
-            target: sanitize_target(target),
+            target,
             context: BTreeMap::new(),
+        }
+    }
+
+    /// Record a fault known to belong to the shared host, without inventing a project.
+    pub fn new_host(kind: ErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            scope: ErrorScope::Host,
+            ..Self::new(kind, message, ErrorTarget::default())
         }
     }
 
@@ -91,6 +164,12 @@ impl ErrorRecord {
 /// Append `record` to today's ledger file. Fail-open callers should use
 /// [`record_fail_open`].
 pub fn record(record: ErrorRecord) -> io::Result<ErrorRecord> {
+    if record.scope == ErrorScope::Project && !has_project_root(&record.target) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "project error requires target.project_root",
+        ));
+    }
     #[cfg(any(test, feature = "test-support"))]
     if crate::test_support::gwt_home_override().is_none() {
         return Ok(record);
@@ -265,6 +344,32 @@ mod tests {
                 project_root: Some("/tmp/repo".into()),
             },
         )
+    }
+
+    #[test]
+    fn scope_distinguishes_project_host_and_unknown_without_inventing_roots() {
+        let project = sample(ErrorKind::DaemonFault, "project");
+        assert_eq!(serde_json::to_value(&project).unwrap()["scope"], "project");
+        let unknown = ErrorRecord::new(ErrorKind::DaemonFault, "unknown", ErrorTarget::default());
+        assert_eq!(serde_json::to_value(&unknown).unwrap()["scope"], "unknown");
+        let host = ErrorRecord::new_host(ErrorKind::DaemonFault, "host");
+        let host: ErrorRecord =
+            serde_json::from_value(serde_json::to_value(host).unwrap()).unwrap();
+        assert_eq!(serde_json::to_value(&host).unwrap()["scope"], "host");
+        assert!(host.target.project_root.is_none());
+    }
+
+    #[test]
+    fn legacy_scope_uses_only_recorded_root_and_project_requires_root() {
+        let mut raw = serde_json::to_value(sample(ErrorKind::HookFailure, "legacy")).unwrap();
+        raw.as_object_mut().unwrap().remove("scope");
+        let project: ErrorRecord = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(serde_json::to_value(project).unwrap()["scope"], "project");
+        raw["target"] = serde_json::json!({});
+        let unknown: ErrorRecord = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(serde_json::to_value(unknown).unwrap()["scope"], "unknown");
+        raw["scope"] = serde_json::json!("project");
+        assert!(serde_json::from_value::<ErrorRecord>(raw).is_err());
     }
 
     #[test]
