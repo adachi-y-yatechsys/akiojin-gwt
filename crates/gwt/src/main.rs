@@ -1449,7 +1449,8 @@ fn issue_monitor_daemon_user_event(
             Some(UserEvent::Dispatch(vec![OutboundEvent::project(
                 gwt_core::paths::resolve_project_scope(project_root).hash,
                 toast,
-            )]))
+            )
+            .with_error_project_root(project_root)]))
         }
         "launch_request" => {
             let issue_number = payload.get("issue_number")?.as_u64()?;
@@ -2108,6 +2109,7 @@ mod tests {
             event,
             knowledge_wire_metadata: None,
             terminal_stream_seq: None,
+            error_origin: None,
         }
     }
 
@@ -10594,7 +10596,7 @@ fn main() -> std::io::Result<()> {
                             level: "error".to_string(),
                             message,
                             issue_number: None,
-                        }))
+                        }).with_error_project_root(&project_root))
                     })
                     .collect::<Vec<_>>();
                 events.extend(app.issue_monitor_scheduled_scan_complete_events(

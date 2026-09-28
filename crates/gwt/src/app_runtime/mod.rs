@@ -484,6 +484,8 @@ pub struct OutboundEvent {
     /// serialized at). Never serialized; the client queue uses it to skip
     /// streamed chunks that a queued snapshot already contains.
     pub(crate) terminal_stream_seq: Option<u64>,
+    /// Error provenance only; never serialized or inferred from dispatch targets.
+    pub(crate) error_origin: Option<gwt::error_report::ErrorOrigin>,
 }
 
 #[derive(Debug)]
@@ -546,6 +548,7 @@ impl OutboundEvent {
             event,
             knowledge_wire_metadata: None,
             terminal_stream_seq: None,
+            error_origin: None,
         }
     }
 
@@ -589,6 +592,7 @@ impl OutboundEvent {
             event,
             knowledge_wire_metadata: None,
             terminal_stream_seq: None,
+            error_origin: None,
         }
     }
 
@@ -610,7 +614,15 @@ impl OutboundEvent {
             },
             knowledge_wire_metadata: None,
             terminal_stream_seq: None,
+            error_origin: Some(gwt::error_report::ErrorOrigin::Host),
         }
+    }
+
+    pub(crate) fn with_error_project_root(mut self, root: &Path) -> Self {
+        self.error_origin = Some(gwt::error_report::ErrorOrigin::Project(
+            root.display().to_string(),
+        ));
+        self
     }
 
     pub(crate) fn reply(client_id: impl Into<ClientId>, event: BackendEvent) -> Self {
@@ -619,6 +631,7 @@ impl OutboundEvent {
             event,
             knowledge_wire_metadata: None,
             terminal_stream_seq: None,
+            error_origin: None,
         }
     }
 
@@ -636,6 +649,7 @@ impl OutboundEvent {
             event,
             knowledge_wire_metadata: semantic_retry.map(KnowledgeWireMetadata::SemanticRetry),
             terminal_stream_seq: None,
+            error_origin: None,
         }
     }
 
@@ -659,6 +673,7 @@ impl OutboundEvent {
             event,
             knowledge_wire_metadata: Some(KnowledgeWireMetadata::NonSemanticError),
             terminal_stream_seq: None,
+            error_origin: None,
         }
     }
 
@@ -5874,15 +5889,18 @@ impl AppRuntime {
                     "issue monitor close finalizer failed"
                 );
                 if let Some(context) = owner.as_ref() {
-                    events.push(OutboundEvent::project(
-                        context.project_key.clone(),
-                        BackendEvent::IssueMonitorToast {
-                            notification_transition: None,
-                            level: "error".to_string(),
-                            message: error.to_string(),
-                            issue_number: None,
-                        },
-                    ));
+                    events.push(
+                        OutboundEvent::project(
+                            context.project_key.clone(),
+                            BackendEvent::IssueMonitorToast {
+                                notification_transition: None,
+                                level: "error".to_string(),
+                                message: error.to_string(),
+                                issue_number: None,
+                            },
+                        )
+                        .with_error_project_root(&context.project_root),
+                    );
                 }
             }
         }
@@ -6257,7 +6275,13 @@ impl AppRuntime {
             issue_number,
         };
         match client_id {
-            Some(client_id) => Some(OutboundEvent::reply(client_id, toast)),
+            Some(client_id) => {
+                let mut outbound = OutboundEvent::reply(client_id, toast);
+                if let Some(root) = project_root {
+                    outbound = outbound.with_error_project_root(root);
+                }
+                Some(outbound)
+            }
             None => self.issue_monitor_project_notification(project_root, toast),
         }
         .into_iter()
@@ -6277,7 +6301,10 @@ impl AppRuntime {
             );
             return None;
         };
-        Some(OutboundEvent::project(context.project_key, event))
+        Some(
+            OutboundEvent::project(context.project_key, event)
+                .with_error_project_root(&context.project_root),
+        )
     }
 
     fn quick_register_issue_events(
@@ -6298,7 +6325,8 @@ impl AppRuntime {
                     message: "Issue title is required".to_string(),
                     issue_number: None,
                 },
-            )];
+            )
+            .with_error_project_root(&context.project_root)];
         }
 
         let project_root = context.project_root.clone();
@@ -6314,7 +6342,8 @@ impl AppRuntime {
                             message: format!("GitHub origin remote is unavailable: {error}"),
                             issue_number: None,
                         },
-                    )];
+                    )
+                    .with_error_project_root(&context.project_root)];
                 }
             };
 
@@ -6329,7 +6358,8 @@ impl AppRuntime {
                         message: issue_registration_failure_message(&error),
                         issue_number: None,
                     },
-                )];
+                )
+                .with_error_project_root(&context.project_root)];
             }
         };
 
@@ -6350,7 +6380,8 @@ impl AppRuntime {
                         message: issue_registration_failure_message(&error),
                         issue_number: None,
                     },
-                )];
+                )
+                .with_error_project_root(&context.project_root)];
             }
         };
 
@@ -6359,18 +6390,21 @@ impl AppRuntime {
         let mut events = Vec::new();
         match gwt_github::Cache::new(cache_root.clone()).write_snapshot(&snapshot) {
             Ok(()) => {}
-            Err(error) => events.push(OutboundEvent::reply(
-                client_id,
-                BackendEvent::IssueMonitorToast {
-                    notification_transition: None,
-                    level: "error".to_string(),
-                    message: format!(
-                        "Issue #{} registered, but local cache update failed: {error}",
-                        snapshot.number.0
-                    ),
-                    issue_number: Some(snapshot.number.0),
-                },
-            )),
+            Err(error) => events.push(
+                OutboundEvent::reply(
+                    client_id,
+                    BackendEvent::IssueMonitorToast {
+                        notification_transition: None,
+                        level: "error".to_string(),
+                        message: format!(
+                            "Issue #{} registered, but local cache update failed: {error}",
+                            snapshot.number.0
+                        ),
+                        issue_number: Some(snapshot.number.0),
+                    },
+                )
+                .with_error_project_root(&context.project_root),
+            ),
         }
 
         events.push(OutboundEvent::reply(
