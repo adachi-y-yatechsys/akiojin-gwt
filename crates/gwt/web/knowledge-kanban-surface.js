@@ -3370,42 +3370,6 @@ export function createKnowledgeKanbanSurface({
         renderKnowledgeDetailOnly(windowId, state);
       }
 
-      function knowledgeStatusView(state, issueSurface) {
-        if (state.error) {
-          // Issue windows keep the status line empty on error (a failed load
-          // is not "no items"); other kinds keep their red band.
-          return issueSurface ? null : { tone: "error", text: state.error };
-        }
-        if (!issueSurface && state.searching) {
-          return { tone: "info", text: "Searching semantic index" };
-        }
-        if (state.loading && state.entries.length > 0) {
-          return {
-            tone: "info",
-            text: state.refreshing
-              ? issueSurface
-                ? "Refreshing cached work items"
-                : "Refreshing cached knowledge"
-              : issueSurface
-                ? "Loading cache-backed work items"
-                : "Loading cache-backed data",
-          };
-        }
-        if (state.loading && state.entries.length === 0) {
-          return {
-            tone: "info",
-            text: issueSurface ? "Loading cache-backed work items" : "Loading cache-backed data",
-          };
-        }
-        if (state.entries.length === 0 && !state.searching) {
-          return {
-            tone: "info",
-            text: state.emptyMessage || (issueSurface ? "No cached work items" : "No cached items"),
-          };
-        }
-        return null;
-      }
-
       function formatRefreshedTime(ms) {
         const date = new Date(ms);
         return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
@@ -3446,6 +3410,42 @@ export function createKnowledgeKanbanSurface({
           status.classList.add("visible", view.tone);
           status.textContent = view.text;
         }
+      }
+
+      function knowledgeStatusView(state, issueSurface) {
+        if (state.error) {
+          // Issue windows keep the status line empty on error (a failed load
+          // is not "no items"); other kinds keep their red band.
+          return issueSurface ? null : { tone: "error", text: state.error };
+        }
+        if (!issueSurface && state.searching) {
+          return { tone: "info", text: "Searching semantic index" };
+        }
+        if (state.loading && state.entries.length > 0) {
+          return {
+            tone: "info",
+            text: state.refreshing
+              ? issueSurface
+                ? "Refreshing cached work items"
+                : "Refreshing cached knowledge"
+              : issueSurface
+                ? "Loading cache-backed work items"
+                : "Loading cache-backed data",
+          };
+        }
+        if (state.loading && state.entries.length === 0) {
+          return {
+            tone: "info",
+            text: issueSurface ? "Loading cache-backed work items" : "Loading cache-backed data",
+          };
+        }
+        if (state.entries.length === 0 && !state.searching) {
+          return {
+            tone: "info",
+            text: state.emptyMessage || (issueSurface ? "No cached work items" : "No cached items"),
+          };
+        }
+        return null;
       }
 
       function canonicalQueuedKnowledgeEntries(state) {
