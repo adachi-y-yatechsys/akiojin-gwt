@@ -49752,6 +49752,8 @@ fn app_runtime_autonomous_fallback_epoch_overflow_is_zero_write_error() {
 
 #[test]
 fn app_runtime_full_issue_monitor_scan_migrates_legacy_git_failure_and_persists_marker() {
+    // Verify migration and durable state, independently of host fsync latency.
+    let _clock = gwt_core::operation_deadline::ScopedOperationClock::set(Instant::now());
     let _env_lock = env_test_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -49915,6 +49917,8 @@ fn issue_monitor_scan_failures_prefer_launch_failure_over_merge_query_error() {
 
 #[test]
 fn app_runtime_full_issue_monitor_cache_fallback_does_not_migrate_legacy_failure() {
+    // Verify cache provenance, independently of the prefs commit wall-clock budget.
+    let _clock = gwt_core::operation_deadline::ScopedOperationClock::set(Instant::now());
     let _env_lock = env_test_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
