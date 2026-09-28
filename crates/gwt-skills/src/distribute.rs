@@ -2,7 +2,7 @@
 
 use std::{
     collections::HashSet,
-    fs, io,
+    io,
     path::{Path, PathBuf},
 };
 
@@ -148,11 +148,11 @@ impl DistributePlan {
                 DistributionOperation::Write(path, contents) => {
                     if let Some(parent) = path.parent() {
                         if !parent.exists() {
-                            fs::create_dir_all(parent)?;
+                            crate::asset_io::create_dir_all(parent)?;
                             report.dirs_created += 1;
                         }
                     }
-                    fs::write(path, contents)?;
+                    crate::asset_io::write(path, contents)?;
                     report.files_written += 1;
                 }
                 DistributionOperation::Remove(path) => {
@@ -160,8 +160,8 @@ impl DistributePlan {
                     report.paths_removed += 1;
                 }
                 DistributionOperation::RemoveIfEmpty(path) => {
-                    if path.exists() && fs::read_dir(&path)?.next().is_none() {
-                        fs::remove_dir(path)?;
+                    if path.exists() && crate::asset_io::read_dir(&path)?.next().is_none() {
+                        crate::asset_io::remove_dir(path)?;
                         report.paths_removed += 1;
                     }
                 }
@@ -312,7 +312,7 @@ fn normalize_targets(targets: &[ManagedAssetTarget]) -> Vec<ManagedAssetTarget> 
 
 fn prune_retired_hook_scripts(dest: &Path, plan: &mut DistributePlan) -> io::Result<()> {
     if dest.exists() {
-        for entry in fs::read_dir(dest)? {
+        for entry in crate::asset_io::read_dir(dest)? {
             let entry = entry?;
             let name = entry.file_name();
             let name = name.to_string_lossy();
@@ -440,7 +440,7 @@ fn prune_dir_against_source(
         .map(str::to_string)
         .collect();
 
-    for entry in fs::read_dir(dest)? {
+    for entry in crate::asset_io::read_dir(dest)? {
         let entry = entry?;
         let name = entry.file_name();
         let name = name.to_string_lossy();
@@ -492,12 +492,13 @@ fn prune_dir_against_source(
 }
 
 fn remove_path(path: &Path) -> io::Result<()> {
-    let metadata = fs::symlink_metadata(path)?;
+    let metadata = crate::asset_io::symlink_metadata(path)?;
     if metadata.is_dir() {
-        fs::remove_dir_all(path)
+        crate::asset_io::remove_dir_all(path)?;
     } else {
-        fs::remove_file(path)
+        crate::asset_io::remove_file(path)?;
     }
+    Ok(())
 }
 
 /// gwt-managed namespaces the intake override may refresh even when tracked
@@ -596,6 +597,9 @@ fn is_git_worktree(worktree: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    // Production code reaches the filesystem through `crate::asset_io`, which
+    // tags every failure with its route and path (#4486 AC-6). Fixtures do not.
+    use std::fs;
     use super::*;
 
     #[test]
