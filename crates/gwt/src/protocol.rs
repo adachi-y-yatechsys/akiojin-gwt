@@ -2026,6 +2026,11 @@ pub enum BackendEvent {
         running_reasoning: Option<String>,
         is_running: bool,
         agent_options: Vec<PmAgentOption>,
+        /// #4486 AC-7: why the PM is not running, when the reason is one a
+        /// Restart cannot clear. `None` means Restart is worth offering —
+        /// either the PM is fine, or the last refusal was transient.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_block: Option<crate::pm_registry::PmStartBlock>,
     },
     IssueMonitorStatus {
         /// Boxed: the view is by far the largest payload in this enum
@@ -3648,6 +3653,7 @@ mod tests {
             running_reasoning: None,
             is_running: false,
             agent_options: Vec::new(),
+            start_block: None,
         };
 
         let value = serde_json::to_value(&event).expect("serialize PM status");

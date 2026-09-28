@@ -601,6 +601,7 @@ mod tests {
                 }),
                 settings: crate::pm_registry::PmSettings::default(),
                 worktree_freshness: None,
+                start_block: None,
             },
         )
         .expect("seed PM registration");
