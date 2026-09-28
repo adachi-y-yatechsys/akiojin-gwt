@@ -799,6 +799,7 @@ export function createKnowledgeKanbanSurface({
       }
 
       function renderIssueMonitorControls(element) {
+        renderIssueMonitorPool(element);
         const bar = element?.querySelector(".knowledge-monitor-bar");
         if (!bar) return;
         const maxActive = Math.max(
@@ -888,6 +889,135 @@ export function createKnowledgeKanbanSurface({
           autoApply.dataset.enabled = enabled ? "true" : "false";
           autoApply.classList.toggle("primary", enabled);
         }
+      }
+
+      // #4530: pool edits use the same sparse profile contract as profiles.set.
+      function renderIssueMonitorPool(element) {
+        const pool = element?.querySelector(".knowledge-monitor-pool");
+        if (!pool) return;
+        const content = pool.querySelector(".knowledge-monitor-pool-content");
+        if (content.contains(document.activeElement)) return;
+        const candidates = Array.isArray(issueMonitorStatus.launch_profile_candidates)
+          ? issueMonitorStatus.launch_profile_candidates : [];
+        content.replaceChildren();
+        pool.querySelector("summary").textContent = candidates.length > 1
+          ? `Candidates · Auto (${candidates.length})` : `Candidates (${candidates.length})`;
+        const error = createNode("p", "knowledge-monitor-pool-message");
+        error.setAttribute("role", "status");
+        const profiles = () => (issueMonitorStatus.launch_profile_candidates || []).map(({ agent_id }) => ({ agent_id }));
+        const submit = (nextProfiles, threshold) => {
+          error.textContent = "";
+          pool.querySelector("summary").focus();
+          send({ kind: "issue_monitor_profiles_set", profiles: nextProfiles,
+            ...(threshold === undefined ? {} : { usage_threshold_percent: threshold }) });
+        };
+        const field = (labelText, name, value) => {
+          const label = createNode("label", "knowledge-monitor-pool-field");
+          label.appendChild(createNode("span", "", labelText));
+          const input = createNode("input");
+          input.dataset.poolField = name;
+          input.value = String(value);
+          label.appendChild(input);
+          return { label, input };
+        };
+        const threshold = field("Usage threshold (%)", "threshold", issueMonitorStatus.usage_threshold_percent ?? 80);
+        threshold.input.type = "number";
+        threshold.input.min = "1";
+        threshold.input.max = "100";
+        threshold.input.step = "1";
+        threshold.input.disabled = candidates.length === 0;
+        threshold.input.addEventListener("change", () => {
+          const value = Number(threshold.input.value);
+          if (!Number.isInteger(value) || value < 1 || value > 100) {
+            error.textContent = "Usage threshold must be a whole number from 1 to 100.";
+            return;
+          }
+          submit(profiles(), value);
+        });
+        content.appendChild(threshold.label);
+        for (const [index, candidate] of candidates.entries()) {
+          const row = createNode("div", "knowledge-monitor-candidate");
+          row.dataset.agentId = candidate.agent_id;
+          const heading = createNode("div", "knowledge-monitor-candidate-heading");
+          heading.appendChild(createNode("span", "knowledge-monitor-candidate-summary", `${index + 1}. ${candidate.summary || candidate.agent_id}`));
+          if (candidate.held_until) {
+            const held = createNode("span", "knowledge-row-badge", "Held");
+            held.dataset.tone = "needs-input";
+            held.title = `Held until ${candidate.held_until}`;
+            heading.appendChild(held);
+          }
+          for (const [action, text, label, disabled] of [
+            ["up", "↑", "Move up", index === 0],
+            ["down", "↓", "Move down", index === candidates.length - 1],
+            ["remove", "×", "Remove", candidates.length <= 1],
+          ]) {
+            const button = createNode("button", "icon-button", text);
+            button.type = "button";
+            button.dataset.poolAction = action;
+            button.setAttribute("aria-label", `${label} ${candidate.agent_id}`);
+            button.disabled = disabled;
+            button.addEventListener("click", () => {
+              if (button.disabled) return;
+              const next = profiles();
+              const current = next.findIndex(({ agent_id }) => agent_id === candidate.agent_id);
+              if (current < 0) return;
+              if (action === "remove") {
+                if (next.length <= 1) return;
+                next.splice(current, 1);
+              } else {
+                const target = current + (action === "up" ? -1 : 1);
+                if (target < 0 || target >= next.length) return;
+                [next[current], next[target]] = [next[target], next[current]];
+              }
+              button.focus();
+              submit(next);
+            });
+            heading.appendChild(button);
+          }
+          row.appendChild(heading);
+          const tags = field(`Prefer for ${candidate.agent_id}`, "prefer-for", (candidate.prefer_for || []).join(", "));
+          tags.input.placeholder = "type:fix, kind:spec, label:bug";
+          tags.input.addEventListener("change", () => {
+            const values = tags.input.value.split(/[\s,]+/).filter(Boolean);
+            if (values.some((tag) => !/^(type|kind|label):[a-z0-9_.-]+$/.test(tag))) {
+              error.textContent = "Use tags such as type:fix, kind:spec or label:bug.";
+              return;
+            }
+            const next = profiles();
+            const target = next.find(({ agent_id }) => agent_id === candidate.agent_id);
+            if (!target) {
+              error.textContent = "This candidate was removed. Refresh the pool before editing.";
+              return;
+            }
+            target.prefer_for = [...new Set(values)];
+            submit(next);
+          });
+          row.appendChild(tags.label);
+          content.appendChild(row);
+        }
+        const addRow = createNode("div", "knowledge-monitor-pool-add");
+        const agent = field("Agent command", "agent", "");
+        agent.input.placeholder = "codex, claude, grok…";
+        agent.input.autocomplete = "off";
+        const add = createNode("button", "wizard-button is-compact", "Add candidate");
+        add.type = "button";
+        add.dataset.poolAction = "add";
+        add.addEventListener("click", () => {
+          const agentId = agent.input.value.trim().toLowerCase();
+          if (!agentId) {
+            error.textContent = "Enter an agent command to add a candidate.";
+            agent.input.focus();
+            return;
+          }
+          if (profiles().some((candidate) => candidate.agent_id === agentId)) {
+            error.textContent = "This agent is already in the candidate pool.";
+            return;
+          }
+          add.focus();
+          submit([...profiles(), { agent_id: agentId }]);
+        });
+        addRow.append(agent.label, add);
+        content.append(addRow, error);
       }
 
       function renderAllIssueMonitorControls() {
@@ -1047,6 +1177,13 @@ export function createKnowledgeKanbanSurface({
       }
 
       function wireIssueMonitorControls(body) {
+        const pool = body.querySelector(".knowledge-monitor-pool");
+        pool?.addEventListener("mousedown", (event) => event.stopPropagation());
+        pool?.addEventListener("focusout", () => {
+          setTimeout(() => {
+            if (!pool.contains(document.activeElement)) renderIssueMonitorPool(body);
+          }, 0);
+        });
         body
           .querySelector('[data-action="issue-new"]')
           ?.addEventListener("click", (event) => {
@@ -4114,6 +4251,10 @@ export function createKnowledgeKanbanSurface({
                   <button type="button" class="wizard-button is-compact primary" data-action="monitor-setup" hidden>Set up agent</button>
                   <button type="button" class="icon-button" data-action="monitor-settings" aria-label="Agent settings">⚙</button>
                 </section>
+                <details class="knowledge-monitor-pool">
+                  <summary>Candidates (0)</summary>
+                  <div class="knowledge-monitor-pool-content"></div>
+                </details>
                 <div class="knowledge-split workspace-split issue-list-shell">
                   <div class="knowledge-list-pane">
                     <div class="knowledge-list" role="list" aria-label="Cached work items"></div>

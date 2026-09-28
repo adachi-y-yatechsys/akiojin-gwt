@@ -2873,7 +2873,7 @@ fn is_valid_prefer_for_tag(tag: &str) -> bool {
 /// limited to known agents, carry well-formed routing tags, and the threshold
 /// must be within 1..=100. Shared by the daemon control and the local
 /// fallback so the two can never accept different pools.
-pub(crate) fn validate_monitor_profiles_set(
+pub fn validate_monitor_profiles_set(
     profiles: &[crate::IssueMonitorLaunchProfile],
     usage_threshold_percent: Option<u8>,
 ) -> io::Result<()> {
