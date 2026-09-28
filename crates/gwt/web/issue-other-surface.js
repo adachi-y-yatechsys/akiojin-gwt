@@ -152,7 +152,7 @@ export function mergeActiveWorkProjectionPatch(previous, patch) {
   };
 }
 
-export function createWorkspaceKanbanSurface({
+export function createIssueOtherSurface({
   activeWorkspace,
   agentStatusLabel,
   appendMeta,
@@ -162,13 +162,12 @@ export function createWorkspaceKanbanSurface({
   openWorkspaceCleanup,
   send,
   windowMap,
-  workspaceWindowById,
   openWorkspaceResumePicker,
   getResumeBounds,
   focusBoardEntry,
-  branchesSurface,
   launchPending,
   continueWork,
+  onChanged,
 }) {
   const workspaceStateMap = new Map();
 
@@ -177,18 +176,11 @@ export function createWorkspaceKanbanSurface({
       workspaceStateMap.set(windowId, {
         selectedId: null,
         filter: "all",
+        open: false,
       });
     }
     return workspaceStateMap.get(windowId);
   }
-
-  const WORKSPACE_FILTERS = Object.freeze([
-    { id: "all", label: "All" },
-    { id: "needs_attention", label: "Needs Attention" },
-    { id: "running", label: "Running" },
-    { id: "paused", label: "Paused" },
-    { id: "closed", label: "Closed" },
-  ]);
 
   const ATTENTION_PRIORITY = Object.freeze({
     needs_attention: 0,
@@ -457,6 +449,7 @@ export function createWorkspaceKanbanSurface({
       // SPEC-2359 W16-3 (FR-390): branch known only from fetched refs — no
       // local worktree. Display-only; Launch materializes one on demand.
       remote_only: Boolean(item?.remote_only),
+      linked_issue_numbers: item?.linked_issue_numbers,
       // SPEC-2359 W16-4 (FR-391): derived Done classification (merged ∧ no
       // update after the merge). Display-only; clears on new activity.
       done_equivalent: Boolean(item?.done_equivalent),
@@ -570,23 +563,6 @@ export function createWorkspaceKanbanSurface({
   function filteredWorkspaces(workspaces, filter) {
     if (!filter || filter === "all") return workspaces;
     return workspaces.filter((workspace) => attentionForWorkspace(workspace).lane === filter);
-  }
-
-  function workspaceFilterCounts(workspaces) {
-    const counts = {
-      all: workspaces.length,
-      needs_attention: 0,
-      running: 0,
-      paused: 0,
-      closed: 0,
-    };
-    for (const workspace of workspaces) {
-      const key = attentionForWorkspace(workspace).lane;
-      if (Object.prototype.hasOwnProperty.call(counts, key)) {
-        counts[key] += 1;
-      }
-    }
-    return counts;
   }
 
   function appendMetaText(container, value) {
@@ -804,7 +780,7 @@ export function createWorkspaceKanbanSurface({
     row.appendChild(actions);
     row.addEventListener("click", () => {
       state.selectedId = item.id;
-      renderWorkspaceOverviewWindow(windowId, true);
+      renderWorkspaceOverviewWindow(windowId);
       // The re-render replaced this row, dropping focus to <body> — restore
       // it onto the freshly rendered selected row so ArrowUp / ArrowDown
       // keyboard navigation keeps working after a mouse selection.
@@ -817,40 +793,6 @@ export function createWorkspaceKanbanSurface({
       row.click();
     });
     return row;
-  }
-
-  function renderWorkspaceFilterBar(windowId, state, workspaces) {
-    const counts = workspaceFilterCounts(workspaces);
-    const bar = createNode("div", "workspace-overview-filter-bar");
-    const filters = createNode("div", "workspace-overview-filters");
-    for (const filter of WORKSPACE_FILTERS) {
-      const button = createNode("button", "workspace-overview-filter");
-      button.type = "button";
-      button.dataset.workspaceFilter = filter.id;
-      button.setAttribute("aria-pressed", state.filter === filter.id ? "true" : "false");
-      if (state.filter === filter.id) {
-        button.classList.add("is-active");
-      }
-      button.appendChild(createNode("span", "workspace-overview-filter-label", filter.label));
-      button.appendChild(
-        createNode(
-          "span",
-          "workspace-overview-filter-count",
-          String(counts[filter.id] || 0),
-        ),
-      );
-      button.addEventListener("click", () => {
-        state.filter = filter.id;
-        renderWorkspaceOverviewWindow(windowId, true);
-        const root = windowMap.get(windowId);
-        root
-          ?.querySelector?.(`[data-workspace-filter="${filter.id}"]`)
-          ?.focus?.();
-      });
-      filters.appendChild(button);
-    }
-    bar.appendChild(filters);
-    return bar;
   }
 
   function renderWorkspaceList(windowId, state, items) {
@@ -1885,54 +1827,37 @@ export function createWorkspaceKanbanSurface({
     );
   }
 
-  function renderWorkspaceOverviewWindow(windowId, force) {
+  function renderWorkspaceOverviewWindow(windowId) {
     const element = windowMap.get(windowId);
     if (!element) return;
     const root = element.querySelector(".workspace-overview-root");
     if (!root) return;
 
     const projection = getActiveWorkProjection();
-    const signature = JSON.stringify(projection);
     const state = ensureState(windowId);
-    if (!force && state._lastSignature !== undefined && state._lastSignature === signature) return;
-    state._lastSignature = signature;
 
-    const workspaces = workspacesFromProjection(projection);
+    const projectedWorkspaces = workspacesFromProjection(projection);
+    const workspaces = projectedWorkspaces.filter((item) =>
+      Array.isArray(item.linked_issue_numbers) && item.linked_issue_numbers.length === 0,
+    );
     // SPEC-2359 US-83: fold eligible existing remote branches into the same
     // list as ordinary rows (tagged Remote), de-duped against real Workspaces,
     // so they share lane sort, filter counts, and keyboard navigation.
-    const remoteItems = remoteStartWorkItems(state, workspaces);
+    const remoteItems = remoteStartWorkItems(state, projectedWorkspaces);
     const allWorkspaces =
       remoteItems.length > 0 ? workspaces.concat(remoteItems) : workspaces;
     const unassignedAgents = unassignedAgentsFromProjection(projection);
     const listOrder = workspacesInListOrder(allWorkspaces);
-    if (!WORKSPACE_FILTERS.some((filter) => filter.id === state.filter)) {
-      state.filter = "all";
-    }
     const visibleWorkspaces = filteredWorkspaces(listOrder, state.filter);
     const selected = selectedWorkspace(state, visibleWorkspaces);
-    const needsAttentionCount = workspaces.filter(
-      (workspace) => attentionForWorkspace(workspace).lane === "needs_attention",
-    ).length;
-
-    const status = root.querySelector(".workspace-overview-status-line");
-    if (status) {
-      // The headline counts real Workspaces (works you have). Eligible remote
-      // branches are surfaced as a separate "Startable" count, not folded into
-      // "Workspaces", so the number still answers "how many Workspaces do I
-      // have" even when the list also shows startable branches as rows.
-      const startable = remoteItems.length;
-      status.textContent = projection
-        ? `${workspaces.length} Workspaces${startable > 0 ? ` · ${startable} Startable` : ""} · ${needsAttentionCount} Needs Attention · ${unassignedAgents.length} Unassigned Agents`
-        : "No Workspace projection";
-    }
+    const summary = root.querySelector(".issue-other-summary");
+    if (summary) summary.textContent = `Other (${visibleWorkspaces.length})`;
 
     const listPane = root.querySelector(".workspace-overview-list-pane");
     listPane.innerHTML = "";
     if (allWorkspaces.length === 0) {
       listPane.appendChild(createNode("div", "workspace-overview-empty", "No Workspaces"));
     } else {
-      listPane.appendChild(renderWorkspaceFilterBar(windowId, state, listOrder));
       // User verification 2026-06-12 + SPEC-2359 US-78: completed local
       // branches need a BULK cleanup path, but only for backend-vetted row
       // candidates. Remote-start stubs never carry cleanup_candidate, so they
@@ -1968,62 +1893,39 @@ export function createWorkspaceKanbanSurface({
     renderWorkspaceDetail(root.querySelector(".workspace-overview-detail-pane"), selected, windowId);
   }
 
-  function mountWorkSurface(parent) {
-    const root = createNode("div", "workspace-overview-root");
-
-    const toolbar = createNode("div", "workspace-toolbar is-stacked workspace-overview-toolbar");
-    const toolbarMain = createNode("div", "workspace-toolbar-main");
-    toolbarMain.appendChild(createNode("div", "knowledge-heading", "Workspace"));
-    toolbarMain.appendChild(createNode("div", "knowledge-status workspace-overview-status-line"));
-    toolbar.appendChild(toolbarMain);
-
-    // SPEC-2359: single fused Workspace surface — the Work / Git Branches tab
-    // toggle is removed. The spine lists persistent Workspaces (Active+Paused);
-    // the detail pane shows the selected Workspace's sessions / branch / PR.
-    const toolbarActions = createNode("div", "workspace-toolbar-actions");
-    const refreshBtn = createNode("button", "icon-button", "↻");
-    refreshBtn.dataset.action = "refresh-workspace-overview";
-    refreshBtn.setAttribute("aria-label", "Refresh Workspaces");
-    toolbarActions.appendChild(refreshBtn);
-    toolbar.appendChild(toolbarActions);
-    root.appendChild(toolbar);
-
-    const workShell = createNode("div", "workspace-overview-shell");
+  function renderInto(parent, windowId, { laneFilter = "all" } = {}) {
+    const state = ensureState(windowId);
+    state.filter = laneFilter;
+    let root = parent.querySelector(".issue-other-group");
+    if (root) {
+      renderWorkspaceOverviewWindow(windowId);
+      return;
+    }
+    root = createNode("details", "issue-other-group workspace-overview-root");
+    if (state.open) root.setAttribute("open", "");
+    root.addEventListener("toggle", () => {
+      state.open = root.hasAttribute("open");
+    });
+    root.appendChild(createNode("summary", "issue-other-summary", "Other"));
+    const shell = createNode("div", "workspace-overview-shell");
     const listPane = createNode("section", "workspace-overview-list-pane");
-    listPane.setAttribute("aria-label", "Workspace list");
-    workShell.appendChild(listPane);
-    const detailPane = createNode("main", "workspace-overview-detail-pane");
-    detailPane.setAttribute("aria-label", "Work detail");
-    workShell.appendChild(detailPane);
-    root.appendChild(workShell);
-
+    listPane.setAttribute("aria-label", "Other workspaces");
+    shell.appendChild(listPane);
+    const detailPane = createNode("section", "workspace-overview-detail-pane");
+    detailPane.setAttribute("aria-label", "Other work detail");
+    shell.appendChild(detailPane);
+    root.appendChild(shell);
     parent.appendChild(root);
-    return root;
-  }
-
-  function mount(parent, windowData, { focusWindowLocally, sendFocus } = {}) {
-    parent.textContent = "";
-    mountWorkSurface(parent);
-
-    parent.addEventListener("mousedown", () => {
-      focusWindowLocally?.(windowData.id);
-      sendFocus?.(windowData.id);
-    });
-
-    const refresh = parent.querySelector("[data-action='refresh-workspace-overview']");
-    refresh?.addEventListener("click", (event) => {
-      event.stopPropagation();
-      renderWorkspaceOverviewWindow(windowData.id, true);
-    });
 
     // Keyboard navigation: ArrowUp / ArrowDown move the Workspace selection
     // (user request 2026-06-11). Delegated from the mount root so the
     // listener survives row re-renders; the existing row click path handles
     // selection + re-render, then focus returns to the selected row so the
     // user can keep navigating.
-    parent.addEventListener("keydown", (event) => {
+    root.addEventListener("keydown", (event) => {
       if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
-      const list = parent.querySelector(".workspace-overview-list");
+      if (event.target?.closest?.("button, input, select, textarea, summary")) return;
+      const list = root.querySelector(".workspace-overview-list");
       if (!list) return;
       const rows = Array.from(
         list.querySelectorAll(".workspace-overview-row[data-workspace-id]"),
@@ -2041,19 +1943,15 @@ export function createWorkspaceKanbanSurface({
       const target = rows[targetIndex];
       if (!target || target.getAttribute("aria-selected") === "true") return;
       target.click();
-      focusSelectedWorkspaceRow(windowData.id);
+      focusSelectedWorkspaceRow(windowId);
     });
 
-    renderWorkspaceOverviewWindow(windowData.id);
+    renderWorkspaceOverviewWindow(windowId);
   }
 
-  function renderWindows(force = false) {
-    for (const windowData of activeWorkspace()?.windows || []) {
-      const preset = workspaceWindowById(windowData.id)?.preset;
-      if (preset !== "work" && preset !== "workspace" && preset !== "branches") {
-        continue;
-      }
-      renderWorkspaceOverviewWindow(windowData.id, force);
+  function renderWindows() {
+    for (const windowId of workspaceStateMap.keys()) {
+      if (windowMap.has(windowId)) onChanged?.(windowId);
     }
   }
 
@@ -2074,11 +1972,11 @@ export function createWorkspaceKanbanSurface({
     if (!windowMap.has(windowId)) return;
     const state = ensureState(windowId);
     state.remoteBranches = Array.isArray(event.branches) ? event.branches : [];
-    renderWorkspaceOverviewWindow(windowId, true);
+    onChanged?.(windowId);
   }
 
   return {
-    mount,
+    renderInto,
     renderWindows,
     deleteState,
     applyRemoteStartWorkBranches,

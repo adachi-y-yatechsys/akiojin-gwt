@@ -601,6 +601,7 @@ export function createKnowledgeKanbanSurface({
   // projection and the derivation helpers are the Work surface's own — the Issue
   // surface never re-derives lifecycle or attention rules.
   getActiveWorkProjection,
+  renderOtherWork = () => {},
   workAttentionFor,
   formatWorkLifecycleLabel,
   continueWork,
@@ -1292,6 +1293,7 @@ export function createKnowledgeKanbanSurface({
             // render a spinner until the server confirms the move.
             hideDone: readKanbanHideDonePreference(),
             issueStateFilter: "open",
+            issueLaneFilter: "all",
             dndSnapshot: null,
             pendingPhaseUpdates: new Map(),
             autoRefreshTimer: null,
@@ -2566,9 +2568,12 @@ export function createKnowledgeKanbanSurface({
         // request is pending and becomes the authoritative semantic result
         // set on completion. Reapplying substring filtering here would hide
         // valid semantic matches whose wording differs from the query.
-        return (Array.isArray(state.entries) ? state.entries : []).filter((entry) =>
-          issueEntryMatchesStateFilter(entry, state.issueStateFilter || "open"),
-        );
+        return (Array.isArray(state.entries) ? state.entries : []).filter((entry) => {
+          if (!issueEntryMatchesStateFilter(entry, state.issueStateFilter || "open")) return false;
+          if (!state.issueLaneFilter || state.issueLaneFilter === "all") return true;
+          const work = issueWorkRowForEntry(getActiveWorkProjection?.(), entry);
+          return work && workAttentionFor?.(work)?.lane === state.issueLaneFilter;
+        });
       }
 
       function kanbanEmptyMessage(state, phase) {
@@ -3882,6 +3887,7 @@ export function createKnowledgeKanbanSurface({
             list.appendChild(renderIssueRow(windowId, state, entry));
           }
         }
+        renderOtherWork(list, windowId, { laneFilter: state.issueLaneFilter || "all" });
         renderKnowledgeDetailPane(windowId, state, detailPane, { agentPreview: !splitMode });
       }
 
@@ -4076,6 +4082,14 @@ export function createKnowledgeKanbanSurface({
                       <button type="button" data-issue-view="list">List</button>
                       <button type="button" data-issue-view="split">Split</button>
                     </div>
+                    <select class="issue-lane-filter" data-issue-lane-filter aria-label="Work state filter">
+                      <option value="all">All work states</option>
+                      <option value="running">Running</option>
+                      <option value="paused">Paused</option>
+                      <option value="needs_attention">Needs Attention</option>
+                      <option value="remote">Remote</option>
+                      <option value="closed">Closed</option>
+                    </select>
                   </div>
                   <div class="workspace-toolbar-actions">
                     <button type="button" class="wizard-button is-compact" data-action="issue-new" aria-haspopup="dialog">＋ New</button>
@@ -4117,6 +4131,14 @@ export function createKnowledgeKanbanSurface({
             windowData.id,
             knowledgeKind,
           );
+          const laneFilter = body.querySelector("[data-issue-lane-filter]");
+          if (laneFilter) {
+            for (const option of laneFilter.options) option.selected = option.value === state.issueLaneFilter;
+            laneFilter.addEventListener("change", () => {
+              state.issueLaneFilter = laneFilter.value;
+              renderKnowledgeBridge(windowData.id);
+            });
+          }
           const pendingIndexTarget = pendingIndexOpenTargetsByPreset.get(windowData.preset);
           if (
             pendingIndexTarget
