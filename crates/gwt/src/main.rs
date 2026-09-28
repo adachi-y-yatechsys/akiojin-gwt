@@ -1807,8 +1807,14 @@ enum UserEvent {
         pm_status: Option<BackendEvent>,
         monitor_result: WindowCloseMonitorResult,
     },
+    FreshExecutionReadyResend {
+        grant: AgentCapabilityGrant,
+        request: gwt::AgentExecutionContinuationRequest,
+        reply: std::sync::mpsc::Sender<
+            Result<Option<gwt::AgentExecutionContinuationReceipt>, gwt::AgentWorkspaceUpdateError>,
+        >,
+    },
     RuntimeHook(gwt::RuntimeHookEvent),
-    PreparedExecutionReadiness(embedded_server::PreparedExecutionReadiness),
     DaemonRuntimeHook(gwt::RuntimeHookEvent),
     DaemonRuntimeApprovalOverlay {
         id: String,
@@ -10519,12 +10525,14 @@ fn main() -> std::io::Result<()> {
                     monitor_result,
                 ));
             }
+            Event::UserEvent(UserEvent::FreshExecutionReadyResend { grant, request, reply }) => {
+                let (result, events) = app.resend_fresh_execution_ready(&grant, &request);
+                clients.dispatch(events);
+                let _ = reply.send(result);
+            }
             Event::UserEvent(UserEvent::RuntimeHook(event)) => {
                 let events = app.handle_runtime_hook_event(event);
                 clients.dispatch(events);
-            }
-            Event::UserEvent(UserEvent::PreparedExecutionReadiness(request)) => {
-                clients.dispatch(app.handle_prepared_execution_readiness(request));
             }
             Event::UserEvent(UserEvent::DaemonRuntimeHook(event)) => {
                 let events = app.handle_daemon_runtime_hook_event(event);

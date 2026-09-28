@@ -103,13 +103,13 @@ pub fn adopt_authenticated_execution(
     )
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentExecutionContinuationRequest {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub readiness_nonce: Option<String>,
     pub schema_version: u32,
     pub operation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness_nonce: Option<String>,
 }
 
 impl AgentExecutionContinuationRequest {
@@ -120,11 +120,20 @@ impl AgentExecutionContinuationRequest {
                 "unsupported execution continuation schema version",
             ));
         }
-        validate_ephemeral_probe_identifier(&self.operation_id, "operation id")?;
-        if let Some(nonce) = self.readiness_nonce.as_deref() {
-            validate_ephemeral_probe_identifier(nonce, "readiness nonce")?;
-        }
-        Ok(())
+        validate_ephemeral_probe_identifier(&self.operation_id, "operation id")
+    }
+}
+
+impl std::fmt::Debug for AgentExecutionContinuationRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentExecutionContinuationRequest")
+            .field("schema_version", &self.schema_version)
+            .field("operation_id", &self.operation_id)
+            .field(
+                "readiness_nonce",
+                &self.readiness_nonce.as_ref().map(|_| "[redacted]"),
+            )
+            .finish()
     }
 }
 
@@ -838,21 +847,6 @@ fn evaluate_authenticated_execution_continuation(
     })
 }
 
-/// Prepared authority is observational until the Host validates a ready replay.
-pub(crate) fn session_has_prepared_execution_binding(
-    project_root: &Path,
-    session_id: &str,
-) -> bool {
-    if gwt_agent::validate_session_id_path_component(session_id).is_err() {
-        return false;
-    }
-    load_session_for_mutation(session_id).is_ok_and(|session| {
-        session.execution_binding.as_ref().is_some_and(|binding| {
-            validate_prepared_execution_binding_authority(project_root, session_id, binding).is_ok()
-        })
-    })
-}
-
 /// Side-effect-free prerequisite evaluator shared by diagnosis and execution.
 pub(crate) fn probe_authenticated_execution_continuation(
     authenticated_project_root: &Path,
@@ -861,21 +855,6 @@ pub(crate) fn probe_authenticated_execution_continuation(
     use crate::cli::governance::{
         GovernanceCause, GovernanceEffect, GovernanceMetadata, RecoveryProbe,
     };
-    if session_has_prepared_execution_binding(authenticated_project_root, authenticated_session_id)
-    {
-        // A local probe cannot establish that the live Host still holds the
-        // pending launch and its nonce. Do not promise an executable recovery.
-        return RecoveryProbe::unavailable(
-            "execution.continue",
-            GovernanceMetadata {
-                effect: Some(GovernanceEffect::Protected),
-                cause: Some(GovernanceCause::NotReady),
-                retryable: Some(true),
-                ..GovernanceMetadata::default()
-            },
-            "prepared_execution_requires_authenticated_ready_replay: execution.continue forwards the existing launch nonce; the Host must validate the pending launch before activation",
-        );
-    }
     match evaluate_authenticated_execution_continuation(
         authenticated_project_root,
         authenticated_session_id,
@@ -6023,19 +6002,6 @@ mod tests {
     }
 
     #[test]
-    fn execution_continuation_request_accepts_optional_readiness_nonce() {
-        let legacy = serde_json::json!({"schema_version": 1, "operation_id": "continue"});
-        let decoded: AgentExecutionContinuationRequest =
-            serde_json::from_value(legacy.clone()).expect("legacy request");
-        assert_eq!(serde_json::to_value(decoded).unwrap(), legacy);
-        let mut replay = legacy;
-        replay["readiness_nonce"] = serde_json::json!("ready-challenge");
-        let decoded: AgentExecutionContinuationRequest =
-            serde_json::from_value(replay.clone()).expect("authenticated readiness replay request");
-        assert_eq!(serde_json::to_value(decoded).unwrap(), replay);
-    }
-
-    #[test]
     fn execution_continuation_rebinds_current_generation_after_host_restart() {
         with_strict_target_fixture(|repo, session| {
             let (session, binding) = bind_session_to_current_execution(repo, session);
@@ -7871,18 +7837,6 @@ mod tests {
                 .set_execution_binding(Some(prepared_binding.clone()))
                 .expect("project Prepared binding into durable Session");
             save_session_fixture(&session);
-            let diagnosis = crate::cli::execution_state::diagnose(repo, Some(&session.id));
-            assert!(
-                !diagnosis
-                    .available_recoveries
-                    .contains(&"execution.adopt".to_string()),
-                "Prepared authority must not advertise adoption: {diagnosis:?}"
-            );
-            let continuation_probe = probe_authenticated_execution_continuation(repo, &session.id);
-            assert!(!continuation_probe.advertise());
-            assert!(serde_json::to_string(&continuation_probe)
-                .unwrap()
-                .contains("prepared_execution_requires_authenticated_ready_replay"));
             let before = ExecutionBindingAuthoritySnapshot::capture(repo, repo, &session.id);
 
             let receipt = probe_authenticated_prepared_execution_binding(

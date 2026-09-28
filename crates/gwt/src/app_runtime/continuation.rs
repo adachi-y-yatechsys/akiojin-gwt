@@ -441,7 +441,7 @@ fn continue_work_outcome(
     )
 }
 
-pub(super) fn reject_continue_work_workspace_commit(
+fn reject_continue_work_workspace_commit(
     project_root: &Path,
     work_event_root: &Path,
     operation_id: &str,
@@ -2361,6 +2361,95 @@ fn durable_fresh_execution_candidate(
             .ok_or_else(|| "persisted fresh-launch Session identity is missing".to_string())?,
         agent_id: session.agent_id.clone(),
     }))
+}
+
+/// Inspect only this owner's current Prepared attempts, not Session history.
+/// Receipt-backed recovery stays with the existing startup reconciler.
+pub(super) fn reconcile_unindexed_prepared_fresh_launches(
+    sessions_dir: &Path,
+    worktree: &Path,
+    owner: gwt::cli::execution_state::ExecutionOwnerKey,
+) -> Result<(), String> {
+    let Some(ledger) = gwt::cli::execution_state::load_generation_ledger(worktree, owner)
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(());
+    };
+    let mut seen = std::collections::HashSet::new();
+    for attempt in ledger.continuation_attempts.iter().rev() {
+        if !seen.insert(&attempt.request.operation_id)
+            || attempt.status != gwt::cli::execution_state::ContinuationAttemptStatus::Prepared
+            || attempt.predecessor.generation_id != ledger.current_generation_id
+            || !gwt::cli::execution_state::is_owner_launch_successor_attempt(attempt)
+            || durable_launch_recovery_exists(sessions_dir, &attempt.request.initial_session_id)
+        {
+            continue;
+        }
+        let path = sessions_dir.join(format!("{}.toml", attempt.request.initial_session_id));
+        let session = match gwt_agent::inspect_session_path(&path) {
+            gwt_agent::SessionPathState::Present(session) => session,
+            gwt_agent::SessionPathState::Missing => {
+                tracing::warn!(owner = owner.number, operation_id = %attempt.request.operation_id,
+                    session_id = %attempt.request.initial_session_id,
+                    "retained Prepared launch without receipt or Session: abandonment cannot be proven");
+                continue;
+            }
+            gwt_agent::SessionPathState::Error(error) => {
+                tracing::warn!(owner = owner.number, operation_id = %attempt.request.operation_id,
+                    session_id = %attempt.request.initial_session_id, %error,
+                    "retained Prepared launch without receipt: Session evidence is unreadable");
+                continue;
+            }
+        };
+        let Some(candidate) = durable_fresh_execution_candidate(&session)? else {
+            continue;
+        };
+        if candidate.owner != owner
+            || !path_matches(&candidate.worktree_path, worktree)
+            || candidate.attempt.request != attempt.request
+        {
+            continue;
+        }
+        let Some(receipt_project_root) = candidate.session_identity.project_state_root.as_deref()
+        else {
+            continue;
+        };
+        let cleaned = gwt::cli::execution_state::abort_abandoned_prepared_successor_with(
+            worktree,
+            owner,
+            &attempt.request,
+            sessions_dir,
+            &candidate.session_identity,
+            || {
+                persist_durable_launch_recovery_with_identity(
+                    sessions_dir,
+                    DurableLaunchRecoveryKind::FreshSuccessor {
+                        operation_id: attempt.request.operation_id.clone(),
+                    },
+                    &session.id,
+                    receipt_project_root,
+                    &candidate.worktree_path,
+                    owner,
+                    Some(&candidate.binding),
+                    Some(&candidate.agent_id),
+                    Some(&candidate.session_identity),
+                )
+                .map_err(std::io::Error::other)
+            },
+            || {
+                reject_continue_work_workspace_commit(
+                    &candidate.project_root,
+                    worktree,
+                    &attempt.request.operation_id,
+                )
+            },
+        )
+        .map_err(|error| error.to_string())?;
+        if cleaned {
+            clear_durable_launch_recovery(sessions_dir, &session.id)?;
+        }
+    }
+    Ok(())
 }
 
 fn pending_execution_is_activated(pending: &PendingContinueWork) -> bool {
@@ -6695,113 +6784,113 @@ impl AppRuntime {
         )]
     }
 
-    pub(crate) fn handle_prepared_execution_readiness(
+    /// Resend the original authenticated readiness receipt through the fresh
+    /// coordinator. Prepared authority is never adopted or activated by the CLI.
+    pub(crate) fn resend_fresh_execution_ready(
         &mut self,
-        request: crate::embedded_server::PreparedExecutionReadiness,
-    ) -> Vec<OutboundEvent> {
-        use gwt::{AgentWorkspaceUpdateError, AgentWorkspaceUpdateErrorCode};
-        let refuse = |request: crate::embedded_server::PreparedExecutionReadiness, reason: &str| {
-            request.complete(Err(AgentWorkspaceUpdateError::new(
-                AgentWorkspaceUpdateErrorCode::ExecutionBindingMismatch,
-                reason,
-            )));
-            Vec::new()
+        grant: &crate::embedded_server::AgentCapabilityGrant,
+        request: &gwt::AgentExecutionContinuationRequest,
+    ) -> (
+        Result<Option<gwt::AgentExecutionContinuationReceipt>, gwt::AgentWorkspaceUpdateError>,
+        Vec<OutboundEvent>,
+    ) {
+        let refuse = |reason: &str| {
+            (
+                Err(gwt::AgentWorkspaceUpdateError::new(
+                    gwt::AgentWorkspaceUpdateErrorCode::ExecutionBindingMismatch,
+                    reason,
+                )),
+                Vec::new(),
+            )
         };
-        if request.cancelled() {
-            return Vec::new();
+        if let Err(error) = request.validate() {
+            return (Err(error), Vec::new());
         }
-        let Some(binding) = request
-            .principal()
-            .prepared_execution_binding()
-            .or_else(|| request.principal().active_execution_binding())
-            .cloned()
-        else {
-            return refuse(
-                request,
-                "readiness replay requires an authenticated Prepared binding",
-            );
-        };
-        let Some(window_id) = self
-            .active_agent_sessions
-            .iter()
-            .find_map(|(window_id, session)| {
-                (session.session_id == binding.session_id).then(|| window_id.clone())
-            })
-        else {
-            return refuse(
-                request,
-                "the Prepared Session has no active launch coordinator",
-            );
+        let principal = grant.principal();
+        let prepared = principal.prepared_execution_binding().is_some();
+        let Some(binding) = principal.execution_binding() else {
+            return refuse("readiness resend requires an exact bound Host capability");
         };
         let Some(issuer) = self.agent_capability_issuer.clone() else {
-            return refuse(request, "the launch capability issuer is unavailable");
+            return refuse("Host readiness coordinator is unavailable");
         };
-        let Some(token) = self.agent_capability_tokens.get(&window_id).cloned() else {
-            return refuse(request, "the launch capability is unavailable");
-        };
-        if !request.matches_token(&token) {
+        if !issuer.grant_is_current(grant) {
+            return refuse("Prepared Host capability changed before readiness resend");
+        }
+        let Some((window_id, pending)) = self
+            .pending_fresh_execution_launches
+            .iter()
+            .find(|(_, pending)| {
+                pending.binding == *binding
+                    && pending.binding.session_id == principal.session_id()
+                    && path_matches(&pending.project_root, principal.canonical_project_root())
+            })
+            .map(|(id, pending)| (id.clone(), pending.clone()))
+        else {
+            // Ordinary Active continuation retains the existing generic path.
+            if !prepared {
+                return (Ok(None), Vec::new());
+            }
             return refuse(
-                request,
-                "the launch capability changed before readiness replay",
+                "the matching fresh launch coordinator is no longer pending; run execution.status",
+            );
+        };
+        if prepared && request.readiness_nonce.as_deref() != Some(pending.readiness_nonce.as_str())
+        {
+            return refuse(
+                "execution.continue requires the original authenticated launch readiness nonce",
             );
         }
-        let project_root = request.principal().canonical_project_root().to_path_buf();
-        let events = if let Some(pending) = self
-            .pending_fresh_execution_launches
-            .get(&window_id)
-            .cloned()
-        {
-            if pending.binding != binding
-                || !path_matches(&pending.project_root, &project_root)
-                || pending.readiness_nonce != request.nonce()
-            {
-                return refuse(
-                    request,
-                    "the ready replay does not match the exact pending launch",
-                );
-            }
-            if pending_fresh_execution_activation_status(&pending) == Some(true) {
-                self.reconcile_activated_fresh_execution_launch_events(&window_id, &pending)
-            } else {
-                self.finalize_fresh_execution_launch_session_start(
-                    &window_id,
-                    Some(request.nonce()),
-                )
-            }
-        } else {
-            // The launch nonce remains in the agent environment after readiness.
-            // Let ordinary continuation validate the lifecycle, including Completed.
-            if issuer.active_token_is_current(&token, &binding) {
-                request.complete(Ok(()));
-                return Vec::new();
-            }
-            return refuse(request, "the Prepared Session has no pending fresh launch");
+        let Some(token) = self.agent_capability_tokens.get(&window_id).cloned() else {
+            return refuse("Prepared Host capability is missing");
         };
-        let verified = !self
+        if !grant.matches_token(&token) {
+            return refuse("Prepared Host capability changed before readiness resend");
+        }
+        let events = if prepared {
+            self.finalize_fresh_execution_launch_session_start(
+                &window_id,
+                request.readiness_nonce.as_deref(),
+            )
+        } else if pending_fresh_execution_activation_status(&pending) == Some(true) {
+            // Readiness was authenticated before activation. Repair an interrupted
+            // Work publication through the existing exact-Session coordinator.
+            self.reconcile_activated_fresh_execution_launch_events(&window_id, &pending)
+        } else {
+            return refuse(
+                "Active capability has no authenticated activation for the pending fresh launch",
+            );
+        };
+        if self
             .pending_fresh_execution_launches
             .contains_key(&window_id)
-            && issuer.active_token_is_current(&token, &binding)
-            && gwt::probe_authenticated_execution_binding(
-                &project_root,
-                &binding.session_id,
-                &binding,
-                "fresh-linked-owner-launch-coordinator",
-                gwt::AgentExecutionBindingProbeRequest {
-                    schema_version: gwt::AGENT_EXECUTION_BINDING_PROBE_SCHEMA_VERSION,
-                    operation_id: "continue-ready-replay".to_string(),
-                    nonce: uuid::Uuid::new_v4().to_string(),
-                },
+            || !issuer.active_token_is_current(&token, binding)
+            || !fresh_execution_commit_readback_matches(
+                &pending.worktree_path,
+                pending.owner,
+                &pending.session_identity,
             )
-            .is_ok();
-        request.complete(if verified {
-            Ok(())
-        } else {
-            Err(AgentWorkspaceUpdateError::new(
-                AgentWorkspaceUpdateErrorCode::TransactionConflict,
-                "the fresh launch coordinator could not commit readiness; inspect execution.status",
-            ))
-        });
-        events
+        {
+            return (Err(gwt::AgentWorkspaceUpdateError::new(
+                gwt::AgentWorkspaceUpdateErrorCode::TransactionConflict,
+                "Host readiness coordinator did not commit the candidate; run execution.status before retrying",
+            )), events);
+        }
+        (
+            Ok(Some(gwt::AgentExecutionContinuationReceipt {
+                schema_version: gwt::AGENT_EXECUTION_CONTINUATION_SCHEMA_VERSION,
+                operation_id: request.operation_id.clone(),
+                outcome: gwt::AgentExecutionContinuationOutcome::SuccessorCreated,
+                predecessor_generation_id: Some(pending.predecessor_binding.generation_id),
+                generation_id: binding.identity.generation_id.clone(),
+                execution_binding: binding.identity.clone(),
+                capability_generation: binding.capability_generation,
+                superseded_execution_binding: None,
+                takeover_audit_id: None,
+                validated: true,
+            })),
+            events,
+        )
     }
 
     pub(crate) fn finalize_fresh_execution_launch_session_start(

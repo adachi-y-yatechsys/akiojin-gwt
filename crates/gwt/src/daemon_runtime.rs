@@ -2219,7 +2219,7 @@ mod tests {
             token: "continuation-redirect-secret".to_string(),
         };
         let request = crate::AgentExecutionContinuationRequest {
-            readiness_nonce: Some("launch-ready-nonce".to_string()),
+            readiness_nonce: None,
             schema_version: crate::AGENT_EXECUTION_CONTINUATION_SCHEMA_VERSION,
             operation_id: "continuation-redirect".to_string(),
         };
@@ -2236,7 +2236,6 @@ mod tests {
             Some("Bearer continuation-redirect-secret")
         );
         assert_eq!(body["operation_id"], "continuation-redirect");
-        assert_eq!(body["readiness_nonce"], "launch-ready-nonce");
         server.assert_no_redirect();
     }
 
@@ -2349,7 +2348,7 @@ mod tests {
             }),
         );
         let request = crate::AgentExecutionContinuationRequest {
-            readiness_nonce: None,
+            readiness_nonce: Some("private-readiness-sentinel".to_string()),
             schema_version: crate::AGENT_EXECUTION_CONTINUATION_SCHEMA_VERSION,
             operation_id: "continuation-diagnostics".to_string(),
         };
@@ -2374,7 +2373,9 @@ mod tests {
             !error.contains("workspace.prune"),
             "a recovery operation that does not exist reached the agent: {error}"
         );
-        server.receive();
+        let (_, captured) = server.receive();
+        assert_eq!(captured["readiness_nonce"], "private-readiness-sentinel");
+        assert!(!format!("{request:?}").contains("private-readiness-sentinel"));
 
         let unsafe_server = BindingProbeServer::start(
             StatusCode::CONFLICT,
