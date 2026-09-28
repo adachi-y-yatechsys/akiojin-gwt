@@ -128,7 +128,7 @@ fn generate_hook_config(worktree: &Path, target: ManagedHookTarget) -> io::Resul
 
 fn generate_hook_config_at_path(settings_path: &Path, target: ManagedHookTarget) -> io::Result<()> {
     if let Some(parent) = settings_path.parent() {
-        fs::create_dir_all(parent)?;
+        crate::asset_io::create_dir_all(parent)?;
     }
 
     let mut root = read_existing_settings(settings_path)?;
@@ -263,7 +263,7 @@ fn read_existing_settings(path: &Path) -> io::Result<Map<String, Value>> {
         return Ok(Map::new());
     }
 
-    let content = fs::read_to_string(path)?;
+    let content = crate::asset_io::read_to_string(path)?;
     if content.trim().is_empty() {
         return Ok(Map::new());
     }
@@ -283,23 +283,26 @@ pub(crate) fn write_settings_atomically(path: &Path, value: &Value) -> io::Resul
 pub(crate) fn write_text_atomically(path: &Path, content: &str) -> io::Result<()> {
     let tmp_path = atomic_staging_path(path, "gwt-managed")?;
     // Only clean up a staging file this invocation successfully created.
-    let mut tmp = fs::File::create(&tmp_path)?;
+    let staging_write = |source| {
+        crate::asset_io::AssetIoError::new(crate::asset_io::AssetRoute::Write, &tmp_path, source)
+    };
+    let mut tmp = fs::File::create(&tmp_path).map_err(staging_write)?;
     let result = (|| {
         tmp.write_all(content.as_bytes())?;
         if !content.ends_with('\n') {
             tmp.write_all(b"\n")?;
         }
         tmp.sync_all()
-    })();
+    })()
+    .map_err(staging_write);
     drop(tmp);
-    let result = result.and_then(|()| commit_staged_file(&tmp_path, path));
+    let result: io::Result<()> = result
+        .map_err(io::Error::from)
+        .and_then(|()| commit_staged_file(&tmp_path, path));
     if let Err(error) = result {
-        if let Err(cleanup) = fs::remove_file(&tmp_path) {
+        if let Err(cleanup) = crate::asset_io::remove_file(&tmp_path) {
             if cleanup.kind() != io::ErrorKind::NotFound {
-                return Err(io::Error::other(format!(
-                    "{error}; remove staging file {}: {cleanup}",
-                    tmp_path.display()
-                )));
+                return Err(io::Error::other(format!("{error}; {cleanup}")));
             }
         }
         return Err(error);
@@ -309,7 +312,7 @@ pub(crate) fn write_text_atomically(path: &Path, content: &str) -> io::Result<()
 
 fn atomic_staging_path(path: &Path, fallback_name: &str) -> io::Result<PathBuf> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(dir)?;
+    crate::asset_io::create_dir_all(dir)?;
     let nonce = ATOMIC_WRITE_NONCE.fetch_add(1, Ordering::Relaxed);
     Ok(dir.join(format!(
         ".{}.tmp-{}-{nonce}",
@@ -329,7 +332,7 @@ fn atomic_staging_path(path: &Path, fallback_name: &str) -> io::Result<PathBuf> 
 /// exactly that window, and the in-process lock that guarded it could not see
 /// writers in other processes (PR #3520 review).
 fn commit_staged_file(staging_path: &Path, destination: &Path) -> io::Result<()> {
-    fs::rename(staging_path, destination)
+    Ok(crate::asset_io::rename(staging_path, destination)?)
 }
 
 pub(crate) fn set_executable(path: &Path) -> io::Result<()> {
