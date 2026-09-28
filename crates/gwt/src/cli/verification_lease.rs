@@ -257,7 +257,7 @@ fn release(
     out: &mut String,
 ) -> Result<i32, SpecOpsError> {
     let Some(control) = control_dir_for(lease_id) else {
-        return reclaim_orphan(lease_id, reason, reclaimer, out);
+        return reclaim_holder(lease_id, reason, reclaimer, out);
     };
     // Issue #4360: the holder waits for this file to exist and then reads the
     // reason out of it, so a plain write lets it read the empty moment between
@@ -281,9 +281,9 @@ fn release(
     Ok(0)
 }
 
-/// Issue #4633: how long a holder that looked orphaned is watched again
+/// How long a holder that looked reclaimable is watched again
 /// before it is ended. The first reading spans [`PROGRESS_WINDOW`]; this one
-/// has to show the same — parent gone, nothing of its own running, no CPU
+/// has to show the same — nothing of its own running, no CPU
 /// beyond noise — over a window long enough to cover the gap between two
 /// commands of a live matrix.
 ///
@@ -350,10 +350,29 @@ impl OrphanReclaimer for SystemReclaimer {
                 Err(format!("failed to signal holder pid {pid}: {err}"))
             }
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            // Hidden console children have no cooperative signal channel.
+            // Match daemon_supervisor's Windows termination, without /T:
+            // only the twice-observed holder is authorized for reclamation.
+            let _ = force;
+            let output = gwt_core::process::hidden_command("taskkill")
+                .args(["/PID", &pid.to_string(), "/F"])
+                .output()
+                .map_err(|error| format!("failed to terminate holder pid {pid}: {error}"))?;
+            if output.status.success() || !crate::process::is_host_process_alive(pid) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "failed to terminate holder pid {pid}: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ))
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = (pid, force);
-            Err("reclaiming an orphaned verification holder is supported on Unix only".to_string())
+            Err("reclaiming a verification holder is unsupported on this platform".to_string())
         }
     }
 }
@@ -373,14 +392,14 @@ fn holder_workload(
     })
 }
 
-/// Issue #4633 AC-2/AC-3: free a canonical lease whose holder is orphaned.
+/// Free a canonical lease whose holder is orphaned or stalled without work.
 ///
 /// A canonical lease is a kernel lock inside its `verify.run`, so the only way
-/// to free it from outside is to end that process. That is allowed for one
-/// holder only: one whose requester is gone and which has nothing left to
-/// run, confirmed by two readings [`ORPHAN_CONFIRM_WINDOW`] apart. Every other
+/// to free it from outside is to end that process. An orphan, or an old
+/// in-tree driver with no remaining workload (#4746), must be confirmed by
+/// two readings [`ORPHAN_CONFIRM_WINDOW`] apart. Every other
 /// holder keeps the protection it had — the manual API cannot touch it.
-fn reclaim_orphan(
+fn reclaim_holder(
     lease_id: &str,
     reason: Option<&str>,
     reclaimer: &mut dyn OrphanReclaimer,
@@ -400,7 +419,7 @@ fn reclaim_orphan(
         return Err(canonical_refusal(lease_id, None));
     };
     let first = reclaimer.observe(owner.pid, &status, Duration::ZERO);
-    let Some(first) = first.filter(holder_activity::HolderActivity::orphaned) else {
+    let Some(first) = first.filter(holder_activity::HolderActivity::reclaimable) else {
         return Err(canonical_refusal(
             lease_id,
             first.map(|activity| activity.describe()).as_deref(),
@@ -408,7 +427,7 @@ fn reclaim_orphan(
     };
     let Some(reason) = reason.map(str::trim).filter(|reason| !reason.is_empty()) else {
         return Err(unexpected(format!(
-            "verification lease {lease_id} is held by an orphaned holder ({}). Reclaiming it \
+            "verification lease {lease_id} is held by a reclaimable holder ({}). Reclaiming it \
              ends pid {} and is recorded in the lease ledger, so it needs a reason: pass \
              `params.reason`.",
             first.describe(),
@@ -416,11 +435,11 @@ fn reclaim_orphan(
         )));
     };
     let confirmed = reclaimer.observe(owner.pid, &status, ORPHAN_CONFIRM_WINDOW);
-    let Some(confirmed) = confirmed.filter(holder_activity::HolderActivity::orphaned) else {
+    let Some(confirmed) = confirmed.filter(holder_activity::HolderActivity::reclaimable) else {
         return Err(canonical_refusal(
             lease_id,
             Some(&format!(
-                "the holder looked orphaned, but a second reading {}s later did not confirm it: {}",
+                "the holder looked reclaimable, but a second reading {}s later did not confirm it: {}",
                 ORPHAN_CONFIRM_WINDOW.as_secs(),
                 confirmed
                     .map(|activity| activity.describe())
@@ -441,7 +460,8 @@ fn reclaim_orphan(
     }
     let target = status.target.as_deref().unwrap_or("unknown");
     let record = format!(
-        "orphaned holder pid {} reclaimed by pid {}: {reason}",
+        "{} holder pid {} reclaimed by pid {}: {reason}",
+        confirmed.state(),
         owner.pid,
         std::process::id()
     );
@@ -541,7 +561,8 @@ const HOLDER_STATE_ADVICE: &str = "holder_state is one sampled reading, not a ve
                                    reading saw no CPU and no process turnover; `unknown` means \
                                    the work runs outside the holder's tree and was not found; \
                                    `orphaned` means its parent exited with nothing of its own \
-                                   left running — `verify.lease.release` with a reason \
+                                   left running; `reclaimable` means an old in-tree driver has \
+                                   no remaining workload — `verify.lease.release` with a reason \
                                    re-checks that and reclaims the lease. Confirm with \
                                    `ps -eo pid,ppid,time,command` before acting.";
 
@@ -792,8 +813,8 @@ fn canonical_refusal(lease_id: &str, holder: Option<&str>) -> SpecOpsError {
     unexpected(format!(
         "verification lease {lease_id} is held without a legacy control channel. \
          Canonical leases are owned by `verify.run` and release when the runner finishes; \
-         they cannot be released or extended through the manual API — only a holder whose \
-         parent exited with nothing left to run can be reclaimed.{holder} \
+         they cannot be released or extended through the manual API unless the holder is \
+         orphaned or an old in-tree driver is stalled with no workload left to run.{holder} \
          Check `verify.lease.status` for the current holder."
     ))
 }
@@ -939,6 +960,41 @@ mod tests {
     }
 
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_reclaimer_terminates_the_confirmed_holder() {
+        use std::process::Stdio;
+
+        let worktree = tempfile::tempdir().unwrap();
+        let mut child = gwt_core::process::hidden_command("cmd")
+            .args(["/C", "pause"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        assert!(child.try_wait().unwrap().is_none(), "holder must be alive");
+        let result = SystemReclaimer::new(worktree.path()).terminate(child.id(), false);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let exited = loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break true,
+                Ok(None) if result.is_ok() && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                _ => break false,
+            }
+        };
+        // Clean up even when the native termination under test failed.
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            exited,
+            "the confirmed holder must exit before the lease TTL"
+        );
+    }
     use gwt_core::index_coordinator::JobPriority;
 
     #[test]
@@ -1188,6 +1244,13 @@ mod tests {
             reading(true, 0)
         }
 
+        fn stalled_driver() -> HolderActivity {
+            HolderActivity {
+                delegated: false,
+                ..reading(false, 0)
+            }
+        }
+
         /// Scripted readings; "ending" the holder drops the lease, the way
         /// the kernel releases it when the holder process exits.
         struct ScriptedReclaimer<'a> {
@@ -1306,6 +1369,67 @@ mod tests {
             let reason = event.reason.as_deref().unwrap_or_default();
             assert!(reason.contains("reclaimed by pid"), "{reason}");
             assert!(reason.contains("window closed"), "{reason}");
+        }
+
+        #[test]
+        fn a_confirmed_empty_stalled_driver_releases_the_lease() {
+            let mut held = hold_lease();
+            let lease_id = held.lease_id.clone();
+            let mut reclaimer = ScriptedReclaimer {
+                readings: vec![Some(stalled_driver()), Some(stalled_driver())],
+                held: &mut held,
+                terminated: Vec::new(),
+            };
+            let mut out = String::new();
+
+            release(
+                &lease_id,
+                Some("all commands exited"),
+                &mut reclaimer,
+                &mut out,
+            )
+            .unwrap();
+
+            assert_eq!(reclaimer.terminated, vec![(std::process::id(), false)]);
+            assert!(!still_held(&lease_id));
+            let events = open_coordinator().unwrap().lease_events().unwrap();
+            let event = events.last().unwrap();
+            assert_eq!(event.kind, LeaseEventKind::Reclaimed);
+            assert!(event
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("all commands exited"));
+        }
+
+        #[test]
+        fn a_stalled_driver_that_resumes_before_confirmation_keeps_its_lease() {
+            let mut held = hold_lease();
+            let lease_id = held.lease_id.clone();
+            let mut reclaimer = ScriptedReclaimer {
+                readings: vec![
+                    Some(stalled_driver()),
+                    Some(HolderActivity {
+                        workload_processes: 1,
+                        ..stalled_driver()
+                    }),
+                ],
+                held: &mut held,
+                terminated: Vec::new(),
+            };
+
+            let err = release(
+                &lease_id,
+                Some("looked idle"),
+                &mut reclaimer,
+                &mut String::new(),
+            )
+            .unwrap_err()
+            .to_string();
+
+            assert!(err.contains("did not confirm"), "{err}");
+            assert!(reclaimer.terminated.is_empty());
+            assert!(still_held(&lease_id));
         }
 
         /// Ending a process is recorded, so it cannot be done anonymously.
