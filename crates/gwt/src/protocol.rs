@@ -886,6 +886,10 @@ pub enum FrontendEvent {
     SetIssueMonitorAutoApplyUpdates {
         enabled: bool,
     },
+    IssueMonitorProfilesSet {
+        profiles: Vec<crate::IssueMonitorLaunchProfilePatch>,
+        usage_threshold_percent: Option<u8>,
+    },
     SetIssueMonitorMaxActiveAgents {
         max_active_agents: usize,
     },

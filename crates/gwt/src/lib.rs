@@ -15,6 +15,7 @@ pub mod board_remote;
 pub mod branch_cleanup;
 pub mod branch_list;
 pub mod cli;
+pub use cli::issue::validate_monitor_profiles_set;
 pub mod custom_agents_dispatch;
 pub mod custom_agents_service;
 pub mod daemon_publisher;

@@ -54164,6 +54164,138 @@ fn pool_profile(agent_id: &str) -> gwt::IssueMonitorLaunchProfile {
 }
 
 #[test]
+fn app_runtime_issue_monitor_profiles_set_preserves_sparse_candidate_settings() {
+    let temp = tempdir().expect("tempdir");
+    let _home = ScopedGwtHome::set(temp.path());
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    init_repo_with_initial_commit(&repo);
+    let prefs_path = gwt::issue_monitor_prefs_path_for_repo_path(&repo);
+    let mut claude = pool_profile("claude");
+    claude.model = Some("saved-claude-model".into());
+    claude.reasoning = Some("high".into());
+    claude.skip_permissions = true;
+    claude.prefer_for = vec!["type:bug".into()];
+    let mut codex = pool_profile("codex");
+    codex.model = Some("saved-codex-model".into());
+    codex.fast_mode = true;
+    let mut seeded = gwt::IssueMonitorPrefs {
+        max_active_agents: 7,
+        launch_usage_threshold_percent: 83,
+        ..Default::default()
+    };
+    seeded.set_launch_profile_pool(vec![claude.clone(), codex.clone()]);
+    gwt::save_issue_monitor_prefs(&prefs_path, &seeded).expect("seed pool");
+    let tab = sample_project_tab("tab-1", "Repo", repo, ProjectKind::Git, &[]);
+    let mut runtime = sample_runtime(temp.path(), vec![tab], Some("tab-1"));
+    let event = serde_json::from_value(serde_json::json!({
+        "kind": "issue_monitor_profiles_set",
+        "profiles": [{"agent_id": "codex", "prefer_for": ["kind:feature"]},
+                     {"agent_id": "claude"}, {"agent_id": "grok"}]
+    }))
+    .expect("candidate editing event");
+    let events = runtime.handle_frontend_event("client-1".into(), event);
+    let errors: Vec<_> = events
+        .iter()
+        .filter_map(|event| match &event.event {
+            BackendEvent::IssueMonitorToast { level, message, .. } if level == "error" => {
+                Some(message)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(errors.is_empty(), "{errors:?}");
+    let saved = gwt::load_issue_monitor_prefs(&prefs_path).expect("reload pool");
+    codex.prefer_for = vec!["kind:feature".into()];
+    assert_eq!(saved.launch_profiles[0], codex);
+    assert_eq!(saved.launch_profiles[1], claude);
+    assert_eq!(saved.launch_profiles[2].agent_id, "grok");
+    assert!(
+        saved.launch_profiles[2].skip_permissions,
+        "new candidate inherits shared settings"
+    );
+    assert_eq!(saved.launch_profile.as_ref(), Some(&codex));
+    assert_eq!(saved.launch_usage_threshold_percent, 83);
+    assert_eq!(saved.max_active_agents, 7);
+    assert_eq!(
+        saved.effect_authority_epoch,
+        seeded.effect_authority_epoch + 1
+    );
+
+    // Removing candidates and changing only the threshold retain the remaining
+    // candidate's provider-specific configuration and its routing tags.
+    let event = serde_json::from_value(serde_json::json!({
+        "kind": "issue_monitor_profiles_set",
+        "profiles": [{"agent_id": "codex"}], "usage_threshold_percent": 71
+    }))
+    .expect("candidate removal event");
+    runtime.handle_frontend_event("client-1".into(), event);
+    let saved = gwt::load_issue_monitor_prefs(&prefs_path).expect("reload reduced pool");
+    assert_eq!(saved.launch_profiles, vec![codex]);
+    assert_eq!(saved.launch_usage_threshold_percent, 71);
+    assert_eq!(saved.max_active_agents, 7);
+}
+
+#[test]
+fn app_runtime_issue_monitor_profiles_set_rejects_invalid_edits_without_writing() {
+    let temp = tempdir().expect("tempdir");
+    let _home = ScopedGwtHome::set(temp.path());
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    init_repo_with_initial_commit(&repo);
+    let prefs_path = gwt::issue_monitor_prefs_path_for_repo_path(&repo);
+    let mut seeded = gwt::IssueMonitorPrefs::default();
+    seeded.set_launch_profile_pool(vec![pool_profile("claude")]);
+    gwt::save_issue_monitor_prefs(&prefs_path, &seeded).expect("seed pool");
+    let tab = sample_project_tab("tab-1", "Repo", repo, ProjectKind::Git, &[]);
+    let mut runtime = sample_runtime(temp.path(), vec![tab], Some("tab-1"));
+    for payload in [
+        serde_json::json!({"profiles": []}),
+        serde_json::json!({"profiles": [{"agent_id": "claude", "prefer_for": ["invalid"]}]}),
+        serde_json::json!({"profiles": [{"agent_id": "claude"}], "usage_threshold_percent": 0}),
+    ] {
+        let before = fs::read(&prefs_path).expect("read prefs");
+        let mut payload = payload;
+        payload["kind"] = "issue_monitor_profiles_set".into();
+        let event = serde_json::from_value(payload).expect("candidate editing event");
+        let events = runtime.handle_frontend_event("client-1".into(), event);
+        assert!(events.iter().any(|event| matches!(
+            &event.event, BackendEvent::IssueMonitorToast { level, .. } if level == "error"
+        )));
+        assert_eq!(fs::read(&prefs_path).expect("reload prefs"), before);
+    }
+}
+
+#[test]
+fn app_runtime_issue_monitor_profiles_set_epoch_overflow_is_zero_write_error() {
+    let temp = tempdir().expect("tempdir");
+    let _home = ScopedGwtHome::set(temp.path());
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    init_repo_with_initial_commit(&repo);
+    let prefs_path = gwt::issue_monitor_prefs_path_for_repo_path(&repo);
+    let mut seeded = gwt::IssueMonitorPrefs {
+        effect_authority_epoch: u64::MAX,
+        ..Default::default()
+    };
+    seeded.set_launch_profile_pool(vec![pool_profile("claude")]);
+    gwt::save_issue_monitor_prefs(&prefs_path, &seeded).expect("seed pool");
+    let before = fs::read(&prefs_path).expect("read prefs");
+    let tab = sample_project_tab("tab-1", "Repo", repo, ProjectKind::Git, &[]);
+    let mut runtime = sample_runtime(temp.path(), vec![tab], Some("tab-1"));
+    let event = serde_json::from_value(serde_json::json!({
+        "kind": "issue_monitor_profiles_set", "profiles": [{"agent_id": "codex"}]
+    }))
+    .expect("candidate editing event");
+    let events = runtime.handle_frontend_event("client-1".into(), event);
+    assert!(events.iter().any(|event| matches!(
+        &event.event, BackendEvent::IssueMonitorToast { level, message, .. }
+            if level == "error" && message.contains("authority epoch exhausted")
+    )));
+    assert_eq!(fs::read(&prefs_path).expect("reload prefs"), before);
+}
+
+#[test]
 fn app_runtime_issue_monitor_profile_save_switches_the_pool_head() {
     // Issue #4079 AC-1: with `[claude, codex]` saved, an Agent Settings save
     // for codex must make codex candidate 1 — and the `launch_profile` mirror

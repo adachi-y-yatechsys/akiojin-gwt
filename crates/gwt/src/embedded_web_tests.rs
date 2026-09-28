@@ -4285,3 +4285,30 @@ fn embedded_web_retires_the_autonomous_notifications_log_region() {
         "SPEC #3206 FR-011: issue_monitor_toast must record into the notification center",
     );
 }
+
+#[test]
+fn embedded_web_issue_monitor_candidate_pool_contract() {
+    let surface = root_js_module_source("/knowledge-kanban-surface.js");
+    for contract in [
+        "knowledge-monitor-pool",
+        "knowledge-monitor-candidate",
+        "issue_monitor_profiles_set",
+        "Add candidate",
+        "prefer_for",
+        "usage_threshold_percent",
+    ] {
+        assert!(
+            surface.contains(contract),
+            "missing pool contract: {contract}"
+        );
+    }
+    let css = static_asset_text("/styles/app.css");
+    let pool_styles = css
+        .split("/* Issue #4530 candidate pool */")
+        .nth(1)
+        .expect("pool styles");
+    assert!(pool_styles.contains("var(--color-border)"));
+    assert!(pool_styles.contains("var(--type-"));
+    assert!(!pool_styles.contains("rgba("));
+    assert!(!pool_styles.contains("rgb("));
+}
