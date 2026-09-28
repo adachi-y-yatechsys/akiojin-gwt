@@ -411,12 +411,29 @@ fn materialize_pm_project_policy(
             ));
         }
         let source = worktree.join(&relative);
-        let content = fs::read_to_string(&source).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("read opted-in PM policy {}: {error}", source.display()),
-            )
-        })?;
+        // #4486 AC-11: a policy file the project opted into but does not carry
+        // is configuration drift, not a PM failure. Propagating NotFound here
+        // aborted the whole refresh — `refresh_pm_runtime_assets` rolls back to
+        // its snapshot and returns the error — so a repository with no
+        // `AGENTS.md` / `CLAUDE.md` left the resident PM unable to start at all.
+        // Skipping the absent file keeps the PM launchable; every other read
+        // error (permissions, non-UTF8, I/O) still fails the refresh.
+        let content = match fs::read_to_string(&source) {
+            Ok(content) => content,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                tracing::warn!(
+                    path = %source.display(),
+                    "opted-in PM policy file is absent; skipping it for this refresh"
+                );
+                continue;
+            }
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("read opted-in PM policy {}: {error}", source.display()),
+                ));
+            }
+        };
         policy.push_str(&format!("\n### {}\n\n{}\n", relative.display(), content));
     }
     if policy.is_empty() {
@@ -2174,9 +2191,29 @@ mod tests {
             .unwrap()
             .contains("PROJECT-ONLY-SENTINEL"));
         let before = std::fs::read(&skill).unwrap();
+        // #4486 AC-11: an opted-in policy file the project does not carry is
+        // configuration drift, not a refresh failure. This used to return an
+        // error, which left the resident PM unable to start in a repository
+        // with no `AGENTS.md` / `CLAUDE.md` at all.
         std::fs::write(
             &prefs,
             r#"{"settings":{"project_policy_files":["missing.md"]}}"#,
+        )
+        .unwrap();
+        super::refresh_managed_gwt_assets_for_pm_worktree_locked(&worktree)
+            .expect("an absent opted-in policy file must not fail the PM refresh");
+        assert_eq!(
+            std::fs::read(&skill).unwrap(),
+            before,
+            "skipping an absent opt-in leaves the owned runtime leaf policy-free"
+        );
+        // A read failure that is *not* absence still fails the refresh and still
+        // rolls the owned leaf back — opting into a directory reads as an error
+        // on every platform, and none of them report it as NotFound.
+        std::fs::create_dir_all(worktree.join("policy-dir")).unwrap();
+        std::fs::write(
+            &prefs,
+            r#"{"settings":{"project_policy_files":["policy-dir"]}}"#,
         )
         .unwrap();
         assert!(super::refresh_managed_gwt_assets_for_pm_worktree_locked(&worktree).is_err());
