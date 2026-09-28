@@ -1805,6 +1805,7 @@ enum UserEvent {
         monitor_result: WindowCloseMonitorResult,
     },
     RuntimeHook(gwt::RuntimeHookEvent),
+    PreparedExecutionReadiness(embedded_server::PreparedExecutionReadiness),
     DaemonRuntimeHook(gwt::RuntimeHookEvent),
     DaemonRuntimeApprovalOverlay {
         id: String,
@@ -10371,6 +10372,9 @@ fn main() -> std::io::Result<()> {
             Event::UserEvent(UserEvent::RuntimeHook(event)) => {
                 let events = app.handle_runtime_hook_event(event);
                 clients.dispatch(events);
+            }
+            Event::UserEvent(UserEvent::PreparedExecutionReadiness(request)) => {
+                clients.dispatch(app.handle_prepared_execution_readiness(request));
             }
             Event::UserEvent(UserEvent::DaemonRuntimeHook(event)) => {
                 let events = app.handle_daemon_runtime_hook_event(event);

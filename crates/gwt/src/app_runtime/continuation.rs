@@ -441,7 +441,7 @@ fn continue_work_outcome(
     )
 }
 
-fn reject_continue_work_workspace_commit(
+pub(super) fn reject_continue_work_workspace_commit(
     project_root: &Path,
     work_event_root: &Path,
     operation_id: &str,
@@ -6693,6 +6693,115 @@ impl AppRuntime {
                 detail: Some(detail),
             },
         )]
+    }
+
+    pub(crate) fn handle_prepared_execution_readiness(
+        &mut self,
+        request: crate::embedded_server::PreparedExecutionReadiness,
+    ) -> Vec<OutboundEvent> {
+        use gwt::{AgentWorkspaceUpdateError, AgentWorkspaceUpdateErrorCode};
+        let refuse = |request: crate::embedded_server::PreparedExecutionReadiness, reason: &str| {
+            request.complete(Err(AgentWorkspaceUpdateError::new(
+                AgentWorkspaceUpdateErrorCode::ExecutionBindingMismatch,
+                reason,
+            )));
+            Vec::new()
+        };
+        if request.cancelled() {
+            return Vec::new();
+        }
+        let Some(binding) = request
+            .principal()
+            .prepared_execution_binding()
+            .or_else(|| request.principal().active_execution_binding())
+            .cloned()
+        else {
+            return refuse(
+                request,
+                "readiness replay requires an authenticated Prepared binding",
+            );
+        };
+        let Some(window_id) = self
+            .active_agent_sessions
+            .iter()
+            .find_map(|(window_id, session)| {
+                (session.session_id == binding.session_id).then(|| window_id.clone())
+            })
+        else {
+            return refuse(
+                request,
+                "the Prepared Session has no active launch coordinator",
+            );
+        };
+        let Some(issuer) = self.agent_capability_issuer.clone() else {
+            return refuse(request, "the launch capability issuer is unavailable");
+        };
+        let Some(token) = self.agent_capability_tokens.get(&window_id).cloned() else {
+            return refuse(request, "the launch capability is unavailable");
+        };
+        if !request.matches_token(&token) {
+            return refuse(
+                request,
+                "the launch capability changed before readiness replay",
+            );
+        }
+        let project_root = request.principal().canonical_project_root().to_path_buf();
+        let events = if let Some(pending) = self
+            .pending_fresh_execution_launches
+            .get(&window_id)
+            .cloned()
+        {
+            if pending.binding != binding
+                || !path_matches(&pending.project_root, &project_root)
+                || pending.readiness_nonce != request.nonce()
+            {
+                return refuse(
+                    request,
+                    "the ready replay does not match the exact pending launch",
+                );
+            }
+            if pending_fresh_execution_activation_status(&pending) == Some(true) {
+                self.reconcile_activated_fresh_execution_launch_events(&window_id, &pending)
+            } else {
+                self.finalize_fresh_execution_launch_session_start(
+                    &window_id,
+                    Some(request.nonce()),
+                )
+            }
+        } else {
+            // The launch nonce remains in the agent environment after readiness.
+            // Let ordinary continuation validate the lifecycle, including Completed.
+            if issuer.active_token_is_current(&token, &binding) {
+                request.complete(Ok(()));
+                return Vec::new();
+            }
+            return refuse(request, "the Prepared Session has no pending fresh launch");
+        };
+        let verified = !self
+            .pending_fresh_execution_launches
+            .contains_key(&window_id)
+            && issuer.active_token_is_current(&token, &binding)
+            && gwt::probe_authenticated_execution_binding(
+                &project_root,
+                &binding.session_id,
+                &binding,
+                "fresh-linked-owner-launch-coordinator",
+                gwt::AgentExecutionBindingProbeRequest {
+                    schema_version: gwt::AGENT_EXECUTION_BINDING_PROBE_SCHEMA_VERSION,
+                    operation_id: "continue-ready-replay".to_string(),
+                    nonce: uuid::Uuid::new_v4().to_string(),
+                },
+            )
+            .is_ok();
+        request.complete(if verified {
+            Ok(())
+        } else {
+            Err(AgentWorkspaceUpdateError::new(
+                AgentWorkspaceUpdateErrorCode::TransactionConflict,
+                "the fresh launch coordinator could not commit readiness; inspect execution.status",
+            ))
+        });
+        events
     }
 
     pub(crate) fn finalize_fresh_execution_launch_session_start(

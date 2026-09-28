@@ -1417,6 +1417,47 @@ impl FinalizedAgentCapabilityLaunch<'_> {
                 .map_err(|error| error.to_string())?;
         }
         if let Some(current) = current_binding {
+            // A legacy launch may have committed Prepared without a recovery receipt.
+            // Only an exact dead-Host handshake may release it; absence alone is
+            // also the normal interval before a new launch persists its Session.
+            if let Some(ledger) = gwt::cli::execution_state::load_generation_ledger(worktree, owner)
+                .map_err(|error| error.to_string())?
+            {
+                for blocked in
+                    gwt::cli::execution_state::blocking_prepared_transactions(sessions_dir, &ledger)
+                {
+                    if blocked.kind != "successor" {
+                        continue;
+                    }
+                    let Some(attempt) =
+                        gwt::cli::execution_state::continuation_attempt_for_operation(
+                            worktree,
+                            owner,
+                            &blocked.operation_id,
+                        )
+                        .map_err(|error| error.to_string())?
+                    else {
+                        continue;
+                    };
+                    gwt::cli::execution_state::abort_abandoned_prepared_owner_launch_with(
+                        worktree,
+                        owner,
+                        sessions_dir,
+                        &attempt.request,
+                        || {
+                            super::continuation::reject_continue_work_workspace_commit(
+                                project_root,
+                                worktree,
+                                &attempt.request.operation_id,
+                            )
+                        },
+                    )
+                     .map_err(|error| {
+                        tracing::warn!(operation_id = %attempt.request.operation_id, %error, "Prepared launch recovery retained unresolved evidence");
+                        error.to_string()
+                    })?;
+                }
+            }
             let ledger = gwt::cli::execution_state::load_generation_ledger(worktree, owner)
                 .map_err(|error| error.to_string())?
                 .ok_or_else(|| {

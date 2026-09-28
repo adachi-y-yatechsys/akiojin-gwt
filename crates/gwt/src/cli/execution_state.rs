@@ -8804,6 +8804,117 @@ fn abort_successor_bound_to(
     Ok(aborted)
 }
 
+/// Recover a receiptless owner launch only from its exact dead-Host handshake.
+/// The callback rejects its Work transaction under the same owner/Session leases.
+/// Session history is retained; the Aborted attempt fences any late activation.
+pub fn abort_abandoned_prepared_owner_launch_with(
+    worktree: &Path,
+    owner: ExecutionOwnerKey,
+    sessions_dir: &Path,
+    request: &SuccessorRequest,
+    reject_work: impl FnOnce() -> io::Result<()>,
+) -> io::Result<bool> {
+    let retain = |reason: &str| {
+        tracing::info!(operation_id = %request.operation_id, reason, "retained Prepared launch without decisive abandonment proof");
+        Ok(false)
+    };
+    with_generation_owner_lease(worktree, owner, |context| {
+        let Some(ledger) = load_owner_generation_ledger_from_context(context)? else {
+            return retain("owner ledger missing");
+        };
+        let Some(current) = ledger.current_generation() else {
+            return retain("current generation missing");
+        };
+        let Some(attempt) =
+            latest_operation_attempt(&ledger, request, &context.worktree_binding_hash)?
+        else {
+            return retain("attempt missing");
+        };
+        if attempt.status != ContinuationAttemptStatus::Prepared
+            || !is_owner_launch_successor_attempt(attempt)
+            || attempt.predecessor.generation_id != current.identity.generation_id
+        {
+            return retain("attempt no longer targets current owner launch");
+        }
+        let Some(successor) = prepared_successor_generation(context, &ledger, request)? else {
+            return retain("exact successor no longer Prepared");
+        };
+        let mut planned = ledger;
+        planned.current_generation_id = successor.identity.generation_id.clone();
+        planned.generations.push(successor);
+        let expected_binding = execution_binding_for_generation(
+            &planned,
+            planned
+                .current_generation()
+                .ok_or_else(|| invalid_generation_data("planned successor missing"))?,
+        );
+        gwt_agent::with_session_path_lease(sessions_dir, &request.initial_session_id, |state| {
+            let session = match state {
+                gwt_agent::SessionPathState::Present(session) => session,
+                gwt_agent::SessionPathState::Missing => {
+                    return retain("Session absent; launch may still be materializing")
+                }
+                gwt_agent::SessionPathState::Error(error) => return Err(error),
+            };
+            let Some(identity) = gwt_agent::SessionExecutionIdentity::from_session(&session)
+                .map_err(invalid_generation_data)?
+            else {
+                return retain("Session has no exact execution identity");
+            };
+            if identity.session_id != request.initial_session_id
+                || identity.execution_binding.owner_kind != owner.kind.as_str()
+                || identity.execution_binding.owner_number != owner.number
+                || dunce::canonicalize(&session.worktree_path).ok().as_ref()
+                    != Some(&context.worktree)
+                || expected_binding != identity.execution_binding.identity
+            {
+                return retain("Session does not match exact Prepared owner and worktree");
+            }
+            let Some(handshake) = gwt_agent::read_session_active_launch_handshake_under_lease(
+                sessions_dir,
+                &identity,
+            )?
+            else {
+                return retain("no exact active-launch handshake");
+            };
+            let host_start = crate::process::host_process_start_time(handshake.host_pid);
+            if host_start == Some(handshake.host_started_at)
+                || (host_start.is_none()
+                    && crate::process::is_host_process_alive(handshake.host_pid))
+            {
+                return retain("launch Host is live or unknown");
+            }
+            match handshake.phase {
+                gwt_agent::SessionActiveLaunchPhase::PreSpawn => {}
+                gwt_agent::SessionActiveLaunchPhase::ChildSpawned {
+                    child_pid,
+                    child_started_at,
+                } if !crate::process::exact_pty_process_tree_is_alive(
+                    child_pid,
+                    child_started_at,
+                ) => {}
+                _ => return retain("launch child is live or unclassified"),
+            }
+            if !matches!(
+                classify_exact_session_runtime(sessions_dir, &identity)?,
+                ExactSessionRuntimeDisposition::Absent | ExactSessionRuntimeDisposition::HostDead
+            ) {
+                return retain("runtime does not prove absence of a live launch");
+            }
+            // Reject first: an I/O failure must leave Prepared and the exact
+            // handshake available for the next launch to retry.
+            reject_work()?;
+            abort_successor_in_context(
+                context,
+                request,
+                "recovered Prepared launch after exact Host and child death",
+            )?;
+            gwt_agent::clear_session_active_launch_handshake_under_lease(sessions_dir, &handshake)?;
+            Ok(true)
+        })
+    })
+}
+
 /// Abort one Prepared successor and remove its exact Session while holding
 /// leases in the canonical owner -> Session order.
 #[allow(clippy::too_many_arguments)]
@@ -13074,6 +13185,20 @@ fn probe_execution_adopt_for_recovery(
     if recovery_context.is_some_and(Result::is_err) {
         return invalid_execution_recovery_scope_probe("execution.adopt");
     }
+    let project_root = recovery_context
+        .and_then(|context| context.as_ref().ok())
+        .map_or(worktree, |context| context.project_state_root());
+    if crate::agent_project_state::session_has_prepared_execution_binding(project_root, session_id)
+    {
+        return crate::cli::governance::RecoveryProbe::unavailable(
+            "execution.adopt",
+            protected_recovery_metadata(
+                Some(crate::cli::governance::GovernanceCause::Authority),
+                false,
+            ),
+            "prepared_execution_requires_authenticated_ready_replay: use execution.continue with the existing launch nonce for Host validation",
+        );
+    }
     if recovery_context
         .and_then(|context| context.as_ref().ok())
         .is_some_and(|context| context.exact_unbound_host())
@@ -15433,6 +15558,7 @@ fn run_impl<E: CliEnv>(
             }
         };
         let request = crate::AgentExecutionContinuationRequest {
+            readiness_nonce: std::env::var(gwt_agent::GWT_CONTINUE_WORK_READY_NONCE_ENV).ok(),
             schema_version: crate::AGENT_EXECUTION_CONTINUATION_SCHEMA_VERSION,
             operation_id: operation_id.clone(),
         };
@@ -17932,6 +18058,122 @@ mod tests {
         );
         prepare_exact_manual_launch_successor(dir.path(), owner, &successor, predecessor)
             .expect("the launch the diagnosis recommends must be accepted after the release");
+    }
+
+    #[test]
+    fn receiptless_prepared_launch_requires_dead_handshake_and_allows_three_retries() {
+        let _env_lock = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = tempfile::tempdir().unwrap();
+        let _home = ScopedEnvVar::set("HOME", home.path());
+        let _profile = ScopedEnvVar::set("USERPROFILE", home.path());
+        let _session_env = unset_live_session_env();
+        let dir = tempfile::tempdir().unwrap();
+        crate::cli::trusted_store::init_git_repo_with_origin(dir.path());
+        let owner = generation_owner();
+        let mut record = active_record("receiptless-holder");
+        record.owner_number = owner.number;
+        save(dir.path(), &record).unwrap();
+        ensure_generation_ledger(dir.path(), owner, LegacyActiveDisposition::Live).unwrap();
+        settle(
+            dir.path(),
+            "receiptless-holder",
+            ExecutionSettlement::Blocked {
+                reason: "holder died".into(),
+                missing_verification: None,
+            },
+        )
+        .unwrap();
+        let sessions_dir = gwt_core::paths::gwt_sessions_dir();
+        for index in 0..3 {
+            let request = successor_request(
+                &format!("receiptless-{index}"),
+                "gwt-host-launch",
+                FRESH_LINKED_OWNER_LAUNCH_SOURCE,
+            );
+            prepare_fresh_linked_owner_launch_successor(dir.path(), owner, &request).unwrap();
+            let identity =
+                prepared_successor_execution_binding(dir.path(), owner, &request).unwrap();
+            persist_generation_session_binding(
+                dir.path(),
+                owner,
+                &request.initial_session_id,
+                identity,
+            );
+            let session = gwt_agent::Session::load(
+                &sessions_dir.join(format!("{}.toml", request.initial_session_id)),
+            )
+            .unwrap();
+            assert!(!abort_abandoned_prepared_owner_launch_with(
+                dir.path(),
+                owner,
+                &sessions_dir,
+                &request,
+                || panic!("no handshake must retain launch")
+            )
+            .unwrap());
+            let mut handshake =
+                claim_prepared_session_launch(dir.path(), owner, &sessions_dir, &session)
+                    .unwrap()
+                    .unwrap();
+            assert!(!abort_abandoned_prepared_owner_launch_with(
+                dir.path(),
+                owner,
+                &sessions_dir,
+                &request,
+                || panic!("live Host must retain launch")
+            )
+            .unwrap());
+            handshake.host_pid = i32::MAX as u32;
+            handshake.host_started_at = 1;
+            fs::write(
+                gwt_agent::active_launch_handshake_path(&sessions_dir, &session.id),
+                serde_json::to_vec_pretty(&handshake).unwrap(),
+            )
+            .unwrap();
+            if index == 0 {
+                assert!(abort_abandoned_prepared_owner_launch_with(
+                    dir.path(),
+                    owner,
+                    &sessions_dir,
+                    &request,
+                    || Err(io::Error::other("Work rejection unavailable")),
+                )
+                .is_err());
+                assert_eq!(
+                    continuation_attempt_for_operation(dir.path(), owner, &request.operation_id)
+                        .unwrap()
+                        .unwrap()
+                        .status,
+                    ContinuationAttemptStatus::Prepared
+                );
+            }
+            let mut rejected_work = false;
+            assert!(abort_abandoned_prepared_owner_launch_with(
+                dir.path(),
+                owner,
+                &sessions_dir,
+                &request,
+                || {
+                    rejected_work = true;
+                    Ok(())
+                }
+            )
+            .unwrap());
+            assert!(rejected_work);
+            assert!(
+                activate_successor(dir.path(), owner, &request).is_err(),
+                "old candidate must never activate after recovery"
+            );
+        }
+        let request = successor_request(
+            "receiptless-final",
+            "gwt-host-launch",
+            FRESH_LINKED_OWNER_LAUNCH_SOURCE,
+        );
+        prepare_fresh_linked_owner_launch_successor(dir.path(), owner, &request).unwrap();
+        activate_successor(dir.path(), owner, &request).unwrap();
     }
 
     #[test]

@@ -106,8 +106,26 @@ pub fn adopt_authenticated_execution(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentExecutionContinuationRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness_nonce: Option<String>,
     pub schema_version: u32,
     pub operation_id: String,
+}
+
+impl AgentExecutionContinuationRequest {
+    pub fn validate(&self) -> std::result::Result<(), AgentWorkspaceUpdateError> {
+        if self.schema_version != AGENT_EXECUTION_CONTINUATION_SCHEMA_VERSION {
+            return Err(AgentWorkspaceUpdateError::new(
+                AgentWorkspaceUpdateErrorCode::InvalidRequest,
+                "unsupported execution continuation schema version",
+            ));
+        }
+        validate_ephemeral_probe_identifier(&self.operation_id, "operation id")?;
+        if let Some(nonce) = self.readiness_nonce.as_deref() {
+            validate_ephemeral_probe_identifier(nonce, "readiness nonce")?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -476,6 +494,7 @@ pub fn prepare_resume_producing_authority(
     predecessor_session_id: &str,
 ) -> Option<(AgentExecutionContinuationReceipt, SessionExecutionBinding)> {
     let request = AgentExecutionContinuationRequest {
+        readiness_nonce: None,
         schema_version: AGENT_EXECUTION_CONTINUATION_SCHEMA_VERSION,
         operation_id: format!("resume-producing-{}", uuid::Uuid::new_v4()),
     };
@@ -819,6 +838,21 @@ fn evaluate_authenticated_execution_continuation(
     })
 }
 
+/// Prepared authority is observational until the Host validates a ready replay.
+pub(crate) fn session_has_prepared_execution_binding(
+    project_root: &Path,
+    session_id: &str,
+) -> bool {
+    if gwt_agent::validate_session_id_path_component(session_id).is_err() {
+        return false;
+    }
+    load_session_for_mutation(session_id).is_ok_and(|session| {
+        session.execution_binding.as_ref().is_some_and(|binding| {
+            validate_prepared_execution_binding_authority(project_root, session_id, binding).is_ok()
+        })
+    })
+}
+
 /// Side-effect-free prerequisite evaluator shared by diagnosis and execution.
 pub(crate) fn probe_authenticated_execution_continuation(
     authenticated_project_root: &Path,
@@ -827,6 +861,21 @@ pub(crate) fn probe_authenticated_execution_continuation(
     use crate::cli::governance::{
         GovernanceCause, GovernanceEffect, GovernanceMetadata, RecoveryProbe,
     };
+    if session_has_prepared_execution_binding(authenticated_project_root, authenticated_session_id)
+    {
+        // A local probe cannot establish that the live Host still holds the
+        // pending launch and its nonce. Do not promise an executable recovery.
+        return RecoveryProbe::unavailable(
+            "execution.continue",
+            GovernanceMetadata {
+                effect: Some(GovernanceEffect::Protected),
+                cause: Some(GovernanceCause::NotReady),
+                retryable: Some(true),
+                ..GovernanceMetadata::default()
+            },
+            "prepared_execution_requires_authenticated_ready_replay: execution.continue forwards the existing launch nonce; the Host must validate the pending launch before activation",
+        );
+    }
     match evaluate_authenticated_execution_continuation(
         authenticated_project_root,
         authenticated_session_id,
@@ -894,13 +943,7 @@ pub fn continue_authenticated_execution(
     (AgentExecutionContinuationReceipt, SessionExecutionBinding),
     AgentWorkspaceUpdateError,
 > {
-    if request.schema_version != AGENT_EXECUTION_CONTINUATION_SCHEMA_VERSION {
-        return Err(AgentWorkspaceUpdateError::new(
-            AgentWorkspaceUpdateErrorCode::InvalidRequest,
-            "unsupported execution continuation schema version",
-        ));
-    }
-    validate_ephemeral_probe_identifier(&request.operation_id, "operation id")?;
+    request.validate()?;
     let authority = evaluate_authenticated_execution_continuation(
         authenticated_project_root,
         authenticated_session_id,
@@ -5980,11 +6023,25 @@ mod tests {
     }
 
     #[test]
+    fn execution_continuation_request_accepts_optional_readiness_nonce() {
+        let legacy = serde_json::json!({"schema_version": 1, "operation_id": "continue"});
+        let decoded: AgentExecutionContinuationRequest =
+            serde_json::from_value(legacy.clone()).expect("legacy request");
+        assert_eq!(serde_json::to_value(decoded).unwrap(), legacy);
+        let mut replay = legacy;
+        replay["readiness_nonce"] = serde_json::json!("ready-challenge");
+        let decoded: AgentExecutionContinuationRequest =
+            serde_json::from_value(replay.clone()).expect("authenticated readiness replay request");
+        assert_eq!(serde_json::to_value(decoded).unwrap(), replay);
+    }
+
+    #[test]
     fn execution_continuation_rebinds_current_generation_after_host_restart() {
         with_strict_target_fixture(|repo, session| {
             let (session, binding) = bind_session_to_current_execution(repo, session);
 
             let request = AgentExecutionContinuationRequest {
+                readiness_nonce: None,
                 schema_version: AGENT_EXECUTION_CONTINUATION_SCHEMA_VERSION,
                 operation_id: "continue-rebound-current".to_string(),
             };
@@ -6135,6 +6192,7 @@ mod tests {
                     project_state_root,
                     &session.id,
                     AgentExecutionContinuationRequest {
+                        readiness_nonce: None,
                         schema_version: AGENT_EXECUTION_CONTINUATION_SCHEMA_VERSION,
                         operation_id: "split-root-status-host-parity".to_string(),
                     },
@@ -6751,6 +6809,7 @@ mod tests {
             "{label}: invalid continuation must be unavailable"
         );
         let request = AgentExecutionContinuationRequest {
+            readiness_nonce: None,
             schema_version: AGENT_EXECUTION_CONTINUATION_SCHEMA_VERSION,
             operation_id: format!("reject-{label}"),
         };
@@ -6899,6 +6958,7 @@ mod tests {
                 repo,
                 &bound.id,
                 AgentExecutionContinuationRequest {
+                    readiness_nonce: None,
                     schema_version: AGENT_EXECUTION_CONTINUATION_SCHEMA_VERSION,
                     operation_id: "continue-after-takeover-suffix".to_string(),
                 },
@@ -6965,6 +7025,7 @@ mod tests {
                 repo,
                 &session.id,
                 AgentExecutionContinuationRequest {
+                    readiness_nonce: None,
                     schema_version: AGENT_EXECUTION_CONTINUATION_SCHEMA_VERSION,
                     operation_id: "continue-fail-before-prepare-commit".to_string(),
                 },
@@ -6990,6 +7051,7 @@ mod tests {
                 repo,
                 &session.id,
                 AgentExecutionContinuationRequest {
+                    readiness_nonce: None,
                     schema_version: AGENT_EXECUTION_CONTINUATION_SCHEMA_VERSION,
                     operation_id: "continue-fail-before-activation-commit".to_string(),
                 },
@@ -7010,6 +7072,7 @@ mod tests {
             let (session, owner, predecessor) = seed_foreign_active_exact_unbound(repo, session);
             crate::cli::execution_state::set_generation_write_failure_after_ledger();
             let request = AgentExecutionContinuationRequest {
+                readiness_nonce: None,
                 schema_version: AGENT_EXECUTION_CONTINUATION_SCHEMA_VERSION,
                 operation_id: "continue-post-ledger-retry".to_string(),
             };
@@ -7059,6 +7122,7 @@ mod tests {
             let (session, owner, _) = seed_foreign_active_exact_unbound(repo, session);
             crate::cli::execution_state::set_generation_write_failure_after_ledger();
             let request = AgentExecutionContinuationRequest {
+                readiness_nonce: None,
                 schema_version: AGENT_EXECUTION_CONTINUATION_SCHEMA_VERSION,
                 operation_id: "continue-post-ledger-takeover-suffix".to_string(),
             };
@@ -7168,6 +7232,7 @@ mod tests {
                 repo,
                 &stale_unbound.id,
                 AgentExecutionContinuationRequest {
+                    readiness_nonce: None,
                     schema_version: AGENT_EXECUTION_CONTINUATION_SCHEMA_VERSION,
                     operation_id: "continue-byte-winner".to_string(),
                 },
@@ -7305,6 +7370,7 @@ mod tests {
                 repo,
                 &legacy.id,
                 AgentExecutionContinuationRequest {
+                    readiness_nonce: None,
                     schema_version: AGENT_EXECUTION_CONTINUATION_SCHEMA_VERSION,
                     operation_id: "continue-legacy-exact-unbound".to_string(),
                 },
@@ -7410,6 +7476,7 @@ mod tests {
                 .contains(&"execution.repair".to_string()));
 
             let request = AgentExecutionContinuationRequest {
+                readiness_nonce: None,
                 schema_version: AGENT_EXECUTION_CONTINUATION_SCHEMA_VERSION,
                 operation_id: "continue-exact-unbound-successor".to_string(),
             };
@@ -7481,6 +7548,7 @@ mod tests {
             let (session, _) = bind_session_to_current_execution(repo, session);
             crate::cli::execution_state::set_continuation_validation_write_failure();
             let request = AgentExecutionContinuationRequest {
+                readiness_nonce: None,
                 schema_version: AGENT_EXECUTION_CONTINUATION_SCHEMA_VERSION,
                 operation_id: "continue-validation-retry".to_string(),
             };
@@ -7532,6 +7600,7 @@ mod tests {
                 crate::cli::execution_state::SettleResult::Settled(_)
             ));
             let request = AgentExecutionContinuationRequest {
+                readiness_nonce: None,
                 schema_version: AGENT_EXECUTION_CONTINUATION_SCHEMA_VERSION,
                 operation_id: "continue-successor".to_string(),
             };
@@ -7621,6 +7690,7 @@ mod tests {
                             &repo,
                             &session_id,
                             AgentExecutionContinuationRequest {
+                                readiness_nonce: None,
                                 schema_version: AGENT_EXECUTION_CONTINUATION_SCHEMA_VERSION,
                                 operation_id: operation_id.to_string(),
                             },
@@ -7801,6 +7871,18 @@ mod tests {
                 .set_execution_binding(Some(prepared_binding.clone()))
                 .expect("project Prepared binding into durable Session");
             save_session_fixture(&session);
+            let diagnosis = crate::cli::execution_state::diagnose(repo, Some(&session.id));
+            assert!(
+                !diagnosis
+                    .available_recoveries
+                    .contains(&"execution.adopt".to_string()),
+                "Prepared authority must not advertise adoption: {diagnosis:?}"
+            );
+            let continuation_probe = probe_authenticated_execution_continuation(repo, &session.id);
+            assert!(!continuation_probe.advertise());
+            assert!(serde_json::to_string(&continuation_probe)
+                .unwrap()
+                .contains("prepared_execution_requires_authenticated_ready_replay"));
             let before = ExecutionBindingAuthoritySnapshot::capture(repo, repo, &session.id);
 
             let receipt = probe_authenticated_prepared_execution_binding(

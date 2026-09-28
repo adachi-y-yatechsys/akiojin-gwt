@@ -1371,6 +1371,71 @@ pub(crate) struct AgentSelfCloseResponder {
     sender: Arc<Mutex<Option<oneshot::Sender<AgentSelfCloseDirectAcceptance>>>>,
 }
 
+type PreparedReadinessResult = Result<(), AgentWorkspaceUpdateError>;
+
+/// Authenticated ready replay delivered only to the existing launch coordinator.
+/// Neither the nonce nor the bearer may appear in event-loop diagnostics.
+#[derive(Clone)]
+pub(crate) struct PreparedExecutionReadiness {
+    grant: AgentCapabilityGrant,
+    nonce: String,
+    sender: Arc<Mutex<Option<oneshot::Sender<PreparedReadinessResult>>>>,
+}
+
+impl std::fmt::Debug for PreparedExecutionReadiness {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PreparedExecutionReadiness(<redacted>)")
+    }
+}
+
+impl PreparedExecutionReadiness {
+    fn channel(
+        grant: AgentCapabilityGrant,
+        nonce: String,
+    ) -> (Self, oneshot::Receiver<PreparedReadinessResult>) {
+        let (sender, receiver) = oneshot::channel();
+        (
+            Self {
+                grant,
+                nonce,
+                sender: Arc::new(Mutex::new(Some(sender))),
+            },
+            receiver,
+        )
+    }
+
+    pub(crate) fn principal(&self) -> &AgentSessionPrincipal {
+        self.grant.principal()
+    }
+
+    pub(crate) fn nonce(&self) -> &str {
+        &self.nonce
+    }
+
+    pub(crate) fn matches_token(&self, token: &str) -> bool {
+        constant_time_token_eq(token, &self.grant.token)
+    }
+
+    pub(crate) fn cancelled(&self) -> bool {
+        self.sender
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .is_none_or(oneshot::Sender::is_closed)
+    }
+
+    pub(crate) fn complete(self, result: PreparedReadinessResult) {
+        if let Some(sender) = self
+            .sender
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let _ = sender.send(result);
+        }
+    }
+}
+
 /// Direct origin-socket response channel for one privileged PM send.
 /// Delivery results never enter the ambient browser/client event stream.
 #[derive(Clone)]
@@ -3960,6 +4025,39 @@ async fn execution_continuation_handler(
             ),
         );
     };
+    if let Err(error) = request.validate() {
+        return workspace_update_error_response(workspace_update_error_status(error.code), error);
+    }
+    if grant.principal().prepared_execution_binding().is_some() || request.readiness_nonce.is_some()
+    {
+        let Some(nonce) = request.readiness_nonce.clone() else {
+            return workspace_update_error_response(
+                StatusCode::CONFLICT,
+                AgentWorkspaceUpdateError::new(
+                    AgentWorkspaceUpdateErrorCode::ExecutionBindingMismatch,
+                    "Prepared execution.continue requires the existing launch readiness nonce",
+                ),
+            );
+        };
+        let (ready, response) = PreparedExecutionReadiness::channel(grant.clone(), nonce);
+        state
+            .proxy
+            .send(UserEvent::PreparedExecutionReadiness(ready));
+        match tokio::time::timeout(Duration::from_secs(25), response).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => {
+                return workspace_update_error_response(
+                    workspace_update_error_status(error.code),
+                    error,
+                );
+            }
+            _ => {
+                return workspace_update_error_response(StatusCode::CONFLICT,
+                    AgentWorkspaceUpdateError::new(AgentWorkspaceUpdateErrorCode::TransactionConflict,
+                        "Prepared readiness response is unavailable; inspect execution.status before retrying"));
+            }
+        }
+    }
     let project_root = grant.principal().canonical_project_root().to_path_buf();
     let session_id = grant.principal().session_id().to_string();
     let mutation_project_root = project_root.clone();

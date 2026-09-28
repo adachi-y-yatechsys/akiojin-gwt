@@ -2219,6 +2219,7 @@ mod tests {
             token: "continuation-redirect-secret".to_string(),
         };
         let request = crate::AgentExecutionContinuationRequest {
+            readiness_nonce: Some("launch-ready-nonce".to_string()),
             schema_version: crate::AGENT_EXECUTION_CONTINUATION_SCHEMA_VERSION,
             operation_id: "continuation-redirect".to_string(),
         };
@@ -2235,6 +2236,7 @@ mod tests {
             Some("Bearer continuation-redirect-secret")
         );
         assert_eq!(body["operation_id"], "continuation-redirect");
+        assert_eq!(body["readiness_nonce"], "launch-ready-nonce");
         server.assert_no_redirect();
     }
 
@@ -2347,6 +2349,7 @@ mod tests {
             }),
         );
         let request = crate::AgentExecutionContinuationRequest {
+            readiness_nonce: None,
             schema_version: crate::AGENT_EXECUTION_CONTINUATION_SCHEMA_VERSION,
             operation_id: "continuation-diagnostics".to_string(),
         };
@@ -2630,6 +2633,7 @@ mod tests {
         receipt_server.receive();
 
         let continuation_request = crate::AgentExecutionContinuationRequest {
+            readiness_nonce: None,
             schema_version: crate::AGENT_EXECUTION_CONTINUATION_SCHEMA_VERSION,
             operation_id: "continuation-reason-codes".to_string(),
         };

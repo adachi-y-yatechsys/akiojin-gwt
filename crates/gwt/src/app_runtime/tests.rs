@@ -23351,6 +23351,157 @@ fn pending_fresh_execution_fixture(
     )
 }
 
+#[test]
+fn prepared_continue_replays_readiness_through_host_and_commits_work() {
+    let _env_guard = env_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().expect("tempdir");
+    let _home = ScopedGwtHome::set(temp.path());
+    // The HTTP handler runs on Tokio threads, outside the thread-local override.
+    let _http_home = gwt_core::test_support::ScopedEnvVar::set("HOME", temp.path());
+    let _http_profile = gwt_core::test_support::ScopedEnvVar::set("USERPROFILE", temp.path());
+    let mut fixture = pending_fresh_execution_fixture(temp.path(), "continue-ready-recovery");
+    run_git(&fixture.repo, &["checkout", "-b", "work/issue-2359"]);
+    let tokio = TokioRuntime::new().expect("runtime");
+    let (proxy, recorded) = AppEventProxy::stub();
+    let mut server = crate::embedded_server::EmbeddedServer::start(
+        &tokio,
+        proxy,
+        crate::embedded_server::ClientHub::default(),
+        Arc::new(RwLock::new(HashMap::new())),
+        AttachmentUploadStore::in_system_temp(),
+    )
+    .expect("Host server");
+    let issuer = server.agent_capability_issuer();
+    let target = issuer
+        .issue_prepared(
+            &fixture.repo,
+            &fixture.candidate_session_id,
+            fixture.binding.clone(),
+        )
+        .expect("Prepared Host grant");
+    fixture.runtime.agent_capability_issuer = Some(issuer.clone());
+    fixture
+        .runtime
+        .agent_capability_tokens
+        .insert(fixture.window_id.clone(), target.token.clone());
+    let nonce = fixture.runtime.pending_fresh_execution_launches[&fixture.window_id]
+        .readiness_nonce
+        .clone();
+    let send = |fixture: &mut PendingFreshExecutionFixture, nonce: &str, operation_id: &str| {
+        let target = target.clone();
+        let nonce = nonce.to_string();
+        let operation_id = operation_id.to_string();
+        let (tx, rx) = mpsc::channel();
+        let request = thread::spawn(move || {
+            let mut url = reqwest::Url::parse(&target.url).unwrap();
+            url.set_path("/internal/execution-continuation");
+            let response = reqwest::blocking::Client::new()
+                .post(url)
+                .bearer_auth(target.token)
+                .timeout(Duration::from_secs(10))
+                .json(&serde_json::json!({
+                    "schema_version": 1,
+                    "operation_id": operation_id,
+                    "readiness_nonce": nonce,
+                }))
+                .send()
+                .expect("continuation response");
+            tx.send((response.status(), response.text().unwrap()))
+                .unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let (status, body) = loop {
+            if let Ok(response) = rx.try_recv() {
+                break response;
+            }
+            let events = std::mem::take(&mut *recorded.lock().unwrap());
+            for event in events {
+                match event {
+                    UserEvent::RuntimeHook(event) => {
+                        fixture.runtime.handle_runtime_hook_event(event);
+                    }
+                    UserEvent::PreparedExecutionReadiness(request) => {
+                        fixture.runtime.handle_prepared_execution_readiness(request);
+                    }
+                    _ => {}
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Host recovery response timed out"
+            );
+            thread::sleep(Duration::from_millis(100));
+        };
+        request.join().unwrap();
+        (status, body)
+    };
+    let (invalid_status, _) = send(&mut fixture, "wrong-launch-nonce", "recover-prepared");
+    assert_eq!(invalid_status, reqwest::StatusCode::CONFLICT);
+    assert_eq!(
+        gwt::cli::execution_state::current_execution_binding(&fixture.repo, fixture.owner).unwrap(),
+        Some(fixture.predecessor_binding.clone()),
+        "wrong readiness must not activate or abort the pending launch"
+    );
+    assert!(fixture
+        .runtime
+        .pending_fresh_execution_launches
+        .contains_key(&fixture.window_id));
+    let (status, body) = send(&mut fixture, &nonce, "recover-prepared");
+    assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+    assert_eq!(
+        gwt::cli::execution_state::current_execution_binding(&fixture.repo, fixture.owner).unwrap(),
+        Some(fixture.binding.identity.clone()),
+        "recovery must activate the existing candidate, not create a different successor"
+    );
+    assert!(!fixture
+        .runtime
+        .pending_fresh_execution_launches
+        .contains_key(&fixture.window_id));
+    assert_eq!(
+        gwt::cli::execution_state::load(&fixture.repo)
+            .unwrap()
+            .unwrap()
+            .primary_session_id,
+        fixture.candidate_session_id
+    );
+    let projection = gwt_core::workspace_projection::load_workspace_projection(&fixture.repo)
+        .unwrap()
+        .expect("committed Work projection");
+    assert!(projection
+        .latest_agent_for_session(&fixture.candidate_session_id)
+        .expect("candidate Work assignment")
+        .is_assigned());
+    let (replay_status, replay_body) = send(&mut fixture, &nonce, "recover-prepared");
+    assert_eq!(replay_status, reqwest::StatusCode::OK, "{replay_body}");
+    assert_eq!(
+        gwt::cli::execution_state::current_execution_binding(&fixture.repo, fixture.owner).unwrap(),
+        Some(fixture.binding.identity.clone())
+    );
+    gwt::cli::execution_state::settle(
+        &fixture.repo,
+        &fixture.candidate_session_id,
+        gwt::cli::execution_state::ExecutionSettlement::Completed,
+    )
+    .expect("complete the recovered execution");
+    let (continued_status, continued_body) = send(&mut fixture, &nonce, "continue-after-completed");
+    assert_eq!(
+        continued_status,
+        reqwest::StatusCode::OK,
+        "{continued_body}"
+    );
+    assert_ne!(
+        gwt::cli::execution_state::current_execution_binding(&fixture.repo, fixture.owner)
+            .unwrap()
+            .unwrap()
+            .generation_id,
+        fixture.binding.identity.generation_id,
+        "the old launch nonce must not block a later Completed-to-successor continuation"
+    );
+    server.shutdown();
+}
+
 fn pending_fresh_execution_fixture_with_owner_kind(
     temp_root: &Path,
     operation_id: &str,
