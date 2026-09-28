@@ -16779,9 +16779,12 @@ exit 1
         ));
 
         assert!(monitor.pending_effects().is_empty());
+        // Issue #3944 AC-3 / #4726: the moved HEAD requeued the Issue for a
+        // re-review. The compensating disarm succeeding while the mode is ON
+        // must not then park it as if the kill switch had fired.
         assert_eq!(
             monitor.autonomous_record(42).map(|record| record.phase),
-            Some(crate::AutonomousPhase::NeedsHuman)
+            Some(crate::AutonomousPhase::Idle)
         );
     }
 
