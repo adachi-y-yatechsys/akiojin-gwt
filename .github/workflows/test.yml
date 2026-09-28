@@ -328,13 +328,22 @@ jobs:
       - name: Run priority roundtrip from Normal and BelowNormal launchers
         run: cargo test -p gwt-core --test process_priority_roundtrip -- --nocapture
         timeout-minutes: 15
+      - name: Repeat gwt-core at default parallelism five times
+        shell: bash
+        run: |
+          unset RUST_TEST_THREADS
+          for iteration in 1 2 3 4 5; do
+            echo "gwt-core default-parallel run ${iteration}/5"
+            cargo test -p gwt-core
+          done
+        timeout-minutes: 30
       - name: Run shared Windows process resolver tests
         run: cargo test -p gwt-core --test windows_process_resolver --test process_adapter_parity
         timeout-minutes: 15
       - name: Run real Claude probe caller regressions
         shell: bash
         run: |
-          cargo test -p gwt-core --lib real_bun_global_placeholder_fixture
+          cargo test -p gwt-core --test windows_claude_user_agent
           cargo test -p gwt-agent --lib real_bun_global_placeholder_fixture
           cargo test -p gwt-agent --lib package_runner_resolution_failure_still_emits_an_end_summary
           cargo test -p gwt --bin gwt real_bun_global_placeholder_fixture
