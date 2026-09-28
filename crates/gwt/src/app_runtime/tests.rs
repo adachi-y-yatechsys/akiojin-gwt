@@ -125,17 +125,14 @@ fn pty_start_gate_helper() {
 
 #[test]
 fn agent_bootstrap_spawn_routes_apply_resource_policy_before_release() {
-    let source = include_str!("launch.rs");
+    let source = include_str!("../project_runtime.rs");
     let direct = source
-        .split("pub(crate) fn spawn_process_window_with_console_kind")
+        .split("pub fn spawn_unbound_pane")
         .nth(1)
-        .and_then(|tail| {
-            tail.split("fn spawn_bound_process_window_with_console_kind")
-                .next()
-        })
+        .and_then(|tail| tail.split("pub fn spawn_bound_pane").next())
         .expect("direct spawn route body");
     assert!(
-        direct.contains("resource_policy"),
+        direct.contains("policy_gate"),
         "direct AgentBootstrap route must consult the launch resource policy"
     );
     assert!(
@@ -151,9 +148,9 @@ fn agent_bootstrap_spawn_routes_apply_resource_policy_before_release() {
     assert!(apply < release, "policy must be applied before release");
 
     let bound = source
-        .split("fn spawn_bound_process_window_with_console_kind")
+        .split("pub fn spawn_bound_pane")
         .nth(1)
-        .and_then(|tail| tail.split("fn install_process_window").next())
+        .and_then(|tail| tail.split("#[cfg(test)]").next())
         .expect("bound spawn route body");
     let apply = bound.find("apply_policy(").expect("bound apply_policy");
     let release = bound.find(".release()").expect("bound release");
@@ -168,19 +165,16 @@ fn agent_bootstrap_spawn_routes_apply_resource_policy_before_release() {
 /// so neither spawn route may turn it into `PTY creation failed`.
 #[test]
 fn agent_resource_policy_failure_never_fails_the_spawn_routes() {
-    let source = include_str!("launch.rs");
+    let source = include_str!("../project_runtime.rs");
     let direct = source
-        .split("pub(crate) fn spawn_process_window_with_console_kind")
+        .split("pub fn spawn_unbound_pane")
         .nth(1)
-        .and_then(|tail| {
-            tail.split("fn spawn_bound_process_window_with_console_kind")
-                .next()
-        })
+        .and_then(|tail| tail.split("pub fn spawn_bound_pane").next())
         .expect("direct spawn route body");
     let bound = source
-        .split("fn spawn_bound_process_window_with_console_kind")
+        .split("pub fn spawn_bound_pane")
         .nth(1)
-        .and_then(|tail| tail.split("fn install_process_window").next())
+        .and_then(|tail| tail.split("#[cfg(test)]").next())
         .expect("bound spawn route body");
 
     for (route, body) in [("direct", direct), ("bound", bound)] {
@@ -201,7 +195,7 @@ fn agent_resource_policy_failure_never_fails_the_spawn_routes() {
     // The routes cannot re-introduce the failure path even by editing the
     // statement: the helper owns the call and hands no outcome back.
     let helper = source
-        .split("pub(crate) fn best_effort_apply_policy(")
+        .split("fn best_effort_apply_policy(")
         .nth(1)
         .expect("best-effort helper");
     let signature = &helper[..helper.find('{').expect("helper body")];
@@ -216,7 +210,7 @@ fn agent_resource_policy_failure_never_fails_the_spawn_routes() {
 #[test]
 fn agent_resource_policy_failure_warns_once_and_keeps_the_launch() {
     let events = capture_tracing_events(|| {
-        super::launch::note_unapplied_agent_resource_policy(
+        gwt::project_runtime::note_unapplied_agent_resource_policy_for_test(
             "window-3942",
             Err(gwt_terminal::TerminalError::PtyCreationFailed {
                 reason: "apply process policy: setpriority(pgrp 4242, nice 10): \
@@ -253,7 +247,7 @@ fn agent_resource_policy_failure_warns_once_and_keeps_the_launch() {
     );
 
     let applied = capture_tracing_events(|| {
-        super::launch::note_unapplied_agent_resource_policy("window-3942", Ok(()));
+        gwt::project_runtime::note_unapplied_agent_resource_policy_for_test("window-3942", Ok(()));
     });
     assert!(
         applied.iter().all(|event| !matches!(
@@ -269,6 +263,7 @@ fn gwt_input_trace_markers_exclude_payload_lengths_and_raw_errors() {
     for (source_name, source) in [
         ("embedded_server.rs", include_str!("../embedded_server.rs")),
         ("app_runtime/pty_io.rs", include_str!("pty_io.rs")),
+        ("pane_runtime.rs", include_str!("../pane_runtime.rs")),
     ] {
         for (index, tail) in source
             .split("target: \"gwt_input_trace\"")
@@ -321,11 +316,14 @@ fn backend_gwt_input_trace_markers_use_stage_local_exact_allowlists() {
                     "close_finalizer_registry_deregister_poisoned",
                     vec!["outcome", "stage", "window_id"],
                 ),
-                (
-                    "reader_pane_lock",
-                    vec!["lock_wait_us", "parse_us", "stage", "window_id"],
-                ),
             ]),
+        ),
+        (
+            "pane_runtime.rs",
+            HashMap::from([(
+                "reader_pane_lock",
+                vec!["lock_wait_us", "parse_us", "stage", "window_id"],
+            )]),
         ),
         (
             "embedded_server.rs",
@@ -365,6 +363,7 @@ fn backend_gwt_input_trace_markers_use_stage_local_exact_allowlists() {
     for (source_name, source) in [
         ("embedded_server.rs", include_str!("../embedded_server.rs")),
         ("app_runtime/pty_io.rs", include_str!("pty_io.rs")),
+        ("pane_runtime.rs", include_str!("../pane_runtime.rs")),
     ] {
         let mut actual = HashMap::new();
         for tail in source.split("target: \"gwt_input_trace\"").skip(1) {
@@ -4313,7 +4312,7 @@ fn sample_runtime_with_events(
         // Issue #3633: tests must never leave real daemons behind on the
         // developer's machine, but the ensure pass still has to be observable
         // so the wiring cannot silently disappear again.
-        daemon_supervisor: gwt::daemon_supervisor::DaemonSupervisor::disabled(),
+        daemon_supervisor: Arc::new(gwt::daemon_supervisor::DaemonSupervisor::disabled()),
         pending_continue_work: HashMap::new(),
         pending_fresh_execution_launches: HashMap::new(),
         pending_tool_runtime_migrations: HashMap::new(),
@@ -72285,7 +72284,7 @@ fn the_daemon_supervision_tick_keeps_a_runtime_daemon_alive_for_enabled_projects
 
     let tab = sample_project_tab("tab-1", "Repo", repo.clone(), ProjectKind::Git, &[]);
     let mut runtime = sample_runtime(temp.path(), vec![tab], Some("tab-1"));
-    let (spawner, _tasks) = BlockingTaskSpawner::queued();
+    let (spawner, tasks) = BlockingTaskSpawner::queued();
     runtime.blocking_tasks = spawner;
 
     gwt::save_issue_monitor_prefs(
@@ -72314,6 +72313,19 @@ fn the_daemon_supervision_tick_keeps_a_runtime_daemon_alive_for_enabled_projects
     runtime.ensure_runtime_daemons_for_enabled_projects();
     assert_eq!(
         runtime.daemon_supervisor.ensure_attempts(),
+        0,
+        "GUI only enqueues ensure"
+    );
+    runtime.ensure_runtime_daemons_for_enabled_projects();
+    assert_eq!(
+        tasks.lock().unwrap().len(),
+        1,
+        "same project coalesces while queued"
+    );
+    let task = tasks.lock().unwrap().pop().unwrap();
+    task();
+    assert_eq!(
+        runtime.daemon_supervisor.ensure_attempts(),
         1,
         "the tick must own the daemon for an enabled project"
     );
@@ -72321,6 +72333,8 @@ fn the_daemon_supervision_tick_keeps_a_runtime_daemon_alive_for_enabled_projects
     // AC-2 in the topology: supervision is "the tick keeps asking", so a
     // second tick has to ask again rather than trust the first answer.
     runtime.ensure_runtime_daemons_for_enabled_projects();
+    let task = tasks.lock().unwrap().pop().unwrap();
+    task();
     assert_eq!(runtime.daemon_supervisor.ensure_attempts(), 2);
 }
 
