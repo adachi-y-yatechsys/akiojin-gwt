@@ -27,10 +27,10 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
       } from "/window-docking.js";
       import {
         attentionForWorkspace,
-        createWorkspaceKanbanSurface as createWorkspaceOverviewSurface,
+        createIssueOtherSurface,
         formatLifecycleStateLabel,
         mergeActiveWorkProjectionPatch,
-      } from "/workspace-kanban-surface.js";
+      } from "/issue-other-surface.js";
       import {
         createAgentKanbanPendingPlacementController,
         createAgentKanbanSurface,
@@ -56,7 +56,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
       } from "/launch-pending-controller.js";
       import { createConnectionOverlay } from "/connection-overlay.js";
       // Issue #3365 — render-key exception safety + degradation visibility.
-      import { createWorkspaceRenderSync } from "/workspace-render-sync.js";
+      import { createWorkspaceRenderSync } from "/issue-render-sync.js";
       import { createRenderDegradationBanner } from "/render-degradation-banner.js";
       import { createUpdateCtaController } from "/update-cta.js";
       // SPEC-2356 Anshin Addendum (FR-040): the in-app attention toaster ships
@@ -504,7 +504,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
       };
       let hubCatalog = null;
       // Issue #3365: renderedWorkspaceWindowsKey moved into
-      // workspaceRenderSync (see /workspace-render-sync.js) so a failed sync
+      // workspaceRenderSync (see /issue-render-sync.js) so a failed sync
       // never leaves a committed key behind.
       let renderedAppVersionLabel = null;
       let renderedOperatorTelemetryKey = "";
@@ -870,7 +870,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
           return "agent-kanban";
         }
         if (preset === "branches") {
-          return "work";
+          return "knowledge";
         }
         if (preset === "profile") {
           return "profile";
@@ -893,7 +893,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
           return "index";
         }
         if (preset === "work" || preset === "workspace") {
-          return "work";
+          return "knowledge";
         }
         if (preset === "console") {
           return "console";
@@ -902,7 +902,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
       }
 
       function knowledgeKindForPreset(preset) {
-        if (preset === "issue" || preset === "issue_monitor" || preset === "spec") {
+        if (["issue", "issue_monitor", "spec", "work", "workspace", "branches"].includes(preset)) {
           return "issue";
         }
         if (preset === "pr") {
@@ -1654,8 +1654,8 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
           spec: "SPEC",
           // SPEC-3671 FR-015: the wire preset is `work` (`workspace` is only a
           // legacy deserialization alias), and the surface lists Works.
-          work: "Work",
-          workspace: "Work",
+          work: "Issue",
+          workspace: "Issue",
           board: "Board",
           pr: "PR",
         };
@@ -2025,7 +2025,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
       }
 
       function openWorkspaceOverview() {
-        focusOrSpawnPreset("work");
+        focusOrSpawnPreset("issue");
       }
 
       function clamp(value, min) {
@@ -4790,6 +4790,8 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
         // derivations and action paths rather than re-deriving them.
         getActiveWorkProjection: () => activeWorkProjection,
         workAttentionFor: attentionForWorkspace,
+        renderOtherWork: (parent, windowId, options) =>
+          workspaceOverviewSurface.renderInto(parent, windowId, options),
         formatWorkLifecycleLabel: formatLifecycleStateLabel,
         continueWork: (workId, bounds) => continueWorkDispatcher.dispatch(workId, bounds),
         openWorkspaceResumePicker: (workspaceId) => workspaceResumePicker.open(workspaceId),
@@ -5048,7 +5050,8 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
         renderWorkspaceWindows: () => workspaceOverviewSurface.renderWindows(),
       });
 
-      const workspaceOverviewSurface = createWorkspaceOverviewSurface({
+      const workspaceOverviewSurface = createIssueOtherSurface({
+        onChanged: (windowId) => renderKnowledgeBridge(windowId),
         activeWorkspace,
         agentStatusLabel,
         appendMeta,
@@ -5438,20 +5441,6 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
           return;
         }
 
-        if (surface === "work") {
-          workspaceOverviewSurface.mount(body, windowData, {
-            focusWindowLocally,
-            sendFocus: (id) => socketTransport.send({ kind: "focus_window", id }),
-          });
-          // SPEC-2359 US-83: fetch the eligible remote branches for this
-          // Workspace window so they fold into the unified Workspace list as
-          // Remote-tagged rows. Sent from app.js (not the surface's mount) so
-          // the surface stays a pure renderer and its unit tests keep their
-          // exact-message contracts.
-          send({ kind: "request_remote_start_work_branches", id: windowData.id });
-          return;
-        }
-
         if (surface === "console") {
           // SPEC-2809 — Console window mount: register a controller for
           // this windowId and attach its DOM to the window body. The
@@ -5475,6 +5464,9 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
           // SPEC-3064 Phase 3 (E6d): the Knowledge window mount moved to
           // the knowledge kanban surface.
           mountKnowledgeWindow(windowData, body);
+          if (knowledgeKindForPreset(windowData.preset) === "issue") {
+            send({ kind: "request_remote_start_work_branches", id: windowData.id });
+          }
           return;
         }
 
@@ -7568,8 +7560,8 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
       }
 
       function normalizeSurfacePreset(preset) {
-        if (preset === "branches" || preset === "workspace") {
-          return "work";
+        if (preset === "branches" || preset === "workspace" || preset === "work") {
+          return "issue";
         }
         if (preset === "spec") {
           return "issue";

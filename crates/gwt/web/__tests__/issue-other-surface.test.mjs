@@ -6,9 +6,9 @@ import {
 import assert from "node:assert/strict";
 import { parseHTML } from "linkedom";
 import {
-  createWorkspaceKanbanSurface,
+  createIssueOtherSurface,
   mergeActiveWorkProjectionPatch,
-} from "../workspace-kanban-surface.js";
+} from "../issue-other-surface.js";
 
 test("bounded Active Work patches preserve history while replacing live membership", () => {
   const previousSession = {
@@ -88,18 +88,15 @@ test("Active Work patches never graft history across project identities", () => 
   );
 });
 
-test("Workspace Overview renders a readable Workspace list with compact filters", () => {
+test("Other renders the existing workspace list and detail without independent filters", () => {
   const fixture = createFixture();
   const surface = createSurface(fixture, sampleProjection());
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   assert.ok(fixture.body.querySelector(".workspace-overview-root"));
   assert.ok(fixture.body.querySelector(".workspace-overview-list-pane"));
-  assert.ok(fixture.body.querySelector(".workspace-overview-filter-bar"));
+  assert.equal(fixture.body.querySelector(".workspace-overview-filter-bar"), null);
   assert.ok(fixture.body.querySelector(".workspace-overview-list"));
   assert.ok(fixture.body.querySelector(".workspace-overview-detail-pane"));
   assert.equal(
@@ -107,20 +104,7 @@ test("Workspace Overview renders a readable Workspace list with compact filters"
     0,
     "Workspace overview must not render mini Kanban lanes in the persistent pane",
   );
-  assert.deepEqual(
-    Array.from(fixture.body.querySelectorAll("[data-workspace-filter]"), (filter) => [
-      filter.dataset.workspaceFilter,
-      filter.querySelector(".workspace-overview-filter-label")?.textContent.trim(),
-      filter.querySelector(".workspace-overview-filter-count")?.textContent.trim(),
-    ]),
-    [
-      ["all", "All", "2"],
-      ["needs_attention", "Needs Attention", "1"],
-      ["running", "Running", "0"],
-      ["paused", "Paused", "0"],
-      ["closed", "Closed", "1"],
-    ],
-  );
+
 
   const rows = Array.from(
     fixture.body.querySelectorAll(".workspace-overview-row[data-workspace-id]"),
@@ -191,10 +175,7 @@ test("Workspace list filters explicit attention separately from PR metadata", ()
     unassigned_agents: [],
   });
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   assert.deepEqual(rowIdsInList(fixture), [
     "work-attention",
@@ -215,14 +196,8 @@ test("Workspace list filters explicit attention separately from PR metadata", ()
   assert.match(prOnly.textContent, /PR #2847/);
   assert.doesNotMatch(prOnly.textContent, /Needs Attention/);
 
-  fixture.body.querySelector('[data-workspace-filter="paused"]').click();
+  surface.renderInto(fixture.body, fixture.windowData.id, { laneFilter: "paused" });
   assert.deepEqual(rowIdsInList(fixture), ["work-paused"]);
-  assert.equal(
-    fixture.body
-      .querySelector('[data-workspace-filter="paused"]')
-      .getAttribute("aria-pressed"),
-    "true",
-  );
 });
 
 test("Workspace list does not expose Kanban D&D lifecycle affordances", () => {
@@ -259,10 +234,7 @@ test("Workspace list does not expose Kanban D&D lifecycle affordances", () => {
     { send: (message) => sent.push(message) },
   );
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const runningRow = fixture.body.querySelector(
     '.workspace-overview-row[data-workspace-id="work-running"]',
@@ -303,10 +275,7 @@ test("Workspace list row Launch Agent opens the launch wizard without changing s
     { send: (message) => sent.push(message) },
   );
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const rowLaunch = fixture.body.querySelector(
     '.workspace-overview-row[data-workspace-id="work-launch"] [data-action="launch-workspace-row"]',
@@ -360,10 +329,7 @@ test("Workspace list row keyboard handler does not steal Launch Agent button key
     unassigned_agents: [],
   });
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const selectedRow = fixture.body.querySelector(
     '.workspace-overview-row[data-workspace-id="work-selected"]',
@@ -384,10 +350,7 @@ test("Workspace Overview keeps unassigned agents in an explicit queue outside Wo
   const fixture = createFixture();
   const surface = createSurface(fixture, sampleProjection());
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const queue = fixture.body.querySelector(".workspace-agent-queue");
   assert.ok(queue, "unassigned agents should have a dedicated queue");
@@ -448,16 +411,13 @@ test("Workspace Overview renders Active Works from active_works and keeps Unassi
     ],
   });
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
-  assert.match(fixture.body.textContent, /Workspaces/);
+  assert.match(fixture.body.textContent, /Other/);
   assert.match(fixture.body.textContent, /Unassigned Agents/);
   assert.match(
-    fixture.body.querySelector(".workspace-overview-status-line").textContent,
-    /2 Workspaces · 1 Needs Attention · 1 Unassigned Agents/,
+    fixture.body.querySelector(".issue-other-summary").textContent,
+    /Other \(2\)/,
   );
   const rows = Array.from(
     fixture.body.querySelectorAll(".workspace-overview-row[data-workspace-id]"),
@@ -500,10 +460,7 @@ test("Workspace Overview does not leak projection progress summary into other Ac
     unassigned_agents: [],
   });
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const detail = fixture.body.querySelector(".workspace-overview-detail-pane");
   assert.ok(detail);
@@ -525,10 +482,7 @@ test("Workspace detail renders structured body sections without preformatted dum
   const fixture = createFixture();
   const surface = createSurface(fixture, sampleProjection());
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const detail = fixture.body.querySelector(".workspace-overview-detail-pane");
   assert.ok(detail);
@@ -576,10 +530,7 @@ test("Linked Work links the PR through the shared PR renderer", () => {
   const fixture = createFixture();
   const surface = createSurface(fixture, sampleProjection());
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const detail = fixture.body.querySelector(".workspace-overview-detail-pane");
   assert.ok(detail);
@@ -612,10 +563,7 @@ test("Linked Work falls back to plain PR text when the projection has no PR url"
   const fixture = createFixture();
   const surface = createSurface(fixture, projection);
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const detail = fixture.body.querySelector(".workspace-overview-detail-pane");
   const linkedWork = Array.from(
@@ -695,10 +643,7 @@ test("Workspace detail renders backend execution diagnosis without replacing the
   const fixture = createFixture();
   const surface = createSurface(fixture, projection);
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   assert.equal(
     fixture.body.querySelector(".workspace-detail-title").textContent.trim(),
@@ -765,10 +710,7 @@ test("Workspace detail surfaces an active bound execution as clear without recov
   const fixture = createFixture();
   const surface = createSurface(fixture, projection);
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const diagnosis = fixture.body.querySelector(
     '[data-section="execution-diagnosis"][data-severity="clear"]',
@@ -788,10 +730,7 @@ test("Workspace detail Board refs can focus the matching Board entry", () => {
     focusBoardEntry: (entryId) => focused.push(entryId),
   });
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const diagnostics = fixture.body.querySelector(
     'details[data-section="board-diagnostics"]',
@@ -852,10 +791,7 @@ test("Workspace detail surfaces Managed Hooks health without raw JSON dumps", ()
   const fixture = createFixture();
   const surface = createSurface(fixture, projection);
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const detail = fixture.body.querySelector(".workspace-overview-detail-pane");
   const hookSection = detail.querySelector('[data-section="managed-hooks"]');
@@ -880,10 +816,7 @@ test("Workspace detail renders Sessions under a Work, highlighting the active on
   ];
   const fixture = createFixture();
   const surface = createSurface(fixture, projection);
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const sessions = Array.from(fixture.body.querySelectorAll(".workspace-detail-session"));
   // User decision 2026-06-12: multiple Session rows per agent read as noise —
@@ -934,10 +867,7 @@ test("Workspace detail shows a Work heading per launch when a Workspace has mult
   ];
   const fixture = createFixture();
   const surface = createSurface(fixture, projection);
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const headings = Array.from(
     fixture.body.querySelectorAll(".workspace-detail-work-heading"),
@@ -981,10 +911,7 @@ test("Workspace detail renders the latest Session for every Agent in one Work", 
   ];
   const fixture = createFixture();
   const surface = createSurface(fixture, projection);
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const sessions = Array.from(
     fixture.body.querySelectorAll(".workspace-detail-session-id"),
@@ -1012,10 +939,7 @@ test("Workspace list selection updates the detail pane", () => {
   const fixture = createFixture();
   const surface = createSurface(fixture, sampleProjection());
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const second = fixture.body.querySelector(
     '.workspace-overview-row[data-workspace-id="workspace-done"]',
@@ -1045,10 +969,7 @@ test("each Work exposes one Continue work action with opaque Work identity (SPEC
     getResumeBounds: () => ({ x: 0, y: 0, width: 800, height: 600 }),
   });
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   // Producing continuation is a single Work-level intent. It never derives
   // authority from the nested gwt Session or provider conversation.
@@ -1074,10 +995,7 @@ test("Work without Session history keeps one Continue work action and renders on
   const fixture = createFixture();
   const surface = createSurface(fixture, projection);
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const group = fixture.body.querySelector('[data-work-id="work-opaque-1"]');
   assert.equal(group.querySelectorAll('[data-action="continue-work"]').length, 1);
@@ -1117,10 +1035,7 @@ test("Work with mixed Agent history renders real Sessions without empty guidance
   const fixture = createFixture();
   const surface = createSurface(fixture, projection);
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const group = fixture.body.querySelector('[data-work-id="work-opaque-1"]');
   assert.equal(group.querySelectorAll(".workspace-detail-session").length, 1);
@@ -1148,10 +1063,7 @@ test("Task-first Work layout separates purpose, producing intent, and lifecycle 
   const fixture = createFixture();
   const surface = createSurface(fixture, projection);
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const group = fixture.body.querySelector('[data-work-id="work-opaque-1"]');
   const head = group.querySelector(".workspace-detail-work-head");
@@ -1217,10 +1129,7 @@ test("Work detail suppresses empty duplicates when the same Agent has a usable S
   const fixture = createFixture();
   const surface = createSurface(fixture, projection);
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   assert.equal(fixture.body.querySelectorAll(".workspace-detail-session").length, 1);
   assert.equal(fixture.body.querySelectorAll(".workspace-detail-session-empty").length, 0);
@@ -1263,10 +1172,7 @@ test("Work detail preserves punctuation-distinct custom Agent identities (SPEC-2
   const fixture = createFixture();
   const surface = createSurface(fixture, projection);
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const group = fixture.body.querySelector('[data-work-id="work-opaque-1"]');
   assert.deepEqual(
@@ -1315,10 +1221,7 @@ test("Work detail collapses Grok Build builtin aliases into one Agent identity",
   const fixture = createFixture();
   const surface = createSurface(fixture, projection);
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   assert.equal(fixture.body.querySelectorAll(".workspace-detail-session").length, 1);
   assert.equal(fixture.body.querySelectorAll(".workspace-detail-session-empty").length, 0);
@@ -1351,10 +1254,7 @@ test("Open session pending timeout keeps the pending label (SPEC-2359 FR-581)", 
     launchPending,
   });
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
   fixture.body.querySelector('[data-action="resume-session"]').click();
 
   assert.equal(begins.length, 1);
@@ -1372,10 +1272,7 @@ test("discarded Work never exposes Continue work even when a legacy lifecycle is
   const fixture = createFixture();
   const surface = createSurface(fixture, projection);
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   assert.equal(
     fixture.body.querySelectorAll("[data-action='continue-work']").length,
@@ -1400,10 +1297,7 @@ test("Each Session row carries its own Resume that resumes that conversation (SP
     getResumeBounds: () => ({ x: 0, y: 0, width: 800, height: 600 }),
   });
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   // One Resume per Session row (list element), not one per Work and not on the
   // Workspace header.
@@ -1440,10 +1334,7 @@ test("Non-resumable Sessions show no Resume control while Continue work owns fal
     getResumeBounds: () => ({ x: 0, y: 0, width: 800, height: 600 }),
   });
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   // Only the latest Session renders (user decision 2026-06-12) and it
   // carries no Resume control because it is not resumable.
@@ -1466,10 +1357,7 @@ test("Workspace surface is a single fused view with no Work/Git Branches tab tog
   const fixture = createFixture();
   const surface = createSurface(fixture, sampleProjection());
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   // The Work / Git Branches tab toggle and the separate branches section are gone.
   assert.equal(
@@ -1487,42 +1375,21 @@ test("Workspace surface is a single fused view with no Work/Git Branches tab tog
   assert.ok(fixture.body.querySelector(".workspace-overview-detail-pane"));
 });
 
-test("Workspace refresh action rerenders locally without inventing a protocol event", () => {
-  const fixture = createFixture();
-  const sent = [];
-  const surface = createSurface(fixture, sampleProjection(), {
-    send: (message) => sent.push(message),
-  });
-
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
-
-  const refresh = fixture.body.querySelector("[data-action='refresh-workspace-overview']");
-  assert.ok(refresh);
-  refresh.click();
-  assert.deepEqual(sent, []);
-  assert.ok(fixture.body.querySelector(".workspace-overview-detail-pane"));
-});
-
-test("Workspace renderWindows refreshes legacy workspace preset windows", () => {
+test("Other renderWindows notifies the Issue owner to refresh", () => {
   const fixture = createFixture();
   let projection = null;
   const surface = createSurface(fixture, projection, {
     getActiveWorkProjection: () => projection,
   });
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
   assert.equal(
     fixture.body.querySelectorAll(".workspace-overview-row[data-workspace-id]").length,
     0,
   );
 
   projection = sampleProjection();
+  projection.works = projection.works.map((item) => ({ ...item, linked_issue_numbers: [] }));
   surface.renderWindows();
 
   const rows = Array.from(
@@ -1556,10 +1423,7 @@ test("Merged Workspace without a cleanup candidate does not claim it is safe to 
     ],
   });
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const row = fixture.body.querySelector(
     '.workspace-overview-row[data-workspace-id="work-live-cwd"]',
@@ -1605,10 +1469,7 @@ test("Work surface renders a lifecycle_state badge on each Work row (SPEC-2359 W
     ],
   });
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const activeRow = fixture.body.querySelector(
     '.workspace-overview-row[data-workspace-id="work-active"]',
@@ -1653,10 +1514,7 @@ test("Paused child Work Done sends close_work for the child identity", () => {
     ],
   }, { send: (message) => sent.push(message) });
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const doneButton = fixture.body.querySelector("[data-action='close-work-done']");
   assert.ok(doneButton, "expected a Done action on the selected Work detail");
@@ -1694,10 +1552,7 @@ test("Paused child Work Discard sends close_work for the child identity", () => 
     ],
   }, { send: (message) => sent.push(message) });
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const discardButton = fixture.body.querySelector("[data-action='close-work-discard']");
   assert.ok(discardButton, "expected a Discard action on the selected Work detail");
@@ -1760,10 +1615,7 @@ test("Workspace header is read-only and operations belong to target contexts", (
     },
   );
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   assert.equal(
     fixture.body.querySelectorAll(".workspace-detail-header button").length,
@@ -1932,7 +1784,7 @@ function createFixture() {
   `);
   const windowElement = document.getElementById("workspace-window");
   const body = windowElement.querySelector(".window-body");
-  const windowData = { id: "workspace-1", preset: "workspace" };
+  const windowData = { id: "workspace-1", preset: "issues" };
   return {
     document,
     window,
@@ -1947,7 +1799,15 @@ function createSurface(fixture, projection, overrides = {}) {
     title: "gwt",
     windows: [fixture.windowData],
   };
-  return createWorkspaceKanbanSurface({
+  const withAuthority = (value) => {
+    if (!value) return value;
+    return { ...value, linked_issue_numbers: value.linked_issue_numbers ?? [],
+      ...Object.fromEntries(["active_works", "works", "workspaces", "work_items", "journal_entries"]
+        .filter((key) => Array.isArray(value[key]))
+        .map((key) => [key, value[key].map(withAuthority)])),
+    };
+  };
+  const surface = createIssueOtherSurface({
     activeWorkspace: () => workspace,
     agentStatusLabel: (status) => String(status || "unknown"),
     appendMeta(container, value) {
@@ -1976,14 +1836,16 @@ function createSurface(fixture, projection, overrides = {}) {
     },
     createNode: (tag, className, text) =>
       createNode(fixture.document, tag, className, text),
-    getActiveWorkProjection: () => projection,
+    getActiveWorkProjection: () => withAuthority(projection),
     openWorkspaceCleanup() {},
     send() {},
     windowMap: fixture.windowMap,
     workspaceWindowById: (windowId) =>
       workspace.windows.find((window) => window.id === windowId) || null,
+    onChanged: (windowId) => surface.renderInto(fixture.body, windowId),
     ...overrides,
   });
+  return surface;
 }
 
 function createNode(document, tag, className, text) {
@@ -2032,10 +1894,7 @@ test("sessionless Workspace offers a Launch control that opens the launch wizard
     { send: (message) => sent.push(message) },
   );
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const launch = fixture.body.querySelector('[data-action="launch-workspace"]');
   assert.ok(launch, "sessionless Workspace detail must offer a Launch control");
@@ -2074,10 +1933,7 @@ test("Launch control lives in branch context and duplicate branch meta is suppre
     { send() {} },
   );
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const launch = fixture.body.querySelector('[data-action="launch-workspace"]');
   assert.ok(launch, "Launch Agent control must exist");
@@ -2129,10 +1985,7 @@ test("Workspace rows are titled by work purpose with the branch as the sub-line 
     { send() {} },
   );
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const row = fixture.body.querySelector(".workspace-overview-row[data-workspace-id]");
   assert.equal(
@@ -2199,10 +2052,7 @@ test("Workspace rail never promotes a status snapshot to the row label (SPEC-307
     { send() {} },
   );
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const row = fixture.body.querySelector(".workspace-overview-row[data-workspace-id]");
   // The status snapshot must not surface as a label anywhere on the row.
@@ -2250,10 +2100,7 @@ test("Workspace rail leads with the work_summary purpose and demotes the branch 
     { send() {} },
   );
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const row = fixture.body.querySelector(".workspace-overview-row[data-workspace-id]");
   assert.equal(
@@ -2300,10 +2147,7 @@ test("Workspace detail omits a Purpose that only repeats the branch (SPEC-3075)"
     { send() {} },
   );
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const sectionTitles = Array.from(
     fixture.body.querySelectorAll(".workspace-detail-section-title"),
@@ -2346,10 +2190,7 @@ test("Workspace purpose shows the owner, not a gwt-* skill-name title (SPEC-3075
     { send() {} },
   );
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const detail = fixture.body.querySelector(".workspace-overview-detail-pane");
   // The purpose is the detail heading; a gwt-* skill name is not a purpose, so
@@ -2391,10 +2232,7 @@ test("Workspace purpose drops a raw work-item id title (SPEC-3075)", () => {
     { send() {} },
   );
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const row = fixture.body.querySelector(".workspace-overview-row[data-workspace-id]");
   const metaTexts = Array.from(
@@ -2452,10 +2290,7 @@ test("detail shows '+N more sessions' when session_agent_total exceeds rendered 
     { send() {} },
   );
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const more = fixture.body.querySelector(".workspace-detail-more-sessions");
   assert.ok(more, "expected the more-sessions label");
@@ -2502,10 +2337,7 @@ test("Workspace with existing Works still offers a Launch control", () => {
     { send: (message) => sent.push(message) },
   );
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const launch = fixture.body.querySelector('[data-action="launch-workspace"]');
   assert.ok(launch, "Launch control must exist even when Works are present");
@@ -2572,10 +2404,7 @@ test("merged Workspace detail offers Clean Up only from a backend cleanup candid
     },
   );
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const cleanup = fixture.body.querySelector(
     '[data-section="worktree-context"] [data-action="cleanup-merged-workspace"]',
@@ -2623,10 +2452,7 @@ test("merged Workspace without cleanup candidate does not offer Clean Up", () =>
     },
   );
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const cleanup = [...fixture.body.querySelectorAll(".workspace-detail-actions button")]
     .find((button) => button.textContent.trim() === "Clean Up");
@@ -2666,10 +2492,7 @@ test("blocked cleanup Workspace shows a disabled Clean Up action with a reason",
     },
   );
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const cleanup = fixture.body.querySelector("[data-action='cleanup-blocked-workspace']");
   assert.ok(cleanup, "eligible-but-blocked Workspace still shows Clean Up");
@@ -2715,10 +2538,7 @@ test("no-changes cleanup candidate shows Clean Up and no-changes detail signal",
     },
   );
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   assert.match(
     fixture.body.querySelector(".workspace-detail-subtitle").textContent,
@@ -2817,10 +2637,7 @@ test("list header offers bulk Clean Up Ready for enabled cleanup Workspaces", ()
     },
   );
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const bulk = fixture.body.querySelector('[data-action="cleanup-merged-workspaces"]');
   assert.ok(bulk, "bulk Clean Up Ready control must exist");
@@ -2877,10 +2694,7 @@ test("list header keeps bulk Clean Up Ready visible but disabled without cleanup
     },
   );
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const bulk = fixture.body.querySelector('[data-action="cleanup-merged-workspaces"]');
   assert.ok(bulk, "bulk Clean Up Ready control must stay visible even at 0");
@@ -2926,10 +2740,7 @@ test("done-equivalent Workspace presents as derived Done, not Paused", () => {
     { send() {} },
   );
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const badge = fixture.body.querySelector(".workspace-overview-lifecycle");
   assert.equal(badge.textContent, "Done", "derived Done presents as Done");
@@ -2969,10 +2780,7 @@ test("remote-only Workspace shows the Remote badge and keeps the prefilled Launc
     { send: (message) => sent.push(message) },
   );
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const badge = fixture.body.querySelector(".workspace-overview-remote");
   assert.ok(badge, "Remote badge renders for remote-only rows");
@@ -3027,10 +2835,7 @@ test("eligible remote branches render as unified Workspace rows tagged Remote", 
     { send: (message) => sent.push(message) },
   );
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   // Before any backend response the list holds only the local work.
   assert.deepEqual(rowIdsInList(fixture), ["work-local"]);
@@ -3060,8 +2865,8 @@ test("eligible remote branches render as unified Workspace rows tagged Remote", 
   // The headline still counts real Workspaces only; startable remote branches
   // are a separate count, so "N Workspaces" never conflates the two.
   assert.equal(
-    fixture.body.querySelector(".workspace-overview-status-line").textContent,
-    "1 Workspaces · 2 Startable · 0 Needs Attention · 0 Unassigned Agents",
+    fixture.body.querySelector(".issue-other-summary").textContent,
+    "Other (3)",
   );
 
   const remoteRow = fixture.body.querySelector(
@@ -3116,10 +2921,7 @@ test("a startable remote branch row offers only Launch in detail (no Done/Discar
     { send: (message) => sent.push(message) },
   );
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   surface.applyRemoteStartWorkBranches({
     id: fixture.windowData.id,
@@ -3174,10 +2976,7 @@ test("the row hook badge only shows when a hook is broken (degraded)", () => {
     { send() {} },
   );
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const badgeCountFor = (id) =>
     fixture.body
@@ -3225,10 +3024,7 @@ test("row title splits the branch namespace prefix from the leaf", () => {
     { send() {} },
   );
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const title = fixture.body.querySelector(".workspace-overview-row-title");
   assert.equal(title.textContent, "work/20260610-0120-4", "verbatim branch text is preserved");
@@ -3297,10 +3093,7 @@ test("work groups carry the agent identity color keyword", () => {
     { send() {} },
   );
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const groups = [...fixture.body.querySelectorAll(".workspace-detail-work-group")];
   assert.equal(groups.length, 2);
@@ -3335,10 +3128,7 @@ test("ArrowDown / ArrowUp move the Workspace list selection", () => {
     { send() {} },
   );
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const pressOnList = (key) => {
     const list = fixture.body.querySelector(".workspace-overview-list");
@@ -3416,10 +3206,7 @@ test("cleanup-candidate Workspace shows the safe-to-delete detail signal", () =>
     { send() {} },
   );
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const rows = Array.from(
     fixture.body.querySelectorAll(".workspace-overview-row[data-workspace-id]"),
@@ -3465,10 +3252,7 @@ test("Continue work click marks the Work pending and a re-click does not re-send
     launchPending,
   });
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const continueButton = fixture.body.querySelector("[data-action='continue-work']");
   continueButton.click();
@@ -3522,10 +3306,7 @@ test("Continue work keeps keyboard focus on the pending replacement action", () 
     },
   });
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
   const button = fixture.body.querySelector("[data-action='continue-work']");
   button.focus();
   button.click();
@@ -3554,10 +3335,7 @@ test("a pending Work renders focusable disabled semantics with progress label", 
     launchPending,
   });
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const continueButton = fixture.body.querySelector("[data-action='continue-work']");
   assert.ok(continueButton, "Continue work control still renders while pending");
@@ -3601,10 +3379,7 @@ test("child Work with no owner does not inherit the projection owner (#3455)", (
     { send() {} },
   );
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const row = fixture.body.querySelector(
     '.workspace-overview-row[data-workspace-id="work-work-20260621-2342-3c84198a"]',
@@ -3659,10 +3434,7 @@ test("child Work does not inherit projection agents or board_refs (#3455)", () =
     { send() {} },
   );
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const row = fixture.body.querySelector(
     '.workspace-overview-row[data-workspace-id="work-no-agents"]',
@@ -3708,10 +3480,7 @@ test("child Work with its own owner still renders it (#3455 regression)", () => 
     { send() {} },
   );
 
-  surface.mount(fixture.body, fixture.windowData, {
-    focusWindowLocally() {},
-    sendFocus() {},
-  });
+  surface.renderInto(fixture.body, fixture.windowData.id);
 
   const row = fixture.body.querySelector(
     '.workspace-overview-row[data-workspace-id="work-with-owner"]',
@@ -3726,4 +3495,45 @@ test("child Work with its own owner still renders it (#3455 regression)", () => 
     !row.textContent.includes("3410"),
     `the projection owner must never replace a declared owner: ${row.textContent}`,
   );
+});
+
+
+test("Other is collapsed and admits only authoritative non-Issue rows", () => {
+  const fixture = createFixture();
+  const surface = createSurface(fixture, null, {
+    getActiveWorkProjection: () => ({ id: "p", active_works: [
+      { id: "other", linked_issue_numbers: [], branch: "feature/issue-12", owner: "Issue #12" },
+      { id: "linked", linked_issue_numbers: [12], branch: "feature/linked" },
+      { id: "unknown", branch: "feature/unknown" },
+    ] }),
+  });
+  surface.renderInto(fixture.body, fixture.windowData.id, { laneFilter: "all" });
+  const group = fixture.body.querySelector("details.issue-other-group");
+  assert.ok(group);
+  assert.equal(group.hasAttribute("open"), false);
+  assert.match(group.querySelector("summary").textContent, /Other/);
+  assert.deepEqual(rowIdsInList(fixture), ["other"]);
+  assert.equal(group.querySelector("[data-workspace-filter]"), null);
+  group.setAttribute("open", "");
+  group.dispatchEvent(new fixture.window.Event("toggle"));
+  surface.renderInto(fixture.body, fixture.windowData.id, { laneFilter: "all" });
+  assert.equal(fixture.body.querySelectorAll("details.issue-other-group").length, 1);
+  assert.equal(fixture.body.querySelector("details.issue-other-group").hasAttribute("open"), true);
+});
+
+
+test("Other remote rows deduplicate Issue-linked branches and use the Issue lane filter", () => {
+  const fixture = createFixture();
+  const surface = createSurface(fixture, { id: "p", active_works: [
+    { id: "linked", linked_issue_numbers: [4556], branch: "feature/linked" },
+    { id: "local", linked_issue_numbers: [], branch: "feature/local", lifecycle_state: "paused" },
+  ] });
+  surface.renderInto(fixture.body, fixture.windowData.id);
+  surface.applyRemoteStartWorkBranches({ id: fixture.windowData.id,
+    branches: ["origin/feature/linked", "origin/feature/local", "origin/feature/remote"],
+  });
+  assert.deepEqual(rowIdsInList(fixture), ["remote-start:feature/remote", "local"]);
+  surface.renderInto(fixture.body, fixture.windowData.id, { laneFilter: "remote" });
+  assert.deepEqual(rowIdsInList(fixture), ["remote-start:feature/remote"]);
+  assert.equal(fixture.body.querySelector(".issue-other-summary").textContent, "Other (1)");
 });

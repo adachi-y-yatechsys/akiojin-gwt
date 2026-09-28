@@ -103,7 +103,7 @@ const ROOT_MODULES = new Set([
   "settings-surface.js",
   "socket-receive-dispatcher.js",
   // Issue #3365 — render-key exception safety + degradation banner.
-  "workspace-render-sync.js",
+  "issue-render-sync.js",
   "render-degradation-banner.js",
   // SPEC-3064 Phase 3 (E2) — terminal attachments & clipboard surface.
   "terminal-attachments.js",
@@ -123,7 +123,7 @@ const ROOT_MODULES = new Set([
   "window-list-model.js",
   "window-geometry-sync.js",
   "window-docking.js",
-  "workspace-kanban-surface.js",
+  "issue-other-surface.js",
   // SPEC-2359 US-42 — Workspace Resume Picker modal renderer.
   "workspace-resume-picker-modal.js",
 ]);
