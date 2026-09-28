@@ -39,6 +39,7 @@ use uuid::Uuid;
 
 mod app_runtime;
 mod attachment_upload;
+mod dispatch_watchdog;
 mod docker_launch;
 mod embedded_server;
 mod embedded_web;
@@ -1596,6 +1597,8 @@ fn browser_project_input_allowed(
 )]
 #[derive(Debug, Clone)]
 enum UserEvent {
+    StartupReady,
+    StartupStopped,
     ProjectIndexRefreshRequested {
         project_key: gwt_core::repo_hash::ProjectKey,
         project_root: PathBuf,
@@ -9366,6 +9369,52 @@ fn log_startup_fd_limit(raise: gwt_core::fd_limit::FdLimitRaise) {
     }
 }
 
+/// A completed initializer may race Quit before the event loop takes ownership.
+/// Keep cleanup attached to the value even while it sits in the delivery channel.
+struct PendingApp(Option<AppRuntime>);
+
+impl PendingApp {
+    fn take(mut self) -> AppRuntime {
+        self.0.take().expect("initialized app")
+    }
+}
+
+impl Drop for PendingApp {
+    fn drop(&mut self) {
+        if let Some(mut app) = self.0.take() {
+            app.stop_all_runtimes();
+            app.daemon_supervisor.shutdown();
+        }
+    }
+}
+
+fn bootstrap_app(
+    startup_dir: &Path,
+    proxy: EventLoopProxy<UserEvent>,
+    pty_writers: PtyWriterRegistry,
+    attachment_uploads: AttachmentUploadStore,
+    blocking_tasks: BlockingTaskSpawner,
+    log_router: Option<gwt_core::logging::ProjectLogRouter>,
+) -> std::io::Result<PendingApp> {
+    // Hook preparation discovers the repository through Git. It must precede
+    // project/agent bootstrap, but must not hold up native tray dispatch.
+    if let Err(error) = gwt::cli::hook::prepare_front_door_for_path(startup_dir) {
+        eprintln!("gwt front door preparation: {error}");
+    }
+    let mut pending = PendingApp(Some(AppRuntime::new(
+        proxy,
+        pty_writers,
+        attachment_uploads,
+        blocking_tasks,
+    )?));
+    let app = pending.0.as_mut().expect("created app");
+    if let Some(router) = log_router {
+        app.set_project_log_router(router);
+    }
+    app.bootstrap();
+    Ok(pending)
+}
+
 fn main() -> std::io::Result<()> {
     let _ = PROCESS_STARTED_AT.set(std::time::Instant::now());
     let argv: Vec<String> = std::env::args().collect();
@@ -9506,10 +9555,6 @@ fn main() -> std::io::Result<()> {
         ),
     };
 
-    if let Err(error) = gwt::cli::hook::prepare_front_door_for_path(&startup_dir) {
-        eprintln!("gwt front door preparation: {error}");
-    }
-
     // SPEC #2920 Phase 4 / FR-011: acquire the per-user tray
     // single-instance lock. A second `gwt` launched by the same user
     // simply prints the running URL on stderr and exits 0 — the
@@ -9601,21 +9646,27 @@ fn main() -> std::io::Result<()> {
     let clients = ClientHub::default();
     let pty_writers: PtyWriterRegistry = Arc::new(RwLock::new(HashMap::new()));
     let attachment_uploads = AttachmentUploadStore::in_system_temp();
-    let mut app = AppRuntime::new(
-        proxy.clone(),
-        pty_writers.clone(),
-        attachment_uploads.clone(),
-        BlockingTaskSpawner::tokio(runtime.handle().clone()),
-    )
-    .expect("app runtime");
-    if let Some(handles) = log_handles.as_ref() {
-        app.set_project_log_router(handles.router());
-    }
-    app.bootstrap();
+    let bootstrap_proxy = proxy.clone();
+    let bootstrap_writers = pty_writers.clone();
+    let bootstrap_uploads = attachment_uploads.clone();
+    let bootstrap_tasks = BlockingTaskSpawner::tokio(runtime.handle().clone());
+    let bootstrap_router = log_handles.as_ref().map(|handles| handles.router());
+    let mut bootstrap_job = Some(move || {
+        bootstrap_app(
+            &startup_dir,
+            bootstrap_proxy,
+            bootstrap_writers,
+            bootstrap_uploads,
+            bootstrap_tasks,
+            bootstrap_router,
+        )
+    });
+    let (startup_tx, startup_rx) = std_mpsc::channel();
+    let mut app: Option<AppRuntime> = None;
+    let mut startup_events = std::collections::VecDeque::new();
+    let mut startup_quit_requested = false;
     let mut board_projection_watchers = BoardProjectionWatcherRegistry::default();
-    board_projection_watchers.sync(&app, proxy.clone());
     let mut workspace_projection_watchers = WorkspaceProjectionWatcherRegistry::default();
-    workspace_projection_watchers.sync(&app, proxy.clone());
     // Issue #3505: GUI-owned scheduled scan cadence. Without this tick no
     // component in the production topology ever runs scheduled scans, so
     // autonomous launches silently never happen.
@@ -9687,7 +9738,6 @@ fn main() -> std::io::Result<()> {
         }
     }
     let mut board_daemon_subscribers = BoardDaemonSubscriberRegistry::default();
-    board_daemon_subscribers.sync(&app, proxy.clone());
     if let Some(log_handles) = log_handles.as_mut() {
         if let Some(mut ui_rx) = log_handles.take_ui_rx() {
             let log_proxy = proxy.clone();
@@ -9753,7 +9803,6 @@ fn main() -> std::io::Result<()> {
             server.bound_port()
         );
     }
-    app.set_agent_capability_issuer(server.agent_capability_issuer());
     // SPEC #2920 Phase 4: own the browser URL so it can survive the
     // tao event_loop closure's 'static requirement (the closure moves
     // `server`, which the previous `&str` borrow blocked).
@@ -9761,11 +9810,9 @@ fn main() -> std::io::Result<()> {
     let front_door = gui_front_door_launch_surface(&browser_url);
     // SPEC-2785 FR-E: hand the bound URL to AppRuntime so
     // `open_server_url_events` can gate `OpenServerUrl` requests against it.
-    app.set_server_url(browser_url.clone());
     // SPEC-2970: background provider-usage poller. The shared Notify lets the
     // Claude opt-in toggle request an immediate refresh.
     let usage_refresh = std::sync::Arc::new(tokio::sync::Notify::new());
-    app.set_usage_refresh(usage_refresh.clone());
     // Issue #3616: the poller's account rows also reach AppRuntime, which owns
     // the provider-quota classifier. A dropped send just means this tick did
     // not corroborate; the screen notice remains the trigger.
@@ -9773,7 +9820,7 @@ fn main() -> std::io::Result<()> {
     usage_poller::spawn_usage_poller(
         &runtime,
         clients.clone(),
-        usage_refresh,
+        usage_refresh.clone(),
         std::sync::Arc::new(move |accounts| {
             let _ = usage_proxy.send_event(UserEvent::ProviderUsageSnapshot { accounts });
         }),
@@ -9798,25 +9845,7 @@ fn main() -> std::io::Result<()> {
             proxy.clone(),
         ));
     }
-    let mut startup_index_projects: std::collections::HashSet<String> = app
-        .project_contexts()
-        .into_iter()
-        .map(|context| context.project_root.display().to_string())
-        .collect();
-    for context in app.project_contexts() {
-        let log_scope = app.project_log_scope_for_tab(&context.tab_id).cloned();
-        let _log_scope = log_scope.as_ref().map(|scope| scope.enter());
-        let inventory = app.take_startup_worktree_inventory(&context);
-        if let Some(state) = app.project_state(&context) {
-            spawn_project_index_status_check(
-                &runtime,
-                state.project_index_bootstrap.clone(),
-                AppEventProxy::new(proxy.clone()).for_project(context.clone()),
-                Some(context.project_root),
-                inventory,
-            );
-        }
-    }
+    let mut startup_index_projects = HashSet::new();
 
     // SPEC #2920 Phase 4 + 5: tray-resident front door. The wry/tao
     // native WebView path is removed; instead we build a tray-icon menu
@@ -9829,7 +9858,7 @@ fn main() -> std::io::Result<()> {
     let tray_menu = Menu::new();
     let tray_open = MenuItem::with_id(
         gwt::cli::tray::menu::ids::OPEN,
-        "Open in browser",
+        "Starting… — Open in browser",
         true,
         None,
     );
@@ -9886,6 +9915,10 @@ fn main() -> std::io::Result<()> {
             );
             None
         });
+
+    if tray_icon_handle.is_some() {
+        gwt::perf::startup::mark(gwt::perf::startup::StartupPhase::TrayReady);
+    }
 
     // Mark the URL on the tray lock file so a concurrent `gwt`
     // launch and `gwt open` invocation can read it back. Best effort —
@@ -9944,8 +9977,124 @@ fn main() -> std::io::Result<()> {
     let mut board_refresh_queue = BoardRefreshQueue::default();
     let mut active_work_refresh_queue = ActiveWorkRefreshQueue::default();
 
+    let mut dispatch_watchdog = dispatch_watchdog::DispatchWatchdog::start();
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Wait;
+        let mut dispatch_timer = EventLoopDispatchTimer::start(&event);
+        let mut watchdog_guard = dispatch_watchdog.enter(event_loop_dispatch_label(&event).as_str());
+        let event = match event {
+            Event::UserEvent(UserEvent::MenuEvent(ref menu))
+                if gwt::cli::tray::menu::MenuAction::from_id(menu.id.as_ref())
+                    == Some(gwt::cli::tray::menu::MenuAction::Quit) =>
+                Event::UserEvent(UserEvent::QuitApp { reason: GuiShutdownReason::QuitApp }),
+            event => event,
+        };
+        // Quit wins even when the completed initializer and queued work race it.
+        if app.is_none() {
+            match &event {
+                Event::UserEvent(UserEvent::QuitApp { reason }) => {
+                    if !startup_quit_requested {
+                        spawn_gui_exit_backstop(reason.clone(), GUI_SHUTDOWN_BACKSTOP_GRACE);
+                        startup_quit_requested = true;
+                    }
+                    tray_open.set_text("Stopping…");
+                    server.shutdown();
+                    // Keep dispatching until the worker returns ownership for cleanup.
+                    // Tao exits the process without dropping the closure on Exit.
+                    return;
+                }
+                Event::LoopDestroyed => { server.shutdown(); return; }
+                Event::UserEvent(UserEvent::StartupStopped) => {
+                    *control_flow = ControlFlow::Exit;
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if let Some(job) = bootstrap_job.take() {
+            let sender = startup_tx.clone();
+            let wake = proxy.clone();
+            std::thread::Builder::new().name("app-bootstrap".into()).spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job))
+                    .unwrap_or_else(|_| Err(std::io::Error::other("app bootstrap panicked")));
+                let _ = sender.send(result);
+                let _ = wake.send_event(UserEvent::StartupReady);
+            }).expect("spawn app bootstrap");
+        }
+        if app.is_none() {
+            match startup_rx.try_recv() {
+                Ok(Ok(pending)) => {
+                    if startup_quit_requested {
+                        let wake = proxy.clone();
+                        std::thread::Builder::new().name("startup-cleanup".into()).spawn(move || {
+                            drop(pending);
+                            let _ = wake.send_event(UserEvent::StartupStopped);
+                        }).expect("spawn startup cleanup");
+                        return;
+                    }
+                    let mut ready = pending.take();
+                    ready.set_agent_capability_issuer(server.agent_capability_issuer());
+                    ready.set_server_url(browser_url.clone());
+                    ready.set_usage_refresh(usage_refresh.clone());
+                    board_projection_watchers.sync(&ready, proxy.clone());
+                    workspace_projection_watchers.sync(&ready, proxy.clone());
+                    board_daemon_subscribers.sync(&ready, proxy.clone());
+                    startup_index_projects = ready
+                        .project_contexts()
+                        .into_iter()
+                        .map(|context| context.project_root.display().to_string())
+                        .collect();
+                    for context in ready.project_contexts() {
+                        let log_scope = ready.project_log_scope_for_tab(&context.tab_id).cloned();
+                        let _log_scope = log_scope.as_ref().map(|scope| scope.enter());
+                        let inventory = ready.take_startup_worktree_inventory(&context);
+                        if let Some(state) = ready.project_state(&context) {
+                            spawn_project_index_status_check(
+                                &runtime,
+                                state.project_index_bootstrap.clone(),
+                                AppEventProxy::new(proxy.clone()).for_project(context.clone()),
+                                Some(context.project_root),
+                                inventory,
+                            );
+                        }
+                    }
+
+                    tray_open.set_text("Open in browser");
+                    app = Some(ready);
+                }
+                Ok(Err(error)) => {
+                    server.shutdown();
+                    fatal_startup_exit(&mut log_handles, &format!("app bootstrap failed: {error}"), 1);
+                }
+                Err(_) => {}
+            }
+        }
+        // Runtime completions remain in arrival order until bootstrap finishes.
+        let event = if app.is_none() {
+            match event {
+                Event::UserEvent(UserEvent::StartupReady) => {}
+                Event::UserEvent(UserEvent::MenuEvent(menu)) => {
+                    tray_open.set_text("Starting… — request received");
+                    tracing::info!(target: "gwt_tray", "tray request accepted during startup");
+                    startup_events.push_back(UserEvent::MenuEvent(menu));
+                }
+                Event::UserEvent(event) => startup_events.push_back(event),
+                _ => {}
+            }
+            return;
+        } else {
+            match event {
+                Event::UserEvent(event @ UserEvent::QuitApp { .. }) => Event::UserEvent(event),
+                Event::UserEvent(event) => {
+                    if !matches!(event, UserEvent::StartupReady) { startup_events.push_back(event); }
+                    let Some(next) = startup_events.pop_front() else { return; };
+                    if !startup_events.is_empty() { let _ = proxy.send_event(UserEvent::StartupReady); }
+                    Event::UserEvent(next)
+                }
+                event => event,
+            }
+        };
+        let app = app.as_mut().expect("startup complete");
         // Issue #3611 AC-4: every dispatch on this thread is timed, not just
         // the frontend ones. The Work/branch scan results land as `UserEvent`s,
         // so a projection stall was previously invisible in the logs.
@@ -9960,7 +10109,8 @@ fn main() -> std::io::Result<()> {
             }
             event => event,
         };
-        let _dispatch_timer = EventLoopDispatchTimer::start(&event);
+        dispatch_timer.label = event_loop_dispatch_label(&event);
+        watchdog_guard.set_event(dispatch_timer.label.as_str());
         // Keep the tray icon handle alive for the lifetime of the
         // event loop closure; dropping it would unregister the tray
         // icon from the OS. `tray_lock_handle` lives in the outer
@@ -10085,9 +10235,9 @@ fn main() -> std::io::Result<()> {
                     app.window_lookup.len(),
                 );
                 if sync_board_projection_watchers {
-                    board_projection_watchers.sync(&app, proxy.clone());
-                    workspace_projection_watchers.sync(&app, proxy.clone());
-                    board_daemon_subscribers.sync(&app, proxy.clone());
+                    board_projection_watchers.sync(app, proxy.clone());
+                    workspace_projection_watchers.sync(app, proxy.clone());
+                    board_daemon_subscribers.sync(app, proxy.clone());
                 }
                 clients.dispatch(events);
                 if refresh_index_status {
@@ -10342,8 +10492,8 @@ fn main() -> std::io::Result<()> {
                     );
                 }
             }
-            Event::UserEvent(UserEvent::ProjectDispatch { context, events }) => {
-                if app.project_context_is_current(&context) { clients.dispatch(events); }
+            Event::UserEvent(UserEvent::ProjectDispatch { context, events }) if app.project_context_is_current(&context) => {
+                clients.dispatch(events);
             }
             Event::UserEvent(UserEvent::PreparedActiveWorkDispatch {
                 context,
@@ -10606,10 +10756,10 @@ fn main() -> std::io::Result<()> {
                 );
                 let events = app.handle_project_navigation_prepared(*prepared);
                 if may_open_project && !events.is_empty() {
-                    board_projection_watchers.sync(&app, proxy.clone());
-                    workspace_projection_watchers.sync(&app, proxy.clone());
+                    board_projection_watchers.sync(app, proxy.clone());
+                    workspace_projection_watchers.sync(app, proxy.clone());
                     #[cfg(unix)]
-                    board_daemon_subscribers.sync(&app, proxy.clone());
+                    board_daemon_subscribers.sync(app, proxy.clone());
                 }
                 clients.dispatch(events);
             }
@@ -10644,7 +10794,7 @@ fn main() -> std::io::Result<()> {
                 clients.dispatch(app.apply_launch_wizard_branch_candidates(wizard_id, candidates));
             }
             Event::UserEvent(UserEvent::UpdateAvailable(state)) => {
-                clients.dispatch(record_update_available(&mut app, state));
+                clients.dispatch(record_update_available(app, state));
             }
             Event::UserEvent(UserEvent::ApplyUpdate { state, client_id }) => {
                 // Issue #4038 (AC-1): the legacy toast click no longer exits
@@ -10903,9 +11053,9 @@ fn main() -> std::io::Result<()> {
                 branch_worktree_path,
             }) => {
                 let events = app.handle_migration_done(&context, &branch_worktree_path);
-                board_projection_watchers.sync(&app, proxy.clone());
-                workspace_projection_watchers.sync(&app, proxy.clone());
-                board_daemon_subscribers.sync(&app, proxy.clone());
+                board_projection_watchers.sync(app, proxy.clone());
+                workspace_projection_watchers.sync(app, proxy.clone());
+                board_daemon_subscribers.sync(app, proxy.clone());
                 clients.dispatch(events);
             }
             Event::UserEvent(UserEvent::MigrationError {
@@ -10924,9 +11074,9 @@ fn main() -> std::io::Result<()> {
             }
             Event::UserEvent(UserEvent::CloneProjectDone { workspace_home }) => {
                 let events = app.handle_clone_project_done(&workspace_home);
-                board_projection_watchers.sync(&app, proxy.clone());
-                workspace_projection_watchers.sync(&app, proxy.clone());
-                board_daemon_subscribers.sync(&app, proxy.clone());
+                board_projection_watchers.sync(app, proxy.clone());
+                workspace_projection_watchers.sync(app, proxy.clone());
+                board_daemon_subscribers.sync(app, proxy.clone());
                 clients.dispatch(events);
             }
             Event::UserEvent(UserEvent::CloneProjectError { message }) => {
@@ -10953,6 +11103,8 @@ fn main() -> std::io::Result<()> {
                                 url = browser_url.as_str(),
                                 "tray Open menu failed to launch the default browser"
                             );
+                        } else {
+                            tracing::info!(target: "gwt_tray", "tray Open browser launch requested");
                         }
                     }
                     Some(MenuAction::CopyUrl) => {
