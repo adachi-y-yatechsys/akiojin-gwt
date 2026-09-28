@@ -2303,7 +2303,8 @@ impl AppRuntime {
                 ),
                 issue_number: None,
             },
-        )]
+        )
+        .with_error_project_root(&context.project_root)]
     }
 
     /// SPEC-3431 FR-026: the launch config for a fresh PM spawn.

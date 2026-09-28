@@ -1339,11 +1339,7 @@ fn emit_live_event_fail_open(diagnostic_event: Option<&str>, event: RuntimeHookE
         ErrorTarget {
             issue: linked_issue,
             session_id: event.gwt_session_id.clone(),
-            project_root: event.project_root.clone().or_else(|| {
-                std::env::current_dir()
-                    .ok()
-                    .map(|dir| dir.display().to_string())
-            }),
+            project_root: event.project_root.clone(),
             ..ErrorTarget::default()
         },
         context,
@@ -1803,6 +1799,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn live_forward_failure_without_project_does_not_borrow_process_cwd() {
+        let _lock = env_test_lock();
+        let home = tempfile::tempdir().unwrap();
+        let _home = gwt_core::test_support::ScopedGwtHome::set(home.path());
+        let _url = ScopedEnvVar::set(GWT_HOOK_FORWARD_URL_ENV, "unsupported://local");
+        let _token = ScopedEnvVar::set(GWT_HOOK_FORWARD_TOKEN_ENV, "test-token");
+        let mut event = hook_live_test_event("Stop", None);
+        event.project_root = None;
+
+        emit_live_event_fail_open(Some("Stop"), event);
+
+        let rows = gwt_core::error_ledger::list_since(None).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].scope, gwt_core::error_ledger::ErrorScope::Unknown);
+        assert!(rows[0].target.project_root.is_none());
+    }
+
     fn short_hook_live_retry_policy() -> HookLiveRetryPolicy {
         HookLiveRetryPolicy {
             per_attempt_timeout: Duration::from_millis(40),
@@ -2219,6 +2233,7 @@ mod tests {
             token: "continuation-redirect-secret".to_string(),
         };
         let request = crate::AgentExecutionContinuationRequest {
+            readiness_nonce: None,
             schema_version: crate::AGENT_EXECUTION_CONTINUATION_SCHEMA_VERSION,
             operation_id: "continuation-redirect".to_string(),
         };
@@ -2347,6 +2362,7 @@ mod tests {
             }),
         );
         let request = crate::AgentExecutionContinuationRequest {
+            readiness_nonce: Some("private-readiness-sentinel".to_string()),
             schema_version: crate::AGENT_EXECUTION_CONTINUATION_SCHEMA_VERSION,
             operation_id: "continuation-diagnostics".to_string(),
         };
@@ -2371,7 +2387,9 @@ mod tests {
             !error.contains("workspace.prune"),
             "a recovery operation that does not exist reached the agent: {error}"
         );
-        server.receive();
+        let (_, captured) = server.receive();
+        assert_eq!(captured["readiness_nonce"], "private-readiness-sentinel");
+        assert!(!format!("{request:?}").contains("private-readiness-sentinel"));
 
         let unsafe_server = BindingProbeServer::start(
             StatusCode::CONFLICT,
@@ -2630,6 +2648,7 @@ mod tests {
         receipt_server.receive();
 
         let continuation_request = crate::AgentExecutionContinuationRequest {
+            readiness_nonce: None,
             schema_version: crate::AGENT_EXECUTION_CONTINUATION_SCHEMA_VERSION,
             operation_id: "continuation-reason-codes".to_string(),
         };
