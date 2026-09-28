@@ -127,8 +127,22 @@ fn frontend_issue_monitor_events_use_snake_case_wire_shape() {
     .expect("quick issue event");
     assert!(matches!(
         event,
-        FrontendEvent::QuickRegisterIssue { title, launch: true }
+        FrontendEvent::QuickRegisterIssue { title, launch: true, auto_merge: false }
             if title == "Investigate Intake registration"
+    ));
+
+    // SPEC #3885 T-033: the "+ New" popover sends its auto-merge checkbox.
+    let event: FrontendEvent = serde_json::from_str(
+        r#"{"kind":"quick_register_issue","title":"Ship","launch":false,"auto_merge":true}"#,
+    )
+    .expect("quick issue event with auto_merge");
+    assert!(matches!(
+        event,
+        FrontendEvent::QuickRegisterIssue {
+            launch: false,
+            auto_merge: true,
+            ..
+        }
     ));
 }
 

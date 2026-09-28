@@ -15,6 +15,23 @@ const TRAY_LOCK: &str = include_str!("../src/cli/tray/lock.rs");
 const OPEN_CLI: &str = include_str!("../src/cli/open.rs");
 
 #[test]
+fn tray_event_loop_does_not_wait_for_project_bootstrap() {
+    let startup = MAIN_RS.split_once("fn main()").expect("main entry").1;
+    let before_loop = startup
+        .split_once("event_loop.run(")
+        .expect("native event loop")
+        .0;
+    assert!(
+        !before_loop.contains("app.bootstrap();"),
+        "project bootstrap must not block tray creation and the first native dispatch"
+    );
+    assert!(
+        !before_loop.contains("prepare_front_door_for_path("),
+        "managed hook preparation runs Git and must remain inside the bootstrap worker"
+    );
+}
+
+#[test]
 fn cli_root_declares_tray_and_open_modules() {
     assert!(
         CLI_ROOT.contains("pub mod tray;"),
