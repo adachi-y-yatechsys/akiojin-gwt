@@ -456,6 +456,10 @@ pub const OPERATIONS: &[Operation] = &[
         aliases: &[],
     },
     Operation {
+        name: "pm.capabilities",
+        aliases: &[],
+    },
+    Operation {
         name: "pm.message.send",
         aliases: &["pm.pane.send"],
     },

@@ -732,6 +732,12 @@ fn mark_degraded_cache_projection(status: &mut crate::IssueMonitorAgentStatus) {
     // AC-3: preferences are what a stopped monitor stops maintaining, so an
     // empty list here is "no launch recorded", not "no launch running".
     status.active_launches_incomplete = true;
+    // Issue #4249: only prefs are read here, so `disabled` is known but
+    // whether a GUI is attached — and every gate after it — is not.
+    if status.stall_reason != Some(crate::IssueMonitorStallReason::Disabled) {
+        status.stall_reason = Some(crate::IssueMonitorStallReason::Unknown);
+        status.gui_action = None;
+    }
     status.last_error = status.last_error.take().map(degraded_projection_error);
     if let Some(view) = status.gui_status.as_mut() {
         view.last_error = view.last_error.take().map(degraded_projection_error);
@@ -6621,6 +6627,8 @@ mod tests {
             issue_cache: None,
             review_windows: Vec::new(),
             failure_surge: None,
+            stall_reason: None,
+            gui_action: None,
             idle_windows: Vec::new(),
             idle_window_counts: std::collections::BTreeMap::new(),
         };
@@ -6697,6 +6705,8 @@ mod tests {
             issue_cache: None,
             review_windows: Vec::new(),
             failure_surge: None,
+            stall_reason: None,
+            gui_action: None,
             idle_windows: Vec::new(),
             idle_window_counts: std::collections::BTreeMap::new(),
         };
@@ -6824,6 +6834,8 @@ mod tests {
                 issue_cache: None,
                 review_windows: Vec::new(),
                 failure_surge: None,
+                stall_reason: None,
+                gui_action: None,
                 idle_windows: Vec::new(),
                 idle_window_counts: std::collections::BTreeMap::new(),
             };
@@ -6895,6 +6907,8 @@ mod tests {
             issue_cache: None,
             review_windows: Vec::new(),
             failure_surge: None,
+            stall_reason: None,
+            gui_action: None,
             idle_windows: Vec::new(),
             idle_window_counts: std::collections::BTreeMap::new(),
         };
@@ -7053,6 +7067,7 @@ mod tests {
                 // projection, and `active_launches` is whatever preferences
                 // still record — both facts ship with the numbers.
                 "source": "degraded_cache",
+                "stall_reason": "unknown",
                 "project_root": std::fs::canonicalize(&repo).expect("canonical project"),
                 "active_launches_incomplete": true,
                 "queue": [2, 1],
@@ -9106,6 +9121,8 @@ mod tests {
             build_artifact_gc: None,
             review_windows: Vec::new(),
             failure_surge: None,
+            stall_reason: None,
+            gui_action: None,
             issue_cache: None,
         };
 
