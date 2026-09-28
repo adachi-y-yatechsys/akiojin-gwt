@@ -88,7 +88,8 @@ impl From<AssetIoError> for std::io::Error {
 /// Read a file, tagging failure as [`AssetRoute::Read`].
 pub fn read_to_string(path: impl AsRef<Path>) -> Result<String, AssetIoError> {
     let path = path.as_ref();
-    std::fs::read_to_string(path).map_err(|source| AssetIoError::new(AssetRoute::Read, path, source))
+    std::fs::read_to_string(path)
+        .map_err(|source| AssetIoError::new(AssetRoute::Read, path, source))
 }
 
 /// Read a file's bytes, tagging failure as [`AssetRoute::Read`].
@@ -100,7 +101,8 @@ pub fn read(path: impl AsRef<Path>) -> Result<Vec<u8>, AssetIoError> {
 /// Create a directory tree, tagging failure as [`AssetRoute::Write`].
 pub fn create_dir_all(path: impl AsRef<Path>) -> Result<(), AssetIoError> {
     let path = path.as_ref();
-    std::fs::create_dir_all(path).map_err(|source| AssetIoError::new(AssetRoute::Write, path, source))
+    std::fs::create_dir_all(path)
+        .map_err(|source| AssetIoError::new(AssetRoute::Write, path, source))
 }
 
 /// Write a file, tagging failure as [`AssetRoute::Write`]. The path reported is
@@ -115,7 +117,8 @@ pub fn write(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> Result<(), A
 /// reported is the destination, because that is where a backup fails.
 pub fn backup(from: impl AsRef<Path>, to: impl AsRef<Path>) -> Result<u64, AssetIoError> {
     let to = to.as_ref();
-    std::fs::copy(from.as_ref(), to).map_err(|source| AssetIoError::new(AssetRoute::Backup, to, source))
+    std::fs::copy(from.as_ref(), to)
+        .map_err(|source| AssetIoError::new(AssetRoute::Backup, to, source))
 }
 
 /// Move a file into place, tagging failure as [`AssetRoute::Write`].
@@ -175,7 +178,11 @@ mod tests {
         .collect();
         assert_eq!(names, ["read", "backup", "write", "delete"]);
         let unique: std::collections::BTreeSet<&str> = names.iter().copied().collect();
-        assert_eq!(unique.len(), names.len(), "route names must be distinguishable");
+        assert_eq!(
+            unique.len(),
+            names.len(),
+            "route names must be distinguishable"
+        );
     }
 
     #[test]
@@ -188,7 +195,10 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
         let rendered = error.to_string();
         assert!(rendered.contains("read"), "{rendered}");
-        assert!(rendered.contains(&missing.display().to_string()), "{rendered}");
+        assert!(
+            rendered.contains(&missing.display().to_string()),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -244,6 +254,9 @@ mod tests {
         );
         let rendered = converted.to_string();
         assert!(rendered.contains("read"), "{rendered}");
-        assert!(rendered.contains(&missing.display().to_string()), "{rendered}");
+        assert!(
+            rendered.contains(&missing.display().to_string()),
+            "{rendered}"
+        );
     }
 }

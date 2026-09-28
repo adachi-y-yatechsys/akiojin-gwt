@@ -599,8 +599,8 @@ fn is_git_worktree(worktree: &Path) -> bool {
 mod tests {
     // Production code reaches the filesystem through `crate::asset_io`, which
     // tags every failure with its route and path (#4486 AC-6). Fixtures do not.
-    use std::fs;
     use super::*;
+    use std::fs;
 
     #[test]
     fn distribution_plan_restores_tracked_file_after_case_variant_prune() {
