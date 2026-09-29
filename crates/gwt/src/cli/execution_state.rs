@@ -11868,7 +11868,9 @@ fn evidence_status_name(status: crate::cli::verification_record::EvidenceStatus)
         EvidenceStatus::WrongSession => "wrong_session",
         EvidenceStatus::WrongOwner => "wrong_owner",
         EvidenceStatus::WrongGeneration => "wrong_generation",
-        EvidenceStatus::StaleFingerprint => "stale_fingerprint",
+        EvidenceStatus::StaleFingerprint | EvidenceStatus::StaleFingerprintFiles(_) => {
+            "stale_fingerprint"
+        }
         EvidenceStatus::Failing => "failing",
         EvidenceStatus::Unreadable => "unreadable",
         EvidenceStatus::Tampered => "tampered",
