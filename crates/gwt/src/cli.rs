@@ -15,6 +15,7 @@ mod commands;
 mod concern;
 pub mod daemon;
 pub mod delivered_owner;
+pub(crate) mod delivery_paths;
 mod diagnostics;
 mod discuss;
 pub(crate) mod discussion;

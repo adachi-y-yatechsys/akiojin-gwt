@@ -894,10 +894,18 @@ mod tests {
                 .unwrap();
             FileExt::lock_exclusive(&lock).unwrap();
             ready_tx.send(()).unwrap();
-            release_rx.recv().unwrap();
+            // A regressed reader must fail instead of hanging with a fixed clock.
+            release_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("prompt must finish while the Board writer lock is held");
         });
         ready_rx.recv().unwrap();
-        let result = handle_with_input("UserPromptSubmit", "{}", &worktree, Some(&session.id));
+        let result = {
+            // Exercise lock independence, not the host's ability to read within
+            // the production 25 ms Board budget on a loaded runner.
+            let _clock = gwt_core::operation_deadline::ScopedOperationClock::set(Instant::now());
+            handle_with_input("UserPromptSubmit", "{}", &worktree, Some(&session.id))
+        };
         release_tx.send(()).unwrap();
         holder.join().unwrap();
         let HookOutput::HookSpecificAdditionalContext { text, .. } = result.unwrap() else {
