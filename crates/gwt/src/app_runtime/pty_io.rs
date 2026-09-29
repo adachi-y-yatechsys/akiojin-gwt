@@ -693,15 +693,16 @@ impl AppRuntime {
             Unavailable(String),
         }
 
-        // Capture only local evidence at the close ACK boundary. Durable
-        // diagnosis stays on the existing background finalizer and does not
+        // Capture only immediately available evidence at the close ACK
+        // boundary: a busy pane is Unknown, never a reason to delay close.
+        // Durable diagnosis stays on the background finalizer and does not
         // grant or replace its independent terminalization authority.
         let termination_receipt = self
             .active_agent_sessions
             .get(window_id)
             .zip(self.runtimes.get(window_id))
             .and_then(|(active, runtime)| {
-                let has_exit = runtime.pane.lock().ok()?.last_exit().is_some();
+                let has_exit = runtime.pane.try_lock().ok()?.last_exit().is_some();
                 Some((active.session_id.clone(), runtime.incarnation, has_exit))
             });
         let mut runtime = self.runtimes.remove(window_id);

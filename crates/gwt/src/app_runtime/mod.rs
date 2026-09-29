@@ -4951,7 +4951,7 @@ impl AppRuntime {
         let classification = (|| {
             let active = self.active_agent_sessions.get(window_id)?;
             let runtime = self.runtimes.get(window_id)?;
-            let has_exit = runtime.pane.lock().ok()?.last_exit().is_some();
+            let has_exit = runtime.pane.try_lock().ok()?.last_exit().is_some();
             Some(Self::classify_issue_monitor_termination(
                 &self.sessions_dir,
                 &active.session_id,
