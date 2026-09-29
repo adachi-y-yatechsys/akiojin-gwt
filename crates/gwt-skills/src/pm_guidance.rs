@@ -1130,9 +1130,14 @@ never covered. "The record went terminal" is not new work.
 bump sits on the branch with nothing driving it to a release, and the
 gap stays invisible until someone happens to look (Issue #3516).
 
-- Every resident cycle, run JSON operation `release.status`. It is a
-  local git read whenever no bump is pending, so it costs no GitHub
-  budget on an ordinary cycle and never needs `refresh`.
+- Every resident cycle, run JSON operation `release.status`. Every call
+  reads the remote tags and release branch fresh, so a failed read is an
+  explicit error, never an old value; it never needs `refresh`.
+- The same output reports the running binary's generation. When
+  `stale_runtime` is `true`, a landed fix is not running yet: never call
+  it running, and name `behind_commits` and the `owner_action` in the
+  digest. `null` means unknown; never report an unknown generation as
+  current.
 - Act on `state`, not on your own reading of the log: `no_bump`,
   `released` (the version is already tagged) and `pr_open` are quiet
   states with nothing to do. Only `stalled` — bump landed, version
@@ -1246,6 +1251,27 @@ owning Issue in `needs_human` and both carry a four-part body: 事象,
   suppressed.
 - A repeated refusal of the same operation is not restated on the Board.
   Do not read one escalation as one occurrence.
+
+## Before handing an action to the owner
+
+Every action you hand the owner is one the fleet waits on. Of the three
+owner actions measured in Issue #4249, two were already within the PM's
+own authority.
+
+- Before declaring any wait on an owner action, pass both checks:
+  1. Confirm by measurement that no equivalent operation exists: run
+     the operation or its family's `--help`. Memory is not a measurement.
+  2. Run JSON operation `pm.capabilities` and look the action up. If it
+     is `executable: true` for you, perform it yourself instead of asking.
+- Hand the owner only an action `pm.capabilities` lists as not
+  executable, and phrase the request from that row: its `reason`
+  (`permission` or `missing_operation`) and its `owner_action`.
+- When the reason is `missing_operation`, or no operation covers the
+  action at all, register an Issue for the missing operation in the same
+  cycle (search first, as for any Issue) and name it in the handoff. An
+  operation gap is a product defect, not a standing owner chore.
+- For a stalled Monitor queue, read `stall_reason` and `gui_action` from
+  `issue.monitor.status`, and hand over only the named `gui_action`.
 
 ## Issue proposals from agents
 
@@ -2164,6 +2190,32 @@ mod tests {
         ] {
             assert!(body.contains(phrase), "missing `{phrase}`");
         }
+    }
+
+    /// Issue #4249 FR-005 / AC-6: an owner-action wait is declared only after
+    /// the PM measured that no operation covers it and that `pm.capabilities`
+    /// does not list it as executable; an operation gap becomes an Issue.
+    /// FR-002: a landed fix that is not running yet reaches the digest.
+    #[test]
+    fn contract_checks_its_own_authority_before_handing_the_owner_an_action() {
+        let body = body();
+        for phrase in [
+            "## Before handing an action to the owner",
+            "Confirm by measurement that no equivalent operation exists",
+            "Run JSON operation `pm.capabilities`",
+            "perform it yourself instead of asking",
+            "its `reason` (`permission` or `missing_operation`) and its `owner_action`",
+            "register an Issue for the missing operation in the same cycle",
+            "read `stall_reason` and `gui_action` from `issue.monitor.status`",
+            "When `stale_runtime` is `true`",
+            "`null` means unknown",
+        ] {
+            assert!(body.contains(phrase), "missing `{phrase}`");
+        }
+        assert!(
+            !body.contains("so it costs no GitHub\n  budget on an ordinary cycle"),
+            "release.status reads the remote on every call"
+        );
     }
 
     /// Issue #3868 AC-2 / AC-3 / AC-5 / AC-6: a row the Monitor cannot act on
