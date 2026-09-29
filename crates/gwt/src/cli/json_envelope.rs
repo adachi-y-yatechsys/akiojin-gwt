@@ -3014,10 +3014,15 @@ mod tests {
         assert_eq!(refusal.target.project_root.as_deref(), requested.to_str());
     }
 
-    /// Issue #3814 AC-2/AC-3: the JSON surface must return a structured
-    /// refusal for a registered PM and reject a mixed request atomically.
+    /// SPEC #4778 AC-1 (supersedes Issue #3814 AC-2/AC-3 for the PM).
+    ///
+    /// The structured refusal and the atomic rejection of a mixed request are
+    /// still the contract — for everyone except the resident PM, which is now
+    /// the one JSON caller allowed to turn the Monitor on. The caller here is
+    /// a session the registry does not know, which is the shape #3814 was
+    /// written against.
     #[test]
-    fn issue_monitor_pm_on_refusal_answers_ok_false_and_preserves_prefs() {
+    fn issue_monitor_on_refusal_answers_ok_false_and_preserves_prefs() {
         let _guard = crate::env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3039,6 +3044,7 @@ mod tests {
         .expect("save prefs");
         let before = std::fs::read(&prefs_path).expect("prefs bytes");
 
+        // A PM is registered, but the caller is a different session.
         let pm_prefs_path = crate::pm_registry::pm_prefs_path_for_repo_path(&project_root);
         crate::pm_registry::try_register_pm(
             &pm_prefs_path,
@@ -3053,12 +3059,10 @@ mod tests {
             |_| false,
         )
         .expect("register PM");
-        assert!(crate::pm_registry::session_is_registered_pm(
-            &pm_prefs_path,
-            "pm-session"
-        ));
-        let _pm =
-            gwt_core::test_support::ScopedEnvVar::set(gwt_agent::GWT_SESSION_ID_ENV, "pm-session");
+        let _other = gwt_core::test_support::ScopedEnvVar::set(
+            gwt_agent::GWT_SESSION_ID_ENV,
+            "some-other-session",
+        );
 
         for params in [
             json!({
@@ -3092,6 +3096,69 @@ mod tests {
                 "a mixed ON request must not partially apply allowed fields"
             );
         }
+    }
+
+    /// SPEC #4778 AC-1: the same envelope from the resident PM is accepted.
+    ///
+    /// Paired with the refusal above so the only difference under test is who
+    /// the caller is, not how the request is shaped.
+    #[test]
+    fn issue_monitor_on_from_the_resident_pm_is_accepted_over_the_json_surface() {
+        let _guard = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _home = gwt_core::test_support::ScopedGwtHome::set(temp.path().join("gwt-home"));
+        let project_root = temp.path().join("repo");
+        std::fs::create_dir_all(&project_root).expect("repo dir");
+
+        let prefs_path = crate::issue_monitor_prefs_path_for_repo_path(&project_root);
+        crate::save_issue_monitor_prefs(
+            &prefs_path,
+            &crate::IssueMonitorPrefs {
+                enabled: false,
+                autonomous_mode: false,
+                max_active_agents: 3,
+                ..crate::IssueMonitorPrefs::default()
+            },
+        )
+        .expect("save prefs");
+
+        let pm_prefs_path = crate::pm_registry::pm_prefs_path_for_repo_path(&project_root);
+        crate::pm_registry::try_register_pm(
+            &pm_prefs_path,
+            crate::pm_registry::PmRegistration {
+                session_id: "pm-session".to_string(),
+                agent_id: "claude".to_string(),
+                worktree_path: project_root.to_string_lossy().into_owned(),
+                created_at: None,
+                consecutive_crashes: 0,
+                next_not_before: None,
+            },
+            |_| false,
+        )
+        .expect("register PM");
+        let _pm =
+            gwt_core::test_support::ScopedEnvVar::set(gwt_agent::GWT_SESSION_ID_ENV, "pm-session");
+
+        let mut env = TestEnv::new(project_root.clone());
+        env.stdin = envelope(
+            "issue.monitor.config.set",
+            json!({
+                "project_root": project_root.to_string_lossy(),
+                "enabled": true,
+                "autonomous_mode": true,
+                "max_active": 7,
+            }),
+        );
+
+        let code = super::dispatch(&mut env, "gwtd");
+
+        assert_eq!(code, 0, "the resident PM may turn the Issue Monitor on");
+        let prefs = crate::load_issue_monitor_prefs(&prefs_path).expect("prefs after the PM's ON");
+        assert!(prefs.enabled, "the PM's ON must persist");
+        assert!(prefs.autonomous_mode, "the PM's autonomous ON must persist");
+        assert_eq!(prefs.max_active_agents, 7);
     }
 
     #[test]
