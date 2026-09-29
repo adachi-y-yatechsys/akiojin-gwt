@@ -2928,6 +2928,9 @@ fn try_apply_accepted_issue_monitor_control_with_disk_migration_observed(
 /// but a frame is just bytes on a channel, so the daemon re-checks the session
 /// id it carries against this repository's PM registry. Passing `None` means no
 /// registry is reachable, and then ON stays refused exactly as before.
+// Only the tests decode without a repository: the worker always has
+// `scope.project_root`, so a production build has no caller for this shape.
+#[cfg(test)]
 fn decode_issue_monitor_control(payload: serde_json::Value) -> Option<IssueMonitorControl> {
     decode_issue_monitor_control_in_repo(payload, None)
 }
