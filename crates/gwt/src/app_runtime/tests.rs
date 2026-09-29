@@ -24155,9 +24155,59 @@ fn issue_monitor_scan_reconciles_activated_launch_but_preserves_unready_candidat
         if activated {
             leave_fresh_execution_activated_before_projection_commit(&mut fixture);
         }
+        let (spawner, queued_tasks) = BlockingTaskSpawner::queued();
+        let (proxy, recorded_events) = AppEventProxy::stub();
+        fixture.runtime.blocking_tasks = spawner;
+        fixture.runtime.proxy = proxy;
         fixture
             .runtime
             .issue_monitor_scheduled_tick_events_at(&Utc::now().to_rfc3339());
+        assert!(
+            fixture
+                .runtime
+                .pending_fresh_execution_launches
+                .contains_key(&fixture.window_id),
+            "scan must defer durable repair and ACK until its blocking task completes"
+        );
+        assert_eq!(
+            gwt::load_issue_monitor_prefs(&prefs_path)
+                .unwrap()
+                .launching_issues
+                .len(),
+            1
+        );
+        drain_queued_blocking_tasks(&queued_tasks);
+        let completions = std::mem::take(&mut *recorded_events.lock().unwrap());
+        let mut repaired = false;
+        for event in completions {
+            if let UserEvent::IssueMonitorFreshLaunchRepaired {
+                window_id,
+                operation_id,
+                binding,
+            } = event
+            {
+                repaired = true;
+                // A completion for a replaced operation cannot acknowledge this window.
+                assert!(fixture
+                    .runtime
+                    .handle_issue_monitor_fresh_launch_repaired(
+                        &window_id,
+                        "stale-operation",
+                        &binding,
+                    )
+                    .is_empty());
+                assert!(fixture
+                    .runtime
+                    .pending_fresh_execution_launches
+                    .contains_key(&window_id));
+                fixture.runtime.handle_issue_monitor_fresh_launch_repaired(
+                    &window_id,
+                    &operation_id,
+                    &binding,
+                );
+            }
+        }
+        assert_eq!(repaired, activated);
         let prefs = gwt::load_issue_monitor_prefs(&prefs_path).unwrap();
         assert!(
             fixture
@@ -52025,6 +52075,24 @@ fn monitor_relaunch_fixture(
     holder: MonitorNativeHolderFixture,
     durable_delivery: bool,
 ) -> MonitorRelaunchFixture {
+    monitor_relaunch_fixture_with_settlement(
+        root,
+        case_name,
+        conversation,
+        holder,
+        durable_delivery,
+        gwt::cli::execution_state::ExecutionSettlement::Completed,
+    )
+}
+
+fn monitor_relaunch_fixture_with_settlement(
+    root: &Path,
+    case_name: &str,
+    conversation: MonitorProviderConversationFixture,
+    holder: MonitorNativeHolderFixture,
+    durable_delivery: bool,
+    settlement: gwt::cli::execution_state::ExecutionSettlement,
+) -> MonitorRelaunchFixture {
     let case_root = root.join(case_name);
     fs::create_dir_all(&case_root).expect("create monitor relaunch case root");
     let repo = case_root.join("repo");
@@ -52049,7 +52117,8 @@ fn monitor_relaunch_fixture(
         .expect("materialize monitored issue worktree");
     assert!(status.success(), "git worktree add failed with {status}");
 
-    let sessions_dir = case_root.join("sessions");
+    // Resume authority and the launch handshake must read the same Session store.
+    let sessions_dir = gwt_core::paths::gwt_sessions_dir();
     fs::create_dir_all(&sessions_dir).expect("create sessions dir");
     let native_conversation_id = format!("native-monitor-{case_name}");
     let source_session_id = format!("session-monitor-{case_name}");
@@ -52085,15 +52154,8 @@ fn monitor_relaunch_fixture(
     )
     .expect("materialize monitored predecessor execution");
     assert!(matches!(
-        gwt::cli::execution_state::settle(
-            &worktree,
-            &source_session_id,
-            gwt::cli::execution_state::ExecutionSettlement::Blocked {
-                reason: "monitor predecessor failed".to_string(),
-                missing_verification: Some("successor verification pending".to_string()),
-            },
-        )
-        .expect("settle monitored predecessor"),
+        gwt::cli::execution_state::settle(&worktree, &source_session_id, settlement,)
+            .expect("settle monitored predecessor"),
         gwt::cli::execution_state::SettleResult::Settled(_)
     ));
     gwt::cli::execution_state::ensure_generation_ledger(
@@ -52124,12 +52186,6 @@ fn monitor_relaunch_fixture(
     source
         .save(&sessions_dir)
         .expect("save resume source Session");
-    let global_sessions_dir = gwt_core::paths::gwt_sessions_dir();
-    fs::create_dir_all(&global_sessions_dir).expect("create isolated global sessions dir");
-    source
-        .save(&global_sessions_dir)
-        .expect("save globally discoverable predecessor Session");
-
     let holder_window_id = (holder != MonitorNativeHolderFixture::None)
         .then(|| combined_window_id("tab-1", "agent-holder"));
     let holder_session_id = holder_window_id.as_ref().map(|_| {
@@ -52277,6 +52333,7 @@ fn monitor_relaunch_fixture(
     };
     let (mut runtime, recorded_events) =
         sample_runtime_with_events(&case_root, vec![tab], Some("tab-1"));
+    runtime.sessions_dir = sessions_dir.clone();
     let mut agent_options = sample_agent_options();
     agent_options.push(gwt::AgentOption {
         id: "claude".to_string(),
@@ -52535,6 +52592,19 @@ fn assert_monitor_exact_resume(result: AgentLaunchResult, fixture: &MonitorRelau
         gwt_agent::Session::load(&fixture.sessions_dir.join(format!("{session_id}.toml")))
             .expect("load prepared exact Resume Session");
     assert_eq!(resumed.session_mode, gwt_agent::SessionMode::Resume);
+    let binding = resumed
+        .execution_binding
+        .as_ref()
+        .expect("exact Monitor Resume must retain producing authority");
+    assert_eq!(binding.session_id, session_id);
+    assert_eq!(
+        gwt::cli::execution_state::current_execution_binding(
+            &fixture.worktree,
+            fixture.execution_owner,
+        )
+        .unwrap(),
+        Some(binding.identity.clone())
+    );
     assert_eq!(
         resumed.agent_session_id.as_deref(),
         Some(fixture.native_conversation_id.as_str()),
@@ -52595,12 +52665,16 @@ fn app_runtime_monitor_resume_from_terminal_owner_retains_execution_authority() 
     let _forward_url = ScopedEnvVar::unset(gwt_agent::GWT_HOOK_FORWARD_URL_ENV);
     let _forward_token = ScopedEnvVar::unset(gwt_agent::GWT_HOOK_FORWARD_TOKEN_ENV);
     let _pane_url = ScopedEnvVar::unset(gwt_agent::GWT_PANE_WS_URL_ENV);
-    let mut fixture = monitor_relaunch_fixture(
+    let mut fixture = monitor_relaunch_fixture_with_settlement(
         temp.path(),
         "resume-terminal-authority",
         MonitorProviderConversationFixture::Present,
         MonitorNativeHolderFixture::None,
         false,
+        gwt::cli::execution_state::ExecutionSettlement::Blocked {
+            reason: "monitor predecessor failed".to_string(),
+            missing_verification: Some("successor verification pending".to_string()),
+        },
     );
     fixture.runtime.auto_launch_issue_monitor_delivery_events(
         &fixture.runtime.test_context(),
