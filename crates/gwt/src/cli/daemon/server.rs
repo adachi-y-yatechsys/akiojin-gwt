@@ -3009,8 +3009,7 @@ fn decode_issue_monitor_control_in_repo(
                             })
                         })
                     });
-                if (!resident_pm
-                    && (enabled == Some(true) || autonomous_mode == Some(true)))
+                if (!resident_pm && (enabled == Some(true) || autonomous_mode == Some(true)))
                     || max_active_agents == Some(0)
                     || (enabled.is_none()
                         && autonomous_mode.is_none()
@@ -5543,8 +5542,8 @@ mod tests {
 
     use super::{
         apply_issue_monitor_control, build_handshake_response, decode_issue_monitor_control,
-        decode_issue_monitor_control_in_repo,
-        handle_connection, issue_monitor_control_is_authorizing, run_server,
+        decode_issue_monitor_control_in_repo, handle_connection,
+        issue_monitor_control_is_authorizing, run_server,
         run_server_with_shutdown_and_worker_config, spawn_issue_monitor_worker_with_config,
         spawn_issue_monitor_worker_with_config_and_scan_probe,
         spawn_issue_monitor_worker_with_config_and_timeout, BroadcastHub, ConnectionGuard,
@@ -8075,13 +8074,14 @@ exit 0
         });
         assert!(!monitor.autonomous_mode());
 
-        let arm =
-            decode_issue_monitor_control_for_test(crate::runtime_daemon_events::issue_monitor_payload(
+        let arm = decode_issue_monitor_control_for_test(
+            crate::runtime_daemon_events::issue_monitor_payload(
                 "control",
                 serde_json::json!({ "autonomous_mode": true }),
                 std::process::id() + 1,
-            ))
-            .expect("arm control decodes");
+            ),
+        )
+        .expect("arm control decodes");
         assert!(
             apply_issue_monitor_control(&mut monitor, arm),
             "rescan requested"
@@ -8089,13 +8089,14 @@ exit 0
         assert!(monitor.autonomous_mode(), "kill switch armed");
         assert!(monitor.status_view().autonomous_mode);
 
-        let disarm =
-            decode_issue_monitor_control_for_test(crate::runtime_daemon_events::issue_monitor_payload(
+        let disarm = decode_issue_monitor_control_for_test(
+            crate::runtime_daemon_events::issue_monitor_payload(
                 "control",
                 serde_json::json!({ "autonomous_mode": false }),
                 std::process::id() + 1,
-            ))
-            .expect("disarm control decodes");
+            ),
+        )
+        .expect("disarm control decodes");
         apply_issue_monitor_control(&mut monitor, disarm);
         assert!(!monitor.autonomous_mode(), "kill switch disarmed");
     }
@@ -8198,15 +8199,16 @@ exit 0
             },
         );
 
-        let live =
-            decode_issue_monitor_control_for_test(crate::runtime_daemon_events::issue_monitor_payload(
+        let live = decode_issue_monitor_control_for_test(
+            crate::runtime_daemon_events::issue_monitor_payload(
                 "control",
                 serde_json::json!({
                     "requeue": { "issue_number": 43, "reason": "operator recovery" }
                 }),
                 std::process::id() + 1,
-            ))
-            .expect("requeue decodes");
+            ),
+        )
+        .expect("requeue decodes");
         assert!(
             !apply_issue_monitor_control(&mut monitor, live),
             "a row a launch still owns must not be recovered by this control"
@@ -8217,15 +8219,16 @@ exit 0
             "the live launch must be untouched"
         );
 
-        let dead =
-            decode_issue_monitor_control_for_test(crate::runtime_daemon_events::issue_monitor_payload(
+        let dead = decode_issue_monitor_control_for_test(
+            crate::runtime_daemon_events::issue_monitor_payload(
                 "control",
                 serde_json::json!({
                     "requeue": { "issue_number": 42, "reason": "operator recovery" }
                 }),
                 std::process::id() + 1,
-            ))
-            .expect("requeue decodes");
+            ),
+        )
+        .expect("requeue decodes");
         assert!(
             apply_issue_monitor_control(&mut monitor, dead),
             "releasing a dead hold must request a scan so the row runs now"
@@ -8566,8 +8569,8 @@ exit 0
                 ..crate::IssueMonitorPrefs::default()
             },
         );
-        let legacy =
-            decode_issue_monitor_control_for_test(crate::runtime_daemon_events::issue_monitor_payload(
+        let legacy = decode_issue_monitor_control_for_test(
+            crate::runtime_daemon_events::issue_monitor_payload(
                 "control",
                 serde_json::json!({
                     "window_closed": {
@@ -8575,8 +8578,9 @@ exit 0
                     }
                 }),
                 std::process::id() + 1,
-            ))
-            .expect("legacy targetless close still decodes");
+            ),
+        )
+        .expect("legacy targetless close still decodes");
 
         assert!(!apply_issue_monitor_control(&mut monitor, legacy));
         assert_eq!(monitor.active_count(), 1);
@@ -10000,13 +10004,14 @@ exit 0
     // decodable control and drops the Issue from this terminal's queue.
     #[test]
     fn issue_monitor_terminal_queue_remove_control_decodes_and_applies() {
-        let control =
-            decode_issue_monitor_control_for_test(crate::runtime_daemon_events::issue_monitor_payload(
+        let control = decode_issue_monitor_control_for_test(
+            crate::runtime_daemon_events::issue_monitor_payload(
                 "control",
                 serde_json::json!({ "terminal_queue_remove": { "issue_numbers": [42] } }),
                 std::process::id() + 1,
-            ))
-            .expect("queue remove control decodes");
+            ),
+        )
+        .expect("queue remove control decodes");
         assert_eq!(control, IssueMonitorControl::TerminalQueueRemove(vec![42]));
 
         let mut monitor = crate::IssueMonitorState::new(crate::IssueMonitorConfig::default());
@@ -10148,11 +10153,13 @@ exit 0
         assert_eq!(drain.reason, crate::IssueMonitorUpdateDrainReason::Auto);
         assert_eq!(drain.version, "9.99.0");
         assert!(
-            decode_issue_monitor_control_for_test(crate::runtime_daemon_events::issue_monitor_payload(
-                "control",
-                serde_json::json!({ "config_set": { "update_drain": "soon" } }),
-                std::process::id() + 1,
-            ))
+            decode_issue_monitor_control_for_test(
+                crate::runtime_daemon_events::issue_monitor_payload(
+                    "control",
+                    serde_json::json!({ "config_set": { "update_drain": "soon" } }),
+                    std::process::id() + 1,
+                )
+            )
             .is_none(),
             "a malformed drain control is refused whole"
         );
@@ -10257,13 +10264,14 @@ exit 0
             "the drain must not touch the launch ledgers"
         );
 
-        let clear =
-            decode_issue_monitor_control_for_test(crate::runtime_daemon_events::issue_monitor_payload(
+        let clear = decode_issue_monitor_control_for_test(
+            crate::runtime_daemon_events::issue_monitor_payload(
                 "control",
                 serde_json::json!({ "config_set": { "update_drain": false } }),
                 std::process::id() + 1,
-            ))
-            .expect("clear control");
+            ),
+        )
+        .expect("clear control");
         assert!(super::apply_issue_monitor_control_with_disk_migration(
             &prefs_path,
             &mut monitor,
@@ -10554,8 +10562,8 @@ exit 0
         );
 
         let released_at = "2026-09-05T01:26:30.123Z";
-        let control =
-            decode_issue_monitor_control_for_test(crate::runtime_daemon_events::issue_monitor_payload(
+        let control = decode_issue_monitor_control_for_test(
+            crate::runtime_daemon_events::issue_monitor_payload(
                 "control",
                 serde_json::json!({
                     "quota_hold_clear": {
@@ -10565,8 +10573,9 @@ exit 0
                     }
                 }),
                 std::process::id() + 1,
-            ))
-            .expect("quota_hold_clear decodes");
+            ),
+        )
+        .expect("quota_hold_clear decodes");
         assert_eq!(
             control,
             IssueMonitorControl::QuotaHoldClear {
@@ -10604,8 +10613,8 @@ exit 0
         assert_eq!(record.retry_hold_provider, None);
 
         // A blank provider is a malformed control, not a release of nothing.
-        assert!(
-            decode_issue_monitor_control_for_test(crate::runtime_daemon_events::issue_monitor_payload(
+        assert!(decode_issue_monitor_control_for_test(
+            crate::runtime_daemon_events::issue_monitor_payload(
                 "control",
                 serde_json::json!({
                     "quota_hold_clear": {
@@ -10615,9 +10624,9 @@ exit 0
                     }
                 }),
                 std::process::id() + 1,
-            ))
-            .is_none()
-        );
+            )
+        )
+        .is_none());
     }
 
     #[test]

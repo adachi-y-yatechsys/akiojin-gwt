@@ -2665,6 +2665,7 @@ pub(crate) fn apply_update_drain(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_monitor_config_set(
     enabled: Option<bool>,
     autonomous_mode: Option<bool>,
