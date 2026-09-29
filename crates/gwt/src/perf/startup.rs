@@ -25,6 +25,10 @@ pub enum StartupPhase {
     CanvasReady,
     FirstFrame,
     RestoreDrain,
+    /// Issue #4520 AC-3: the restore drain's own phases, so a slow drain is
+    /// attributable in the report rather than only in the tracing log.
+    RestoreDrainResume,
+    RestoreDrainPmEnsure,
     PtyStart,
     IndexRuntimeReady,
     ShellInteractive,
@@ -34,7 +38,17 @@ pub enum StartupPhase {
     WorktreeInventory,
     /// Each logged Git completion during the startup observation window.
     GitCommand,
+    /// Issue #4520 AC-2: one GUI event-loop dispatch that blocked past
+    /// [`EVENT_LOOP_STALL_MS`] during the startup observation window.
+    EventLoopStall,
 }
+
+/// Issue #4520 AC-2: an event-loop dispatch longer than this is a stall.
+pub const EVENT_LOOP_STALL_MS: f64 = 100.0;
+
+/// Git commands and event-loop stalls are observed for this long after process
+/// start, since background startup work can outlive the restore drain.
+const STARTUP_OBSERVATION_MS: f64 = 600_000.0;
 
 impl StartupPhase {
     pub fn name(self) -> &'static str {
@@ -49,12 +63,15 @@ impl StartupPhase {
             Self::CanvasReady => "canvas_ready",
             Self::FirstFrame => "first_frame",
             Self::RestoreDrain => "restore_drain",
+            Self::RestoreDrainResume => "restore_drain_resume",
+            Self::RestoreDrainPmEnsure => "restore_drain_pm_ensure",
             Self::PtyStart => "pty_start",
             Self::IndexRuntimeReady => "index_runtime_ready",
             Self::ShellInteractive => "shell_interactive",
             Self::TerminalInteractive => "terminal_interactive",
             Self::WorktreeInventory => "worktree_inventory",
             Self::GitCommand => "git_command",
+            Self::EventLoopStall => "event_loop_stall",
         }
     }
 
@@ -93,6 +110,9 @@ pub struct StartupSample {
     pub git_spawn_count: u64,
     #[serde(default)]
     pub git_duration_ms: f64,
+    /// The dispatch label of an [`StartupPhase::EventLoopStall`] row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<String>,
 }
 
 struct TerminalReadiness {
@@ -209,6 +229,7 @@ impl StartupRun {
                 count,
                 git_spawn_count: git_cost.0,
                 git_duration_ms: git_cost.1,
+                event: None,
             },
             duration_ms,
         )
@@ -289,7 +310,7 @@ impl StartupRun {
     /// commands for the first ten minutes without counting phase overlap twice.
     fn git_command(&self, elapsed_ms: f64, duration_ms: f64) -> Option<PerfRecord> {
         if !elapsed_ms.is_finite()
-            || !(0.0..=600_000.0).contains(&elapsed_ms)
+            || !(0.0..=STARTUP_OBSERVATION_MS).contains(&elapsed_ms)
             || !duration_ms.is_finite()
             || duration_ms < 0.0
         {
@@ -302,6 +323,40 @@ impl StartupRun {
             None,
             Some(1),
             (1, duration_ms),
+        ))
+    }
+
+    /// Issue #4520 AC-2: one event-loop dispatch named `event` that ended at
+    /// `elapsed_ms` after holding the loop for `duration_ms`. Rows repeat, and
+    /// dispatches within the budget or after the observation window are not
+    /// recorded.
+    pub fn event_loop_stall(
+        &self,
+        event: &str,
+        elapsed_ms: f64,
+        duration_ms: f64,
+    ) -> Option<PerfRecord> {
+        if !elapsed_ms.is_finite()
+            || !(0.0..=STARTUP_OBSERVATION_MS).contains(&elapsed_ms)
+            || !duration_ms.is_finite()
+            || duration_ms <= EVENT_LOOP_STALL_MS
+        {
+            return None;
+        }
+        Some(PerfRecord::startup(
+            StartupSample {
+                startup_id: self.id.clone(),
+                process_started_at: self.started_at,
+                phase: StartupPhase::EventLoopStall,
+                start_ms: (elapsed_ms - duration_ms).max(0.0),
+                restored_window_count: self.restored_window_count,
+                window_id: None,
+                count: None,
+                git_spawn_count: 0,
+                git_duration_ms: 0.0,
+                event: Some(super::sanitize_ui_action_field(event)),
+            },
+            duration_ms,
         ))
     }
 
@@ -412,6 +467,16 @@ pub fn record_worktree_inventory(started: Instant) {
     });
 }
 
+/// Issue #4520 AC-2: record a GUI event-loop dispatch that just finished
+/// after holding the loop for `duration_ms`.
+pub fn event_loop_stall(event: &str, duration_ms: f64) {
+    update(|run, elapsed| {
+        run.event_loop_stall(event, elapsed, duration_ms)
+            .into_iter()
+            .collect()
+    });
+}
+
 pub fn mark(phase: StartupPhase) {
     update(|run, elapsed| run.phase(phase, 0.0, elapsed).into_iter().collect());
 }
@@ -511,6 +576,8 @@ pub struct StartupPhaseResult {
     pub count: Option<usize>,
     pub git_spawn_count: u64,
     pub git_duration_ms: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -531,6 +598,10 @@ pub struct StartupReport {
     /// Independent completion totals, excluding overlapping phase/inventory rows.
     pub git_spawn_count: u64,
     pub git_duration_ms: f64,
+    /// Issue #4520 AC-2: event-loop dispatches that blocked past 100 ms, and
+    /// the longest one. Each is also an `event_loop_stall` row in `phases`.
+    pub event_loop_stall_count: usize,
+    pub event_loop_stall_max_ms: f64,
 }
 
 pub fn latest_startup(records: &[PerfLogRecord]) -> Option<StartupReport> {
@@ -567,6 +638,7 @@ pub fn latest_startup(records: &[PerfLogRecord]) -> Option<StartupReport> {
             count: sample.count,
             git_spawn_count: sample.git_spawn_count,
             git_duration_ms: sample.git_duration_ms,
+            event: sample.event.clone(),
         })
         .collect::<Vec<_>>();
     let first_frame_budget_ms = if restored_window_count == 0 {
@@ -597,6 +669,11 @@ pub fn latest_startup(records: &[PerfLogRecord]) -> Option<StartupReport> {
         .filter(|phase| phase.phase == StartupPhase::GitCommand);
     let git_spawn_count = git_commands.clone().count() as u64;
     let git_duration_ms = git_commands.map(|phase| phase.duration_ms).sum();
+    let stalls = phases
+        .iter()
+        .filter(|phase| phase.phase == StartupPhase::EventLoopStall);
+    let event_loop_stall_count = stalls.clone().count();
+    let event_loop_stall_max_ms = stalls.map(|phase| phase.duration_ms).fold(0.0, f64::max);
     Some(StartupReport {
         startup_id: newest.startup_id.clone(),
         process_started_at: newest.process_started_at,
@@ -611,6 +688,8 @@ pub fn latest_startup(records: &[PerfLogRecord]) -> Option<StartupReport> {
         worktree_inventory_ms,
         git_spawn_count,
         git_duration_ms,
+        event_loop_stall_count,
+        event_loop_stall_max_ms,
     })
 }
 
@@ -785,6 +864,64 @@ mod tests {
         let report = latest_startup(&records).unwrap();
         assert_eq!(report.worktree_inventory_count, 2);
         assert_eq!(report.worktree_inventory_ms, 490.0);
+    }
+
+    /// Issue #4520 AC-2 / AC-3: the restore drain's phases and every event-loop
+    /// dispatch that blocked past 100 ms reach the startup report, not only
+    /// the tracing log.
+    #[test]
+    fn startup_report_carries_restore_drain_breakdown_and_event_loop_stalls() {
+        let mut run = StartupRun::new(Utc::now());
+        let records = [
+            run.phase_with_git(StartupPhase::RestoreDrainResume, 1_000.0, 20.0, 0, 0.0)
+                .unwrap(),
+            run.phase_with_git(
+                StartupPhase::RestoreDrainPmEnsure,
+                1_020.0,
+                3_687.0,
+                2,
+                3_600.0,
+            )
+            .unwrap(),
+            run.phase(StartupPhase::RestoreDrain, 1_000.0, 3_707.0)
+                .unwrap(),
+            run.event_loop_stall("StartupAutoResumeReady", 4_707.0, 3_707.0)
+                .unwrap(),
+            run.event_loop_stall("WorkMergeStatus", 9_000.0, 150.0)
+                .unwrap(),
+        ];
+        assert!(run.event_loop_stall("Refresh", 9_500.0, 100.0).is_none());
+        assert!(run.event_loop_stall("Late", 600_001.0, 500.0).is_none());
+
+        let records = records.into_iter().map(read_record).collect::<Vec<_>>();
+        let report = latest_startup(&records).unwrap();
+        let pm_ensure = report
+            .phases
+            .iter()
+            .find(|p| p.phase == StartupPhase::RestoreDrainPmEnsure)
+            .unwrap();
+        assert_eq!(
+            (
+                pm_ensure.start_ms,
+                pm_ensure.duration_ms,
+                pm_ensure.git_spawn_count
+            ),
+            (1_020.0, 3_687.0, 2)
+        );
+        assert!(report
+            .phases
+            .iter()
+            .any(|p| p.phase == StartupPhase::RestoreDrainResume));
+        let stalls = report
+            .phases
+            .iter()
+            .filter(|p| p.phase == StartupPhase::EventLoopStall)
+            .collect::<Vec<_>>();
+        assert_eq!(stalls.len(), 2);
+        assert_eq!(stalls[0].event.as_deref(), Some("StartupAutoResumeReady"));
+        assert_eq!((stalls[0].start_ms, stalls[0].end_ms), (1_000.0, 4_707.0));
+        assert_eq!(report.event_loop_stall_count, 2);
+        assert_eq!(report.event_loop_stall_max_ms, 3_707.0);
     }
 
     #[test]
