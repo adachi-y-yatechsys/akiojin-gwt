@@ -364,8 +364,11 @@ limit, and Start monitor / Stop. Auto-refill is **off by default**; enabling it
 opts into adding eligible open Issues up to the configured queue limit. An empty
 queue starts no new work; already-running work continues. Monitor errors appear
 in the notification center. The detail pane shows acceptance-criteria progress
-and state-specific actions. The legacy `issue_monitor` preset opens this same
-Issue surface.
+and state-specific actions. Select a card and use **Issue / Output** to switch
+between its body and acceptance criteria and its agent's read-only output.
+**Windowize** moves the agent to Canvas. **Hide preview / Show preview** gives
+the board the full width or restores the detail pane; columns scroll horizontally
+instead of shrinking. The legacy `issue_monitor` preset opens this same Issue surface.
 
 Open GitHub Issues remain in Backlog until explicitly queued or added by enabled
 auto-refill. Queue membership authorizes the monitor to consider an Issue; normal

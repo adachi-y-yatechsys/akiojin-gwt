@@ -10,10 +10,32 @@
  * The fixture serves the embedded frontend through Playwright routes and replaces
  * WebSocket with a deterministic backend, matching `tests/kanban.spec.ts`.
  */
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 import { APP_URL, installEmbeddedRoutes } from "./_helpers/embedded-frontend";
 
+const configuredUrl = process.env.GWT_PLAYWRIGHT_BASE_URL;
+const liveUrl = configuredUrl
+  ? new URL(new URL(configuredUrl).pathname === "/" ? new URL(APP_URL).pathname : new URL(configuredUrl).pathname, configuredUrl).toString()
+  : undefined;
+
+const errors = new WeakMap<Page, string[]>();
+
 test.describe("Issue preview placement", () => {
+  test.beforeEach(async ({page}, info) => {
+    const captured: string[] = [];
+    errors.set(page, captured);
+    page.on("pageerror", error => captured.push(error.message));
+    page.on("console", message => { if (message.type() === "error") captured.push(message.text()); });
+    await page.addInitScript(theme => localStorage.setItem("gwt:ui:theme", theme), info.project.name.includes("light") ? "light" : "dark");
+  });
+
+  test.afterEach(async ({page}, info) => {
+    await expect(page.locator("html")).toHaveAttribute("data-theme", info.project.name.includes("light") ? "light" : "dark");
+    const screenshot = info.outputPath("issue-preview.png");
+    await page.screenshot({path:screenshot});
+    await info.attach("issue-preview", {path:screenshot,contentType:"image/png"});
+    expect(errors.get(page), "zero console/page errors").toEqual([]);
+  });
   test.use({
     deviceScaleFactor: 1,
     viewport: { width: 1600, height: 1000 },
@@ -28,10 +50,11 @@ test.describe("Issue preview placement", () => {
     });
     page.on("pageerror", (error) => pageErrors.push(String(error)));
 
-    await installEmbeddedRoutes(page);
+    if (!liveUrl) await installEmbeddedRoutes(page);
     await installIssuePreviewBackend(page);
 
-    await page.goto(APP_URL);
+    await page.goto(liveUrl || APP_URL);
+    await page.getByRole("button", {name:"Output",exact:true}).click();
 
     await expect(page.locator(".workspace-window.surface-knowledge")).toBeVisible();
     await expect(page.locator(".workspace-window:visible")).toHaveCount(1);
@@ -43,10 +66,11 @@ test.describe("Issue preview placement", () => {
 
   // 受け入れシナリオ 2 / FR-007 / FR-008.
   test("the Issue window mirrors the agent output read-only", async ({ page }) => {
-    await installEmbeddedRoutes(page);
+    if (!liveUrl) await installEmbeddedRoutes(page);
     await installIssuePreviewBackend(page);
 
-    await page.goto(APP_URL);
+    await page.goto(liveUrl || APP_URL);
+    await page.getByRole("button", {name:"Output",exact:true}).click();
 
     const preview = page.locator(".surface-knowledge .issue-preview");
     await expect(preview).toHaveCount(1);
@@ -69,10 +93,11 @@ test.describe("Issue preview placement", () => {
 
   // 受け入れシナリオ 3 / FR-009.
   test("only the selected Issue's agent is mirrored", async ({ page }) => {
-    await installEmbeddedRoutes(page);
+    if (!liveUrl) await installEmbeddedRoutes(page);
     await installIssuePreviewBackend(page);
 
-    await page.goto(APP_URL);
+    await page.goto(liveUrl || APP_URL);
+    await page.getByRole("button", {name:"Output",exact:true}).click();
 
     await expect(page.locator(".surface-knowledge .issue-preview")).toHaveAttribute(
       "data-window-id",
@@ -82,6 +107,7 @@ test.describe("Issue preview placement", () => {
     await page
       .locator(".surface-knowledge .knowledge-row[data-issue-number='3672'] .knowledge-row-select")
       .click();
+    await expect(page.getByRole("button", {name:"Output",exact:true})).toHaveAttribute("aria-pressed", "true");
 
     await expect(page.locator(".surface-knowledge .issue-preview")).toHaveCount(1);
     await expect(page.locator(".surface-knowledge .issue-preview")).toHaveAttribute(
@@ -92,10 +118,11 @@ test.describe("Issue preview placement", () => {
 
   // 受け入れシナリオ 4 / FR-010.
   test("Windowize puts the mirrored agent on the canvas", async ({ page }) => {
-    await installEmbeddedRoutes(page);
+    if (!liveUrl) await installEmbeddedRoutes(page);
     await installIssuePreviewBackend(page);
 
-    await page.goto(APP_URL);
+    await page.goto(liveUrl || APP_URL);
+    await page.getByRole("button", {name:"Output",exact:true}).click();
 
     await expect(page.locator(".workspace-window:visible")).toHaveCount(1);
     await page
@@ -112,6 +139,13 @@ test.describe("Issue preview placement", () => {
 
     await expect(page.locator(".workspace-window.surface-terminal:visible")).toHaveCount(1);
     await expect(page.locator(".surface-knowledge .issue-preview")).toHaveCount(0);
+    const detail = page.locator(".knowledge-detail-pane");
+    await expect(detail.locator(".issue-preview-empty")).toHaveText("Shown on canvas. Use Focus window to view the agent output.");
+    // Supplemental protocol assertion: the canvas window overlaps the source pane after Windowize.
+    await detail.locator('[data-action="focus-canvas-window"]').dispatchEvent("click");
+    await expect.poll(() => page.evaluate(() => window.__knowledgeLoadMessages
+      .filter(message => message.kind === "focus_window").at(-1)?.id))
+      .toBe("tab-issue::agent-preview");
   });
 
   // SPEC #3885 AC-11 / AC-12 / AC-13 — the Windowized agent is an Issue window.
@@ -125,10 +159,11 @@ test.describe("Issue preview placement", () => {
     });
     page.on("pageerror", (error) => pageErrors.push(String(error)));
 
-    await installEmbeddedRoutes(page);
+    if (!liveUrl) await installEmbeddedRoutes(page);
     await installIssuePreviewBackend(page);
 
-    await page.goto(APP_URL);
+    await page.goto(liveUrl || APP_URL);
+    await page.getByRole("button", {name:"Output",exact:true}).click();
 
     await page
       .locator(".surface-knowledge .issue-preview [data-action='windowize-issue-preview']")
@@ -179,10 +214,11 @@ test.describe("Issue preview placement", () => {
   test("an errored agent is badged in the Issue row, not opened on the canvas", async ({
     page,
   }) => {
-    await installEmbeddedRoutes(page);
+    if (!liveUrl) await installEmbeddedRoutes(page);
     await installIssuePreviewBackend(page, { agentStatus: "error" });
 
-    await page.goto(APP_URL);
+    await page.goto(liveUrl || APP_URL);
+    await page.getByRole("button", {name:"Output",exact:true}).click();
 
     await expect(
       page.locator(".surface-knowledge .issue-preview .knowledge-monitor-chip"),
@@ -199,10 +235,11 @@ test.describe("Issue preview placement", () => {
   test("the Issue row carries Work state and Work actions without a Work window", async ({
     page,
   }) => {
-    await installEmbeddedRoutes(page);
+    if (!liveUrl) await installEmbeddedRoutes(page);
     await installIssuePreviewBackend(page);
 
-    await page.goto(APP_URL);
+    await page.goto(liveUrl || APP_URL);
+    await page.getByRole("button", {name:"Output",exact:true}).click();
 
     await expect(page.locator(".workspace-window.surface-work")).toHaveCount(0);
 
@@ -265,10 +302,11 @@ test.describe("Issue preview placement", () => {
       if (message.type() === "error") consoleErrors.push(message.text());
     });
     page.on("pageerror", (error) => pageErrors.push(String(error)));
-    await installEmbeddedRoutes(page);
+    if (!liveUrl) await installEmbeddedRoutes(page);
     await installIssuePreviewBackend(page);
 
-    await page.goto(APP_URL);
+    await page.goto(liveUrl || APP_URL);
+    await page.getByRole("button", {name:"Output",exact:true}).click();
 
     await expect(page.locator(".workspace-window:visible")).toHaveCount(1);
     const cells = page.locator("#fleet-minimap .fleet-minimap__cell");
@@ -340,10 +378,11 @@ test.describe("Issue preview placement", () => {
       if (message.type() === "error") consoleErrors.push(message.text());
     });
     page.on("pageerror", (error) => pageErrors.push(String(error)));
-    await installEmbeddedRoutes(page);
+    if (!liveUrl) await installEmbeddedRoutes(page);
     await installIssuePreviewBackend(page);
 
-    await page.goto(APP_URL);
+    await page.goto(liveUrl || APP_URL);
+    await page.getByRole("button", {name:"Output",exact:true}).click();
 
     const statusRows = page.locator(".surface-knowledge .issue-agent-status");
     await expect(statusRows).toHaveCount(3);
@@ -400,10 +439,11 @@ test.describe("Issue preview placement", () => {
       if (message.type() === "error") consoleErrors.push(message.text());
     });
     page.on("pageerror", (error) => pageErrors.push(String(error)));
-    await installEmbeddedRoutes(page);
+    if (!liveUrl) await installEmbeddedRoutes(page);
     await installIssuePreviewBackend(page);
 
-    await page.goto(APP_URL);
+    await page.goto(liveUrl || APP_URL);
+    await page.getByRole("button", {name:"Output",exact:true}).click();
 
     const root = page.locator(".surface-knowledge .issue-bridge-root");
     await expect(root).toHaveAttribute("data-view-mode", "list");
@@ -429,6 +469,12 @@ test.describe("Issue preview placement", () => {
     // The scrollback moved with the runtime.
     const pairTerminal = pairs.nth(0).locator(".issue-split-terminal .terminal-root");
     await expect(pairTerminal).toContainText("split-view keeps this line");
+    // Refreshing Issue details must not steal the split view's interactive terminal.
+    await expect(page.getByRole("button", {name:"Output",exact:true})).toHaveCount(0);
+    await pairs.nth(0).locator(".issue-split-title").click();
+    await expect(page.locator(".knowledge-detail-pane")).toContainText("Issue preview fixture body");
+    await expect(pairTerminal).toContainText("split-view keeps this line");
+    await expect(page.locator(".knowledge-detail-pane .terminal-root")).toHaveCount(0);
     // The pair's terminal is interactive: keystrokes reach the PTY.
     await expect
       .poll(
@@ -492,10 +538,11 @@ test.describe("Issue preview placement", () => {
       if (message.type() === "error") consoleErrors.push(message.text());
     });
     page.on("pageerror", (error) => pageErrors.push(String(error)));
-    await installEmbeddedRoutes(page);
+    if (!liveUrl) await installEmbeddedRoutes(page);
     await installIssuePreviewBackend(page);
 
-    await page.goto(APP_URL);
+    await page.goto(liveUrl || APP_URL);
+    await page.getByRole("button", {name:"Output",exact:true}).click();
 
     await page
       .locator(".surface-knowledge .issue-preview [data-action='windowize-issue-preview']")
@@ -587,10 +634,11 @@ test.describe("Issue preview placement", () => {
       if (message.type() === "error") consoleErrors.push(message.text());
     });
     page.on("pageerror", (error) => pageErrors.push(String(error)));
-    await installEmbeddedRoutes(page);
+    if (!liveUrl) await installEmbeddedRoutes(page);
     await installIssuePreviewBackend(page);
 
-    await page.goto(APP_URL);
+    await page.goto(liveUrl || APP_URL);
+    await page.getByRole("button", {name:"Output",exact:true}).click();
     await page.locator(".surface-knowledge [data-issue-view='split']").click();
     const pair = page.locator(".surface-knowledge .issue-split-pair[data-issue-number='3671']");
     await expect(pair.locator(".issue-split-terminal .terminal-root")).toBeVisible();
@@ -620,10 +668,11 @@ test.describe("Issue preview placement", () => {
   test("Issue #4082: the status row elapsed time follows the backend agent start time", async ({
     page,
   }) => {
-    await installEmbeddedRoutes(page);
+    if (!liveUrl) await installEmbeddedRoutes(page);
     await installIssuePreviewBackend(page);
 
-    await page.goto(APP_URL);
+    await page.goto(liveUrl || APP_URL);
+    await page.getByRole("button", {name:"Output",exact:true}).click();
     const elapsed = page.locator(
       ".surface-knowledge [data-issue-number='3671'] .issue-agent-status-elapsed",
     );
@@ -643,7 +692,7 @@ test.describe("Issue preview placement", () => {
 
 async function installIssuePreviewBackend(page, { agentStatus = "running" } = {}) {
   await page.addInitScript(
-    ({ agentStatus: status }) => {
+    ({ agentStatus: status, projectKey }) => {
       window.__knowledgeLoadMessages = [];
 
       const issueWindow = {
@@ -707,7 +756,7 @@ async function installIssuePreviewBackend(page, { agentStatus = "running" } = {}
               id: "tab-issue",
               title: "Fixture Project",
               project_root: "/fixture",
-              project_key: "0123456789abcdef",
+              project_key: projectKey,
               kind: "git",
               workspace: {
                 viewport: { x: 0, y: 0, zoom: 1 },
@@ -906,6 +955,6 @@ async function installIssuePreviewBackend(page, { agentStatus = "running" } = {}
         value: FixtureWebSocket,
       });
     },
-    { agentStatus },
+    { agentStatus, projectKey: new URL(liveUrl || APP_URL).pathname.split("/")[2] },
   );
 }

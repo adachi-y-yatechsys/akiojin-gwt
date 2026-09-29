@@ -7178,7 +7178,7 @@ body.route-body {
 .knowledge-monitor-status { padding-right: var(--space-3); border-right: 1px solid var(--color-border); }
 .knowledge-monitor-refill-limit { display: flex; align-items: center; gap: var(--space-1); font-size: var(--type-xs); }
 .knowledge-monitor-refill-limit input { width: 4em; }
-.issue-queue-board { display: grid; grid-template-columns: repeat(4, minmax(220px, 1fr)); gap: var(--space-2); align-items: start; }
+.issue-queue-board { display: grid; grid-template-columns: repeat(4, minmax(262px, 1fr)); gap: var(--space-2); align-items: start; }
 .issue-queue-column { min-width: 0; background: var(--color-surface-elevated); border: 1px solid var(--color-border); border-radius: var(--radius-md); padding: var(--space-2); }
 .issue-queue-heading { font-size: var(--type-sm); color: var(--color-text-strong); margin: 0 0 var(--space-2); }
 .issue-queue-column .knowledge-row { margin-bottom: var(--space-2); }
@@ -7192,3 +7192,8 @@ body.route-body {
 .issue-bridge-root .workspace-toolbar-main { grid-template-columns: minmax(100px, 320px) max-content; }
 .issue-bridge-root .knowledge-heading { grid-column: 1 / -1; }
 .issue-bridge-root .knowledge-search { width: 100%; }
+
+.issue-bridge-root[data-preview-hidden="true"] .issue-list-shell { grid-template-columns: minmax(0, 1fr); }
+.issue-bridge-root[data-preview-hidden="true"] .knowledge-detail-pane { display: none; }
+.issue-detail-tabs { flex-shrink: 0; padding: var(--space-2); }
+.issue-detail-provenance { color: var(--color-text-muted); font-size: var(--type-xs); }

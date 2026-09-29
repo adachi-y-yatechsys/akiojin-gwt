@@ -1393,6 +1393,8 @@ export function createKnowledgeKanbanSurface({
             // terminal pairs. `splitPairSizes` remembers which pairs the user
             // grew (T-005) so a data refresh does not shrink them back.
             viewMode: "list",
+            issueDetailView: "issue",
+            previewHidden: false,
             splitPairSizes: new Map(),
             // SPEC #3170 FR-101: independent monotonically increasing
             // explicit-selection generation; 0 means no explicit selection.
@@ -3050,6 +3052,7 @@ export function createKnowledgeKanbanSurface({
         windowize.addEventListener("click", (event) => {
           event.preventDefault();
           event.stopPropagation();
+          windowizedAgentWindowIds.add(target.id);
           windowizeIssuePreviewWindow?.(target.id);
         });
         header.appendChild(windowize);
@@ -3354,13 +3357,52 @@ export function createKnowledgeKanbanSurface({
 
       function renderIssueDetailPane(windowId, state, detailPane, { agentPreview = true } = {}) {
         detailPane.innerHTML = "";
-        // In split mode the agent already has an interactive face in its pair;
-        // a second, read-only one would show the same PTY twice. The mirror does
-        // not wait for the cached detail.
-        const preview = agentPreview ? renderIssueAgentPreview(windowId, state) : null;
+        detailPane.hidden = agentPreview && state.previewHidden === true;
+        if (detailPane.hidden) return;
+        const tabs = createNode("div", "knowledge-state-filter issue-detail-tabs");
+        tabs.setAttribute("role", "group");
+        tabs.setAttribute("aria-label", "Issue preview content");
+        for (const [view, label] of [["issue", "Issue"], ["output", "Output"]]) {
+          const tab = createNode("button", "", label);
+          tab.type = "button";
+          tab.dataset.issueDetailView = view;
+          tab.setAttribute("aria-pressed", String(state.issueDetailView === view));
+          tab.classList.toggle("is-active", state.issueDetailView === view);
+          tab.addEventListener("click", () => {
+            state.issueDetailView = view;
+            renderKnowledgeDetailPane(windowId, state, detailPane, { agentPreview });
+          });
+          tabs.appendChild(tab);
+        }
+        if (agentPreview) detailPane.appendChild(tabs);
+        if (agentPreview && state.issueDetailView === "output") {
+          const preview = agentPreview && state.selectedNumber != null
+            ? renderIssueAgentPreview(windowId, state) : null;
+          if (preview) detailPane.appendChild(preview);
+          else {
+            const entry = issueDetailEntry(state, state.selectedNumber);
+            const work = entry ? issueWorkRowForEntry(getActiveWorkProjection?.(), entry) : null;
+            const canvasWindow = entry ? issueRowFaces(windowId, entry, work).canvasWindow : null;
+            if (canvasWindow) {
+              detailPane.appendChild(createNode("div", "knowledge-detail-empty issue-preview-empty",
+                "Shown on canvas. Use Focus window to view the agent output."));
+              detailPane.appendChild(issueRowActionButton("focus-canvas-window", {
+                windowId, state, entry, work, canvasWindow, target: canvasWindow,
+              }));
+              return;
+            }
+            const column = entry ? issueQueueColumn(queueProjectedEntry(entry)) : null;
+            const reason = state.selectedNumber == null ? "Select an Issue to view its output."
+              : !agentPreview ? "Agent output is shown in the split view."
+              : column === "queued" ? "Waiting in queue. No agent has started."
+              : column === "done" ? "This issue is completed. No agent is running."
+              : "No agent is running for this issue.";
+            detailPane.appendChild(createNode("div", "knowledge-detail-empty issue-preview-empty", reason));
+          }
+          return;
+        }
         const detail = state.detail;
         if (!detail) {
-          if (preview) detailPane.appendChild(preview);
           const empty = createNode(
             "div",
             "knowledge-detail-empty",
@@ -3371,7 +3413,7 @@ export function createKnowledgeKanbanSurface({
               createNode(
                 "div",
                 "issue-detail-hint",
-                "Pick a row to see its acceptance criteria and next action.",
+                "Select a card to see its acceptance criteria and next action.",
               ),
             );
           }
@@ -3379,12 +3421,12 @@ export function createKnowledgeKanbanSurface({
           return;
         }
         const number = Number(detail.number ?? state.selectedNumber);
-        const entry = issueDetailEntry(state, number) || {
+        const entry = queueProjectedEntry(issueDetailEntry(state, number) || {
           number,
           title: detail.title,
           state: detail.state,
           labels: detail.labels || [],
-        };
+        });
         const work = issueWorkRowForEntry(getActiveWorkProjection?.(), entry);
         const attention = work ? workAttentionFor?.(work) || null : null;
         const faces = issueRowFaces(windowId, entry, work);
@@ -3436,12 +3478,15 @@ export function createKnowledgeKanbanSurface({
           status.appendChild(createNode("span", "knowledge-chip", label));
         }
         header.appendChild(status);
+        if (entry.queued_by) {
+          const source = entry.queued_by === "auto-refill" ? "Auto-refill" : "Operator";
+          header.appendChild(createNode("div", "issue-detail-provenance", `Queued by: ${source}`));
+        }
         header.appendChild(renderIssueDetailActions(context));
         detailPane.appendChild(header);
 
         const acceptance = renderIssueDetailAcceptance(detail);
         if (acceptance) detailPane.appendChild(acceptance);
-        if (preview) detailPane.appendChild(preview);
 
         const scroll = createNode("div", "knowledge-detail-scroll workspace-scroll issue-detail-body");
         if (state.detailLoading) {
@@ -3570,7 +3615,7 @@ export function createKnowledgeKanbanSurface({
         if (!detailPane) {
           return;
         }
-        renderKnowledgeDetailPane(windowId, state, detailPane);
+        renderKnowledgeDetailPane(windowId, state, detailPane, { agentPreview: state.viewMode !== "split" });
       }
 
       function renderKnowledgeSelection(windowId, state, previousNumber) {
@@ -4058,6 +4103,13 @@ export function createKnowledgeKanbanSurface({
         const root = element.querySelector(".issue-bridge-root");
         if (root) {
           root.dataset.viewMode = splitMode ? "split" : "list";
+          root.dataset.previewHidden = String(!splitMode && state.previewHidden === true);
+          const toggle = root.querySelector('[data-action="toggle-issue-preview"]');
+          if (toggle) {
+            toggle.hidden = splitMode;
+            toggle.textContent = state.previewHidden ? "Show preview" : "Hide preview";
+            toggle.setAttribute("aria-expanded", String(!state.previewHidden));
+          }
         }
         for (const button of element.querySelectorAll("[data-issue-view]")) {
           const selected = button.dataset.issueView === (splitMode ? "split" : "list");
@@ -4283,6 +4335,7 @@ export function createKnowledgeKanbanSurface({
 
                   </div>
                   <div class="workspace-toolbar-actions">
+                    <button type="button" class="wizard-button is-compact" data-action="toggle-issue-preview" aria-expanded="true">Hide preview</button>
                     <button type="button" class="wizard-button is-compact" data-action="issue-new" aria-haspopup="dialog">＋ New</button>
                     <button class="wizard-button is-compact" data-action="refresh-knowledge" aria-label="Refresh cached work items" title="Refresh cached work items">↻ Refresh</button>
                   </div>
@@ -4393,6 +4446,10 @@ export function createKnowledgeKanbanSurface({
             });
           }
           if (knowledgeKind === "issue") {
+            body.querySelector('[data-action="toggle-issue-preview"]')?.addEventListener("click", () => {
+              state.previewHidden = !state.previewHidden;
+              renderKnowledgeBridge(windowData.id);
+            });
             wireIssueMonitorControls(body);
           }
           // SPEC-2017 — Hide done toggle persists via localStorage so

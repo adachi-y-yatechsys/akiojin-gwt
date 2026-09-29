@@ -342,7 +342,10 @@ Settings、Autonomous、Auto-refill と上限、Start monitor / Stop をラベ�
 Auto-refill は**既定で OFF**です。有効にすると、条件を満たす open Issue を設定した
 キュー上限まで自動補充します。空のキューから新しい作業は起動せず、実行中の作業は継続します。
 監視エラーは通知センターで確認できます。詳細ペインには受け入れ基準の進捗と状態別の
-操作を表示します。従来の `issue_monitor` preset も同じ Issue サーフェスを開きます。
+操作を表示します。カードを選び、**Issue / Output** で本文・受け入れ基準とエージェントの
+読み取り専用出力を切り替えます。**Windowize** でエージェントを Canvas へ移せます。
+**Hide preview / Show preview** でボードを全幅に広げたり、詳細ペインを再表示したりできます。
+列は縮めず横スクロールします。従来の `issue_monitor` preset も同じ Issue サーフェスを開きます。
 
 open な GitHub Issue は、明示的にキューへ追加するか、有効にした Auto-refill が追加する
 まで Backlog に留まります。キューへの所属は Monitor の実行候補になる条件であり、

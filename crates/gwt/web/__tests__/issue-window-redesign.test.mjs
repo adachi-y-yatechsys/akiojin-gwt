@@ -485,3 +485,14 @@ test("AC-28: the Phase 5 CSS uses Operator tokens only", () => {
   assert.doesNotMatch(block, /\brgba?\(/, "no raw rgb");
   assert.doesNotMatch(block, /\bposition:\s*fixed/, "no private overlay shell");
 });
+
+test("queue detail provenance follows authoritative terminal queue", async (t) => {
+  const { body, surface, state } = await makeFixture();
+  t.after(() => surface.clearKnowledgeBridgeState("win-1"));
+  state.entries = [entry(11, "queued", { queued_by: "operator" })];
+  state.selectedNumber = 11;
+  state.detail = { number: 11, title: "Issue 11", labels: [], sections: [] };
+  surface.applyIssueMonitorStatus({ ...STATUS, terminal_queue: [{ number: 11, queued_by: "auto-refill" }] });
+  surface.renderKnowledgeBridge("win-1");
+  assert.equal(body.querySelector(".issue-detail-provenance")?.textContent, "Queued by: Auto-refill");
+});

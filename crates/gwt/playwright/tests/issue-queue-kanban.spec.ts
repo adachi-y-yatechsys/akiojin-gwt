@@ -57,8 +57,20 @@ test("four columns preserve labelled controls, provenance, empty guidance and na
   await expect(page.locator('[data-action="refresh-knowledge"]')).toHaveText("↻ Refresh");
   await expect(page.getByRole("group",{name:"Monitor status",exact:true})).toBeVisible();
   await expect(page.getByRole("group",{name:"Monitor controls",exact:true})).toBeVisible();
-  await page.locator(".workspace-window").evaluate(element => { (element as HTMLElement).style.width="850px"; });
   const pane=page.locator(".issue-bridge-root .knowledge-list-pane");
+  const visibleWidth=(await pane.boundingBox())!.width;
+  await page.getByRole("button",{name:"Hide preview",exact:true}).click();
+  await expect(page.locator(".issue-bridge-root")).toHaveAttribute("data-preview-hidden","true");
+  const hiddenWidth=(await pane.boundingBox())!.width;
+  expect(hiddenWidth).toBeGreaterThan(visibleWidth+100);
+  expect(Math.abs(hiddenWidth-(await page.locator(".issue-list-shell").boundingBox())!.width), "hidden preview gives the board full width").toBeLessThan(2);
+  await expect(page.locator(".knowledge-detail-pane")).not.toBeVisible();
+  await page.getByRole("button",{name:"Show preview",exact:true}).click();
+  await expect(page.locator(".issue-bridge-root")).toHaveAttribute("data-preview-hidden","false");
+  await page.locator(".workspace-window").evaluate(element => { (element as HTMLElement).style.width="850px"; });
+  for (const phase of ["backlog","queued","active","done"]) {
+    expect((await column(page,phase).boundingBox())!.width).toBeGreaterThanOrEqual(262);
+  }
   expect(await pane.evaluate(element=>element.scrollWidth>element.clientWidth)).toBe(true);
   await column(page,"done").scrollIntoViewIfNeeded();
   await expect(column(page,"done")).toBeVisible();
@@ -66,6 +78,27 @@ test("four columns preserve labelled controls, provenance, empty guidance and na
   await expect(column(page,"queued").locator(".knowledge-row")).toHaveCount(0);
   await column(page,"queued").scrollIntoViewIfNeeded();
   await expect(column(page,"queued")).toContainText("Nothing will launch until an issue is queued.");
+});
+
+
+test("card selection keeps issue body, acceptance and provenance beside switchable output", async ({page}) => {
+  const detail=page.locator(".knowledge-detail-pane");
+  for (const [number,source] of [[3,"Operator"],[4,"Auto-refill"]] as const) {
+    await row(page,number).locator(".knowledge-row-select").click();
+    await expect(page.getByRole("button",{name:"Issue",exact:true})).toHaveAttribute("aria-pressed","true");
+    await expect(detail.getByText(`Description for #${number}`, {exact:true})).toBeVisible();
+    await detail.locator(".knowledge-section").filter({hasText:"Acceptance criteria"}).locator("summary").click();
+    await expect(detail.getByText(`AC-${number}: expected behavior`, {exact:true})).toBeVisible();
+    await expect(detail.locator(".issue-detail-provenance")).toHaveText(`Queued by: ${source}`);
+  }
+  await page.getByRole("button",{name:"Output",exact:true}).click();
+  await expect(detail.locator(".issue-preview-empty")).toHaveText("Waiting in queue. No agent has started.");
+  await row(page,6).locator(".knowledge-row-select").click();
+  await expect(page.getByRole("button",{name:"Output",exact:true})).toHaveAttribute("aria-pressed","true");
+  await expect(detail.locator(".issue-preview-empty")).toHaveText("This issue is completed. No agent is running.");
+  await page.getByRole("button",{name:"Issue",exact:true}).click();
+  await expect(detail).toContainText("Description for #6");
+  await expect(page.locator(".issue-queue-board")).toBeVisible();
 });
 
 test("bulk drag and reorder wait for confirmation, forbidden and rejected changes retain cards", async ({ page }) => {
@@ -145,7 +178,7 @@ async function installBackend(page: Page) {
             geometry:{x:40,y:40,width:1470,height:950},z_index:1,status:"running",persist:true,minimized:false,maximized:false}]} }],active_tab_id:"tab-queue",recent_projects:[]}});
         else if(message.kind==="list_issue_monitor") this.emit({kind:"issue_monitor_status",status});
         else if(["load_knowledge_bridge","search_knowledge_bridge"].includes(message.kind)) this.emit({kind:"knowledge_entries",id:message.id,knowledge_kind:"issue",request_id:message.request_id,entries,selected_number:null,refresh_enabled:true});
-        else if(message.kind==="select_knowledge_bridge_entry") this.emit({kind:"knowledge_detail",id:message.id,knowledge_kind:"issue",request_id:message.request_id,detail:{number:message.number,title:entries.find(e=>e.number===message.number)?.title,state:"open",labels:[],sections:[],related_works:[]}});
+        else if(message.kind==="select_knowledge_bridge_entry") this.emit({kind:"knowledge_detail",id:message.id,knowledge_kind:"issue",request_id:message.request_id,detail:{number:message.number,title:entries.find(e=>e.number===message.number)?.title,state:message.number===6?"closed":"open",labels:[],sections:[{title:"Description",body:`Description for #${message.number}`,body_html:`<p>Description for #${message.number}</p>`},{title:"Acceptance criteria",body:`AC-${message.number}: expected behavior`,body_html:`<p>AC-${message.number}: expected behavior</p>`}],related_works:[]}});
       }
       close(){this.readyState=3;this.dispatchEvent(new CloseEvent("close"));}
     }
