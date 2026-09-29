@@ -2025,9 +2025,12 @@ mod tests {
                 session_id: session_id.to_string(),
                 owner_number: Some(3248),
                 execution_binding: binding,
+                lease_id: None,
                 worktree_fingerprint: plan.worktree_fingerprint.clone(),
+                verified_head: None,
                 commands: vec![crate::cli::verification_record::VerificationCommandResult {
                     headed_e2e: None,
+                    terminated_by_signal: None,
                     command: command.clone(),
                     exit_code: 101,
                     output_tail: format!(

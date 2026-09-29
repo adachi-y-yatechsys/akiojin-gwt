@@ -62,6 +62,77 @@ pub struct VerificationCommandResult {
     /// Measured by the command-local Playwright reporter, never by PR prose.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub headed_e2e: Option<headed_e2e::HeadedE2eEvidence>,
+    /// The signal that killed the command from outside (Issue #4528). Such a
+    /// command reports `exit_code: -1` like a spawn failure does, but it says
+    /// nothing about the code under test, so it is counted apart from FAIL.
+    /// It never turns the command into a pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminated_by_signal: Option<i32>,
+}
+
+/// The signal that ended a process, when one did (Issue #4528).
+pub(crate) fn terminating_signal(status: std::process::ExitStatus) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        std::os::unix::process::ExitStatusExt::signal(&status)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        None
+    }
+}
+
+/// How a run's commands ended, with external interruption kept apart from
+/// failure so a killed run is not mistaken for broken code (Issue #4528).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct RunOutcomeCounts {
+    pub passed: usize,
+    pub failed: usize,
+    pub interrupted: usize,
+}
+
+impl RunOutcomeCounts {
+    pub(crate) fn of(commands: &[VerificationCommandResult]) -> Self {
+        let mut counts = Self::default();
+        for command in commands {
+            if command.terminated_by_signal.is_some() {
+                counts.interrupted += 1;
+            } else if command.exit_code == 0 {
+                counts.passed += 1;
+            } else {
+                counts.failed += 1;
+            }
+        }
+        counts
+    }
+
+    pub(crate) fn summary(&self) -> String {
+        format!(
+            "verify: outcome — {} passed, {} failed, {} interrupted by external signal\n",
+            self.passed, self.failed, self.interrupted
+        )
+    }
+}
+
+/// The run's headline status. `INTERRUPTED` is reported only when every
+/// command that did not pass was killed from outside; any real failure keeps
+/// the run a `FAIL`.
+pub(crate) fn run_status_label(
+    all_passed: bool,
+    quarantined: bool,
+    commands: &[VerificationCommandResult],
+) -> &'static str {
+    let counts = RunOutcomeCounts::of(commands);
+    if all_passed {
+        "PASS"
+    } else if quarantined {
+        "QUARANTINED"
+    } else if counts.interrupted > 0 && counts.failed == 0 {
+        "INTERRUPTED"
+    } else {
+        "FAIL"
+    }
 }
 
 /// Plan-bound request to classify one exact Rust/libtest failure. The
@@ -289,9 +360,18 @@ pub struct VerificationRunRecord {
     /// remains readable only for pre-generation legacy executions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_binding: Option<ExecutionBindingIdentity>,
+    /// Host-wide verification lease this run was admitted under (Issue
+    /// #4528). `None` for light runs that share the host and for records
+    /// written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_id: Option<String>,
     /// Worktree fingerprint at run time: normalized HEAD + tracked changes (see
     /// [`worktree_fingerprint`]). Completion recomputes and compares.
     pub worktree_fingerprint: String,
+    /// Diagnostic provenance only; freshness still uses the full fingerprint.
+    /// Omission preserves legacy record serialization and integrity hashes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_head: Option<String>,
     pub commands: Vec<VerificationCommandResult>,
     pub all_passed: bool,
     /// Conditional dispositions for exact failures. Raw command exits and
@@ -705,7 +785,7 @@ pub fn save(worktree: &Path, record: &VerificationRunRecord) -> io::Result<()> {
 }
 
 /// Compute the worktree fingerprint at **content level**: sha256 over
-/// HEAD (skipping canonical Work shard addition-only commits), the full
+/// HEAD (skipping canonical Work shard additions and source-identical merges), the full
 /// `git diff HEAD` content (staged and
 /// unstaged tracked changes), and every untracked file's path and bytes —
 /// all with `.gwt/` excluded (the coordination bookkeeping under `.gwt/`
@@ -830,14 +910,18 @@ fn validate_quarantine_requests(
     Ok(())
 }
 
-/// PR metadata adds immutable shards after verification. Skip only regular-file
-/// shard additions, never source changes, rewrites, empty commits or merges.
+/// PR metadata commits and base merges share one rule: the first-parent diff
+/// must contain only canonical regular-file Work shard additions. A merge with
+/// an identical tree also qualifies. All repository source is conservatively
+/// treated as verification input, so ANY source change invalidates evidence,
+/// even when the feature branch's own diff against its base is unchanged.
+/// Shard rewrites/deletions and ordinary empty commits remain invalidating.
 /// If Git cannot prove the exception, retain the commit as the freshness anchor.
 fn verification_head(worktree: &Path, head: &str) -> String {
     let mut anchor = head.trim().to_string();
     while let Ok(line) = git_stdout(worktree, &["rev-list", "--parents", "-n", "1", &anchor]) {
         let parents: Vec<_> = line.split_whitespace().collect();
-        if parents.len() != 2 {
+        if parents.len() < 2 {
             break;
         }
         let Ok(diff) = gwt_core::process::hidden_command("git")
@@ -856,7 +940,14 @@ fn verification_head(worktree: &Path, head: &str) -> String {
         else {
             break;
         };
-        if !diff.status.success() || diff.stdout.is_empty() {
+        if !diff.status.success() {
+            break;
+        }
+        if diff.stdout.is_empty() {
+            if parents.len() > 2 {
+                anchor = parents[1].to_string();
+                continue;
+            }
             break;
         }
         let Some(bytes) = diff.stdout.strip_suffix(&[0]) else {
@@ -2871,7 +2962,7 @@ fn execute_command_with_isolation(
     capture: Option<&headed_e2e::Capture>,
     host: &VerificationHost,
     progress: Option<&CommandProgress>,
-) -> Result<(i32, String), String> {
+) -> Result<(i32, Option<i32>, String), String> {
     let (assignments, args) = take_env_assignments(split_command_line(command)?)?;
     match host {
         VerificationHost::Daemon(endpoint) => {
@@ -2935,6 +3026,7 @@ fn execute_command_with_isolation(
             };
             let (output, priority) = output;
             let exit_code = output.status.code().unwrap_or(-1);
+            let signal = terminating_signal(output.status);
             let mut tail = String::new();
             if !priority.restored {
                 tail.push_str(&format!("--- priority ---\n{}\n", priority.detail));
@@ -2943,7 +3035,7 @@ fn execute_command_with_isolation(
                 ("stdout", &output.stdout),
                 ("stderr", &output.stderr),
             ]));
-            Ok((exit_code, tail))
+            Ok((exit_code, signal, tail))
         }
     }
 }
@@ -3014,7 +3106,7 @@ fn execute_command_on_daemon(
     request: &gwt_core::daemon::VerificationSpawnRequest,
     endpoint: &gwt_core::daemon::DaemonEndpoint,
     progress: Option<&CommandProgress>,
-) -> Result<(i32, String), String> {
+) -> Result<(i32, Option<i32>, String), String> {
     let delegated = match crate::cli::daemon::verification_host::run(endpoint, request, |pid| {
         progress.map(|progress| progress.start(pid))
     }) {
@@ -3041,13 +3133,13 @@ fn execute_command_on_daemon(
     let stdout = std::fs::read(&request.stdout_path).unwrap_or_default();
     let stderr = std::fs::read(&request.stderr_path).unwrap_or_default();
     tail.push_str(&render_streams(&[("stdout", &stdout), ("stderr", &stderr)]));
-    Ok((delegated.exit_code, tail))
+    Ok((delegated.exit_code, delegated.signal, tail))
 }
 
-fn spawn_failure_result(command: &str, error: &str) -> (i32, String) {
+fn spawn_failure_result(command: &str, error: &str) -> (i32, Option<i32>, String) {
     let diagnostic = format!("failed to spawn '{command}': {error}");
     let clipped = bounded_output_tail(diagnostic.as_bytes());
-    (-1, format!("--- spawn error ---\n{clipped}\n"))
+    (-1, None, format!("--- spawn error ---\n{clipped}\n"))
 }
 
 fn render_streams(streams: &[(&str, &[u8])]) -> String {
@@ -3122,7 +3214,7 @@ fn measure_baseline(
             std::ffi::OsStr::new(merge_base_sha),
         ],
     )?;
-    let (exit_code, output) = execute_command_with_isolation(
+    let (exit_code, _, output) = execute_command_with_isolation(
         &checkout,
         &request.baseline_command,
         true,
@@ -3266,6 +3358,8 @@ struct RunOptions<'a> {
     host: VerificationHost,
     command_progress: Option<&'a CommandProgress>,
     on_progress: Option<&'a mut dyn FnMut(usize, usize, std::time::Duration)>,
+    /// Lease the run was admitted under, recorded as its provenance.
+    lease_id: Option<String>,
 }
 
 fn run_verification_for_caller(
@@ -3321,7 +3415,7 @@ where
     // Snapshot owner, plan, and worktree together. Commands deliberately run
     // outside the lease; the final commit reacquires it and rejects any
     // interleaving writer by invalidating the evidence snapshot.
-    let (owner_number, execution_binding, plan_snapshot, fingerprint_before) =
+    let (owner_number, execution_binding, plan_snapshot, fingerprint_before, verified_head) =
         crate::cli::trusted_store::with_write_lease(worktree, || {
             let (owner_number, execution_binding) = if let Some(authority) = authority {
                 (authority.owner_number, authority.execution_binding.clone())
@@ -3338,7 +3432,14 @@ where
             if let Some(authority) = authority {
                 revalidate_verification_caller_authority(worktree, session_id, authority)?;
             }
-            Ok((owner_number, execution_binding, plan, fingerprint))
+            let verified_head = current_head_sha(worktree).ok();
+            Ok((
+                owner_number,
+                execution_binding,
+                plan,
+                fingerprint,
+                verified_head,
+            ))
         })
         .map_err(|err| {
             if err.kind() == ErrorKind::PermissionDenied {
@@ -3390,7 +3491,7 @@ where
             .then(headed_e2e::Capture::new)
             .transpose()
             .map_err(|error| format!("failed to prepare headed E2E reporter: {error}"))?;
-        let (exit_code, tail) = execute_command_with_isolation(
+        let (exit_code, terminated_by_signal, tail) = execute_command_with_isolation(
             worktree,
             command,
             false,
@@ -3407,12 +3508,18 @@ where
             })
         });
         transcript.push_str(&tail);
-        transcript.push_str(&format!("exit: {exit_code}\n"));
+        match terminated_by_signal {
+            Some(signal) => transcript.push_str(&format!(
+                "exit: {exit_code} (terminated by external signal {signal})\n"
+            )),
+            None => transcript.push_str(&format!("exit: {exit_code}\n")),
+        }
         results.push(VerificationCommandResult {
             command: command.to_string(),
             exit_code,
             output_tail: persisted_failure_output(exit_code, &tail),
             headed_e2e,
+            terminated_by_signal,
         });
         if let Some(on_progress) = options.on_progress.as_mut() {
             on_progress(results.len(), commands.len(), commands_started.elapsed());
@@ -3439,6 +3546,15 @@ where
         let merge_base_sha = crate::cli::verify_derivation::integration_merge_base(worktree)
             .ok_or_else(|| "integration merge-base is unavailable".to_string());
         for result in results.iter().filter(|result| result.exit_code != 0) {
+            // Issue #4528: a killed run's output is cut short, so it cannot
+            // be read as a verdict about one test.
+            if let Some(signal) = result.terminated_by_signal {
+                transcript.push_str(&format!(
+                    "quarantine: '{}' was terminated by external signal {signal}; rerun it instead\n",
+                    result.command
+                ));
+                continue;
+            }
             let Some(inventory) = parse_libtest_failure_inventory(&result.output_tail) else {
                 transcript.push_str(&format!(
                     "quarantine: '{}' has no single complete libtest failure inventory; failure remains blocking\n",
@@ -3522,7 +3638,9 @@ where
         user_verification_result: options.user_verification_result.map(str::to_owned),
         owner_number,
         execution_binding: execution_binding.clone(),
+        lease_id: options.lease_id.take(),
         worktree_fingerprint: fingerprint_before.clone(),
+        verified_head,
         commands: results,
         all_passed,
         quarantined_failures,
@@ -3622,6 +3740,46 @@ fn is_canonical_trivial_plan(plan: &VerificationPlanRecord) -> bool {
         )
 }
 
+/// Explain committed source drift without weakening the fingerprint decision.
+/// Legacy records, dirty-only edits and unavailable Git history retain the
+/// generic stale diagnosis. Never use this diagnostic diff to accept evidence.
+fn stale_fingerprint_status(worktree: &Path, verified_head: Option<&str>) -> EvidenceStatus {
+    let Some(head) = verified_head else {
+        return EvidenceStatus::StaleFingerprint;
+    };
+    let output = gwt_core::process::hidden_command("git")
+        .args([
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            head,
+            "HEAD",
+            "--",
+            ".",
+            ":(exclude).gwt",
+        ])
+        .current_dir(worktree)
+        .output();
+    let Ok(output) = output else {
+        return EvidenceStatus::StaleFingerprint;
+    };
+    if !output.status.success() {
+        return EvidenceStatus::StaleFingerprint;
+    }
+    let paths: Vec<_> = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .collect();
+    if paths.is_empty() {
+        EvidenceStatus::StaleFingerprint
+    } else {
+        EvidenceStatus::StaleFingerprintFiles(paths)
+    }
+}
+
 /// Evidence status consumed by completion and PR handoff gates (T-111/T-112).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EvidenceStatus {
@@ -3637,6 +3795,8 @@ pub enum EvidenceStatus {
     /// The record belongs to a legacy/predecessor execution generation.
     WrongGeneration,
     StaleFingerprint,
+    /// Committed source changes since the recorded verification HEAD.
+    StaleFingerprintFiles(Vec<String>),
     Failing,
     Unreadable,
     /// P9a (T-122): the stored integrity hash does not match the content —
@@ -3674,7 +3834,13 @@ impl EvidenceStatus {
                 "the verification record belongs to a legacy, predecessor, or superseded execution binding — register the plan and rerun `verify.run` from the current generation"
             }
             Self::StaleFingerprint => {
-                "the worktree changed after the last verification run (stale evidence): source/verification inputs or a commit other than canonical Work shard additions changed — rerun `verify.run`; pr.create/pr.edit/pr.ready shard-addition-only commits preserve evidence and do not require another run"
+                "the worktree changed after the last verification run (stale evidence): source/verification inputs or non-exempt history changed — rerun `verify.run`; pr.create/pr.edit/pr.ready shard-addition-only commits and base merges with identical trees or only canonical shard additions preserve evidence"
+            }
+            Self::StaleFingerprintFiles(paths) => {
+                return format!(
+                    "the worktree changed after the last verification run (stale evidence): committed files intersect verification inputs (all repository source): {} — rerun `verify.run`",
+                    paths.iter().map(|path| format!("{path:?}")).collect::<Vec<_>>().join(", ")
+                );
             }
             Self::Failing => {
                 "the last verification run has failing commands — fix the failures and rerun `verify.run`"
@@ -4113,7 +4279,7 @@ fn evaluate_evidence_snapshot_inner(
         worktree_fingerprint_excluding(worktree, generated_outputs.as_deref().unwrap_or_default())
             .unwrap_or_else(|_| "no-git".to_string());
     if record.worktree_fingerprint != current_fingerprint {
-        return EvidenceStatus::StaleFingerprint;
+        return stale_fingerprint_status(worktree, record.verified_head.as_deref());
     }
     // The consumed plan must cover the run's source, but source mutation
     // during/after execution remains the primary stale-evidence diagnosis.
@@ -4846,6 +5012,10 @@ pub(super) fn run<E: CliEnv>(
                             admission.publish_progress(done, total, elapsed);
                         }
                     }),
+                    lease_id: admission
+                        .as_ref()
+                        .and_then(|admission| admission.lease_id())
+                        .map(str::to_owned),
                 },
             );
             // Release the in-process lease before the (lease-free) evidence
@@ -4888,15 +5058,14 @@ pub(super) fn run<E: CliEnv>(
             }
             let command_outcome_accepted =
                 record.all_passed || evidence == EvidenceStatus::FreshWithQuarantine;
+            out.push_str(&RunOutcomeCounts::of(&record.commands).summary());
             out.push_str(&format!(
                 "verify: {status} — record {id} ({count} command(s), owner {owner})\n",
-                status = if record.all_passed {
-                    "PASS"
-                } else if evidence == EvidenceStatus::FreshWithQuarantine {
-                    "QUARANTINED"
-                } else {
-                    "FAIL"
-                },
+                status = run_status_label(
+                    record.all_passed,
+                    evidence == EvidenceStatus::FreshWithQuarantine,
+                    &record.commands,
+                ),
                 id = record.record_id,
                 count = record.commands.len(),
                 owner = record
@@ -4952,9 +5121,12 @@ pub(crate) mod tests {
             session_id: session.to_string(),
             owner_number: Some(3248),
             execution_binding: None,
+            lease_id: None,
             worktree_fingerprint: fingerprint.to_string(),
+            verified_head: None,
             commands: vec![VerificationCommandResult {
                 headed_e2e: None,
+                terminated_by_signal: None,
                 command: "git --version".to_string(),
                 exit_code: 0,
                 output_tail: String::new(),
@@ -5769,6 +5941,98 @@ mod tests {
         assert!(load(dir.path()).unwrap().is_some(), "record must persist");
     }
 
+    /// Issue #4528 AC-2/AC-3: a command killed from outside (the #3566
+    /// `exit -1`) is not a test failure. It is recorded and counted apart,
+    /// while spawn failures — which also report `-1` — stay failures, and the
+    /// run itself still does not pass.
+    #[cfg(unix)]
+    #[test]
+    fn external_signal_termination_is_counted_apart_from_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let (record, transcript) = run_verification(
+            dir.path(),
+            "sess-signal",
+            &[
+                r#"sh -c "kill -TERM $$""#.to_string(),
+                "false".to_string(),
+                "definitely-not-a-real-binary-xyz".to_string(),
+                "git --version".to_string(),
+            ],
+        )
+        .unwrap();
+
+        assert!(!record.all_passed, "an interrupted run must never pass");
+        assert_eq!(record.commands[0].exit_code, -1);
+        assert_eq!(record.commands[0].terminated_by_signal, Some(15));
+        assert_eq!(record.commands[1].terminated_by_signal, None);
+        assert_eq!(record.commands[2].exit_code, -1);
+        assert_eq!(record.commands[2].terminated_by_signal, None);
+        assert!(
+            transcript.contains("exit: -1 (terminated by external signal 15)"),
+            "{transcript}"
+        );
+        let counts = RunOutcomeCounts::of(&record.commands);
+        assert_eq!(
+            (counts.passed, counts.failed, counts.interrupted),
+            (1, 2, 1)
+        );
+        let persisted = load(dir.path()).unwrap().unwrap();
+        assert_eq!(persisted.commands[0].terminated_by_signal, Some(15));
+        assert!(integrity_ok(&persisted));
+    }
+
+    #[test]
+    fn run_status_separates_interruption_from_failure() {
+        let result = |exit_code, terminated_by_signal| VerificationCommandResult {
+            command: "cmd".to_string(),
+            exit_code,
+            output_tail: String::new(),
+            headed_e2e: None,
+            terminated_by_signal,
+        };
+        let interrupted = [result(0, None), result(-1, Some(9))];
+        let mixed = [result(1, None), result(-1, Some(9))];
+
+        assert_eq!(run_status_label(true, false, &interrupted), "PASS");
+        assert_eq!(run_status_label(false, true, &mixed), "QUARANTINED");
+        assert_eq!(run_status_label(false, false, &interrupted), "INTERRUPTED");
+        assert_eq!(run_status_label(false, false, &mixed), "FAIL");
+        assert_eq!(
+            RunOutcomeCounts::of(&mixed).summary(),
+            "verify: outcome — 0 passed, 1 failed, 1 interrupted by external signal\n"
+        );
+    }
+
+    /// Issue #4528 AC-1/AC-3: the lease a heavy run was admitted under is part
+    /// of the integrity-covered record, and a light run records none.
+    #[test]
+    fn run_record_keeps_the_admitting_lease_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let (record, _) = run_verification_inner(
+            dir.path(),
+            "sess-lease",
+            &["git --version".to_string()],
+            None,
+            &[],
+            RunOptions {
+                lease_id: Some("lease-4528".to_string()),
+                ..RunOptions::default()
+            },
+            || {},
+        )
+        .unwrap();
+        assert_eq!(record.lease_id.as_deref(), Some("lease-4528"));
+        let persisted = load(dir.path()).unwrap().unwrap();
+        assert_eq!(persisted.lease_id.as_deref(), Some("lease-4528"));
+        assert!(integrity_ok(&persisted));
+
+        let (light, _) =
+            run_verification(dir.path(), "sess-lease", &["git --version".to_string()]).unwrap();
+        assert_eq!(light.lease_id, None);
+        let serialized = serde_json::to_value(&light).unwrap();
+        assert!(serialized.get("lease_id").is_none(), "{serialized}");
+    }
+
     #[test]
     fn spawn_failure_output_is_bounded_and_sanitized() {
         let dir = tempfile::tempdir().unwrap();
@@ -5806,9 +6070,12 @@ mod tests {
             session_id: "sess-1".to_string(),
             owner_number: Some(3248),
             execution_binding: None,
+            lease_id: None,
             worktree_fingerprint: "abc".to_string(),
+            verified_head: None,
             commands: vec![VerificationCommandResult {
                 headed_e2e: None,
+                terminated_by_signal: None,
                 command: "git --version".to_string(),
                 exit_code: 0,
                 output_tail: String::new(),
@@ -6646,6 +6913,61 @@ mod tests {
         assert!(EvidenceStatus::StaleFingerprint
             .describe()
             .contains("pr.create"));
+    }
+
+    #[test]
+    fn fingerprint_preserves_base_merges_without_source_changes() {
+        let fixture = WorkEventGitFixture::tracked_shards();
+        fixture.git_ok(&["branch", "develop"]);
+        fixture.git_ok(&["commit", "--allow-empty", "-qm", "feature history"]);
+        plan_and_run(&fixture.repo, "sess-merge", &["git --version".to_string()]);
+        let record = load(&fixture.repo).unwrap().unwrap();
+
+        fixture.git_ok(&["checkout", "-q", "develop"]);
+        fixture.git_ok(&["commit", "--allow-empty", "-qm", "base history"]);
+        fixture.git_ok(&["checkout", "-q", "main"]);
+        fixture.git_ok(&["merge", "--no-ff", "-qm", "sync base", "develop"]);
+        assert_eq!(
+            evaluate_evidence(&fixture.repo, "sess-merge", None),
+            EvidenceStatus::Fresh,
+            "a base merge with an identical tree must preserve verification"
+        );
+
+        fixture.git_ok(&["checkout", "-q", "develop"]);
+        fixture.write_event_shard("base-delivery", b"{\"id\":\"base-delivery\"}\n");
+        fixture.stage_event_shards();
+        fixture.commit("chore(work): base delivery");
+        fixture.git_ok(&["checkout", "-q", "main"]);
+        fixture.git_ok(&["merge", "--no-ff", "-qm", "sync base delivery", "develop"]);
+        assert_eq!(
+            evaluate_evidence(&fixture.repo, "sess-merge", None),
+            EvidenceStatus::Fresh,
+            "base merges and pr.create must share the shard-addition rule"
+        );
+        assert_eq!(load(&fixture.repo).unwrap().unwrap(), record);
+    }
+
+    #[test]
+    fn fingerprint_rejects_base_merge_source_changes_and_names_paths() {
+        let fixture = WorkEventGitFixture::tracked_shards();
+        fixture.git_ok(&["branch", "develop"]);
+        fixture.git_ok(&["commit", "--allow-empty", "-qm", "feature history"]);
+        plan_and_run(&fixture.repo, "sess-merge", &["git --version".to_string()]);
+        fixture.git_ok(&["checkout", "-q", "develop"]);
+        fs::write(fixture.repo.join("src.txt"), "changed base source\n").unwrap();
+        fixture.git_ok(&["add", "src.txt"]);
+        fixture.commit("fix: change base source");
+        fixture.git_ok(&["checkout", "-q", "main"]);
+        fixture.git_ok(&["merge", "--no-ff", "-qm", "sync changed base", "develop"]);
+
+        let status = evaluate_evidence(&fixture.repo, "sess-merge", None);
+        assert_ne!(status, EvidenceStatus::Fresh);
+        assert!(
+            status.describe().contains("src.txt"),
+            "{}",
+            status.describe()
+        );
+        assert!(status.describe().contains("verify.run"));
     }
 
     // Freshness: a tracked-file change after the run invalidates evidence,
