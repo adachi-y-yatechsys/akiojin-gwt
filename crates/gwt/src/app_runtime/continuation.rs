@@ -6492,6 +6492,32 @@ impl AppRuntime {
         events
     }
 
+    pub(super) fn reconcile_activated_issue_monitor_launches(&mut self) -> Vec<OutboundEvent> {
+        let pending: Vec<_> = self
+            .pending_fresh_execution_launches
+            .iter()
+            .filter(|(_, launch)| {
+                launch
+                    .launch_feedback_context
+                    .as_ref()
+                    .and_then(|context| context.issue_monitor_launch_binding_issue_number())
+                    .is_some()
+                    && pending_fresh_execution_attempt_status(launch)
+                        == Some(gwt::cli::execution_state::ContinuationAttemptStatus::Activated)
+            })
+            .map(|(window_id, launch)| (window_id.clone(), launch.clone()))
+            .collect();
+        let mut events = Vec::new();
+        for (window_id, launch) in pending {
+            // Reuse the exact binding/capability probe and Work commit before ACK.
+            // A live Prepared candidate still needs its authenticated readiness.
+            events.extend(
+                self.reconcile_activated_fresh_execution_launch_events(&window_id, &launch),
+            );
+        }
+        events
+    }
+
     fn reconcile_activated_fresh_execution_launch_events(
         &mut self,
         window_id: &str,

@@ -80,7 +80,31 @@ fn stable_hook_bin_guard() -> StableHookBinGuard {
 }
 
 fn normalized_embedded_path_text(value: &str) -> String {
-    value.replace("\\\\", "/").replace('\\', "/")
+    hook_config_inspection_text(value)
+        .replace("\\\\", "/")
+        .replace('\\', "/")
+}
+
+fn hook_config_inspection_text(value: &str) -> String {
+    let mut inspected = value.to_string();
+    if let Ok(root) = serde_json::from_str::<serde_json::Value>(value) {
+        for command in root["hooks"]
+            .as_object()
+            .into_iter()
+            .flat_map(|hooks| hooks.values())
+            .filter_map(|groups| groups.as_array())
+            .flatten()
+            .filter_map(|group| group["hooks"].as_array())
+            .flatten()
+            .filter_map(|hook| hook["command"].as_str())
+        {
+            if let Some(decoded) = gwt_skills::decode_powershell_encoded_command(command) {
+                inspected.push('\n');
+                inspected.push_str(&decoded);
+            }
+        }
+    }
+    inspected
 }
 
 #[test]
@@ -484,7 +508,10 @@ fn managed_hook_repair_preserves_user_hooks_and_top_level_settings() {
     assert_eq!(repaired["customSetting"], true);
     let rendered = serde_json::to_string(&repaired).unwrap();
     assert!(rendered.contains("echo user hook"), "{rendered}");
-    assert!(rendered.contains("hook event Stop"), "{rendered}");
+    assert!(
+        hook_config_inspection_text(&rendered).contains("hook event Stop"),
+        "{rendered}"
+    );
 }
 
 #[test]
@@ -542,7 +569,10 @@ fn managed_hook_health_understands_runtime_indirect_fallbacks() {
     for artifact in [".claude/settings.local.json", ".codex/hooks.json"] {
         let rendered = fs::read_to_string(worktree.path().join(artifact)).unwrap();
         let normalized_rendered = normalized_embedded_path_text(&rendered);
-        assert!(rendered.contains("GWT_BIN_PATH"), "{artifact}: {rendered}");
+        assert!(
+            hook_config_inspection_text(&rendered).contains("GWT_BIN_PATH"),
+            "{artifact}: {rendered}"
+        );
         assert!(
             normalized_rendered.contains(&expected_hook_bin),
             "{artifact}: {rendered}"
@@ -755,7 +785,10 @@ fn managed_hook_health_understands_all_provider_runtime_indirect_fallbacks() {
     ] {
         let rendered = fs::read_to_string(worktree.path().join(artifact)).unwrap();
         let normalized_rendered = normalized_embedded_path_text(&rendered);
-        assert!(rendered.contains("GWT_BIN_PATH"), "{artifact}: {rendered}");
+        assert!(
+            hook_config_inspection_text(&rendered).contains("GWT_BIN_PATH"),
+            "{artifact}: {rendered}"
+        );
         assert!(
             normalized_rendered.contains(&expected_hook_bin),
             "{artifact}: {rendered}"
@@ -927,6 +960,72 @@ fn write_legacy_codex_hooks(path: &Path, fallback_bin: &str) {
     .expect("write legacy hooks");
 }
 
+/// Encoded transport must remain transparent to the managed-hook auditor.
+#[test]
+fn powershell_encoded_hook_health_preserves_fallback_audit_and_flags_unsafe_transport() {
+    use base64::Engine;
+
+    let _env_lock = env_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let worktree = tempfile::tempdir().expect("worktree");
+    let _home = gwt_core::test_support::ScopedGwtHome::set(worktree.path());
+    let hook_bin = stable_hook_bin_guard();
+    let path = worktree.path().join(".codex/hooks.json");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let write_hooks = |fallback: &Path, encoded: bool| {
+        let hooks = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop"]
+            .into_iter()
+            .map(|event| {
+                let script = format!(
+                    "& {{ $gwtBin = if ($env:GWT_BIN_PATH) {{ $env:GWT_BIN_PATH }} else {{ '{}' }}; try {{ & $gwtBin hook event {event} }} catch {{ exit 0 }} }}",
+                    fallback.display().to_string().replace('\'', "''")
+                );
+                let command = if encoded {
+                    let bytes: Vec<_> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+                    format!("powershell -NoProfile -EncodedCommand {}", base64::engine::general_purpose::STANDARD.encode(bytes))
+                } else {
+                    format!("powershell -NoProfile -Command \"{script}\"")
+                };
+                (event.to_string(), json!([{ "matcher": "*", "hooks": [{ "type": "command", "command": command }] }]))
+            })
+            .collect::<serde_json::Map<_, _>>();
+        fs::write(
+            &path,
+            serde_json::to_vec(&json!({ "hooks": hooks })).unwrap(),
+        )
+        .unwrap();
+    };
+    let input = ManagedHookHealthInput::new(worktree.path())
+        .with_expected_hook_bin(hook_bin.path().display().to_string());
+
+    write_hooks(hook_bin.path(), true);
+    let healthy = read_managed_hook_health(&input);
+    assert!(healthy.issues.is_empty(), "{:?}", healthy.issues);
+
+    write_hooks(&worktree.path().join("missing-gwtd.exe"), true);
+    let missing = read_managed_hook_health(&input);
+    assert!(
+        missing
+            .issues
+            .iter()
+            .any(|issue| issue.starts_with("managed hook binary missing:")),
+        "{:?}",
+        missing.issues
+    );
+
+    write_hooks(hook_bin.path(), false);
+    let unsafe_wrapper = read_managed_hook_health(&input);
+    assert!(
+        unsafe_wrapper
+            .issues
+            .iter()
+            .any(|issue| issue.starts_with("managed hook PowerShell transport unsafe:")),
+        "{:?}",
+        unsafe_wrapper.issues
+    );
+}
+
 fn run_git(dir: &Path, args: &[&str]) {
     let output = gwt_core::process::hidden_command("git")
         .arg("-C")
@@ -1022,7 +1121,7 @@ fn codex_hook_audit_and_repair_cover_worktree_local_and_workspace_home_copies() 
     for path in &paths {
         let rendered = fs::read_to_string(path).expect("read repaired hooks");
         assert!(
-            rendered.contains("GWT_BIN_PATH"),
+            hook_config_inspection_text(&rendered).contains("GWT_BIN_PATH"),
             "{} did not receive the host-native runtime selector: {rendered}",
             path.display()
         );
@@ -1195,6 +1294,8 @@ fn git_porcelain(dir: &Path) -> String {
 fn repo_with_committed_canonical_codex_hooks() -> tempfile::TempDir {
     let repo = tempfile::tempdir().expect("repo");
     init_git_repo(repo.path());
+    // Match #4758: linked checkouts must not change the fixture's generated bytes.
+    run_git(repo.path(), &["config", "core.autocrlf", "false"]);
     {
         let _bare = ScopedEnvVar::set("GWT_HOOK_BIN", "gwtd");
         gwt_skills::generate_codex_hooks(repo.path()).expect("codex hooks");
@@ -1206,6 +1307,38 @@ fn repo_with_committed_canonical_codex_hooks() -> tempfile::TempDir {
         "fixture must start clean"
     );
     repo
+}
+
+fn contaminate_canonical_hook_fallback(rendered: &str, fallback: &str) -> String {
+    use base64::Engine;
+
+    let mut root: serde_json::Value = serde_json::from_str(rendered).unwrap();
+    for groups in root["hooks"].as_object_mut().unwrap().values_mut() {
+        for group in groups.as_array_mut().unwrap() {
+            for hook in group["hooks"].as_array_mut().unwrap() {
+                let command = hook["command"].as_str().unwrap();
+                let decoded = gwt_skills::decode_powershell_encoded_command(command);
+                let body = decoded.as_deref().unwrap_or(command);
+                let contaminated = body
+                    .replace("gwt_bin='gwtd'", &format!("gwt_bin='{fallback}'"))
+                    .replace("else { 'gwtd' }", &format!("else {{ '{fallback}' }}"));
+                assert_ne!(body, contaminated, "fixture must alter the fallback");
+                hook["command"] = json!(if decoded.is_some() {
+                    let bytes: Vec<_> = contaminated
+                        .encode_utf16()
+                        .flat_map(u16::to_le_bytes)
+                        .collect();
+                    format!(
+                        "powershell -NoProfile -EncodedCommand {}",
+                        base64::engine::general_purpose::STANDARD.encode(bytes)
+                    )
+                } else {
+                    contaminated
+                });
+            }
+        }
+    }
+    serde_json::to_string_pretty(&root).unwrap()
 }
 
 /// #3567 AC-2 / AC-4: a git-TRACKED `.codex/hooks.json` must never receive the
@@ -1231,7 +1364,8 @@ fn tracked_codex_hooks_keep_canonical_binary_fallback() {
         "a tracked hook config must not embed the materializing machine's path: {rendered}"
     );
     assert!(
-        rendered.contains("gwt_bin='gwtd'") || rendered.contains("else { 'gwtd' }"),
+        hook_config_inspection_text(&rendered).contains("gwt_bin='gwtd'")
+            || hook_config_inspection_text(&rendered).contains("else { 'gwtd' }"),
         "a tracked hook config must keep the canonical bare fallback: {rendered}"
     );
     assert!(
@@ -1252,9 +1386,9 @@ fn contaminated_tracked_codex_hooks_converge_back_to_canonical() {
     let repo = repo_with_committed_canonical_codex_hooks();
     let hooks_path = repo.path().join(".codex/hooks.json");
     let committed = fs::read_to_string(&hooks_path).expect("read committed hooks");
-    let contaminated = committed.replace(
-        "gwt_bin='gwtd'",
-        "gwt_bin='/Users/someone/Workbench/gwt/work/issue-3547/target/debug/gwtd'",
+    let contaminated = contaminate_canonical_hook_fallback(
+        &committed,
+        "/Users/someone/Workbench/gwt/work/issue-3547/target/debug/gwtd",
     );
     assert_ne!(committed, contaminated, "fixture must actually contaminate");
     fs::write(&hooks_path, &contaminated).expect("write contaminated hooks");
@@ -1284,9 +1418,9 @@ fn committed_install_path_in_tracked_codex_hooks_is_normalized_on_repair() {
     let repo = repo_with_committed_canonical_codex_hooks();
     let hooks_path = repo.path().join(".codex/hooks.json");
     let canonical = fs::read_to_string(&hooks_path).expect("read canonical hooks");
-    let committed_install_path = canonical.replace(
-        "gwt_bin='gwtd'",
-        "gwt_bin='/Applications/GWT.app/Contents/MacOS/gwtd'",
+    let committed_install_path = contaminate_canonical_hook_fallback(
+        &canonical,
+        "/Applications/GWT.app/Contents/MacOS/gwtd",
     );
     assert_ne!(
         canonical, committed_install_path,
@@ -1311,7 +1445,7 @@ fn committed_install_path_in_tracked_codex_hooks_is_normalized_on_repair() {
         let rendered = fs::read_to_string(&hooks_path).expect("read repaired hooks");
         let installed_text = normalized_embedded_path_text(&installed.path().display().to_string());
         assert!(
-            !rendered.contains("/Applications/GWT.app"),
+            !hook_config_inspection_text(&rendered).contains("/Applications/GWT.app"),
             "repair must drop the committed install path: {rendered}"
         );
         assert!(
