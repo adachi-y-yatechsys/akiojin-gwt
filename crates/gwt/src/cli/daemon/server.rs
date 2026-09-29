@@ -983,7 +983,7 @@ fn spawn_issue_monitor_worker_with_lease(
                                 completion.reject(IssueMonitorControlQueueError::Rejected);
                                 continue;
                             };
-                            if let Some(control) = decode_issue_monitor_control(payload) {
+                            if let Some(control) = decode_issue_monitor_control_in_repo(payload, Some(&scope.project_root)) {
                                 let Some(next_revision) = revision.checked_add(1) else {
                                     tracing::error!("issue monitor revision exhausted; stopping worker");
                                     completion.reject(IssueMonitorControlQueueError::Closed);
@@ -2922,7 +2922,26 @@ fn try_apply_accepted_issue_monitor_control_with_disk_migration_observed(
     }
 }
 
+/// SPEC #4778 AC-1: `repo_path` is what lets an ON frame be believed.
+///
+/// The handler that published the frame checked the caller's PM registration,
+/// but a frame is just bytes on a channel, so the daemon re-checks the session
+/// id it carries against this repository's PM registry. Passing `None` means no
+/// registry is reachable, and then ON stays refused exactly as before.
+// Only the tests decode without a repository: the worker always has
+// `scope.project_root`, so a production build has no caller for this shape.
+// Some of those tests are platform-gated, so on Windows the test build can
+// compile every caller out — the helper is still the right shape to keep.
+#[cfg(test)]
+#[allow(dead_code)]
 fn decode_issue_monitor_control(payload: serde_json::Value) -> Option<IssueMonitorControl> {
+    decode_issue_monitor_control_in_repo(payload, None)
+}
+
+fn decode_issue_monitor_control_in_repo(
+    payload: serde_json::Value,
+    repo_path: Option<&std::path::Path>,
+) -> Option<IssueMonitorControl> {
     match crate::runtime_daemon_events::decode_runtime_daemon_event(
         crate::runtime_daemon_events::ISSUE_MONITOR_CHANNEL,
         payload,
@@ -2979,8 +2998,24 @@ fn decode_issue_monitor_control(payload: serde_json::Value) -> Option<IssueMonit
                         .ok()?,
                     ),
                 };
-                if enabled == Some(true)
-                    || autonomous_mode == Some(true)
+                let resident_pm = config
+                    .get("resident_pm_session")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|session| !session.is_empty())
+                    .is_some_and(|session| {
+                        repo_path.is_some_and(|repo| {
+                            crate::pm_registry::session_is_registered_pm(
+                                &crate::pm_registry::pm_prefs_path_for_repo_path(repo),
+                                session,
+                            ) || crate::pm_registry::pm_repository_key(repo).is_some_and(|key| {
+                                crate::pm_registry::pm_registrations_for_repository(&key)
+                                    .iter()
+                                    .any(|record| record.registration.session_id == session)
+                            })
+                        })
+                    });
+                if (!resident_pm && (enabled == Some(true) || autonomous_mode == Some(true)))
                     || max_active_agents == Some(0)
                     || (enabled.is_none()
                         && autonomous_mode.is_none()
@@ -5513,12 +5548,21 @@ mod tests {
 
     use super::{
         apply_issue_monitor_control, build_handshake_response, decode_issue_monitor_control,
-        handle_connection, issue_monitor_control_is_authorizing, run_server,
+        decode_issue_monitor_control_in_repo, handle_connection,
+        issue_monitor_control_is_authorizing, run_server,
         run_server_with_shutdown_and_worker_config, spawn_issue_monitor_worker_with_config,
         spawn_issue_monitor_worker_with_config_and_scan_probe,
         spawn_issue_monitor_worker_with_config_and_timeout, BroadcastHub, ConnectionGuard,
         DaemonShutdown, IssueMonitorControl, IssueMonitorScanConcurrencyProbe,
     };
+
+    /// SPEC #4778 AC-1: these cases exercise frame shape, not PM authority, so
+    /// they decode with no registry reachable — the strictest of the two paths.
+    fn decode_issue_monitor_control_for_test(
+        payload: serde_json::Value,
+    ) -> Option<IssueMonitorControl> {
+        decode_issue_monitor_control(payload)
+    }
 
     /// Issue #3766 AC-1 regression: a duplicate `gwtd` start against a socket
     /// that a live daemon is still serving must refuse to start instead of
@@ -8036,13 +8080,14 @@ exit 0
         });
         assert!(!monitor.autonomous_mode());
 
-        let arm =
-            decode_issue_monitor_control(crate::runtime_daemon_events::issue_monitor_payload(
+        let arm = decode_issue_monitor_control_for_test(
+            crate::runtime_daemon_events::issue_monitor_payload(
                 "control",
                 serde_json::json!({ "autonomous_mode": true }),
                 std::process::id() + 1,
-            ))
-            .expect("arm control decodes");
+            ),
+        )
+        .expect("arm control decodes");
         assert!(
             apply_issue_monitor_control(&mut monitor, arm),
             "rescan requested"
@@ -8050,13 +8095,14 @@ exit 0
         assert!(monitor.autonomous_mode(), "kill switch armed");
         assert!(monitor.status_view().autonomous_mode);
 
-        let disarm =
-            decode_issue_monitor_control(crate::runtime_daemon_events::issue_monitor_payload(
+        let disarm = decode_issue_monitor_control_for_test(
+            crate::runtime_daemon_events::issue_monitor_payload(
                 "control",
                 serde_json::json!({ "autonomous_mode": false }),
                 std::process::id() + 1,
-            ))
-            .expect("disarm control decodes");
+            ),
+        )
+        .expect("disarm control decodes");
         apply_issue_monitor_control(&mut monitor, disarm);
         assert!(!monitor.autonomous_mode(), "kill switch disarmed");
     }
@@ -8159,15 +8205,16 @@ exit 0
             },
         );
 
-        let live =
-            decode_issue_monitor_control(crate::runtime_daemon_events::issue_monitor_payload(
+        let live = decode_issue_monitor_control_for_test(
+            crate::runtime_daemon_events::issue_monitor_payload(
                 "control",
                 serde_json::json!({
                     "requeue": { "issue_number": 43, "reason": "operator recovery" }
                 }),
                 std::process::id() + 1,
-            ))
-            .expect("requeue decodes");
+            ),
+        )
+        .expect("requeue decodes");
         assert!(
             !apply_issue_monitor_control(&mut monitor, live),
             "a row a launch still owns must not be recovered by this control"
@@ -8178,15 +8225,16 @@ exit 0
             "the live launch must be untouched"
         );
 
-        let dead =
-            decode_issue_monitor_control(crate::runtime_daemon_events::issue_monitor_payload(
+        let dead = decode_issue_monitor_control_for_test(
+            crate::runtime_daemon_events::issue_monitor_payload(
                 "control",
                 serde_json::json!({
                     "requeue": { "issue_number": 42, "reason": "operator recovery" }
                 }),
                 std::process::id() + 1,
-            ))
-            .expect("requeue decodes");
+            ),
+        )
+        .expect("requeue decodes");
         assert!(
             apply_issue_monitor_control(&mut monitor, dead),
             "releasing a dead hold must request a scan so the row runs now"
@@ -8527,8 +8575,8 @@ exit 0
                 ..crate::IssueMonitorPrefs::default()
             },
         );
-        let legacy =
-            decode_issue_monitor_control(crate::runtime_daemon_events::issue_monitor_payload(
+        let legacy = decode_issue_monitor_control_for_test(
+            crate::runtime_daemon_events::issue_monitor_payload(
                 "control",
                 serde_json::json!({
                     "window_closed": {
@@ -8536,8 +8584,9 @@ exit 0
                     }
                 }),
                 std::process::id() + 1,
-            ))
-            .expect("legacy targetless close still decodes");
+            ),
+        )
+        .expect("legacy targetless close still decodes");
 
         assert!(!apply_issue_monitor_control(&mut monitor, legacy));
         assert_eq!(monitor.active_count(), 1);
@@ -9961,13 +10010,14 @@ exit 0
     // decodable control and drops the Issue from this terminal's queue.
     #[test]
     fn issue_monitor_terminal_queue_remove_control_decodes_and_applies() {
-        let control =
-            decode_issue_monitor_control(crate::runtime_daemon_events::issue_monitor_payload(
+        let control = decode_issue_monitor_control_for_test(
+            crate::runtime_daemon_events::issue_monitor_payload(
                 "control",
                 serde_json::json!({ "terminal_queue_remove": { "issue_numbers": [42] } }),
                 std::process::id() + 1,
-            ))
-            .expect("queue remove control decodes");
+            ),
+        )
+        .expect("queue remove control decodes");
         assert_eq!(control, IssueMonitorControl::TerminalQueueRemove(vec![42]));
 
         let mut monitor = crate::IssueMonitorState::new(crate::IssueMonitorConfig::default());
@@ -10109,11 +10159,13 @@ exit 0
         assert_eq!(drain.reason, crate::IssueMonitorUpdateDrainReason::Auto);
         assert_eq!(drain.version, "9.99.0");
         assert!(
-            decode_issue_monitor_control(crate::runtime_daemon_events::issue_monitor_payload(
-                "control",
-                serde_json::json!({ "config_set": { "update_drain": "soon" } }),
-                std::process::id() + 1,
-            ))
+            decode_issue_monitor_control_for_test(
+                crate::runtime_daemon_events::issue_monitor_payload(
+                    "control",
+                    serde_json::json!({ "config_set": { "update_drain": "soon" } }),
+                    std::process::id() + 1,
+                )
+            )
             .is_none(),
             "a malformed drain control is refused whole"
         );
@@ -10218,13 +10270,14 @@ exit 0
             "the drain must not touch the launch ledgers"
         );
 
-        let clear =
-            decode_issue_monitor_control(crate::runtime_daemon_events::issue_monitor_payload(
+        let clear = decode_issue_monitor_control_for_test(
+            crate::runtime_daemon_events::issue_monitor_payload(
                 "control",
                 serde_json::json!({ "config_set": { "update_drain": false } }),
                 std::process::id() + 1,
-            ))
-            .expect("clear control");
+            ),
+        )
+        .expect("clear control");
         assert!(super::apply_issue_monitor_control_with_disk_migration(
             &prefs_path,
             &mut monitor,
@@ -10298,6 +10351,87 @@ exit 0
                 std::process::id() + 1,
             );
             assert!(decode_issue_monitor_control(payload).is_none());
+        }
+    }
+
+    /// SPEC #4778 AC-1: the resident PM's ON frame survives the decoder.
+    ///
+    /// Paired with the rejection above: the only difference between the two is
+    /// a session id that this repository's PM registry vouches for, so the
+    /// decoder is proved to check the registry rather than the marker.
+    #[test]
+    fn issue_monitor_config_set_decoder_admits_an_on_frame_from_the_resident_pm() {
+        let temp = TempDir::new().expect("tempdir");
+        let _home = gwt_core::test_support::ScopedGwtHome::set(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        crate::pm_registry::try_register_pm(
+            &crate::pm_registry::pm_prefs_path_for_repo_path(&repo),
+            crate::pm_registry::PmRegistration {
+                session_id: "pm-session".to_string(),
+                agent_id: "claude".to_string(),
+                worktree_path: repo.to_string_lossy().into_owned(),
+                created_at: None,
+                consecutive_crashes: 0,
+                next_not_before: None,
+            },
+            |_| false,
+        )
+        .expect("register PM");
+
+        for (field, expected_enabled, expected_autonomous) in [
+            ("enabled", Some(true), None),
+            ("autonomous_mode", None, Some(true)),
+        ] {
+            let payload = crate::runtime_daemon_events::issue_monitor_payload(
+                "control",
+                serde_json::json!({"config_set": {
+                    field: true,
+                    "resident_pm_session": "pm-session",
+                }}),
+                std::process::id() + 1,
+            );
+            let control = decode_issue_monitor_control_in_repo(payload, Some(&repo))
+                .expect("the resident PM's ON frame decodes");
+            match control {
+                IssueMonitorControl::ConfigSet {
+                    enabled,
+                    autonomous_mode,
+                    ..
+                } => {
+                    assert_eq!(enabled, expected_enabled, "{field}");
+                    assert_eq!(autonomous_mode, expected_autonomous, "{field}");
+                }
+                other => panic!("{field} must decode as ConfigSet, got {other:?}"),
+            }
+
+            // The same frame without a reachable registry stays refused.
+            let unverifiable = crate::runtime_daemon_events::issue_monitor_payload(
+                "control",
+                serde_json::json!({"config_set": {
+                    field: true,
+                    "resident_pm_session": "pm-session",
+                }}),
+                std::process::id() + 1,
+            );
+            assert!(
+                decode_issue_monitor_control_in_repo(unverifiable, None).is_none(),
+                "{field} must stay refused when no PM registry is reachable"
+            );
+
+            // So does a session id the registry does not know.
+            let impostor = crate::runtime_daemon_events::issue_monitor_payload(
+                "control",
+                serde_json::json!({"config_set": {
+                    field: true,
+                    "resident_pm_session": "not-the-pm",
+                }}),
+                std::process::id() + 1,
+            );
+            assert!(
+                decode_issue_monitor_control_in_repo(impostor, Some(&repo)).is_none(),
+                "{field} must stay refused for an unregistered session"
+            );
         }
     }
 
@@ -10434,8 +10568,8 @@ exit 0
         );
 
         let released_at = "2026-09-05T01:26:30.123Z";
-        let control =
-            decode_issue_monitor_control(crate::runtime_daemon_events::issue_monitor_payload(
+        let control = decode_issue_monitor_control_for_test(
+            crate::runtime_daemon_events::issue_monitor_payload(
                 "control",
                 serde_json::json!({
                     "quota_hold_clear": {
@@ -10445,8 +10579,9 @@ exit 0
                     }
                 }),
                 std::process::id() + 1,
-            ))
-            .expect("quota_hold_clear decodes");
+            ),
+        )
+        .expect("quota_hold_clear decodes");
         assert_eq!(
             control,
             IssueMonitorControl::QuotaHoldClear {
@@ -10484,8 +10619,8 @@ exit 0
         assert_eq!(record.retry_hold_provider, None);
 
         // A blank provider is a malformed control, not a release of nothing.
-        assert!(
-            decode_issue_monitor_control(crate::runtime_daemon_events::issue_monitor_payload(
+        assert!(decode_issue_monitor_control_for_test(
+            crate::runtime_daemon_events::issue_monitor_payload(
                 "control",
                 serde_json::json!({
                     "quota_hold_clear": {
@@ -10495,9 +10630,9 @@ exit 0
                     }
                 }),
                 std::process::id() + 1,
-            ))
-            .is_none()
-        );
+            )
+        )
+        .is_none());
     }
 
     #[test]

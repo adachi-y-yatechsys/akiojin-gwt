@@ -219,11 +219,39 @@ fn resolve_repo_path<E: CliEnv>(env: &E, project_root: Option<String>) -> PathBu
         .unwrap_or_else(|| env.repo_path().to_path_buf())
 }
 
-fn ambient_session_id() -> Option<String> {
+pub(crate) fn ambient_session_id() -> Option<String> {
     std::env::var(gwt_agent::GWT_SESSION_ID_ENV)
         .ok()
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+/// SPEC #4778 AC-1.
+///
+/// The resident PM is the user's standing delegate, so it is the one JSON
+/// caller that may turn the Issue Monitor back on. Authority is proved the same
+/// way `pm.stop` proves it — an ambient Session id that appears in this
+/// repository's PM registrations — so a stray envelope from any other process
+/// still cannot flip the switch.
+pub(crate) fn caller_is_registered_pm(repo_path: &Path) -> bool {
+    let Some(caller_session) = ambient_session_id() else {
+        return false;
+    };
+    // Two stores answer this question and neither covers the other: the
+    // per-path prefs file is the one a plain directory has, and the
+    // repository-scoped registry is the one that still resolves when the PM
+    // runs from a sibling worktree. Either registration is authority.
+    if pm_registry::session_is_registered_pm(
+        &pm_registry::pm_prefs_path_for_repo_path(repo_path),
+        &caller_session,
+    ) {
+        return true;
+    }
+    pm_registry::pm_repository_key(repo_path).is_some_and(|repository_key| {
+        pm_registry::pm_registrations_for_repository(&repository_key)
+            .iter()
+            .any(|record| record.registration.session_id == caller_session)
+    })
 }
 
 /// Issue #3607 AC-5/AC-6.
