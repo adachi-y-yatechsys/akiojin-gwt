@@ -352,8 +352,16 @@ async fn send_pm_pane_input(
                 // one. The input reached the pane; only the target's
                 // acknowledgement is still outstanding, so this must never
                 // read as "the message did not arrive".
-                "unverified" => Err(format!(
-                    "pm message delivery is unverified: {}",
+                //
+                // SPEC #4778 AC-4: and so it is not an error either. Handing
+                // the caller an `Err` invites the one recovery that actually
+                // does harm — sending again, which injects the line twice into
+                // a pane that already has it. The operation's job is to get the
+                // line in front of the agent, and that part succeeded; whether
+                // the agent has acknowledged it yet is the agent's business.
+                "unverified" => Ok(format!(
+                    "pm message submitted to {window_id}; acknowledgement outstanding ({}). \
+                     Do not send it again — the line is already in the pane.\n",
                     reply.reason.unwrap_or_else(|| "unknown reason".to_string())
                 )),
                 "refused" => Err(format!(
@@ -4120,10 +4128,11 @@ mod tests {
         });
     }
 
-    /// Issue #3608 (AC-2): "the acknowledgement never arrived" and "the input
-    /// never committed" are different answers and must not collapse into one
-    /// error. Folding them together is what made the PM read a delivered
-    /// message as undelivered.
+    /// Issue #3608 (AC-2) and SPEC #4778 (AC-4): "the acknowledgement never
+    /// arrived" and "the input never committed" are different answers and must
+    /// not collapse. #3608 separated them into two errors; #4778 finished the
+    /// job by making the first one a success, because an `Err` here invites a
+    /// resend that injects the same line into the pane twice.
     #[test]
     fn pm_message_unverified_and_failed_are_distinct_caller_outcomes() {
         let _env_lock = crate::env_test_lock()
@@ -4178,24 +4187,29 @@ mod tests {
                         .await
                         .expect("send PM outcome");
                 });
-                let error = send_pm_pane_input(
+                let outcome = send_pm_pane_input(
                     &format!("ws://{address}/internal/pane-ws"),
                     None,
                     "codex-1",
                     "one outcome body",
                 )
-                .await
-                .expect_err("a non-delivered outcome is not a success");
+                .await;
                 server.await.expect("PM outcome mock task");
-                outcomes.push(error);
+                // An unverified submit reached the pane, so it reports success;
+                // the other two did not, so they stay errors.
+                outcomes.push(match outcome {
+                    Ok(message) => message,
+                    Err(error) => error,
+                });
             }
 
             let unverified = &outcomes[0];
             let failed = &outcomes[1];
             let refused = &outcomes[2];
             assert!(
-                unverified.contains("unverified")
+                unverified.contains("acknowledgement outstanding")
                     && unverified.contains("submit was not acknowledged")
+                    && unverified.contains("Do not send it again")
                     && !unverified.contains("pm message failed")
                     && !unverified.contains("invalid status"),
                 "{unverified}"
