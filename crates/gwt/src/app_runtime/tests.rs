@@ -66716,6 +66716,55 @@ fn restore_drain_stall_warning_names_the_phase_that_blocked_the_loop() {
     );
 }
 
+/// Issue #4520 AC-4: with an isolated HOME and no restored window, the restore
+/// drain — including the queued startup PM ensure that once ran `git worktree
+/// add` on the loop for 3,687 ms (#4375) — finishes inside 500 ms.
+///
+/// Flake tolerance: the budget is judged on the fastest of three independent
+/// runtimes, so a single scheduling hiccup on a saturated host cannot fail it,
+/// while a drain that is structurally slow is slow in every attempt. The
+/// load-independent half of the guarantee is the Git spawn count: the drain
+/// must start no logged Git process on the loop thread at all.
+#[test]
+fn restore_drain_with_no_restored_windows_finishes_inside_500ms() {
+    const RESTORE_DRAIN_BUDGET: Duration = Duration::from_millis(500);
+    let _pm_gate = super::pm::test_gate::PmEnsureTestGuard::enable();
+    let _env_lock = env_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let mut fastest = Duration::MAX;
+    for _ in 0..3 {
+        let temp = tempdir().expect("tempdir");
+        let _home = ScopedEnvVar::set("HOME", temp.path());
+        let _userprofile = ScopedEnvVar::set("USERPROFILE", temp.path());
+        let repo = temp.path().join("repo");
+        init_git_clone_with_origin(&repo);
+        let tab = sample_project_tab("tab-1", "Repo", repo.clone(), ProjectKind::Git, &[]);
+        let (mut runtime, recorded_events) =
+            sample_runtime_with_events(temp.path(), vec![tab], Some("tab-1"));
+        runtime.bootstrap();
+        assert_eq!(runtime.pending_startup_pm_tabs, vec!["tab-1".to_string()]);
+
+        let git_spawns = gwt_core::process::thread_git_spawn_count();
+        let started = Instant::now();
+        runtime.startup_auto_resume_ready_events(canvas_bounds());
+        fastest = fastest.min(started.elapsed());
+        assert_eq!(
+            gwt_core::process::thread_git_spawn_count() - git_spawns,
+            0,
+            "the restore drain must not run Git on the GUI event loop"
+        );
+
+        // Let the off-loop preparation finish before its tempdir is removed.
+        drain_pm_worktree_preparation(&mut runtime, &recorded_events);
+    }
+    assert!(
+        fastest < RESTORE_DRAIN_BUDGET,
+        "restore_drain took {fastest:?} in its fastest of 3 runs (budget {RESTORE_DRAIN_BUDGET:?})"
+    );
+}
+
 #[test]
 fn pm_ensure_refreshes_existing_unregistered_pm_worktree_to_latest_origin_develop() {
     let _pm_gate = super::pm::test_gate::PmEnsureTestGuard::enable();
