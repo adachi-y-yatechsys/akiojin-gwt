@@ -1119,6 +1119,47 @@ mod tests {
         assert!(loaded.should_mark_interrupted_from_lifecycle());
     }
 
+    /// Issue #4768: Grok Build sends every hook field under both its
+    /// camelCase key and the Claude-compatible snake_case key. Both spellings
+    /// in one payload must not fail the hook closed.
+    #[test]
+    fn runtime_state_records_grok_payload_carrying_both_key_spellings() {
+        let _lock = env_lock();
+        let mut env = EnvGuard::new();
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join(".gwt").join("sessions");
+        let worktree = dir.path().join("repo");
+        std::fs::create_dir_all(&worktree).unwrap();
+
+        let session = Session::new(&worktree, "work/issue-277", AgentId::GrokBuild);
+        let session_id = session.id.clone();
+        session.save(&sessions_dir).unwrap();
+        let runtime_path = gwt_agent::runtime_state_path(&sessions_dir, &session_id);
+        env.set(GWT_SESSION_ID_ENV, session_id.clone());
+        env.set(
+            gwt_agent::GWT_SESSION_RUNTIME_PATH_ENV,
+            runtime_path.as_os_str().to_os_string(),
+        );
+
+        handle_with_input(
+            "SessionStart",
+            r#"{"hookEventName":"session_start","hook_event_name":"SessionStart","sessionId":"grok-conversation-4768","session_id":"grok-conversation-4768","cwd":"repo"}"#,
+        )
+        .expect("SessionStart with both session id spellings must succeed");
+        handle_with_input(
+            "PreToolUse",
+            r#"{"hookEventName":"pre_tool_use","hook_event_name":"PreToolUse","sessionId":"grok-conversation-4768","session_id":"grok-conversation-4768","toolName":"run_command","tool_name":"Bash","toolInput":{"command":"ls"},"tool_input":{"command":"ls"}}"#,
+        )
+        .expect("PreToolUse with both key spellings must succeed");
+
+        let loaded = Session::load(&sessions_dir.join(format!("{session_id}.toml"))).unwrap();
+        assert_eq!(loaded.last_hook_event.as_deref(), Some("PreToolUse"));
+        assert_eq!(
+            loaded.exact_resume_session_id(),
+            Some("grok-conversation-4768")
+        );
+    }
+
     #[test]
     fn runtime_state_records_completed_stop_as_clean_boundary() {
         let _lock = env_lock();
