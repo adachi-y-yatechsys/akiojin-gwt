@@ -389,8 +389,9 @@ test("Issue rows render monitor projections and send controls from the full cano
   assert.ok(moveUp, "Move up is reachable from the overflow menu");
   moveUp.click();
   assert.deepEqual(sent.at(-1), {
-    kind: "reorder_issue_monitor_issues",
-    issue_numbers: [44, 42, 46],
+    kind: "issue_monitor_queue_move",
+    issue_number: 44,
+    position: 0,
   });
 
   const maxActive = body.querySelector(".knowledge-monitor-max-active input");
@@ -793,4 +794,91 @@ test("pool edits preserve newer server candidates received while an input is foc
   assert.deepEqual(sent.at(-1).profiles, [
     { agent_id: "codex" }, { agent_id: "claude", prefer_for: ["type:fix"] }, { agent_id: "grok" },
   ]);
+});
+
+// #4499: terminal queue membership is the Issue board's source of truth.
+test("Issue board has four queue columns, labelled controls and one filter row", async (t) => {
+  const { body, surface, load, sent } = await makeFixture();
+  t.after(() => surface.clearKnowledgeBridgeState("win-1"));
+  surface.applyKnowledgeReceiveEvent({kind:"knowledge_entries",id:"win-1",knowledge_kind:"issue",request_id:load.request_id,
+    entries:[knowledgeEntry(1,"queued"), {...knowledgeEntry(2,"queued",1),queued_by:"operator"}, knowledgeEntry(3,"launching"),knowledgeEntry(4,null,null,{state:"closed"})],refresh_enabled:true});
+  const columns = [...body.querySelectorAll("[data-queue-column]")];
+  assert.deepEqual(columns.map(c=>c.dataset.queueColumn),["backlog","queued","active","done"]);
+  for (const [index,column] of columns.entries()) assert.ok(column.querySelector(`[data-issue-number="${index+1}"]`));
+  assert.match(columns[1].textContent,/operator/i);
+  assert.equal(body.querySelector("[data-issue-filter], [data-issue-lane-filter]"),null);
+  assert.equal(body.querySelector('[data-issue-view="list"]').textContent,"Kanban");
+  assert.match(body.querySelector('[data-action="monitor-settings"]').textContent,/Settings/);
+  const refill=body.querySelector('[data-action="monitor-auto-refill"]');
+  assert.equal(refill.getAttribute("aria-checked"),"false");
+  refill.click();
+  assert.deepEqual(sent.at(-1),{kind:"set_issue_monitor_auto_refill",enabled:true,limit:3});
+  assert.equal(refill.getAttribute("aria-checked"),"false","wait for server status");
+});
+
+test("Issue queue drops send one bulk request and retain server projection", async (t) => {
+  const { body, surface, load, sent } = await makeFixture();
+  t.after(() => surface.clearKnowledgeBridgeState("win-1"));
+  surface.applyKnowledgeReceiveEvent({kind:"knowledge_entries",id:"win-1",knowledge_kind:"issue",request_id:load.request_id,
+    entries:[knowledgeEntry(1,null),knowledgeEntry(2,null),knowledgeEntry(3,"queued",1)],refresh_enabled:true});
+  for (const number of [1,2]) body.querySelector(`[data-issue-number="${number}"] [data-action="queue-select"]`).click();
+  const drop=(column,number)=> { const event=new window.Event("drop",{bubbles:true,cancelable:true}); event.dataTransfer={getData:()=>String(number)}; body.querySelector(`[data-queue-column="${column}"]`).dispatchEvent(event); };
+  const before=sent.length;
+  drop("queued",1);
+  assert.equal(sent.length,before+1);
+  assert.deepEqual(sent.at(-1),{kind:"issue_monitor_queue_push",issue_numbers:[1,2]});
+  assert.ok(body.querySelector('[data-queue-column="backlog"] [data-issue-number="1"]'));
+  drop("active",1);
+  assert.equal(sent.length,before+1);
+  assert.match(body.querySelector('.issue-queue-feedback').textContent,/Active.*monitor/i);
+  drop("backlog",3);
+  assert.deepEqual(sent.at(-1),{kind:"issue_monitor_queue_remove",issue_numbers:[3]});
+});
+
+test("terminal queue broadcasts control membership, provenance and confirmed order", async (t) => {
+  const { body, surface, load, sent } = await makeFixture();
+  t.after(() => surface.clearKnowledgeBridgeState("win-1"));
+  surface.applyKnowledgeReceiveEvent({kind:"knowledge_entries",id:"win-1",knowledge_kind:"issue",request_id:load.request_id,
+    entries:[knowledgeEntry(1,"queued",1),knowledgeEntry(2,"queued",2)],refresh_enabled:true});
+  surface.applyIssueMonitorStatus({terminal_queue:[],terminal_queue_auto_refill:false});
+  assert.equal(body.querySelectorAll('[data-queue-column="queued"] .knowledge-row').length,0);
+  assert.match(body.querySelector('[data-queue-column="queued"]').textContent,/Nothing will launch until an issue is queued/);
+  surface.applyIssueMonitorStatus({terminal_queue:[{number:2,queued_by:"auto-refill"},{number:1,queued_by:"operator"}]});
+  const queued=()=>[...body.querySelectorAll('[data-queue-column="queued"] .knowledge-row')].map(row=>Number(row.dataset.issueNumber));
+  assert.deepEqual(queued(),[2,1]);
+  assert.match(body.querySelector('[data-queue-column="queued"]').textContent,/auto-refill/);
+  const event=new window.Event("drop",{bubbles:true,cancelable:true});
+  event.dataTransfer={getData:()=>"1"};
+  body.querySelector('[data-queue-column="queued"] [data-issue-number="2"]').dispatchEvent(event);
+  assert.deepEqual(sent.at(-1),{kind:"issue_monitor_queue_move",issue_number:1,position:0});
+  assert.deepEqual(queued(),[2,1],"server confirmation controls order");
+  surface.applyIssueMonitorStatus({terminal_queue:[{number:1,queued_by:"operator"},{number:2,queued_by:"auto-refill"}]});
+  assert.deepEqual(queued(),[1,2]);
+});
+
+test("queue drag uses terminal positions when a queued issue is not cached", async (t) => {
+  const { body, surface, load, sent } = await makeFixture();
+  t.after(() => surface.clearKnowledgeBridgeState("win-1"));
+  surface.applyKnowledgeReceiveEvent({kind:"knowledge_entries",id:"win-1",knowledge_kind:"issue",request_id:load.request_id,
+    entries:[knowledgeEntry(1,"queued",2),knowledgeEntry(2,"queued",3)],refresh_enabled:true});
+  surface.applyIssueMonitorStatus({terminal_queue:[99,1,2].map(number=>({number,queued_by:"operator"}))});
+  const drop=new window.Event("drop",{bubbles:true,cancelable:true});
+  drop.dataTransfer={getData:()=>"2"};
+  body.querySelector('[data-queue-column="queued"] [data-issue-number="1"]').dispatchEvent(drop);
+  assert.deepEqual(sent.at(-1),{kind:"issue_monitor_queue_move",issue_number:2,position:1});
+});
+
+test("queue row move preserves uncached predecessors and waits for server order", async (t) => {
+  const { body, surface, load, sent } = await makeFixture();
+  t.after(() => surface.clearKnowledgeBridgeState("win-1"));
+  surface.applyKnowledgeReceiveEvent({kind:"knowledge_entries",id:"win-1",knowledge_kind:"issue",request_id:load.request_id,
+    entries:[knowledgeEntry(1,"queued",2),knowledgeEntry(2,"queued",3)],refresh_enabled:true});
+  surface.applyIssueMonitorStatus({terminal_queue:[99,1,2].map(number=>({number,queued_by:"operator"}))});
+  body.querySelector('[data-issue-number="2"] [data-action="move-up"]').click();
+  assert.deepEqual(sent.at(-1),{kind:"issue_monitor_queue_move",issue_number:2,position:1});
+  assert.equal(body.querySelector('[data-queue-column="queued"] .knowledge-row').dataset.issueNumber,"1");
+  const firstVisibleUp=body.querySelector('[data-issue-number="1"] [data-action="move-up"]');
+  assert.equal(firstVisibleUp.disabled,false,"uncached predecessor remains reachable");
+  firstVisibleUp.click();
+  assert.deepEqual(sent.at(-1),{kind:"issue_monitor_queue_move",issue_number:1,position:0});
 });

@@ -707,6 +707,14 @@ pub(super) fn frontend_user_action_log(event: &FrontendEvent) -> Option<Frontend
             FrontendUserActionLog::new("issue_monitor_queue_remove", "issue_monitor")
                 .target(issue_numbers.len().to_string())
         }
+        FrontendEvent::IssueMonitorQueueMove { issue_number, .. } => {
+            FrontendUserActionLog::new("issue_monitor_queue_move", "issue_monitor")
+                .target(issue_number.to_string())
+        }
+        FrontendEvent::SetIssueMonitorAutoRefill { enabled, .. } => {
+            FrontendUserActionLog::new("set_issue_monitor_auto_refill", "issue_monitor")
+                .mode(if *enabled { "on" } else { "off" })
+        }
         FrontendEvent::ListIssueMonitor => {
             FrontendUserActionLog::new("list_issue_monitor", "issue_monitor")
         }

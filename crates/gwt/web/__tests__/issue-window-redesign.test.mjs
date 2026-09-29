@@ -162,7 +162,7 @@ test("AC-23: ⚙ holds the settings copy and the held fallback in its tooltip", 
   const { body, surface } = await makeFixture();
   t.after(() => surface.clearKnowledgeBridgeState("win-1"));
   const gear = body.querySelector('.knowledge-monitor-bar [data-action="monitor-settings"]');
-  assert.equal(gear.textContent, "⚙");
+  assert.equal(gear.textContent, "⚙ Settings");
 
   surface.applyIssueMonitorStatus({
     ...STATUS,
@@ -453,8 +453,9 @@ test("AC-25: the detail pane renders in FR-023 order with the row's badge vocabu
 
   order[3].querySelector('[data-action="move-to-top"]').click();
   assert.deepEqual(sent.at(-1), {
-    kind: "reorder_issue_monitor_issues",
-    issue_numbers: [11, 10],
+    kind: "issue_monitor_queue_move",
+    issue_number: 11,
+    position: 0,
   });
 });
 

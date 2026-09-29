@@ -217,7 +217,7 @@ function issueRowSecondaryItems({ entry, work, attention, primary }) {
     items.push({
       kind: "chip",
       key: "queue",
-      label: terminal ? `Queue ${entry.queue_position} · ${terminal}` : `Queue ${entry.queue_position}`,
+      label: `Queue ${entry.queue_position}${terminal ? ` · ${terminal}` : ""}${entry.queued_by ? ` · ${entry.queued_by}` : ""}`,
     });
   }
   if (work?.pr_number) {
@@ -878,6 +878,14 @@ export function createKnowledgeKanbanSurface({
           const stateWord = autonomous.querySelector(".knowledge-monitor-switch__state");
           if (stateWord) stateWord.textContent = enabled ? "On" : "Off";
         }
+        const refill = bar.querySelector('[data-action="monitor-auto-refill"]');
+        if (refill) {
+          const enabled = Boolean(issueMonitorStatus.terminal_queue_auto_refill);
+          refill.setAttribute("aria-checked", String(enabled));
+          refill.querySelector(".knowledge-monitor-switch__state").textContent = enabled ? "On" : "Off";
+        }
+        const limit = bar.querySelector(".knowledge-monitor-refill-limit input");
+        if (limit && document.activeElement !== limit) limit.value = String(issueMonitorStatus.terminal_queue_auto_refill_limit ?? 3);
         // Issue #3906 AC-1: `auto_apply_updates` is the effective value
         // (override, else autonomous_mode), so the label shows what happens.
         const autoApply = bar.querySelector('[data-action="monitor-auto-apply"]');
@@ -1042,6 +1050,7 @@ export function createKnowledgeKanbanSurface({
         // row, not a banner. Report once per changed text; resolve on clear.
         syncIssueMonitorErrorReport();
         renderAllIssueMonitorControls();
+        renderAllKnowledgeBridgeWindows();
       }
 
       function scheduleIssueMonitorProjectionRefresh() {
@@ -1236,6 +1245,11 @@ export function createKnowledgeKanbanSurface({
               enabled: !Boolean(issueMonitorStatus.auto_apply_updates),
             });
           });
+        const refillLimit = bar.querySelector(".knowledge-monitor-refill-limit input");
+        const setRefill = enabled => send({kind:"set_issue_monitor_auto_refill", enabled,
+          limit:Math.max(1, Number.parseInt(refillLimit.value, 10) || 3)});
+        bar.querySelector('[data-action="monitor-auto-refill"]')?.addEventListener("click", () => setRefill(!Boolean(issueMonitorStatus.terminal_queue_auto_refill)));
+        refillLimit?.addEventListener("change", () => setRefill(Boolean(issueMonitorStatus.terminal_queue_auto_refill)));
         renderIssueMonitorControls(body);
         send({ kind: "list_issue_monitor" });
       }
@@ -2705,12 +2719,95 @@ export function createKnowledgeKanbanSurface({
         // request is pending and becomes the authoritative semantic result
         // set on completion. Reapplying substring filtering here would hide
         // valid semantic matches whose wording differs from the query.
-        return (Array.isArray(state.entries) ? state.entries : []).filter((entry) => {
-          if (!issueEntryMatchesStateFilter(entry, state.issueStateFilter || "open")) return false;
-          if (!state.issueLaneFilter || state.issueLaneFilter === "all") return true;
-          const work = issueWorkRowForEntry(getActiveWorkProjection?.(), entry);
-          return work && workAttentionFor?.(work)?.lane === state.issueLaneFilter;
-        });
+        return (Array.isArray(state.entries) ? state.entries : []).map(queueProjectedEntry);
+      }
+
+      function queueProjectedEntry(entry) {
+        if (!Array.isArray(issueMonitorStatus.terminal_queue)) return entry;
+        const index = issueMonitorStatus.terminal_queue.findIndex(item => item.number === entry.number);
+        return { ...entry, queue_position: index < 0 ? null : index + 1,
+          queued_by: index < 0 ? null : issueMonitorStatus.terminal_queue[index].queued_by,
+          monitor_state: index >= 0 && (!entry.monitor_state || entry.monitor_state === "queued")
+            ? "queued" : index < 0 && entry.monitor_state === "queued" ? null : entry.monitor_state };
+      }
+
+      function issueQueueColumn(entry) {
+        if (issueEntryStateKey(entry) === "closed" || ["merged", "released"].includes(entry.monitor_state)) return "done";
+        const work = issueWorkRowForEntry(getActiveWorkProjection?.(), entry);
+        if (["launching", "launched"].includes(entry.monitor_state) || Number(work?.active_agents) > 0) return "active";
+        return Number.isFinite(entry.queue_position) ? "queued" : "backlog";
+      }
+
+      function renderIssueQueueBoard(windowId, state, list, entries) {
+        const feedback = createNode("div", "issue-queue-feedback");
+        feedback.setAttribute("role", "status");
+        const board = createNode("div", "issue-queue-board");
+        state.queueSelection ??= new Set();
+        for (const phase of ["backlog", "queued", "active", "done"]) {
+          const column = createNode("section", "issue-queue-column");
+          column.dataset.queueColumn = phase;
+          const label = phase[0].toUpperCase() + phase.slice(1);
+          column.setAttribute("aria-label", `${label} column`);
+          const items = entries.filter(entry => issueQueueColumn(entry) === phase);
+          if (phase === "queued") items.sort((a,b) => a.queue_position - b.queue_position);
+          column.appendChild(createNode("h3", "issue-queue-heading", `${label} · ${items.length}`));
+          if (!items.length) column.appendChild(createNode("div", "knowledge-empty", phase === "queued"
+            ? "Nothing will launch until an issue is queued." : `No ${phase} items`));
+          for (const entry of items) {
+            const row = renderIssueRow(windowId, state, entry);
+            if (phase === "backlog" || phase === "queued") {
+              const selection = createNode("label", "issue-queue-select");
+              const checkbox = createNode("input");
+              checkbox.type = "checkbox";
+              checkbox.dataset.action = "queue-select";
+              checkbox.checked = state.queueSelection.has(entry.number);
+              checkbox.setAttribute("aria-label", `Select issue #${entry.number} for queue move`);
+              checkbox.addEventListener("click", event => {
+                event.stopPropagation();
+                if (state.queueSelection.has(entry.number)) state.queueSelection.delete(entry.number);
+                else state.queueSelection.add(entry.number);
+              });
+              selection.addEventListener("click", event => event.stopPropagation());
+              selection.append(checkbox, createNode("span", "", "Select"));
+              row.prepend(selection);
+              row.draggable = true;
+              row.addEventListener("dragstart", event => {
+                event.dataTransfer?.setData("text/plain", String(entry.number));
+              });
+            }
+            column.appendChild(row);
+          }
+          column.addEventListener("dragover", event => event.preventDefault());
+          column.addEventListener("drop", event => {
+            event.preventDefault();
+            const number = Number.parseInt(event.dataTransfer?.getData("text/plain"), 10);
+            const entry = entries.find(item => item.number === number);
+            if (!entry) return;
+            if (phase === "active" || phase === "done") {
+              feedback.textContent = `${label} is controlled by the monitor and work lifecycle; drop into Backlog or Queued.`;
+              return;
+            }
+            const origin = issueQueueColumn(entry);
+            if (origin !== "backlog" && origin !== "queued") {
+              feedback.textContent = "Active and Done issues cannot be moved into the queue.";
+              return;
+            }
+            if (phase === "queued" && origin === "queued") {
+              const target = event.target?.closest?.("[data-issue-number]");
+              const queued = canonicalQueuedKnowledgeEntries(state);
+              const targetIndex = queued.findIndex(item => item.number === Number(target?.dataset.issueNumber));
+              send({kind:"issue_monitor_queue_move", issue_number:number, position:targetIndex < 0 ? Math.max(0, queued.length - 1) : targetIndex});
+            } else if (origin !== phase) {
+              const numbers = state.queueSelection.has(number)
+                ? entries.filter(item => state.queueSelection.has(item.number) && issueQueueColumn(item) === origin).map(item => item.number)
+                : [number];
+              send({kind:phase === "queued" ? "issue_monitor_queue_push" : "issue_monitor_queue_remove", issue_numbers:numbers});
+            } else return;
+            feedback.textContent = "Queue change requested; waiting for server confirmation.";
+          });
+          board.appendChild(column);
+        }
+        list.append(feedback, board);
       }
 
       function kanbanEmptyMessage(state, phase) {
@@ -3591,13 +3688,13 @@ export function createKnowledgeKanbanSurface({
       }
 
       function canonicalQueuedKnowledgeEntries(state) {
+        if (Array.isArray(issueMonitorStatus.terminal_queue)) return issueMonitorStatus.terminal_queue;
         const source = Array.isArray(state.baseEntries) && state.baseEntries.length > 0
           ? state.baseEntries
           : state.entries;
-        return (Array.isArray(source) ? source : [])
+        return (Array.isArray(source) ? source : []).map(queueProjectedEntry)
           .filter(
             (entry) =>
-              entry?.monitor_state === "queued" &&
               Number.isFinite(entry.queue_position),
           )
           .slice()
@@ -3608,46 +3705,19 @@ export function createKnowledgeKanbanSurface({
           );
       }
 
-      function updateQueuedKnowledgePositions(entries, positions) {
-        if (!Array.isArray(entries)) return;
-        for (let index = 0; index < entries.length; index += 1) {
-          const entry = entries[index];
-          const queuePosition = positions.get(entry?.number);
-          if (queuePosition === undefined || entry.queue_position === queuePosition) {
-            continue;
-          }
-          entries[index] = { ...entry, queue_position: queuePosition };
-        }
-      }
-
       function moveQueuedKnowledgeEntry(windowId, state, issueNumber, direction) {
         const queued = canonicalQueuedKnowledgeEntries(state);
         const index = queued.findIndex((entry) => entry.number === issueNumber);
         const targetIndex = index + direction;
         if (index < 0 || targetIndex < 0 || targetIndex >= queued.length) return;
-        [queued[index], queued[targetIndex]] = [queued[targetIndex], queued[index]];
-        applyQueuedKnowledgeOrder(windowId, state, queued);
+        send({ kind: "issue_monitor_queue_move", issue_number: issueNumber, position: targetIndex });
       }
 
       function moveQueuedKnowledgeEntryToTop(windowId, state, issueNumber) {
         const queued = canonicalQueuedKnowledgeEntries(state);
         const index = queued.findIndex((entry) => entry.number === issueNumber);
         if (index <= 0) return;
-        queued.unshift(...queued.splice(index, 1));
-        applyQueuedKnowledgeOrder(windowId, state, queued);
-      }
-
-      function applyQueuedKnowledgeOrder(windowId, state, queued) {
-        const positions = new Map(
-          queued.map((entry, queueIndex) => [entry.number, queueIndex + 1]),
-        );
-        updateQueuedKnowledgePositions(state.baseEntries, positions);
-        updateQueuedKnowledgePositions(state.entries, positions);
-        send({
-          kind: "reorder_issue_monitor_issues",
-          issue_numbers: queued.map((entry) => entry.number),
-        });
-        renderKnowledgeBridge(windowId);
+        send({ kind: "issue_monitor_queue_move", issue_number: issueNumber, position: 0 });
       }
 
       // SPEC #3885 T-004 (FR-006): every Issue action the row can offer, keyed by
@@ -4012,17 +4082,8 @@ export function createKnowledgeKanbanSurface({
               list.appendChild(pair);
             }
           }
-        } else if (visibleEntries.length === 0) {
-          const filterLabel = state.issueStateFilter === "all"
-            ? ""
-            : `${state.issueStateFilter || "open"} `;
-          list.appendChild(
-            createNode("div", "knowledge-empty", `No ${filterLabel}work items`),
-          );
         } else {
-          for (const entry of visibleEntries) {
-            list.appendChild(renderIssueRow(windowId, state, entry));
-          }
+          renderIssueQueueBoard(windowId, state, list, visibleEntries);
         }
         renderOtherWork(list, windowId, { laneFilter: state.issueLaneFilter || "all" });
         renderKnowledgeDetailPane(windowId, state, detailPane, { agentPreview: !splitMode });
@@ -4210,46 +4271,41 @@ export function createKnowledgeKanbanSurface({
                   <div class="workspace-toolbar-main">
                     <div class="knowledge-heading">${knowledgeHeading(knowledgeKind)}</div>
                     <input class="knowledge-search" type="search" placeholder="${knowledgeSearchPlaceholder(knowledgeKind)}" />
-                    <div class="knowledge-state-filter" role="group" aria-label="Issue state filter">
-                      <button type="button" data-issue-filter="open">Open</button>
-                      <button type="button" data-issue-filter="closed">Closed</button>
-                      <button type="button" data-issue-filter="all">All</button>
-                    </div>
                     <div class="knowledge-state-filter knowledge-view-mode" role="group" aria-label="Issue view mode">
-                      <button type="button" data-issue-view="list">List</button>
+                      <button type="button" data-issue-view="list">Kanban</button>
                       <button type="button" data-issue-view="split">Split</button>
                     </div>
-                    <select class="issue-lane-filter" data-issue-lane-filter aria-label="Work state filter">
-                      <option value="all">All work states</option>
-                      <option value="running">Running</option>
-                      <option value="paused">Paused</option>
-                      <option value="needs_attention">Needs Attention</option>
-                      <option value="remote">Remote</option>
-                      <option value="closed">Closed</option>
-                    </select>
+
                   </div>
                   <div class="workspace-toolbar-actions">
                     <button type="button" class="wizard-button is-compact" data-action="issue-new" aria-haspopup="dialog">＋ New</button>
-                    <button class="icon-button" data-action="refresh-knowledge" aria-label="Refresh cached work items" title="Refresh cached work items">↻</button>
+                    <button class="wizard-button is-compact" data-action="refresh-knowledge" aria-label="Refresh cached work items" title="Refresh cached work items">↻ Refresh</button>
                   </div>
                 </div>
                 <section class="knowledge-monitor-bar" aria-label="Issue execution monitor">
+                  <div class="knowledge-monitor-status" role="group" aria-label="Monitor status">
                   <span class="knowledge-row-badge knowledge-monitor-pill" data-tone="idle" aria-live="polite">Stopped</span>
                   <span class="knowledge-monitor-metric" data-metric="active">Active 0/1</span>
                   <span class="knowledge-monitor-metric" data-metric="queue">Queue 0</span>
+                  </div><div class="knowledge-monitor-controls" role="group" aria-label="Monitor controls">
                   <button type="button" class="knowledge-monitor-switch" role="switch" aria-checked="false" aria-label="Autonomous mode" data-action="monitor-autonomous" data-enabled="false">
                     <span class="knowledge-monitor-switch__label">Autonomous</span>
                     <span class="knowledge-monitor-switch__track" aria-hidden="true"><span class="knowledge-monitor-switch__knob"></span></span>
                     <span class="knowledge-monitor-switch__state">Off</span>
                   </button>
+                  <button type="button" class="knowledge-monitor-switch" role="switch" aria-checked="false" data-action="monitor-auto-refill" aria-label="Auto-refill queue">
+                    <span>Auto-refill</span><span class="knowledge-monitor-switch__state">Off</span>
+                  </button>
+                  <label class="knowledge-monitor-refill-limit"><span>Refill limit</span><input type="number" min="1" step="1" value="3" aria-label="Auto-refill queue limit" /></label>
                   <label class="knowledge-monitor-max-active">
-                    <span>Max</span>
+                    <span>Max active</span>
                     <input type="number" min="1" step="1" value="1" aria-label="Max active agents" />
                   </label>
                   <button type="button" class="wizard-button is-compact primary" data-action="monitor-toggle">Start monitor</button>
                   <button type="button" class="wizard-button is-compact" data-action="monitor-auto-apply" title="Apply a staged gwt update automatically once no agent is running (default: follows Autonomous)">Auto-apply updates: OFF</button>
                   <button type="button" class="wizard-button is-compact primary" data-action="monitor-setup" hidden>Set up agent</button>
-                  <button type="button" class="icon-button" data-action="monitor-settings" aria-label="Agent settings">⚙</button>
+                  <button type="button" class="wizard-button is-compact" data-action="monitor-settings" aria-label="Agent settings">⚙ Settings</button>
+                  </div>
                 </section>
                 <details class="knowledge-monitor-pool">
                   <summary>Candidates (0)</summary>

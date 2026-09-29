@@ -351,26 +351,36 @@ Linux, `Ctrl+Shift+C` also copies the current terminal selection.
 
 ## Issue surface and Issue Monitor
 
-Open `Issue` from Add Window to browse cached GitHub Issues and manage the Issue
-Monitor in one surface. Each row shows its execution state, queue position, and
-any exclusion reason. The toolbar has two bands: the Issue band (search,
-filters, `＋ New` to register an Issue from a popover, and `↻` whose tooltip
-shows the cached count and refresh time) and the Monitor band (state pill,
-Active / Queue, Autonomous, Max, Start monitor / Stop, and `⚙` whose tooltip
-shows the Agent settings). Monitor errors turn the pill into `⚠ Error` and are
-read in the notification center. The detail pane leads with the Issue's
-acceptance-criteria progress and one state-specific action band. The legacy
-`issue_monitor` preset also opens this canonical Issue surface.
+Open `Issue` from Add Window to browse cached GitHub Issues in four columns:
+Backlog, Queued, Active, and Done. Each row preserves its execution state and
+actions. Drag Backlog items into Queued to schedule them, drag them back to remove
+them, or reorder items within Queued. Selecting multiple items sends one queue
+change. Active and Done follow the execution lifecycle and cannot be changed by
+dragging. Queued items show who added them, including `auto-refill`.
 
-The monitor watches the project's open GitHub Issues and turns them into agent
-work. In the default (human-gated) mode it scans candidates into the Issue
-queue, and `Launch now` on a row creates the `work/issue-N` branch/worktree at
-launch time and starts the agent with `gwt-execute #N`. Failed launches remain
-visible on their Issue rows with the execution state.
+Search and the Kanban / Split switch share one row. Monitor status and controls
+are separate, with visible labels for Settings, Autonomous, Auto-refill, its
+limit, and Start monitor / Stop. Auto-refill is **off by default**; enabling it
+opts into adding eligible open Issues up to the configured queue limit. An empty
+queue starts no new work; already-running work continues. Monitor errors appear
+in the notification center. The detail pane shows acceptance-criteria progress
+and state-specific actions. The legacy `issue_monitor` preset opens this same
+Issue surface.
 
-Agents and automation can inspect and reprioritize the project queue through
-the `gwtd` JSON operations `issue.monitor.status`,
-`issue.monitor.priority.move`, and `issue.monitor.priority.set`. The
+Open GitHub Issues remain in Backlog until explicitly queued or added by enabled
+auto-refill. Queue membership authorizes the monitor to consider an Issue; normal
+readiness, claim, and capacity checks still apply. `Launch now` on a row opens the
+launch flow, which creates the `work/issue-N` branch/worktree at launch time and
+starts the agent with `gwt-execute #N`. Failed launches remain visible on their
+Issue rows.
+
+Agents and automation can inspect the queue with `issue.monitor.status` and
+change membership/order with `issue.monitor.queue.push`,
+`issue.monitor.queue.remove`, and `issue.monitor.queue.move`. The
+`issue.monitor.queue.auto_refill` operation sets opt-in refill and its limit.
+`issue.monitor.launch_now` explicitly adds the Issue at the front of the terminal
+queue and requests a scan. Existing `issue.monitor.priority.move` and
+`issue.monitor.priority.set` operations remain available. The
 `issue.monitor.config.set` operation can stop processing, disable autonomous
 mode, or set a positive `max_active` limit. For safety, it rejects
 `enabled=true` and `autonomous_mode=true`; enabling either capability requires

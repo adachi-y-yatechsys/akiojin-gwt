@@ -5,7 +5,11 @@ import { APP_URL, installEmbeddedRoutes } from "./_helpers/embedded-frontend";
 // A browser-check Project URL uses the isolated binary's assets; without one the
 // shared embedded frontend fixture serves this checkout for local development.
 const errors = new WeakMap<Page, string[]>();
-const liveUrl = process.env.GWT_PLAYWRIGHT_BASE_URL;
+const configuredUrl = process.env.GWT_PLAYWRIGHT_BASE_URL;
+// A browser-check URL may point at the Hub; these fixtures exercise Project assets.
+const liveUrl = configuredUrl
+  ? new URL(new URL(configuredUrl).pathname === "/" ? new URL(APP_URL).pathname : new URL(configuredUrl).pathname, configuredUrl).toString()
+  : undefined;
 
 test.use({ viewport: { width: 1600, height: 1100 } });
 test.beforeEach(async ({ page }, info) => {
@@ -42,7 +46,7 @@ async function messages(page: Page, kind: string) {
   ), kind);
 }
 
-test("Other stays authoritative under search and filters, with no Workspace surface", async ({ page }) => {
+test("Other stays authoritative under search and queue columns, with no Workspace surface", async ({ page }) => {
   await boot(page);
   const other = page.locator("details.issue-other-group");
   await expect(other).not.toHaveAttribute("open");
@@ -63,16 +67,11 @@ test("Other stays authoritative under search and filters, with no Workspace surf
   await expect(page.locator(".knowledge-row")).toHaveCount(0);
   await expect(row(page, "other-paused")).toBeVisible();
   await expect(row(page, "linked-visible")).toHaveCount(0);
-  await page.locator('[data-issue-filter="closed"]').click();
+  await expect(page.locator("[data-issue-filter], [data-issue-lane-filter]")).toHaveCount(0);
+  await expect(page.locator("[data-queue-column]")).toHaveCount(4);
   await expect(row(page, "linked-uncached")).toHaveCount(0);
   await expect(row(page, "other-paused")).toBeVisible();
-
-  await page.locator("[data-issue-lane-filter]").selectOption("remote");
-  await expect(row(page, "other-paused")).toHaveCount(0);
   await expect(row(page, "remote-start:feature/remote")).toBeVisible();
-  await page.locator("[data-issue-lane-filter]").selectOption("paused");
-  await expect(row(page, "other-paused")).toBeVisible();
-  await expect(row(page, "remote-start:feature/remote")).toHaveCount(0);
 });
 
 test("Other keeps branch launch, conversation resume and backend-approved cleanup reachable", async ({ page }) => {

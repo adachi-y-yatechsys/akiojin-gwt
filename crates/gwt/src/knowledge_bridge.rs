@@ -208,6 +208,8 @@ pub struct KnowledgeListItem {
     /// One-based position in the Issue Monitor queue, when queued.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue_position: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_by: Option<String>,
     /// Human-readable reason for a non-terminal monitor exclusion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exclusion_reason: Option<String>,
@@ -1128,6 +1130,7 @@ fn issue_list_item(
         parent_spec: parent_spec_from_body(&entry.snapshot.body),
         monitor_state: None,
         queue_position: None,
+        queued_by: None,
         exclusion_reason: None,
         related_work_refs: Vec::new(),
     }
@@ -1158,6 +1161,7 @@ fn spec_list_item(
         parent_spec: parent_spec_from_body(&entry.snapshot.body),
         monitor_state: None,
         queue_position: None,
+        queued_by: None,
         exclusion_reason: None,
         related_work_refs: Vec::new(),
     }

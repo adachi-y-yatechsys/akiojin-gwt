@@ -330,24 +330,32 @@ Linux では `Ctrl+Shift+C` でも現在の選択をコピーできます。
 
 ## Issue サーフェスと Issue Monitor
 
-Add Window から `Issue` を開くと、キャッシュ済み GitHub Issue の閲覧と Issue
-Monitor の操作を単一サーフェスで行えます。各行には実行状態、キュー位置、除外理由が
-表示されます。ツールバーは 2 段で、1 段目は Issue 帯（検索、フィルタ、ポップオーバー
-から Issue を登録する `＋ New`、cached 件数と更新時刻を tooltip に出す `↻`）、2 段目は
-Monitor 帯（状態ピル、Active / Queue、Autonomous、Max、Start monitor / Stop、Agent
-settings を tooltip に出す `⚙`）です。監視エラーは状態ピルが `⚠ Error` になり、本文は
-通知センターで読みます。詳細ペインは受け入れ基準の進捗と状態別の操作帯を先頭に表示
-します。従来の `issue_monitor` preset もこの正本 Issue サーフェスを開きます。
+Add Window から `Issue` を開くと、キャッシュ済み GitHub Issue を Backlog / Queued /
+Active / Done の 4 列で表示します。各行の実行状態と操作はそのまま利用できます。
+Backlog から Queued へドラッグすると実行対象に追加され、逆方向でキューから外れます。
+Queued 内では順序を変更でき、複数選択の移動は 1 回のキュー操作で送信されます。
+Active と Done は実行ライフサイクルに従うため、ドラッグでは変更できません。
+Queued には `auto-refill` などの追加元も表示されます。
 
-Monitor はプロジェクトの open な GitHub Issue を監視し、エージェント作業に変換します。
-既定（human-gated）モードでは候補を Issue キューに取り込み、行の `Launch now` を
-押すと、gwt が起動時に `work/issue-N` のブランチ/worktree を作成し、
-`gwt-execute #N` でエージェントを開始します。起動失敗は実行状態として Issue 行に
-残ります。
+検索と Kanban / Split の切り替えは同じ行に並びます。Monitor の状態表示と操作は分離し、
+Settings、Autonomous、Auto-refill と上限、Start monitor / Stop をラベル付きで表示します。
+Auto-refill は**既定で OFF**です。有効にすると、条件を満たす open Issue を設定した
+キュー上限まで自動補充します。空のキューから新しい作業は起動せず、実行中の作業は継続します。
+監視エラーは通知センターで確認できます。詳細ペインには受け入れ基準の進捗と状態別の
+操作を表示します。従来の `issue_monitor` preset も同じ Issue サーフェスを開きます。
 
-Agent や自動化からは、`gwtd` JSON operation の `issue.monitor.status`、
-`issue.monitor.priority.move`、`issue.monitor.priority.set` を使ってプロジェクトの
-キューを確認・並べ替えできます。`issue.monitor.config.set` は処理停止、Autonomous
+open な GitHub Issue は、明示的にキューへ追加するか、有効にした Auto-refill が追加する
+まで Backlog に留まります。キューへの所属は Monitor の実行候補になる条件であり、
+準備状態・claim・同時実行数のチェックは引き続き適用されます。行の `Launch now` は
+起動フローを開き、起動時に `work/issue-N` のブランチ/worktree を作成して
+`gwt-execute #N` でエージェントを開始します。起動失敗は Issue 行に残ります。
+
+Agent や自動化からは `issue.monitor.status` で確認し、`issue.monitor.queue.push`、
+`issue.monitor.queue.remove`、`issue.monitor.queue.move` で所属と順序を変更できます。
+`issue.monitor.queue.auto_refill` は自動補充の有効化と上限を設定します。
+`issue.monitor.launch_now` は対象を端末キューの先頭へ明示的に追加し、scan を要求します。
+既存の `issue.monitor.priority.move` と `issue.monitor.priority.set` も利用できます。
+`issue.monitor.config.set` は処理停止、Autonomous
 モード無効化、正の `max_active` 上限設定に対応します。安全のため `enabled=true` と
 `autonomous_mode=true` は拒否され、有効化には GUI での明示操作が必要です。
 idle になったエージェント窓はスロットを自動的に解放します。各 scan は起動中の窓を

@@ -188,6 +188,9 @@ fn backend_issue_monitor_status_serializes_for_monitor_card() {
             state: "scanning".to_string(),
             queue_len: 2,
             terminal_queue_len: 0,
+            terminal_queue: Vec::new(),
+            terminal_queue_auto_refill: false,
+            terminal_queue_auto_refill_limit: 0,
             unqueued_open_count: 0,
             other_terminal_queue_count: 0,
             active_count: 1,
@@ -374,6 +377,7 @@ fn knowledge_list_item_monitor_projection_is_backward_compatible() {
         parent_spec: None,
         monitor_state: Some(MonitorInboxState::HoldExcluded),
         queue_position: Some(3),
+        queued_by: None,
         exclusion_reason: Some("matched label: hold".to_string()),
         related_work_refs: vec![gwt::KnowledgeWorkRefView {
             id: "work-42".to_string(),
@@ -389,4 +393,14 @@ fn knowledge_list_item_monitor_projection_is_backward_compatible() {
     assert_eq!(value["exclusion_reason"], "matched label: hold");
     assert_eq!(value["related_work_refs"][0]["id"], "work-42");
     assert_eq!(value["related_work_refs"][0]["branch"], "work/issue-42");
+}
+
+#[test]
+fn kanban_queue_move_and_refill_events_decode() {
+    for payload in [
+        r#"{"kind":"issue_monitor_queue_move","issue_number":42,"position":0}"#,
+        r#"{"kind":"set_issue_monitor_auto_refill","enabled":true,"limit":5}"#,
+    ] {
+        let _: FrontendEvent = serde_json::from_str(payload).expect("Kanban control decodes");
+    }
 }

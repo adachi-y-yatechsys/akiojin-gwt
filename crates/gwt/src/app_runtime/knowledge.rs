@@ -54,8 +54,9 @@ const KNOWLEDGE_MONITOR_SNAPSHOT_CAPACITY: usize = 8;
 
 #[derive(Clone)]
 struct KnowledgeMonitorProjection {
-    state: gwt::MonitorInboxState,
+    state: Option<gwt::MonitorInboxState>,
     queue_position: Option<usize>,
+    queued_by: Option<String>,
     exclusion_reason: Option<String>,
 }
 
@@ -203,25 +204,40 @@ impl KnowledgeMonitorSnapshotCache {
     }
 
     fn replace(&mut self, project_root: &Path, items: &[gwt::IssueMonitorInboxItem]) {
-        let mut next_queue_position = 1;
-        let snapshot = items
+        let previous = self.get(project_root);
+        let mut snapshot = items
             .iter()
             .map(|item| {
-                let queue_position = (item.state == gwt::MonitorInboxState::Queued).then(|| {
-                    let position = next_queue_position;
-                    next_queue_position += 1;
-                    position
-                });
+                let queued = previous
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.get(&item.issue.number));
                 (
                     item.issue.number,
                     KnowledgeMonitorProjection {
-                        state: item.state,
-                        queue_position,
+                        state: Some(item.state),
+                        queue_position: queued.and_then(|item| item.queue_position),
+                        queued_by: queued.and_then(|item| item.queued_by.clone()),
                         exclusion_reason: item.exclusion_reason.clone(),
                     },
                 )
             })
             .collect::<HashMap<_, _>>();
+        // A freshly queued Issue may not have reached the scanner yet.
+        if let Some(previous) = previous {
+            for (number, item) in previous
+                .iter()
+                .filter(|(_, item)| item.queue_position.is_some())
+            {
+                snapshot
+                    .entry(*number)
+                    .or_insert_with(|| KnowledgeMonitorProjection {
+                        state: None,
+                        queue_position: item.queue_position,
+                        queued_by: item.queued_by.clone(),
+                        exclusion_reason: None,
+                    });
+            }
+        }
         let entry = KnowledgeMonitorSnapshotEntry {
             project_root: normalized_snapshot_project_root(project_root),
             snapshot: Arc::new(snapshot),
@@ -232,6 +248,35 @@ impl KnowledgeMonitorSnapshotCache {
         self.entries.push_back(entry);
         while self.entries.len() > KNOWLEDGE_MONITOR_SNAPSHOT_CAPACITY {
             self.entries.pop_front();
+        }
+    }
+    fn replace_queue(
+        &mut self,
+        project_root: &Path,
+        queue: &[gwt::issue_monitor::IssueMonitorTerminalQueueEntry],
+    ) {
+        if self.entry_index(project_root).is_none() {
+            self.replace(project_root, &[]);
+        }
+        let index = self
+            .entry_index(project_root)
+            .expect("snapshot initialized");
+        let snapshot = Arc::make_mut(&mut self.entries[index].snapshot);
+        for item in snapshot.values_mut() {
+            item.queue_position = None;
+            item.queued_by = None;
+        }
+        for (index, entry) in queue.iter().enumerate() {
+            let item = snapshot
+                .entry(entry.number)
+                .or_insert(KnowledgeMonitorProjection {
+                    state: None,
+                    queue_position: None,
+                    queued_by: None,
+                    exclusion_reason: None,
+                });
+            item.queue_position = Some(index + 1);
+            item.queued_by = Some(entry.queued_by.clone());
         }
     }
 }
@@ -275,6 +320,7 @@ mod related_snapshot_cache_tests {
                 parent_spec: None,
                 monitor_state: None,
                 queue_position: None,
+                queued_by: None,
                 exclusion_reason: None,
                 related_work_refs: Vec::new(),
             }],
@@ -521,6 +567,19 @@ mod monitor_snapshot_cache_tests {
         }
     }
 
+    fn queue_entries(numbers: &[u64]) -> Vec<gwt::issue_monitor::IssueMonitorTerminalQueueEntry> {
+        numbers
+            .iter()
+            .map(
+                |number| gwt::issue_monitor::IssueMonitorTerminalQueueEntry {
+                    number: *number,
+                    queued_at: String::new(),
+                    queued_by: "operator".to_string(),
+                },
+            )
+            .collect()
+    }
+
     fn knowledge_entry(number: u64) -> gwt::KnowledgeListItem {
         gwt::KnowledgeListItem {
             number,
@@ -538,9 +597,24 @@ mod monitor_snapshot_cache_tests {
             parent_spec: None,
             monitor_state: Some(gwt::MonitorInboxState::Launched),
             queue_position: Some(99),
+            queued_by: None,
             exclusion_reason: Some("stale".to_string()),
             related_work_refs: Vec::new(),
         }
+    }
+
+    #[test]
+    fn stale_inbox_queued_state_is_not_terminal_membership() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut cache = KnowledgeMonitorSnapshotCache::default();
+        cache.replace(
+            directory.path(),
+            &[inbox_item(42, gwt::MonitorInboxState::Queued, None)],
+        );
+        let snapshot = cache.get(directory.path()).unwrap();
+        let mut entries = vec![knowledge_entry(42)];
+        apply_knowledge_monitor_projection(&mut entries, Some(&snapshot));
+        assert_eq!(entries[0].queue_position, None);
     }
 
     #[test]
@@ -562,6 +636,9 @@ mod monitor_snapshot_cache_tests {
                 ),
             ],
         );
+        let mut queue = queue_entries(&[10, 30, 99]);
+        queue[1].queued_by = "auto-refill".to_string();
+        cache.replace_queue(&project_root, &queue);
         let snapshot = cache.get(&project_root).expect("monitor snapshot");
         let mut filtered_entries = vec![
             knowledge_entry(30),
@@ -596,9 +673,15 @@ mod monitor_snapshot_cache_tests {
                 filtered_entries[2].queue_position,
                 filtered_entries[2].exclusion_reason.as_deref(),
             ),
-            (None, None, None),
+            (None, Some(3), None),
         );
+        assert_eq!(
+            filtered_entries[0].queued_by.as_deref(),
+            Some("auto-refill")
+        );
+        assert_eq!(filtered_entries[2].queued_by.as_deref(), Some("operator"));
 
+        cache.replace_queue(&project_root, &[]);
         cache.replace(&project_root, &[]);
         let empty = cache
             .get(&project_root)
@@ -607,6 +690,7 @@ mod monitor_snapshot_cache_tests {
         assert!(filtered_entries.iter().all(|entry| {
             entry.monitor_state.is_none()
                 && entry.queue_position.is_none()
+                && entry.queued_by.is_none()
                 && entry.exclusion_reason.is_none()
         }));
     }
@@ -638,6 +722,7 @@ mod monitor_snapshot_cache_tests {
             .map(|(index, state)| inbox_item(index as u64 + 1, *state, None))
             .collect::<Vec<_>>();
         cache.replace(&first_root, &items);
+        cache.replace_queue(&first_root, &queue_entries(&[1]));
         cache.replace(
             &second_root,
             &[inbox_item(1, gwt::MonitorInboxState::Released, None)],
@@ -658,11 +743,11 @@ mod monitor_snapshot_cache_tests {
             .iter()
             .all(|entry| entry.queue_position.is_none()));
         assert_eq!(
-            first.get(&1).map(|projection| projection.state),
+            first.get(&1).and_then(|projection| projection.state),
             Some(gwt::MonitorInboxState::Queued),
         );
         assert_eq!(
-            second.get(&1).map(|projection| projection.state),
+            second.get(&1).and_then(|projection| projection.state),
             Some(gwt::MonitorInboxState::Released),
         );
     }
@@ -895,12 +980,14 @@ fn apply_knowledge_monitor_projection(
     for entry in entries {
         entry.monitor_state = None;
         entry.queue_position = None;
+        entry.queued_by = None;
         entry.exclusion_reason = None;
         let Some(projection) = snapshot.and_then(|snapshot| snapshot.get(&entry.number)) else {
             continue;
         };
-        entry.monitor_state = Some(projection.state);
+        entry.monitor_state = projection.state;
         entry.queue_position = projection.queue_position;
+        entry.queued_by.clone_from(&projection.queued_by);
         entry
             .exclusion_reason
             .clone_from(&projection.exclusion_reason);
@@ -1430,6 +1517,17 @@ fn parse_related_time_millis(value: &str) -> i64 {
 }
 
 impl AppRuntime {
+    pub(crate) fn replace_knowledge_terminal_queue(
+        &self,
+        project_root: &Path,
+        queue: &[gwt::issue_monitor::IssueMonitorTerminalQueueEntry],
+    ) {
+        self.knowledge_monitor_snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .replace_queue(project_root, queue);
+    }
+
     pub(crate) fn replace_knowledge_monitor_snapshot(
         &self,
         project_root: &Path,

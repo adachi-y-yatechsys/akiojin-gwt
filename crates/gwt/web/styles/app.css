@@ -7165,3 +7165,30 @@ body.route-body {
 .knowledge-monitor-pool-message:empty {
   display: none;
 }
+
+/* #4499: queue-first Issue board; status and controls remain separate. */
+.knowledge-monitor-status,
+.knowledge-monitor-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+.knowledge-monitor-controls { flex: 1; }
+.knowledge-monitor-status { padding-right: var(--space-3); border-right: 1px solid var(--color-border); }
+.knowledge-monitor-refill-limit { display: flex; align-items: center; gap: var(--space-1); font-size: var(--type-xs); }
+.knowledge-monitor-refill-limit input { width: 4em; }
+.issue-queue-board { display: grid; grid-template-columns: repeat(4, minmax(220px, 1fr)); gap: var(--space-2); align-items: start; }
+.issue-queue-column { min-width: 0; background: var(--color-surface-elevated); border: 1px solid var(--color-border); border-radius: var(--radius-md); padding: var(--space-2); }
+.issue-queue-heading { font-size: var(--type-sm); color: var(--color-text-strong); margin: 0 0 var(--space-2); }
+.issue-queue-column .knowledge-row { margin-bottom: var(--space-2); }
+.issue-queue-select { display: flex; gap: var(--space-1); align-items: center; font-size: var(--type-xs); color: var(--color-text-muted); }
+.issue-queue-feedback { font-size: var(--type-xs); color: var(--color-text-muted); }
+.issue-queue-feedback:not(:empty) { padding: var(--space-2); }
+.issue-bridge-root .issue-list-shell { grid-template-columns: minmax(0, 1fr) minmax(240px, 28%); }
+.issue-queue-column .knowledge-row { grid-template-columns: minmax(0, 1fr); }
+.issue-queue-column .knowledge-row-actions { flex-wrap: wrap; }
+.issue-queue-column .knowledge-row-main { flex-wrap: wrap; }
+.issue-bridge-root .workspace-toolbar-main { grid-template-columns: minmax(100px, 320px) max-content; }
+.issue-bridge-root .knowledge-heading { grid-column: 1 / -1; }
+.issue-bridge-root .knowledge-search { width: 100%; }
