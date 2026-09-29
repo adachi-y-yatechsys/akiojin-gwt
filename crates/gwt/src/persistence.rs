@@ -104,6 +104,7 @@ pub enum WindowState {
     #[serde(alias = "exited")]
     Stopped,
     Error,
+    Interrupted,
 }
 
 pub type WindowProcessStatus = WindowState;
@@ -1945,6 +1946,8 @@ mod tests {
         let running = serde_json::from_str::<WindowState>(r#""running""#).expect("running");
         let stopped = serde_json::from_str::<WindowState>(r#""stopped""#).expect("stopped");
         let error = serde_json::from_str::<WindowState>(r#""error""#).expect("error");
+        let interrupted =
+            serde_json::from_str::<WindowState>(r#""interrupted""#).expect("interrupted");
 
         assert_eq!(waiting, WindowState::Waiting);
         assert_eq!(not_started, WindowState::Starting);
@@ -1960,6 +1963,11 @@ mod tests {
         assert_eq!(running, WindowState::Running);
         assert_eq!(stopped, WindowState::Stopped);
         assert_eq!(error, WindowState::Error);
+        assert_eq!(interrupted, WindowState::Interrupted);
+        assert_eq!(
+            serde_json::to_string(&interrupted).expect("serialize interrupted"),
+            r#""interrupted""#
+        );
 
         let legacy_starting =
             serde_json::from_str::<WindowState>(r#""starting""#).expect("legacy starting");

@@ -39,7 +39,7 @@ use std::{
 use gwt_core::daemon::{
     persist_endpoint, resolve_daemon_socket_path, validate_handshake, ClientFrame, DaemonEndpoint,
     DaemonFrame, DaemonSocketPlacement, DaemonStatus, IpcHandshakeRequest, IpcHandshakeResponse,
-    RuntimeScope, VerificationSpawnFinished, DAEMON_PROTOCOL_VERSION,
+    RuntimeScope, DAEMON_PROTOCOL_VERSION,
 };
 use gwt_github::{client::http::HttpIssueClient, client::ApiError, SpecOpsError};
 use tokio::{
@@ -172,6 +172,7 @@ pub(super) fn serve_blocking<W: std::io::Write + ?Sized>(
     let socket =
         resolve_daemon_socket_path(&endpoint_path).map_err(|err| config_error(err.to_string()))?;
     let socket_path = socket.path;
+    let authority_lease = acquire_daemon_startup_lease(&scope)?;
     if let Err(err) = ensure_socket_parent(&socket_path) {
         return Err(config_error(format!(
             "failed to prepare daemon socket directory: {err}"
@@ -193,8 +194,14 @@ pub(super) fn serve_blocking<W: std::io::Write + ?Sized>(
         env!("CARGO_PKG_VERSION").to_string(),
     );
 
-    persist_endpoint(&endpoint_path, &endpoint)
-        .map_err(|err| config_error(format!("failed to persist daemon endpoint: {err}")))?;
+    let runtime = Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .build()
+        .map_err(|err| config_error(format!("tokio runtime build failed: {err}")))?;
+    let bound = runtime.block_on(async {
+        bind_daemon(&endpoint, &socket_path, &endpoint_path, authority_lease)
+    })?;
 
     // Stream readiness lines to the caller's stdout *before* entering
     // the blocking serve loop. Buffering them in a `&mut String` left
@@ -227,19 +234,21 @@ pub(super) fn serve_blocking<W: std::io::Write + ?Sized>(
     );
     let _ = writer.flush();
 
-    let runtime = Builder::new_multi_thread()
-        .enable_all()
-        .worker_threads(2)
-        .build()
-        .map_err(|err| config_error(format!("tokio runtime build failed: {err}")))?;
-
     let hub = BroadcastHub::new();
-    let result = runtime.block_on(run_server(
-        endpoint.clone(),
-        socket_path.clone(),
-        endpoint_path.clone(),
-        hub,
-    ));
+    let shutdown = Arc::new(DaemonShutdown::new());
+    let result = runtime.block_on(async {
+        spawn_signal_watcher(Arc::clone(&shutdown));
+        run_bound_server(
+            endpoint.clone(),
+            endpoint_path.clone(),
+            hub,
+            shutdown,
+            crate::IssueMonitorConfig::default(),
+            ISSUE_MONITOR_SCAN_TIMEOUT,
+            bound,
+        )
+        .await
+    });
     // A non-cooperative spawn_blocking dependency must not keep process
     // shutdown unbounded after the worker's own absolute-deadline cleanup.
     runtime.shutdown_timeout(DAEMON_RUNTIME_SHUTDOWN_TIMEOUT);
@@ -258,6 +267,7 @@ pub(super) fn serve_blocking<W: std::io::Write + ?Sized>(
     result
 }
 
+#[cfg(test)]
 pub async fn run_server(
     endpoint: DaemonEndpoint,
     socket_path: PathBuf,
@@ -278,6 +288,7 @@ pub async fn run_server(
     .await
 }
 
+#[cfg(test)]
 async fn run_server_with_shutdown_and_worker_config(
     endpoint: DaemonEndpoint,
     socket_path: PathBuf,
@@ -287,19 +298,92 @@ async fn run_server_with_shutdown_and_worker_config(
     monitor_config: crate::IssueMonitorConfig,
     operation_timeout: Duration,
 ) -> Result<i32, SpecOpsError> {
-    let mut listener = IpcListener::bind(&socket_path).map_err(|err| {
+    let authority_lease = acquire_daemon_startup_lease(&endpoint.scope)?;
+    let bound = bind_daemon(&endpoint, &socket_path, &endpoint_path, authority_lease)?;
+    run_bound_server(
+        endpoint,
+        endpoint_path,
+        hub,
+        shutdown,
+        monitor_config,
+        operation_timeout,
+        bound,
+    )
+    .await
+}
+
+struct BoundDaemon {
+    listener: IpcListener,
+    authority_lease: crate::IssueMonitorAuthorityLease,
+}
+
+fn acquire_daemon_startup_lease(
+    scope: &RuntimeScope,
+) -> Result<crate::IssueMonitorAuthorityLease, SpecOpsError> {
+    let _deadline = gwt_core::operation_deadline::ScopedOperationDeadline::enter(
+        gwt_core::operation_deadline::now() + issue_monitor_prefs_timeout(),
+    );
+    crate::issue_monitor::acquire_issue_monitor_daemon_lease(
+        &crate::issue_monitor_prefs_path_for_repo_path(&scope.project_root),
+    )
+    .map_err(|err| {
+        config_error(format!(
+            "cannot acquire project daemon lifetime lease: {err}"
+        ))
+    })
+}
+
+fn bind_daemon(
+    endpoint: &DaemonEndpoint,
+    socket_path: &Path,
+    endpoint_path: &Path,
+    authority_lease: crate::IssueMonitorAuthorityLease,
+) -> Result<BoundDaemon, SpecOpsError> {
+    let listener = IpcListener::bind(socket_path).map_err(|err| {
         config_error(format!(
             "failed to bind daemon socket {}: {err}",
             socket_path.display()
         ))
     })?;
+    if let Err(err) = persist_endpoint(endpoint_path, endpoint) {
+        drop(listener);
+        if !bind_is_served(&socket_path.to_string_lossy()) {
+            cleanup_stale_bind(socket_path);
+        }
+        return Err(config_error(format!(
+            "failed to persist daemon endpoint: {err}"
+        )));
+    }
+    Ok(BoundDaemon {
+        listener,
+        authority_lease,
+    })
+}
 
-    let mut issue_monitor_worker = spawn_issue_monitor_worker_with_config_and_timeout(
+async fn run_bound_server(
+    endpoint: DaemonEndpoint,
+    endpoint_path: PathBuf,
+    hub: BroadcastHub,
+    shutdown: Arc<DaemonShutdown>,
+    monitor_config: crate::IssueMonitorConfig,
+    operation_timeout: Duration,
+    bound: BoundDaemon,
+) -> Result<i32, SpecOpsError> {
+    let BoundDaemon {
+        mut listener,
+        authority_lease,
+    } = bound;
+    // Keep one handle through listener and worker shutdown: a failed worker
+    // must not admit a second daemon while this server still answers IPC.
+    let authority_lease = Arc::new(authority_lease);
+    let mut issue_monitor_worker = spawn_issue_monitor_worker_with_lease(
         endpoint.scope.clone(),
         hub.clone(),
         Arc::clone(&shutdown),
         monitor_config,
         operation_timeout,
+        IssueMonitorWorkerTestHooks::default(),
+        Some(Arc::clone(&authority_lease)),
     );
 
     let endpoint = Arc::new(endpoint);
@@ -558,6 +642,7 @@ fn spawn_issue_monitor_worker_with_config_and_scan_probe(
     )
 }
 
+#[cfg(all(test, unix))]
 fn spawn_issue_monitor_worker_with_config_and_timeout(
     scope: RuntimeScope,
     hub: BroadcastHub,
@@ -575,6 +660,7 @@ fn spawn_issue_monitor_worker_with_config_and_timeout(
     )
 }
 
+#[cfg(all(test, unix))]
 fn spawn_issue_monitor_worker_with_config_timeout_and_hooks(
     scope: RuntimeScope,
     hub: BroadcastHub,
@@ -582,6 +668,26 @@ fn spawn_issue_monitor_worker_with_config_timeout_and_hooks(
     config: crate::IssueMonitorConfig,
     operation_timeout: Duration,
     test_hooks: IssueMonitorWorkerTestHooks,
+) -> tokio::task::JoinHandle<()> {
+    spawn_issue_monitor_worker_with_lease(
+        scope,
+        hub,
+        shutdown,
+        config,
+        operation_timeout,
+        test_hooks,
+        None,
+    )
+}
+
+fn spawn_issue_monitor_worker_with_lease(
+    scope: RuntimeScope,
+    hub: BroadcastHub,
+    shutdown: Arc<DaemonShutdown>,
+    config: crate::IssueMonitorConfig,
+    operation_timeout: Duration,
+    test_hooks: IssueMonitorWorkerTestHooks,
+    authority_lease: Option<Arc<crate::IssueMonitorAuthorityLease>>,
 ) -> tokio::task::JoinHandle<()> {
     // Establish the control-lane state from the durable snapshot before the
     // server can accept a publisher connection. Starting publishers wait on
@@ -597,7 +703,7 @@ fn spawn_issue_monitor_worker_with_config_timeout_and_hooks(
     let loaded = {
         let _deadline =
             gwt_core::operation_deadline::ScopedOperationDeadline::enter(startup_deadline);
-        load_issue_monitor_state_for_daemon(&prefs_path, config.clone())
+        load_issue_monitor_state_for_daemon_with_lease(&prefs_path, config.clone(), authority_lease)
     };
     tokio::spawn(async move {
         let mut loaded = loaded;
@@ -625,6 +731,9 @@ fn spawn_issue_monitor_worker_with_config_timeout_and_hooks(
             }
             let retry_prefs_path = prefs_path.clone();
             let retry_config = config.clone();
+            // A cancelled blocking-pool task must not release the pre-bind
+            // lease while this worker continues serving read-only diagnostics.
+            let retry_lease = loaded.authority_lease.clone();
             // The first claimant either starts the synchronous attempt or
             // cancels it before it can touch authority. A queued abort alone
             // is not joinable until a blocking-pool thread becomes available.
@@ -642,9 +751,10 @@ fn spawn_issue_monitor_worker_with_config_timeout_and_hooks(
                 }
                 let _deadline =
                     gwt_core::operation_deadline::ScopedOperationDeadline::enter(startup_deadline);
-                Some(load_issue_monitor_state_for_daemon(
+                Some(load_issue_monitor_state_for_daemon_with_lease(
                     &retry_prefs_path,
                     retry_config,
+                    retry_lease,
                 ))
             });
             #[cfg(all(test, unix))]
@@ -730,7 +840,8 @@ fn spawn_issue_monitor_worker_with_config_timeout_and_hooks(
             // until an operator resolves the journal explicitly. Keep the
             // read-only error projection alive for clients that connect after
             // the startup broadcast (BroadcastHub has no replay buffer).
-            let _control_lane_guard = IssueMonitorControlLaneGuard::new(hub.clone());
+            let mut _control_lane_guard = IssueMonitorControlLaneGuard::new(hub.clone());
+            _control_lane_guard._authority_lease = authority_lease;
             let mut recovery_status_tick = tokio::time::interval(Duration::from_secs(1));
             loop {
                 tokio::select! {
@@ -1292,7 +1403,7 @@ struct IssueMonitorControlLaneGuard {
     grant_lane_open: Option<Arc<AtomicBool>>,
     prefs_path: Option<PathBuf>,
     authority_fence: Option<crate::IssueMonitorAuthorityFence>,
-    _authority_lease: Option<crate::IssueMonitorAuthorityLease>,
+    _authority_lease: Option<Arc<crate::IssueMonitorAuthorityLease>>,
     authority_cleanup_armed: bool,
 }
 
@@ -1313,7 +1424,7 @@ impl IssueMonitorControlLaneGuard {
         grant_lane_open: Arc<AtomicBool>,
         prefs_path: PathBuf,
         authority_fence: crate::IssueMonitorAuthorityFence,
-        authority_lease: crate::IssueMonitorAuthorityLease,
+        authority_lease: Arc<crate::IssueMonitorAuthorityLease>,
     ) -> Self {
         Self {
             hub,
@@ -1379,28 +1490,46 @@ struct LoadedDaemonIssueMonitorState {
     recovery_blocked: bool,
     authority_retry_pending: bool,
     authority_fence: Option<crate::IssueMonitorAuthorityFence>,
-    authority_lease: Option<crate::IssueMonitorAuthorityLease>,
+    authority_lease: Option<Arc<crate::IssueMonitorAuthorityLease>>,
 }
 
+#[cfg(all(test, unix))]
 fn load_issue_monitor_state_for_daemon(
     prefs_path: &Path,
     config: crate::IssueMonitorConfig,
+) -> LoadedDaemonIssueMonitorState {
+    load_issue_monitor_state_for_daemon_with_lease(prefs_path, config, None)
+}
+
+fn load_issue_monitor_state_for_daemon_with_lease(
+    prefs_path: &Path,
+    config: crate::IssueMonitorConfig,
+    mut authority_lease: Option<Arc<crate::IssueMonitorAuthorityLease>>,
 ) -> LoadedDaemonIssueMonitorState {
     let _deadline = gwt_core::operation_deadline::ScopedOperationDeadline::enter(
         gwt_core::operation_deadline::now() + issue_monitor_prefs_timeout(),
     );
     let authority_fence = crate::IssueMonitorAuthorityFence::current_process();
-    match crate::establish_issue_monitor_authority_fence(
-        prefs_path,
-        &authority_fence,
-        crate::process::is_process_alive,
-    ) {
-        Ok((prefs, authority_lease)) => LoadedDaemonIssueMonitorState {
+    let result = (|| {
+        if authority_lease.is_none() {
+            authority_lease = Some(Arc::new(
+                crate::issue_monitor::acquire_issue_monitor_daemon_lease(prefs_path)?,
+            ));
+        }
+        crate::issue_monitor::establish_issue_monitor_authority_fence_with_lease(
+            prefs_path,
+            &authority_fence,
+            crate::process::is_process_alive,
+            authority_lease.as_ref().expect("lease acquired"),
+        )
+    })();
+    match result {
+        Ok(prefs) => LoadedDaemonIssueMonitorState {
             monitor: crate::IssueMonitorState::with_prefs(config, prefs),
             recovery_blocked: false,
             authority_retry_pending: false,
             authority_fence: Some(authority_fence),
-            authority_lease: Some(authority_lease),
+            authority_lease,
         },
         Err(error)
             if (gwt_core::operation_deadline::is_lock_contended(&error)
@@ -1423,7 +1552,7 @@ fn load_issue_monitor_state_for_daemon(
                 recovery_blocked: false,
                 authority_retry_pending: true,
                 authority_fence: None,
-                authority_lease: None,
+                authority_lease,
             }
         }
         Err(error) => {
@@ -1444,7 +1573,7 @@ fn load_issue_monitor_state_for_daemon(
                 recovery_blocked: true,
                 authority_retry_pending: false,
                 authority_fence: None,
-                authority_lease: None,
+                authority_lease,
             }
         }
     }
@@ -5017,13 +5146,8 @@ async fn handle_connection(
                         verification_reclaim = Some(child.reclaim_handle());
                         let finished_tx = out_tx.clone();
                         tokio::task::spawn_blocking(move || {
-                            let (exit_code, reclaimed_survivors) = child.wait();
-                            let _ = finished_tx.send(DaemonFrame::VerificationFinished(
-                                VerificationSpawnFinished {
-                                    exit_code,
-                                    reclaimed_survivors,
-                                },
-                            ));
+                            let _ =
+                                finished_tx.send(DaemonFrame::VerificationFinished(child.wait()));
                         });
                         if out_tx
                             .send(DaemonFrame::VerificationAccepted(accepted))
@@ -8462,6 +8586,7 @@ exit 0
                 steering: None,
                 review_dispatch_hold: None,
                 last_failure_message: None,
+                delivering_since: None,
             }],
             ..crate::IssueMonitorPrefs::default()
         };
@@ -8571,6 +8696,7 @@ exit 0
                 steering: None,
                 review_dispatch_hold: None,
                 last_failure_message: None,
+                delivering_since: None,
             }],
             ..crate::IssueMonitorPrefs::default()
         };
@@ -12618,6 +12744,7 @@ exit 0
                     steering: None,
                     review_dispatch_hold: None,
                     last_failure_message: None,
+                    delivering_since: None,
                 }],
                 ..crate::IssueMonitorPrefs::default()
             },
@@ -13108,6 +13235,7 @@ exit 1
                     steering: None,
                     review_dispatch_hold: None,
                     last_failure_message: None,
+                    delivering_since: None,
                 }],
                 ..crate::IssueMonitorPrefs::default()
             },
@@ -13974,6 +14102,89 @@ exit 1
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn project_daemon_failed_start_releases_startup_lease() {
+        let temp = TempDir::new().expect("tempdir");
+        let _home = ScopedGwtHome::set(temp.path().join("home"));
+        let project = temp.path().join("project");
+        fs::create_dir_all(&project).expect("project");
+        let scope = RuntimeScope::from_project_root(&project, RuntimeTarget::Host).expect("scope");
+        let socket = temp.path().join("occupied.sock");
+        let _listener = UnixListener::bind(&socket).expect("occupy socket");
+        let endpoint_path = temp.path().join("failed.json");
+        let result = run_server_with_shutdown_and_worker_config(
+            sample_endpoint(scope.clone(), &socket, "failed"),
+            socket,
+            endpoint_path.clone(),
+            BroadcastHub::new(),
+            Arc::new(DaemonShutdown::new()),
+            crate::IssueMonitorConfig::default(),
+            super::ISSUE_MONITOR_SCAN_TIMEOUT,
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(
+            !endpoint_path.exists(),
+            "failed bind must not publish a descriptor"
+        );
+        let replacement = super::acquire_daemon_startup_lease(&scope)
+            .expect("failed startup releases the project lease");
+        // Once bind succeeds, descriptor failure must also release ownership
+        // and remove the socket that this startup just created.
+        fs::create_dir(&endpoint_path).expect("make descriptor destination unwritable");
+        let socket = temp.path().join("unpublished.sock");
+        assert!(super::bind_daemon(
+            &sample_endpoint(scope.clone(), &socket, "unpublished"),
+            &socket,
+            &endpoint_path,
+            replacement,
+        )
+        .is_err());
+        assert!(!socket.exists());
+        let _replacement = super::acquire_daemon_startup_lease(&scope)
+            .expect("failed descriptor publication releases the project lease");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn project_daemon_start_refuses_overlap_before_binding() {
+        let temp = TempDir::new().expect("tempdir");
+        let _home = ScopedGwtHome::set(temp.path().join("home"));
+        let project = temp.path().join("project");
+        fs::create_dir_all(&project).expect("project");
+        let scope = RuntimeScope::from_project_root(&project, RuntimeTarget::Host).expect("scope");
+        let prefs_path = crate::issue_monitor_prefs_path_for_repo_path(&project);
+        let (_, owner) = crate::establish_issue_monitor_authority_fence(
+            &prefs_path,
+            &crate::IssueMonitorAuthorityFence::current_process(),
+            |_| true,
+        )
+        .expect("first owner");
+        let socket = temp.path().join("overlap.sock");
+        let endpoint_path = temp.path().join("overlap.json");
+        let endpoint = sample_endpoint(scope, &socket, "overlap");
+        let shutdown = Arc::new(DaemonShutdown::new());
+        shutdown.request();
+        let result = run_server_with_shutdown_and_worker_config(
+            endpoint,
+            socket.clone(),
+            endpoint_path.clone(),
+            BroadcastHub::new(),
+            shutdown,
+            crate::IssueMonitorConfig::default(),
+            super::ISSUE_MONITOR_SCAN_TIMEOUT,
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "a second daemon must not enter its serving loop"
+        );
+        assert!(!socket.exists(), "a rejected owner must not bind");
+        assert!(!endpoint_path.exists(), "a rejected owner must not publish");
+        drop(owner);
+    }
+
+    #[tokio::test]
     #[allow(clippy::await_holding_lock)] // global GWT home must stay isolated for the worker lifetime
     async fn recovery_blocked_worker_never_publishes_or_drains_launch_delivery() {
         let _env_lock = crate::env_test_lock()
@@ -14134,6 +14345,10 @@ exit 1
 
         assert!(loaded.recovery_blocked);
         assert_eq!(fs::read(&marker).expect("reload fence"), malformed);
+        assert!(
+            loaded.authority_lease.is_some(),
+            "read-only diagnostics must retain the project daemon's lifetime lease"
+        );
         assert_eq!(
             crate::load_issue_monitor_prefs(&prefs_path)
                 .expect("reload prefs")
@@ -15737,6 +15952,7 @@ exit 1
                 steering: None,
                 review_dispatch_hold: None,
                 last_failure_message: None,
+                delivering_since: None,
             }],
             ..crate::IssueMonitorPrefs::default()
         };
@@ -15803,6 +16019,7 @@ exit 1
                 steering: None,
                 review_dispatch_hold: None,
                 last_failure_message: None,
+                delivering_since: None,
             }],
             ..crate::IssueMonitorPrefs::default()
         };
@@ -15922,6 +16139,7 @@ exit 1
                     steering: None,
                     review_dispatch_hold: None,
                     last_failure_message: None,
+                    delivering_since: None,
                 },
                 crate::AutonomousIssueRecord {
                     issue_number: 8,
@@ -15941,6 +16159,7 @@ exit 1
                     steering: None,
                     review_dispatch_hold: None,
                     last_failure_message: None,
+                    delivering_since: None,
                 },
             ],
             ..crate::IssueMonitorPrefs::default()
@@ -16010,6 +16229,7 @@ exit 1
                 steering: None,
                 review_dispatch_hold: None,
                 last_failure_message: None,
+                delivering_since: None,
             }],
             ..crate::IssueMonitorPrefs::default()
         };
@@ -16717,6 +16937,7 @@ exit 1
                 steering: None,
                 review_dispatch_hold: None,
                 last_failure_message: None,
+                delivering_since: None,
             }],
             ..crate::IssueMonitorPrefs::default()
         };
@@ -16769,9 +16990,12 @@ exit 1
         ));
 
         assert!(monitor.pending_effects().is_empty());
+        // Issue #3944 AC-3 / #4726: the moved HEAD requeued the Issue for a
+        // re-review. The compensating disarm succeeding while the mode is ON
+        // must not then park it as if the kill switch had fired.
         assert_eq!(
             monitor.autonomous_record(42).map(|record| record.phase),
-            Some(crate::AutonomousPhase::NeedsHuman)
+            Some(crate::AutonomousPhase::Idle)
         );
     }
 
@@ -16858,6 +17082,7 @@ exit 1
                 steering: None,
                 review_dispatch_hold: None,
                 last_failure_message: None,
+                delivering_since: None,
             }],
             ..crate::IssueMonitorPrefs::default()
         };
@@ -16994,6 +17219,7 @@ exit 1
                 steering: None,
                 review_dispatch_hold: None,
                 last_failure_message: None,
+                delivering_since: None,
             }],
             ..crate::IssueMonitorPrefs::default()
         };
@@ -17349,6 +17575,7 @@ exit 1
             steering: None,
             review_dispatch_hold: None,
             last_failure_message: None,
+            delivering_since: None,
         };
         let disk_same_key = record(42, crate::AutonomousPhase::Implementing, 1);
         let local_same_key = record(42, crate::AutonomousPhase::Reviewing, 2);
@@ -17585,6 +17812,7 @@ exit 1
                     steering: None,
                     review_dispatch_hold: None,
                     last_failure_message: None,
+                    delivering_since: None,
                 }],
                 ..crate::IssueMonitorPrefs::default()
             },
@@ -18602,6 +18830,7 @@ exit 1
                     steering: None,
                     review_dispatch_hold: None,
                     last_failure_message: None,
+                    delivering_since: None,
                 }],
                 ..crate::IssueMonitorPrefs::default()
             },
@@ -18893,6 +19122,7 @@ exit 1
             steering: None,
             review_dispatch_hold: None,
             last_failure_message: None,
+            delivering_since: None,
         };
         crate::save_issue_monitor_prefs(
             &prefs_path,

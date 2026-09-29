@@ -704,14 +704,13 @@ pub(super) fn ensure_codex_recommended_config_at_path(
                 %error,
                 "Codex managed config write failed at startup; continuing"
             );
-            gwt_core::error_ledger::record_fail_open(
+            gwt::error_report::report_host_error(
                 gwt_core::error_ledger::ErrorKind::OperationRefusal,
                 format!(
                     "Codex managed config write refused: could not set {} in {}: {error}",
                     gwt_skills::CODEX_CONTEXT_MANAGEMENT_EXPERIMENTAL_MODE_KEY,
                     config_path.display()
                 ),
-                gwt_core::error_ledger::ErrorTarget::default(),
             );
         }
     }
@@ -1130,16 +1129,16 @@ impl AppRuntime {
             project_root,
             &session.id,
             &session.worktree_path,
-        ) && gwt_core::process::hidden_command("git")
-            .args([
+        ) && gwt_core::process::run_git_logged(
+            &[
                 "merge-base",
                 "--is-ancestor",
                 "HEAD",
                 "refs/remotes/origin/develop",
-            ])
-            .current_dir(&session.worktree_path)
-            .output()
-            .is_ok_and(|output| output.status.success())
+            ],
+            Some(&session.worktree_path),
+        )
+        .is_ok_and(|output| output.status.success())
         {
             if self.restore_placeholder_is_known_empty(session, window_id) {
                 return Err(RestoreRefusal::EmptyLandedWorktree);

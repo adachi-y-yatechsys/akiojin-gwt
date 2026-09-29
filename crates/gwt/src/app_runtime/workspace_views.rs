@@ -110,6 +110,7 @@ struct ActiveWorkProjectionPrepareInput {
     sessions: Vec<ActiveAgentSession>,
     window_pty_statuses: HashMap<String, WindowProcessStatus>,
     sessions_dir: PathBuf,
+    issue_link_cache_dir: PathBuf,
     session_ledger_cache: Arc<Mutex<crate::session_ledger_cache::SessionLedgerCache>>,
     work_items_cache: Arc<Mutex<gwt_core::workspace_projection::WorkItemsCache>>,
     work_known_branch_refs: Option<HashSet<String>>,
@@ -363,6 +364,7 @@ fn active_work_projection_from_live_sessions(
             .then_with(|| left.session_id.cmp(&right.session_id))
     });
     let active_works = vec![gwt::ActiveWorkItemView {
+        linked_issue_numbers: Vec::new(),
         id: tab_id.to_string(),
         title: format!("{tab_title} Work"),
         status_category: "active".to_string(),
@@ -942,6 +944,90 @@ pub(super) fn apply_work_summary_external_sources(
     }
 }
 
+/// Resolve associations from authoritative records before the UI filters Issue rows.
+/// Registry sessions remain uncapped here; the visible Agent summary is bounded.
+pub(super) fn attach_active_work_issue_numbers(
+    active_works: &mut [gwt::ActiveWorkItemView],
+    items: &[gwt_core::workspace_projection::WorkItem],
+    sessions: &[gwt_agent::Session],
+    project_repo_hash: Option<gwt_core::repo_hash::RepoHash>,
+    issue_by_branch: &HashMap<String, u64>,
+) {
+    use super::knowledge::{
+        issue_number_for_branch, issue_number_for_session, issue_number_for_work_item,
+    };
+    let session_index = work_session_index(sessions);
+    let item_index: HashMap<_, _> = items.iter().map(|item| (item.id.as_str(), item)).collect();
+    let registry = crate::workspace_session_registry::branch_session_registry(
+        sessions,
+        project_repo_hash.as_ref().map(|hash| hash.as_str()),
+    );
+    for work in active_works {
+        let mut numbers = Vec::new();
+        numbers.extend(workspace_resume_owner_issue_number(work.owner.as_deref()));
+        numbers.extend(issue_number_for_branch(
+            work.branch.as_deref(),
+            issue_by_branch,
+        ));
+        for child in &work.works {
+            numbers.extend(workspace_resume_owner_issue_number(child.owner.as_deref()));
+        }
+        for id in std::iter::once(work.id.as_str())
+            .chain(work.works.iter().map(|child| child.id.as_str()))
+        {
+            if let Some(item) = item_index.get(id) {
+                numbers.extend(issue_number_for_work_item(
+                    item,
+                    &session_index,
+                    issue_by_branch,
+                ));
+                for container in &item.execution_containers {
+                    numbers.extend(issue_number_for_branch(
+                        container.branch.as_deref(),
+                        issue_by_branch,
+                    ));
+                }
+                for agent in &item.agents {
+                    numbers.extend(
+                        session_index
+                            .get(agent.session_id.as_str())
+                            .and_then(|session| issue_number_for_session(session, issue_by_branch)),
+                    );
+                }
+            }
+        }
+        for agent in work
+            .agents
+            .iter()
+            .chain(work.works.iter().flat_map(|child| child.agents.iter()))
+        {
+            numbers.extend(issue_number_for_branch(
+                agent.branch.as_deref(),
+                issue_by_branch,
+            ));
+            numbers.extend(
+                session_index
+                    .get(agent.session_id.as_str())
+                    .and_then(|session| issue_number_for_session(session, issue_by_branch)),
+            );
+        }
+        if let Some(group) = work
+            .branch
+            .as_deref()
+            .and_then(|branch| registry.get(&normalize_branch_name(branch)))
+        {
+            numbers.extend(
+                group
+                    .iter()
+                    .filter_map(|session| issue_number_for_session(session, issue_by_branch)),
+            );
+        }
+        numbers.sort_unstable();
+        numbers.dedup();
+        work.linked_issue_numbers = numbers;
+    }
+}
+
 fn active_work_items_from_projection(
     projection: &gwt_core::workspace_projection::WorkspaceProjection,
     agents: &[gwt::ActiveWorkAgentView],
@@ -1070,6 +1156,9 @@ fn active_work_items_from_projection(
                 branch_value.as_deref(),
             );
             gwt::ActiveWorkItemView {
+                linked_issue_numbers: workspace_resume_owner_issue_number(owner_value.as_deref())
+                    .into_iter()
+                    .collect(),
                 id: work_id.clone(),
                 // SPEC-3075 FR-002/FR-004: the Work title is its *identity*
                 // (purpose). `current_focus` is the agent's live "what now"
@@ -1226,6 +1315,9 @@ fn append_paused_work_items(
             branch.as_deref(),
         );
         active_works.push(gwt::ActiveWorkItemView {
+            linked_issue_numbers: workspace_resume_owner_issue_number(work.owner.as_deref())
+                .into_iter()
+                .collect(),
             id: work.id.clone(),
             title,
             // Paused Work has no running agent; surface an idle runtime status.
@@ -2379,6 +2471,10 @@ fn assign_and_merge_workspace_groups_impl(
         match index_by_key.get(&key) {
             Some(&slot) => {
                 let target = &mut merged[slot];
+                let mut linked_issue_numbers = target.linked_issue_numbers.clone();
+                linked_issue_numbers.extend(&work.linked_issue_numbers);
+                linked_issue_numbers.sort_unstable();
+                linked_issue_numbers.dedup();
                 let newer = work.updated_at > target.updated_at;
                 let mut agents = std::mem::take(&mut target.agents);
                 agents.extend(work.agents.iter().cloned());
@@ -2425,6 +2521,7 @@ fn assign_and_merge_workspace_groups_impl(
                         }
                     }
                 }
+                target.linked_issue_numbers = linked_issue_numbers;
                 target.agents = agents;
                 target.works = child_works;
                 target.active_agents = active_agents;
@@ -2877,7 +2974,12 @@ fn prepare_active_work_projection(
     });
     let projection_started = Instant::now();
 
-    let view = if let Some(mut projection) = loaded_projection {
+    let agent_sessions = input
+        .session_ledger_cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .load(&input.sessions_dir);
+    let mut view = if let Some(mut projection) = loaded_projection {
         let had_saved_agents = !projection.agents.is_empty();
         let cleanup_candidate = workspace_cleanup_candidate_for_projection(&projection, &sessions);
         merge_active_sessions_into_projection(
@@ -2908,11 +3010,6 @@ fn prepare_active_work_projection(
             .iter()
             .map(workspace_journal_entry_view_from_entry)
             .collect::<Vec<_>>();
-        let agent_sessions = input
-            .session_ledger_cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .load(&input.sessions_dir);
         let session_index = work_session_index(&agent_sessions);
         let resume_branches = ResumeBranchIndex::scanned(input.work_known_branch_refs.as_ref());
         let workspaces = work_items
@@ -3001,6 +3098,16 @@ fn prepare_active_work_projection(
         }
         view.unwrap_or_else(|| empty_active_work_projection_view(&input.tab_id, &input.tab))
     };
+    attach_active_work_issue_numbers(
+        &mut view.active_works,
+        &work_items.work_items,
+        &agent_sessions,
+        gwt_core::repo_hash::detect_repo_hash(&input.project_root),
+        &super::knowledge::load_issue_branch_links(
+            &input.project_root,
+            &input.issue_link_cache_dir,
+        ),
+    );
     let projection_ms = projection_started.elapsed().as_millis() as u64;
     let clone_started = Instant::now();
     let event = BackendEvent::ActiveWorkProjection {
@@ -3121,6 +3228,7 @@ fn bounded_active_workspace_work_snapshot(
 
 fn bounded_active_work_item_snapshot(cached: &gwt::ActiveWorkItemView) -> gwt::ActiveWorkItemView {
     gwt::ActiveWorkItemView {
+        linked_issue_numbers: cached.linked_issue_numbers.clone(),
         id: cached.id.clone(),
         title: cached.title.clone(),
         status_category: cached.status_category.clone(),
@@ -3395,6 +3503,11 @@ fn merge_fresh_cached_root(
     previous_child_by_session: &HashMap<String, String>,
     cached_child_ids: &HashSet<String>,
 ) {
+    target
+        .linked_issue_numbers
+        .extend(&fresh.linked_issue_numbers);
+    target.linked_issue_numbers.sort_unstable();
+    target.linked_issue_numbers.dedup();
     let retained_summary = target.summary.take();
     let retained_progress_summary = target.progress_summary.take();
     let retained_work_summary = target.work_summary.take();
@@ -3728,6 +3841,7 @@ impl AppRuntime {
                 .collect(),
             window_pty_statuses: self.window_pty_statuses.clone(),
             sessions_dir: self.sessions_dir.clone(),
+            issue_link_cache_dir: self.issue_link_cache_dir.clone(),
             session_ledger_cache: self.active_work_session_ledger_cache.clone(),
             work_items_cache: self
                 .project_state_for_tab(&tab.id)
@@ -4486,6 +4600,7 @@ impl AppRuntime {
                 .map(|(window_id, _)| window_id.clone())
                 .collect(),
             sessions_dir: self.sessions_dir.clone(),
+            issue_link_cache_dir: self.issue_link_cache_dir.clone(),
             known_branch_refs: self.work_known_branch_refs.get(&tab.project_root).cloned(),
             merged_branches: self
                 .project_state_for_tab(tab_id)
@@ -4541,6 +4656,7 @@ pub(crate) struct ActiveWorkProjectionJob {
     /// (SPEC-2359 US-80) that used to read `window_pty_statuses` directly.
     running_windows: HashSet<String>,
     sessions_dir: PathBuf,
+    issue_link_cache_dir: PathBuf,
     known_branch_refs: Option<HashSet<String>>,
     merged_branches: Option<HashMap<String, chrono::DateTime<chrono::Utc>>>,
     cleanup_ready_branches: Option<HashMap<String, String>>,
@@ -4738,6 +4854,19 @@ fn build_active_work_projection(
             &sessions,
             live_process_branches,
         );
+        attach_active_work_issue_numbers(
+            &mut view.active_works,
+            work_items
+                .as_ref()
+                .map(|(items, _)| items.work_items.as_slice())
+                .unwrap_or(&[]),
+            &agent_sessions,
+            gwt_core::repo_hash::detect_repo_hash(&job.project_root),
+            &super::knowledge::load_issue_branch_links(
+                &job.project_root,
+                &job.issue_link_cache_dir,
+            ),
+        );
         return Some(view);
     }
 
@@ -4755,6 +4884,17 @@ fn build_active_work_projection(
         ),
     );
     if let Some(view) = view.as_mut() {
+        let agent_sessions = lock_recover(&job.session_ledger_cache).load(&job.sessions_dir);
+        attach_active_work_issue_numbers(
+            &mut view.active_works,
+            &[],
+            &agent_sessions,
+            gwt_core::repo_hash::detect_repo_hash(&job.project_root),
+            &super::knowledge::load_issue_branch_links(
+                &job.project_root,
+                &job.issue_link_cache_dir,
+            ),
+        );
         attach_managed_hook_health_to_active_works(
             &mut view.active_works,
             &job.sessions_dir,
@@ -4934,7 +5074,12 @@ mod bounded_cache_merge_tests {
             events: Vec::new(),
         });
 
+        cached.active_works[0].linked_issue_numbers = vec![3885, 4556];
         let outbound = bounded_active_work_projection_snapshot(&cached);
+        assert_eq!(
+            outbound.active_works[0].linked_issue_numbers,
+            vec![3885, 4556]
+        );
 
         assert!(outbound.works.is_empty());
         assert!(outbound.journal_entries.is_empty());
@@ -4999,7 +5144,12 @@ mod bounded_cache_merge_tests {
             events: Vec::new(),
         });
 
+        cached.active_works[0].linked_issue_numbers = vec![3885, 4556];
         let outbound = bounded_active_work_projection_snapshot(&cached);
+        assert_eq!(
+            outbound.active_works[0].linked_issue_numbers,
+            vec![3885, 4556]
+        );
 
         assert!(outbound.works.is_empty());
         assert!(outbound.journal_entries.is_empty());
@@ -5038,6 +5188,7 @@ mod bounded_cache_merge_tests {
             .iter_mut()
             .find(|work| work.branch.as_deref() == Some("work/existing"))
             .expect("existing grouped Work");
+        existing.linked_issue_numbers = vec![4556];
         existing.work_summary = Some("cached enrichment".to_string());
         existing.merged_into_base = true;
         let mut historical_agent = existing.agents[0].clone();
@@ -5102,6 +5253,7 @@ mod bounded_cache_merge_tests {
             .iter()
             .find(|work| work.branch.as_deref() == Some("work/existing"))
             .expect("existing root group remains");
+        assert_eq!(existing.linked_issue_numbers, vec![4556]);
         assert_eq!(existing.work_summary.as_deref(), Some("cached enrichment"));
         assert!(existing.merged_into_base);
         assert!(cached

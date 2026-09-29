@@ -54,6 +54,7 @@ pub fn status_for_event(event: &str) -> Option<&'static str> {
         crate::persistence::WindowState::Waiting => Some("Waiting"),
         crate::persistence::WindowState::Stopped => Some("Stopped"),
         crate::persistence::WindowState::Error => Some("Error"),
+        crate::persistence::WindowState::Interrupted => Some("Interrupted"),
     }
 }
 

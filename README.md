@@ -353,9 +353,14 @@ Linux, `Ctrl+Shift+C` also copies the current terminal selection.
 
 Open `Issue` from Add Window to browse cached GitHub Issues and manage the Issue
 Monitor in one surface. Each row shows its execution state, queue position, and
-any exclusion reason; the toolbar controls queue concurrency, monitor state,
-Autonomous mode, and Quick issue registration. The legacy `issue_monitor`
-preset also opens this canonical Issue surface.
+any exclusion reason. The toolbar has two bands: the Issue band (search,
+filters, `＋ New` to register an Issue from a popover, and `↻` whose tooltip
+shows the cached count and refresh time) and the Monitor band (state pill,
+Active / Queue, Autonomous, Max, Start monitor / Stop, and `⚙` whose tooltip
+shows the Agent settings). Monitor errors turn the pill into `⚠ Error` and are
+read in the notification center. The detail pane leads with the Issue's
+acceptance-criteria progress and one state-specific action band. The legacy
+`issue_monitor` preset also opens this canonical Issue surface.
 
 The monitor watches the project's open GitHub Issues and turns them into agent
 work. In the default (human-gated) mode it scans candidates into the Issue
@@ -585,6 +590,12 @@ experimental_mode = false
 gwt respects any explicit value (`true` or `false`) and does not change it. A
 config that cannot be parsed or written never blocks startup; the path and
 cause are recorded in the error ledger (`errors.list`).
+
+`errors.list` returns project-scoped errors by default. Set `project_root` to
+filter by project. Use `scope: "host"` for machine-wide errors such as startup
+configuration failures, `scope: "unknown"` for unattributed records, or
+`scope: "all"` to inspect every scope. A `project_root` filter always excludes
+host and unknown records; gwt never guesses their project.
 
 Codex CLIs before 0.153.0 cannot load a table under `[features]`: a single
 `[features.context_management]` table makes the whole config unreadable

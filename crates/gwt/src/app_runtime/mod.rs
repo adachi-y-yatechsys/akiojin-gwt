@@ -269,6 +269,7 @@ use frontend_action_log::log_frontend_user_action;
 use knowledge::knowledge_error_event;
 #[cfg(test)]
 use knowledge::KnowledgeRefreshTask;
+pub(crate) use knowledge::{issue_number_for_branch, load_issue_branch_links};
 pub use knowledge::{KnowledgeLoadRequest, KnowledgeSearchRequest, ProjectIndexSearchRequest};
 #[cfg(test)]
 pub(crate) use launch::AgentLaunchCompletion;
@@ -442,48 +443,14 @@ pub(crate) struct PendingStartupAutoResumeSession {
     pub(crate) workspace_resume_context: Option<WorkspaceResumeContext>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ClientScope {
-    Hub,
-    Project(gwt_core::repo_hash::ProjectKey),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DispatchTarget {
-    All,
-    // Explicit Hub recipients are part of the routing contract; producers migrate separately.
-    #[allow(dead_code)]
-    Hub,
-    Project(gwt_core::repo_hash::ProjectKey),
-    Client(ClientId),
-}
-
-#[derive(Debug, Clone)]
-pub(crate) enum KnowledgeWireMetadata {
-    SemanticRetry(gwt::KnowledgeSemanticRetry),
-    NonSemanticError,
-}
+#[cfg(test)]
+pub use gwt::project_transport::KnowledgeWireMetadata;
+pub use gwt::project_transport::{ClientScope, DispatchTarget, OutboundEvent};
 
 #[derive(Debug, Clone)]
 pub(crate) struct RecoveryCenterAction {
     pub(crate) generation: u64,
     pub(crate) board_entry_id: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct OutboundEvent {
-    pub(crate) target: DispatchTarget,
-    pub(crate) event: BackendEvent,
-    /// SPEC #1939 FR-407 / SPEC #3170 FR-098: private wire-only metadata for
-    /// semantic retry directives and explicitly non-semantic search errors.
-    /// Keeping it outside the public `BackendEvent` preserves the baseline
-    /// Rust construction/destructuring shape.
-    pub(crate) knowledge_wire_metadata: Option<KnowledgeWireMetadata>,
-    /// Issue #4095: pane stream position for `terminal_output` (the chunk's
-    /// own position) and `terminal_snapshot` (the position the snapshot was
-    /// serialized at). Never serialized; the client queue uses it to skip
-    /// streamed chunks that a queued snapshot already contains.
-    pub(crate) terminal_stream_seq: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -534,141 +501,6 @@ fn run_agent_dispatch_test_hook(slot: &'static std::thread::LocalKey<AgentDispat
             hook();
         }
     });
-}
-
-impl OutboundEvent {
-    pub(crate) fn project(
-        project_key: gwt_core::repo_hash::ProjectKey,
-        event: BackendEvent,
-    ) -> Self {
-        Self {
-            target: DispatchTarget::Project(project_key),
-            event,
-            knowledge_wire_metadata: None,
-            terminal_stream_seq: None,
-        }
-    }
-
-    pub(crate) fn hub(event: BackendEvent) -> Self {
-        let mut outbound = Self::reply("", event);
-        outbound.target = DispatchTarget::Hub;
-        outbound
-    }
-
-    pub(crate) fn broadcast(event: BackendEvent) -> Self {
-        // Process diagnostics, account state, host settings, and the updater
-        // are the complete global inventory. System settings live in the
-        // user's global config; autostart describes the user's OS registration.
-        // Their request handlers still reply only to the requesting client:
-        // permission to broadcast does not turn a request reply into a broadcast.
-        // Project and Hub payloads need an owner.
-        assert!(
-            matches!(
-                &event,
-                BackendEvent::ProcessLine { .. }
-                    | BackendEvent::LogEntryAppended { .. }
-                    | BackendEvent::RuntimeHealth { .. }
-                    | BackendEvent::ProviderUsage { .. }
-                    | BackendEvent::BoardAuthStatus { .. }
-                    | BackendEvent::SystemSettings { .. }
-                    | BackendEvent::SystemSettingsUpdated { .. }
-                    | BackendEvent::SystemSettingsError { .. }
-                    | BackendEvent::AutostartStatus { .. }
-                    | BackendEvent::AutostartError { .. }
-                    | BackendEvent::UpdateState(_)
-                    | BackendEvent::UpdateProgress { .. }
-                    | BackendEvent::UpdateReady { .. }
-                    | BackendEvent::UpdateAutoApply { .. }
-                    | BackendEvent::UpdateApplyPendingPersisted { .. }
-                    | BackendEvent::UpdateApplyError { .. }
-            ),
-            "project-owned events require an explicit dispatch scope"
-        );
-        Self {
-            target: DispatchTarget::All,
-            event,
-            knowledge_wire_metadata: None,
-            terminal_stream_seq: None,
-        }
-    }
-
-    /// Host update notifications share the toast wire shape, but never carry
-    /// an Issue owner. Keep this exception separate from project broadcasts:
-    /// allowing IssueMonitorToast in broadcast would also admit project toasts.
-    /// Callers supply only host update text; the constructor fixes the owner to None.
-    pub(crate) fn global_update_notice(
-        level: impl Into<String>,
-        message: impl Into<String>,
-    ) -> Self {
-        Self {
-            target: DispatchTarget::All,
-            event: BackendEvent::IssueMonitorToast {
-                notification_transition: None,
-                level: level.into(),
-                message: message.into(),
-                issue_number: None,
-            },
-            knowledge_wire_metadata: None,
-            terminal_stream_seq: None,
-        }
-    }
-
-    pub(crate) fn reply(client_id: impl Into<ClientId>, event: BackendEvent) -> Self {
-        Self {
-            target: DispatchTarget::Client(client_id.into()),
-            event,
-            knowledge_wire_metadata: None,
-            terminal_stream_seq: None,
-        }
-    }
-
-    pub(crate) fn reply_with_knowledge_semantic_retry(
-        client_id: impl Into<ClientId>,
-        event: BackendEvent,
-        semantic_retry: Option<gwt::KnowledgeSemanticRetry>,
-    ) -> Self {
-        assert!(
-            matches!(event, BackendEvent::KnowledgeSearchResults { .. }),
-            "knowledge semantic retry metadata requires KnowledgeSearchResults"
-        );
-        Self {
-            target: DispatchTarget::Client(client_id.into()),
-            event,
-            knowledge_wire_metadata: semantic_retry.map(KnowledgeWireMetadata::SemanticRetry),
-            terminal_stream_seq: None,
-        }
-    }
-
-    pub(crate) fn reply_with_nonsemantic_knowledge_error(
-        client_id: impl Into<ClientId>,
-        event: BackendEvent,
-    ) -> Self {
-        assert!(
-            matches!(
-                event,
-                BackendEvent::KnowledgeError {
-                    request_id: Some(_),
-                    query: Some(_),
-                    ..
-                }
-            ),
-            "non-semantic knowledge error metadata requires a correlated KnowledgeError"
-        );
-        Self {
-            target: DispatchTarget::Client(client_id.into()),
-            event,
-            knowledge_wire_metadata: Some(KnowledgeWireMetadata::NonSemanticError),
-            terminal_stream_seq: None,
-        }
-    }
-
-    /// Attach the pane stream position of a `terminal_output` /
-    /// `terminal_snapshot` event (Issue #4095). Private to the process; the
-    /// client queue reads it, the wire never carries it.
-    pub(crate) fn with_terminal_stream_seq(mut self, seq: Option<u64>) -> Self {
-        self.terminal_stream_seq = seq;
-        self
-    }
 }
 
 pub fn build_frontend_sync_events(
@@ -1467,7 +1299,7 @@ pub struct AppRuntime {
     /// (`scan_now`, `daemon.subscribe`) was permanently unavailable. The
     /// supervisor is driven from the scheduled tick, which makes the restart
     /// of a crashed daemon fall out of the same idempotent call.
-    pub(crate) daemon_supervisor: gwt::daemon_supervisor::DaemonSupervisor,
+    pub(crate) daemon_supervisor: Arc<gwt::daemon_supervisor::DaemonSupervisor>,
     /// Prepared producing continuations keyed by their pending/active window.
     /// The entry remains until an authenticated SessionStart finalizes the
     /// generation + Work transaction and promotes the same bearer.
@@ -3411,7 +3243,7 @@ impl AppRuntime {
             issue_monitor_materializer_id: uuid::Uuid::new_v4().to_string(),
             issue_monitor_fallback_commit_timeout: ISSUE_MONITOR_FALLBACK_COMMIT_TIMEOUT,
             issue_monitor_provider_auth_probe: gwt::issue_monitor::provider_auth_state_from_env,
-            daemon_supervisor: gwt::daemon_supervisor::DaemonSupervisor::gwtd(),
+            daemon_supervisor: Arc::new(gwt::daemon_supervisor::DaemonSupervisor::gwtd()),
             pending_continue_work: HashMap::new(),
             pending_fresh_execution_launches: HashMap::new(),
             pending_auto_resume_sources: HashMap::new(),
@@ -5874,15 +5706,18 @@ impl AppRuntime {
                     "issue monitor close finalizer failed"
                 );
                 if let Some(context) = owner.as_ref() {
-                    events.push(OutboundEvent::project(
-                        context.project_key.clone(),
-                        BackendEvent::IssueMonitorToast {
-                            notification_transition: None,
-                            level: "error".to_string(),
-                            message: error.to_string(),
-                            issue_number: None,
-                        },
-                    ));
+                    events.push(
+                        OutboundEvent::project(
+                            context.project_key.clone(),
+                            BackendEvent::IssueMonitorToast {
+                                notification_transition: None,
+                                level: "error".to_string(),
+                                message: error.to_string(),
+                                issue_number: None,
+                            },
+                        )
+                        .with_error_project_root(&context.project_root),
+                    );
                 }
             }
         }
@@ -6060,6 +5895,68 @@ impl AppRuntime {
                 None,
             ),
         }
+    }
+
+    fn issue_monitor_profiles_set_events(
+        &mut self,
+        context: &ProjectContext,
+        client_id: &str,
+        patches: Vec<gwt::IssueMonitorLaunchProfilePatch>,
+        usage_threshold_percent: Option<u8>,
+    ) -> Vec<OutboundEvent> {
+        let resolve = |prefs: &gwt::IssueMonitorPrefs| {
+            let pool = prefs.launch_profile_pool();
+            let (profiles, _) = gwt::merge_issue_monitor_profiles_set(
+                &pool,
+                prefs.launch_profile.as_ref().or(pool.first()),
+                &patches,
+            );
+            gwt::validate_monitor_profiles_set(&profiles, usage_threshold_percent)
+                .map_err(|error| error.to_string())?;
+            Ok::<_, String>(profiles)
+        };
+        let prefs_path = gwt::issue_monitor_prefs_path_for_repo_path(&context.project_root);
+        let profiles = match gwt::load_issue_monitor_prefs(&prefs_path)
+            .map_err(|error| error.to_string())
+            .and_then(|prefs| resolve(&prefs))
+        {
+            Ok(profiles) => profiles,
+            Err(error) => {
+                return self.issue_monitor_control_error_events(
+                    Some(&context.project_root),
+                    Some(client_id),
+                    gwt::runtime_daemon_events::IssueMonitorControlPublishError::Rejected(error),
+                    "profiles-set",
+                    None,
+                );
+            }
+        };
+        let publication = self.publish_project_issue_monitor_control(
+            context,
+            serde_json::json!({ "profiles_set": {
+                "profiles": profiles,
+                "usage_threshold_percent": usage_threshold_percent,
+            }}),
+        );
+        self.issue_monitor_authorizing_control_result_events(
+            context,
+            client_id,
+            publication,
+            "profiles-set",
+            |monitor| {
+                // Re-resolve omitted fields against the locked current prefs;
+                // a concurrent settings save must not be replaced by our read.
+                let profiles = resolve(&monitor.prefs())?;
+                monitor
+                    .advance_effect_authority_epoch()
+                    .ok_or_else(|| "authority epoch exhausted".to_string())?;
+                monitor.set_launch_profile_pool(profiles);
+                if let Some(percent) = usage_threshold_percent {
+                    monitor.set_launch_usage_threshold_percent(percent);
+                }
+                Ok(())
+            },
+        )
     }
 
     fn issue_monitor_authorizing_control_result_events(
@@ -6257,7 +6154,13 @@ impl AppRuntime {
             issue_number,
         };
         match client_id {
-            Some(client_id) => Some(OutboundEvent::reply(client_id, toast)),
+            Some(client_id) => {
+                let mut outbound = OutboundEvent::reply(client_id, toast);
+                if let Some(root) = project_root {
+                    outbound = outbound.with_error_project_root(root);
+                }
+                Some(outbound)
+            }
             None => self.issue_monitor_project_notification(project_root, toast),
         }
         .into_iter()
@@ -6277,7 +6180,10 @@ impl AppRuntime {
             );
             return None;
         };
-        Some(OutboundEvent::project(context.project_key, event))
+        Some(
+            OutboundEvent::project(context.project_key, event)
+                .with_error_project_root(&context.project_root),
+        )
     }
 
     fn quick_register_issue_events(
@@ -6286,6 +6192,7 @@ impl AppRuntime {
         client_id: &str,
         title: String,
         launch: bool,
+        auto_merge: bool,
     ) -> Vec<OutboundEvent> {
         let title = title.trim().to_string();
         if title.is_empty() {
@@ -6297,7 +6204,8 @@ impl AppRuntime {
                     message: "Issue title is required".to_string(),
                     issue_number: None,
                 },
-            )];
+            )
+            .with_error_project_root(&context.project_root)];
         }
 
         let project_root = context.project_root.clone();
@@ -6313,7 +6221,8 @@ impl AppRuntime {
                             message: format!("GitHub origin remote is unavailable: {error}"),
                             issue_number: None,
                         },
-                    )];
+                    )
+                    .with_error_project_root(&context.project_root)];
                 }
             };
 
@@ -6328,11 +6237,16 @@ impl AppRuntime {
                         message: issue_registration_failure_message(&error),
                         issue_number: None,
                     },
-                )];
+                )
+                .with_error_project_root(&context.project_root)];
             }
         };
 
-        let labels: Vec<String> = Vec::new();
+        let labels: Vec<String> = if auto_merge {
+            vec!["auto-merge".to_string()]
+        } else {
+            Vec::new()
+        };
         let body = quick_issue_body(&title);
         let snapshot = match client.create_issue(&title, &body, &labels) {
             Ok(snapshot) => snapshot,
@@ -6345,7 +6259,8 @@ impl AppRuntime {
                         message: issue_registration_failure_message(&error),
                         issue_number: None,
                     },
-                )];
+                )
+                .with_error_project_root(&context.project_root)];
             }
         };
 
@@ -6354,18 +6269,21 @@ impl AppRuntime {
         let mut events = Vec::new();
         match gwt_github::Cache::new(cache_root.clone()).write_snapshot(&snapshot) {
             Ok(()) => {}
-            Err(error) => events.push(OutboundEvent::reply(
-                client_id,
-                BackendEvent::IssueMonitorToast {
-                    notification_transition: None,
-                    level: "error".to_string(),
-                    message: format!(
-                        "Issue #{} registered, but local cache update failed: {error}",
-                        snapshot.number.0
-                    ),
-                    issue_number: Some(snapshot.number.0),
-                },
-            )),
+            Err(error) => events.push(
+                OutboundEvent::reply(
+                    client_id,
+                    BackendEvent::IssueMonitorToast {
+                        notification_transition: None,
+                        level: "error".to_string(),
+                        message: format!(
+                            "Issue #{} registered, but local cache update failed: {error}",
+                            snapshot.number.0
+                        ),
+                        issue_number: Some(snapshot.number.0),
+                    },
+                )
+                .with_error_project_root(&context.project_root),
+            ),
         }
 
         events.push(OutboundEvent::reply(
@@ -6885,7 +6803,19 @@ impl AppRuntime {
     /// control lane instead of stopping the monitor. AC-5's staleness
     /// projection is what makes the degraded state visible to a reader.
     pub(crate) fn ensure_runtime_daemon_for(&self, project_root: &Path) {
-        match self.daemon_supervisor.ensure_running(project_root) {
+        let reservation = match self.daemon_supervisor.reserve_ensure(project_root) {
+            Ok(Some(reservation)) => reservation,
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(%error, project_root = %project_root.display(), "could not reserve daemon supervision");
+                return;
+            }
+        };
+        let supervisor = Arc::clone(&self.daemon_supervisor);
+        let project_root = project_root.to_path_buf();
+        if let Err(error) = self.blocking_tasks.try_spawn(move || {
+            let _reservation = reservation;
+            match supervisor.ensure_running(&project_root) {
             Ok(gwt::daemon_supervisor::DaemonEnsureOutcome::Spawned { pid }) => {
                 tracing::info!(
                     pid,
@@ -6899,6 +6829,9 @@ impl AppRuntime {
                 project_root = %project_root.display(),
                 "could not start the runtime daemon; the Issue Monitor stays on the local fallback"
             ),
+        }
+        }) {
+            tracing::warn!(%error, "could not enqueue daemon supervision");
         }
     }
 
@@ -9104,6 +9037,15 @@ impl AppRuntime {
                     },
                 )
             }
+            FrontendEvent::IssueMonitorProfilesSet {
+                profiles,
+                usage_threshold_percent,
+            } => self.issue_monitor_profiles_set_events(
+                context,
+                &client_id,
+                profiles,
+                usage_threshold_percent,
+            ),
             FrontendEvent::SetIssueMonitorMaxActiveAgents { max_active_agents } => {
                 let publication = self.publish_project_issue_monitor_control(
                     context,
@@ -9179,9 +9121,11 @@ impl AppRuntime {
             // Internal agent-listener command. Browser-scoped requests are
             // deliberately inert; the authenticated route below owns it.
             FrontendEvent::AgentIssueMonitorScanNow { .. } => Vec::new(),
-            FrontendEvent::QuickRegisterIssue { title, launch } => {
-                self.quick_register_issue_events(context, &client_id, title, launch)
-            }
+            FrontendEvent::QuickRegisterIssue {
+                title,
+                launch,
+                auto_merge,
+            } => self.quick_register_issue_events(context, &client_id, title, launch, auto_merge),
             FrontendEvent::IssueMonitorLaunchNow {
                 issue_number,
                 linked_issue_kind,
@@ -9836,7 +9780,10 @@ impl AppRuntime {
             request_id,
             own_window_id,
             ticket,
-            self.proxy.clone(),
+            Arc::new({
+                let proxy = self.proxy.clone();
+                move |ticket| proxy.send(UserEvent::CommitAgentSelfClose { ticket })
+            }),
         );
         if let Err(acceptance) = responder.send(acceptance) {
             let ticket = acceptance.disarm();
@@ -10251,9 +10198,9 @@ impl AppRuntime {
         for status in statuses.values() {
             match status {
                 WindowProcessStatus::Running => aggregate.running_count += 1,
-                WindowProcessStatus::Waiting | WindowProcessStatus::Stopped => {
-                    aggregate.block_count += 1
-                }
+                WindowProcessStatus::Waiting
+                | WindowProcessStatus::Stopped
+                | WindowProcessStatus::Interrupted => aggregate.block_count += 1,
                 WindowProcessStatus::Error => {
                     aggregate.block_count += 1;
                     aggregate.error_count += 1;

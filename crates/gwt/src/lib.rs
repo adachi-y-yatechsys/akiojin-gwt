@@ -1,6 +1,10 @@
 pub mod agent_backend_dispatch;
+pub mod agent_capability;
 pub(crate) mod agent_project_state;
 pub mod agent_resource_policy;
+pub mod pane_runtime;
+pub mod session_finalizer;
+pub mod session_launch;
 #[doc(hidden)]
 pub use agent_project_state::validated_project_state_root_for_session_recovery;
 pub mod autonomous_handoff;
@@ -11,6 +15,7 @@ pub mod board_remote;
 pub mod branch_cleanup;
 pub mod branch_list;
 pub mod cli;
+pub use cli::issue::validate_monitor_profiles_set;
 pub mod custom_agents_dispatch;
 pub mod custom_agents_service;
 pub mod daemon_publisher;
@@ -50,6 +55,8 @@ pub mod preset;
 pub mod process;
 pub mod profile_dispatch;
 pub mod project_open_control;
+pub mod project_runtime;
+pub mod project_transport;
 pub mod protocol;
 pub mod pty_start_gate;
 pub mod recovery_delivery;
@@ -168,7 +175,7 @@ pub use issue_monitor::{
     AutonomousHandoffDeliveryPreparation, AutonomousHandoffResumption, AutonomousIssueRecord,
     AutonomousPendingQuestion, AutonomousPhase, AutonomousReviewDispatch,
     AutonomousSteeringRequest, AutonomousWaitDeclaration, AutonomousWaitInvalidation,
-    AutonomousWaitOutcome, EligibilityDecision, IssueMonitorAgentStatus,
+    AutonomousWaitOutcome, DeliveringExit, EligibilityDecision, IssueMonitorAgentStatus,
     IssueMonitorAuthorityFence, IssueMonitorAuthorityFenceState, IssueMonitorAuthorityLease,
     IssueMonitorCandidateSource, IssueMonitorClaimIdentity, IssueMonitorConfig,
     IssueMonitorControlReceipt, IssueMonitorEffectAttemptKey, IssueMonitorEffectPayload,
@@ -186,8 +193,8 @@ pub use issue_monitor::{
     IssueMonitorProviderQuotaHoldRelease, IssueMonitorProviderQuotaPollerWindow,
     IssueMonitorProviderUsageLimitOutcome, IssueMonitorReadiness, IssueMonitorReleasedFailure,
     IssueMonitorRequeueOutcome, IssueMonitorResumeWriterConflictOutcome, IssueMonitorScanDriver,
-    IssueMonitorScanDriverKind, IssueMonitorScanSummary, IssueMonitorState,
-    IssueMonitorStatusSource, IssueMonitorStatusView, IssueMonitorStopMismatch,
+    IssueMonitorScanDriverKind, IssueMonitorScanSummary, IssueMonitorStallReason,
+    IssueMonitorState, IssueMonitorStatusSource, IssueMonitorStatusView, IssueMonitorStopMismatch,
     IssueMonitorStopOutcome, IssueMonitorStopTarget, IssueMonitorTerminalWindowFacts,
     IssueMonitorUpdateDrain, IssueMonitorUpdateDrainControl, IssueMonitorUpdateDrainReason,
     IssueMonitorWaitSummary, IssueMonitorWindowObservation, IssueMonitorWindowSnapshot,

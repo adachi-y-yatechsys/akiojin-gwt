@@ -98,7 +98,14 @@ fn full_pass_reaches_deliver_and_requeues_an_open_issue_only_on_sha_match() {
 
     // Gate assembly + routing: all conditions hold ⇒ Deliver.
     let inputs = monitor
-        .autonomous_gate_inputs(42, verified(), pass_rollup(), SHA, BODY)
+        .autonomous_gate_inputs(
+            42,
+            verified(),
+            pass_rollup(),
+            SHA,
+            BODY,
+            gwt_git::pr_status::PrMergeability::Mergeable,
+        )
         .expect("gate ready once verdict is in");
     assert_eq!(evaluate_autonomous_gate(&inputs), GateDecision::Pass);
     assert_eq!(route_autonomous_gate(&inputs), GateAction::Deliver);
@@ -145,7 +152,14 @@ fn rejected_review_does_not_reach_deliver() {
     drive_to_reviewed(&mut monitor, &issue, false); // review FAILED
 
     let inputs = monitor
-        .autonomous_gate_inputs(42, verified(), pass_rollup(), SHA, BODY)
+        .autonomous_gate_inputs(
+            42,
+            verified(),
+            pass_rollup(),
+            SHA,
+            BODY,
+            gwt_git::pr_status::PrMergeability::Mergeable,
+        )
         .expect("gate ready");
     assert!(matches!(
         evaluate_autonomous_gate(&inputs),
@@ -166,7 +180,14 @@ fn acceptance_drift_after_launch_does_not_reach_deliver() {
     // The Issue body was edited after launch (criteria changed).
     let drifted_body = "## Acceptance Criteria\n- [ ] AC-2: a different requirement\n";
     let inputs = monitor
-        .autonomous_gate_inputs(42, verified(), pass_rollup(), SHA, drifted_body)
+        .autonomous_gate_inputs(
+            42,
+            verified(),
+            pass_rollup(),
+            SHA,
+            drifted_body,
+            gwt_git::pr_status::PrMergeability::Mergeable,
+        )
         .expect("gate ready");
     assert!(matches!(
         evaluate_autonomous_gate(&inputs),
@@ -187,7 +208,14 @@ fn head_advance_after_review_does_not_reach_deliver() {
 
     // HEAD advanced: the current head SHA no longer equals the reviewed SHA.
     let inputs = monitor
-        .autonomous_gate_inputs(42, verified(), pass_rollup(), "def456", BODY)
+        .autonomous_gate_inputs(
+            42,
+            verified(),
+            pass_rollup(),
+            "def456",
+            BODY,
+            gwt_git::pr_status::PrMergeability::Mergeable,
+        )
         .expect("gate ready");
     assert!(matches!(
         evaluate_autonomous_gate(&inputs),
@@ -208,7 +236,14 @@ fn pending_ci_waits_does_not_merge() {
 
     let pending_rollup = r#"[{"name":"build","status":"IN_PROGRESS","conclusion":null}]"#;
     let inputs = monitor
-        .autonomous_gate_inputs(42, verified(), pending_rollup, SHA, BODY)
+        .autonomous_gate_inputs(
+            42,
+            verified(),
+            pending_rollup,
+            SHA,
+            BODY,
+            gwt_git::pr_status::PrMergeability::Mergeable,
+        )
         .expect("gate ready");
     assert!(matches!(
         evaluate_autonomous_gate(&inputs),
@@ -263,7 +298,14 @@ fn gate_not_ready_until_verdict_returns() {
     monitor.begin_review(42, 99, SHA); // verdict pending
     assert!(
         monitor
-            .autonomous_gate_inputs(42, verified(), pass_rollup(), SHA, BODY)
+            .autonomous_gate_inputs(
+                42,
+                verified(),
+                pass_rollup(),
+                SHA,
+                BODY,
+                gwt_git::pr_status::PrMergeability::Mergeable
+            )
             .is_none(),
         "no gate decision while the independent review is still in flight",
     );
@@ -343,7 +385,14 @@ fn fr_family_decision_boundaries_are_observable() {
     monitor.begin_review(42, 99, SHA);
     monitor.record_review_verdict(42, true);
     let inputs = monitor
-        .autonomous_gate_inputs(42, verified(), pass_rollup(), SHA, BODY)
+        .autonomous_gate_inputs(
+            42,
+            verified(),
+            pass_rollup(),
+            SHA,
+            BODY,
+            gwt_git::pr_status::PrMergeability::Mergeable,
+        )
         .expect("gate ready");
     assert_eq!(evaluate_autonomous_gate(&inputs), GateDecision::Pass);
     assert_eq!(route_autonomous_gate(&inputs), GateAction::Deliver);

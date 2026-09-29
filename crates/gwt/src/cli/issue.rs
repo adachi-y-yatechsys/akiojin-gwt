@@ -656,6 +656,7 @@ fn run_monitor_status<E: CliEnv>(
     );
     let mut output =
         serde_json::to_value(&status).map_err(|error| io_as_api_error(io::Error::other(error)))?;
+    output["project_root"] = serde_json::json!(project_root);
     output["active_session_count"] = serde_json::json!(inventory.sessions.len());
     output["worktree_sessions"] = serde_json::json!(inventory.worktree_sessions());
     output["session_observation"] = serde_json::json!({
@@ -731,6 +732,12 @@ fn mark_degraded_cache_projection(status: &mut crate::IssueMonitorAgentStatus) {
     // AC-3: preferences are what a stopped monitor stops maintaining, so an
     // empty list here is "no launch recorded", not "no launch running".
     status.active_launches_incomplete = true;
+    // Issue #4249: only prefs are read here, so `disabled` is known but
+    // whether a GUI is attached — and every gate after it — is not.
+    if status.stall_reason != Some(crate::IssueMonitorStallReason::Disabled) {
+        status.stall_reason = Some(crate::IssueMonitorStallReason::Unknown);
+        status.gui_action = None;
+    }
     status.last_error = status.last_error.take().map(degraded_projection_error);
     if let Some(view) = status.gui_status.as_mut() {
         view.last_error = view.last_error.take().map(degraded_projection_error);
@@ -2866,7 +2873,7 @@ fn is_valid_prefer_for_tag(tag: &str) -> bool {
 /// limited to known agents, carry well-formed routing tags, and the threshold
 /// must be within 1..=100. Shared by the daemon control and the local
 /// fallback so the two can never accept different pools.
-pub(crate) fn validate_monitor_profiles_set(
+pub fn validate_monitor_profiles_set(
     profiles: &[crate::IssueMonitorLaunchProfile],
     usage_threshold_percent: Option<u8>,
 ) -> io::Result<()> {
@@ -6393,6 +6400,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn issue_monitor_status_attributes_errors_to_the_requested_project() {
+        let tmp = TempDir::new().expect("tempdir");
+        let _home = ScopedGwtHome::set(tmp.path().join("home"));
+        let projects = [tmp.path().join("project-a"), tmp.path().join("project-b")];
+        for (index, project) in projects.iter().enumerate() {
+            std::fs::create_dir_all(project).expect("project dir");
+            crate::save_issue_monitor_prefs(
+                &crate::issue_monitor_prefs_path_for_repo_path(project),
+                &crate::IssueMonitorPrefs {
+                    failed_issues: vec![crate::IssueMonitorFailedIssue {
+                        issue_number: 42,
+                        message: format!("project-{index} failure"),
+                        window_id: None,
+                    }],
+                    ..crate::IssueMonitorPrefs::default()
+                },
+            )
+            .expect("save project prefs");
+        }
+        let env = crate::cli::TestEnv::new(projects[0].clone());
+        for (index, project) in projects.iter().enumerate() {
+            let mut out = String::new();
+            run_monitor_status(&env, Some(project), &mut out).expect("project status");
+            let status: serde_json::Value = serde_json::from_str(&out).expect("status JSON");
+            for error in [&status["last_error"], &status["gui_status"]["last_error"]] {
+                let error = error.as_str().expect("project failure remains a string");
+                assert!(error.contains(&format!("project-{index} failure")), "{out}");
+                assert!(
+                    !error.contains(&format!("project-{} failure", 1 - index)),
+                    "{out}"
+                );
+            }
+            assert_eq!(
+                status["project_root"],
+                serde_json::json!(std::fs::canonicalize(project).expect("canonical project")),
+                "the error must identify the requested project, even when the caller is elsewhere"
+            );
+        }
+    }
+
     /// Issue #4234 AC-5: the resident size of every gwt GUI process on the
     /// host is observable from the status the PM already reads, with the
     /// threshold that raises the saturation warning, so a bloating instance
@@ -6579,6 +6627,8 @@ mod tests {
             issue_cache: None,
             review_windows: Vec::new(),
             failure_surge: None,
+            stall_reason: None,
+            gui_action: None,
             idle_windows: Vec::new(),
             idle_window_counts: std::collections::BTreeMap::new(),
         };
@@ -6655,6 +6705,8 @@ mod tests {
             issue_cache: None,
             review_windows: Vec::new(),
             failure_surge: None,
+            stall_reason: None,
+            gui_action: None,
             idle_windows: Vec::new(),
             idle_window_counts: std::collections::BTreeMap::new(),
         };
@@ -6782,6 +6834,8 @@ mod tests {
                 issue_cache: None,
                 review_windows: Vec::new(),
                 failure_surge: None,
+                stall_reason: None,
+                gui_action: None,
                 idle_windows: Vec::new(),
                 idle_window_counts: std::collections::BTreeMap::new(),
             };
@@ -6853,6 +6907,8 @@ mod tests {
             issue_cache: None,
             review_windows: Vec::new(),
             failure_surge: None,
+            stall_reason: None,
+            gui_action: None,
             idle_windows: Vec::new(),
             idle_window_counts: std::collections::BTreeMap::new(),
         };
@@ -7011,6 +7067,8 @@ mod tests {
                 // projection, and `active_launches` is whatever preferences
                 // still record — both facts ship with the numbers.
                 "source": "degraded_cache",
+                "stall_reason": "unknown",
+                "project_root": std::fs::canonicalize(&repo).expect("canonical project"),
                 "active_launches_incomplete": true,
                 "queue": [2, 1],
                 "active_launches": [9],
@@ -9063,6 +9121,8 @@ mod tests {
             build_artifact_gc: None,
             review_windows: Vec::new(),
             failure_surge: None,
+            stall_reason: None,
+            gui_action: None,
             issue_cache: None,
         };
 

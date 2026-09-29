@@ -886,6 +886,10 @@ pub enum FrontendEvent {
     SetIssueMonitorAutoApplyUpdates {
         enabled: bool,
     },
+    IssueMonitorProfilesSet {
+        profiles: Vec<crate::IssueMonitorLaunchProfilePatch>,
+        usage_threshold_percent: Option<u8>,
+    },
     SetIssueMonitorMaxActiveAgents {
         max_active_agents: usize,
     },
@@ -908,6 +912,10 @@ pub enum FrontendEvent {
         title: String,
         #[serde(default)]
         launch: bool,
+        /// SPEC #3885 T-033 (FR-022): the "+ New" popover's auto-merge
+        /// checkbox; `true` creates the Issue with the `auto-merge` label.
+        #[serde(default)]
+        auto_merge: bool,
     },
     IssueMonitorLaunchNow {
         issue_number: u64,
@@ -1662,6 +1670,9 @@ pub struct ActiveWorkspaceWorkView {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ActiveWorkItemView {
+    /// Complete Issue association, independent of paginated Knowledge results.
+    #[serde(default)]
+    pub linked_issue_numbers: Vec<u64>,
     pub id: String,
     pub title: String,
     pub status_category: String,
@@ -2015,6 +2026,11 @@ pub enum BackendEvent {
         running_reasoning: Option<String>,
         is_running: bool,
         agent_options: Vec<PmAgentOption>,
+        /// #4486 AC-7: why the PM is not running, when the reason is one a
+        /// Restart cannot clear. `None` means Restart is worth offering —
+        /// either the PM is fine, or the last refusal was transient.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        start_block: Option<crate::pm_registry::PmStartBlock>,
     },
     IssueMonitorStatus {
         /// Boxed: the view is by far the largest payload in this enum
@@ -3637,6 +3653,7 @@ mod tests {
             running_reasoning: None,
             is_running: false,
             agent_options: Vec::new(),
+            start_block: None,
         };
 
         let value = serde_json::to_value(&event).expect("serialize PM status");
@@ -4329,6 +4346,7 @@ mod tests {
                 managed_hook_health: None,
                 active_work_count: 1,
                 active_works: vec![super::ActiveWorkItemView {
+                    linked_issue_numbers: Vec::new(),
                     id: "work-1".to_string(),
                     title: "Implement Start Work".to_string(),
                     status_category: "active".to_string(),

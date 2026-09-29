@@ -687,6 +687,10 @@ pub(super) fn frontend_user_action_log(event: &FrontendEvent) -> Option<Frontend
             FrontendUserActionLog::new("set_issue_monitor_auto_apply_updates", "issue_monitor")
                 .mode(if *enabled { "on" } else { "off" })
         }
+        FrontendEvent::IssueMonitorProfilesSet { profiles, .. } => {
+            FrontendUserActionLog::new("issue_monitor_profiles_set", "issue_monitor")
+                .target(profiles.len().to_string())
+        }
         FrontendEvent::SetIssueMonitorMaxActiveAgents { max_active_agents } => {
             FrontendUserActionLog::new("set_issue_monitor_max_active_agents", "issue_monitor")
                 .target(max_active_agents.to_string())
@@ -706,7 +710,7 @@ pub(super) fn frontend_user_action_log(event: &FrontendEvent) -> Option<Frontend
         FrontendEvent::ListIssueMonitor => {
             FrontendUserActionLog::new("list_issue_monitor", "issue_monitor")
         }
-        FrontendEvent::QuickRegisterIssue { title, launch } => {
+        FrontendEvent::QuickRegisterIssue { title, launch, .. } => {
             FrontendUserActionLog::new("quick_register_issue", "issue_monitor")
                 .mode(if *launch { "launch" } else { "register" })
                 .count(title.len())

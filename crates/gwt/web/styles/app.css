@@ -1410,6 +1410,53 @@ body {
   display: none !important;
 }
 
+/* SPEC-3885: Other belongs to the Issue list, not an independent window. */
+.issue-other-group {
+  position: static;
+  display: block;
+  flex: 0 0 auto;
+  width: 100%;
+  margin-top: var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  color: var(--color-text);
+  background: var(--color-surface);
+}
+
+.issue-other-summary {
+  padding: var(--space-3);
+  cursor: pointer;
+  font-family: var(--font-body);
+  color: var(--color-text-muted);
+}
+
+.issue-other-group > .workspace-overview-shell {
+  grid-template-columns: minmax(0, 1fr);
+  max-height: 480px;
+  overflow: auto;
+}
+
+.issue-other-group .workspace-overview-list-pane {
+  border-right: 0;
+  overflow: visible;
+}
+
+.issue-other-group .workspace-overview-detail-pane {
+  font-family: var(--font-body);
+  border-top: 1px solid var(--color-border);
+  overflow: visible;
+}
+
+.issue-lane-filter {
+  max-width: 160px;
+  padding: var(--space-1) var(--space-2);
+  font-family: var(--font-body);
+  color: var(--color-text);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+}
+
 .workspace-overview-list-pane {
   overflow-y: auto;
 }
@@ -2291,60 +2338,6 @@ body {
   background: color-mix(in oklab, var(--color-state-active) 16%, transparent);
 }
 
-.knowledge-monitor-panel {
-  display: grid;
-  gap: 8px;
-  padding: 10px 12px;
-  border-bottom: 1px solid var(--color-border);
-  background: var(--color-surface-elevated);
-}
-
-.knowledge-monitor-overview,
-.knowledge-monitor-controls,
-.knowledge-monitor-quick {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.knowledge-monitor-overview {
-  justify-content: space-between;
-  min-width: 0;
-}
-
-.knowledge-monitor-summary,
-.knowledge-monitor-settings-copy,
-.knowledge-monitor-effective-copy,
-.knowledge-monitor-max-active,
-.knowledge-monitor-blackout {
-  font-family: var(--font-mono);
-  font-size: var(--type-xs);
-  letter-spacing: var(--tracking-mono);
-}
-
-.knowledge-monitor-summary {
-  color: var(--color-text-strong);
-}
-
-.knowledge-monitor-settings-copy,
-.knowledge-monitor-effective-copy {
-  min-width: 0;
-  color: var(--color-text-muted);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.knowledge-monitor-controls {
-  flex-wrap: wrap;
-}
-
-.knowledge-monitor-controls .wizard-button,
-.knowledge-monitor-quick .wizard-button {
-  min-height: 30px;
-  padding-block: 4px;
-}
-
 .knowledge-monitor-max-active {
   display: inline-flex;
   align-items: center;
@@ -2427,15 +2420,60 @@ body {
   color: var(--color-text-strong);
 }
 
-.knowledge-monitor-quick {
-  min-width: 0;
+/* SPEC #3885 Phase 5 (T-032..T-035): the Issue window's Monitor band, the
+   "+ New" popover body and the detail pane. Operator tokens and the shared
+   `.modal-*` primitive only. */
+.knowledge-monitor-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--color-border);
+  background: var(--color-surface-elevated);
 }
 
-.knowledge-monitor-quick-title {
-  flex: 1;
-  min-width: 160px;
+.knowledge-monitor-bar .wizard-button {
   min-height: 30px;
-  padding: 4px 8px;
+  padding-block: var(--space-1);
+}
+
+.knowledge-monitor-pill {
+  cursor: default;
+}
+
+.knowledge-monitor-metric,
+.knowledge-monitor-max-active {
+  font-family: var(--font-mono);
+  font-size: var(--type-xs);
+  letter-spacing: var(--tracking-mono);
+}
+
+.knowledge-monitor-metric {
+  color: var(--color-text-strong);
+  white-space: nowrap;
+}
+
+.knowledge-monitor-bar [data-action="monitor-settings"] {
+  margin-left: auto;
+}
+
+.issue-new-body {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.issue-new-field {
+  display: grid;
+  gap: var(--space-1);
+  font-family: var(--font-body);
+  font-size: var(--type-sm);
+  color: var(--color-text-muted);
+}
+
+.issue-new-title {
+  min-height: 32px;
+  padding: var(--space-1) var(--space-2);
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm);
   background: var(--color-surface);
@@ -2444,15 +2482,129 @@ body {
   font-size: var(--type-sm);
 }
 
-/* A project-wide outage: no implementation agent is running at all. Ranked as
-   its own banner because the per-issue error text cannot express a fleet-level
-   fact. */
-.knowledge-monitor-blackout {
-  padding: 6px 8px;
-  border: 1px solid var(--color-state-blocked);
-  border-radius: var(--radius-sm);
-  color: var(--color-state-blocked);
+.issue-new-check {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--type-xs);
+  letter-spacing: var(--tracking-mono);
+  color: var(--color-text);
 }
+
+.issue-detail-header {
+  gap: var(--space-2);
+}
+
+.issue-detail-id {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: var(--type-xs);
+  letter-spacing: var(--tracking-mono);
+  color: var(--color-text-muted);
+}
+
+.issue-detail-branch {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.issue-detail-title {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+}
+
+.issue-detail-status {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.issue-detail-ac {
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border-bottom: 1px solid var(--color-border);
+}
+
+.issue-detail-ac-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--type-xs);
+  letter-spacing: var(--tracking-mono);
+  text-transform: uppercase;
+  color: var(--color-text-muted);
+}
+
+.issue-detail-ac-count {
+  color: var(--color-text-strong);
+}
+
+.issue-detail-ac-gauge {
+  height: 6px;
+  border-radius: var(--radius-pill);
+  background: var(--color-border);
+  overflow: hidden;
+}
+
+.issue-detail-ac-fill {
+  display: block;
+  height: 100%;
+  background: var(--color-state-done);
+}
+
+.issue-detail-ac-list {
+  display: grid;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-height: 11rem;
+  overflow: auto;
+}
+
+.issue-detail-ac-item {
+  display: grid;
+  grid-template-columns: auto auto minmax(0, 1fr);
+  gap: var(--space-2);
+  font-family: var(--font-body);
+  font-size: var(--type-sm);
+  color: var(--color-text);
+}
+
+.issue-detail-ac-mark,
+.issue-detail-ac-id {
+  font-family: var(--font-mono);
+  font-size: var(--type-xs);
+  letter-spacing: var(--tracking-mono);
+  color: var(--color-text-muted);
+}
+
+.issue-detail-ac-item[data-done="true"] .issue-detail-ac-mark {
+  color: var(--color-state-done);
+}
+
+.issue-detail-body details.knowledge-section > summary {
+  cursor: pointer;
+}
+
+.issue-detail-hint {
+  margin-top: var(--space-1);
+  font-size: var(--type-xs);
+}
+/* /SPEC #3885 Phase 5 */
 
 .knowledge-row {
   display: grid;
@@ -6950,4 +7102,66 @@ body.route-body {
   display: inline-flex;
   align-items: center;
   text-decoration: none;
+}
+
+/* Issue #4530 candidate pool */
+.knowledge-monitor-pool {
+  flex: 0 0 auto;
+  border-bottom: 1px solid var(--color-border);
+  font-size: var(--type-sm);
+}
+.knowledge-monitor-pool > summary {
+  padding: var(--space-2) var(--space-3);
+  cursor: pointer;
+  color: var(--color-text-muted);
+}
+.knowledge-monitor-pool-content {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  max-height: 300px;
+  overflow: auto;
+}
+.knowledge-monitor-candidate {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: var(--space-2);
+}
+.knowledge-monitor-candidate-heading,
+.knowledge-monitor-pool-add {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+.knowledge-monitor-candidate-summary {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.knowledge-monitor-pool-field {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  font-size: var(--type-xs);
+}
+.knowledge-monitor-pool-field input {
+  min-width: 0;
+  max-width: 100%;
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font: inherit;
+}
+.knowledge-monitor-pool-message {
+  margin: 0;
+  color: var(--color-text-muted);
+  font-size: var(--type-xs);
+}
+.knowledge-monitor-pool-message:empty {
+  display: none;
 }

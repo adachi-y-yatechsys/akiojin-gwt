@@ -28,6 +28,7 @@ fn default_schema_version() -> u64 {
 struct ParsedEnvelope {
     operation: String,
     command: CliCommand,
+    requested_project_root: Option<String>,
     /// Issue #3655 AC-1: the reason an agent gave when it declared itself
     /// unable to proceed, carried past parsing so the escalation can be raised
     /// from the same call rather than from a Board post the agent also has to
@@ -89,6 +90,7 @@ pub(crate) fn dispatch<E: CliEnv>(env: &mut E, prog: &str) -> i32 {
     };
     let operation = parsed.operation.clone();
     let declared_block = parsed.declared_block;
+    let requested_project_root = parsed.requested_project_root;
     // SPEC #3700 FR-002 / Issue #4145 AC-1: every JSON-envelope operation
     // funnels through here, so one timer covers the whole `op` stream. The
     // collector is fail-open and is only installed by the `gwtd` binary, so
@@ -122,7 +124,11 @@ pub(crate) fn dispatch<E: CliEnv>(env: &mut E, prog: &str) -> i32 {
                 (0, Some(block)) => super::board::auto_file_declared_block(env, &block),
                 (0, None) => {}
                 _ => {
-                    report_operation_refusal(env, &operation, &output);
+                    report_operation_refusal(
+                        &operation,
+                        &output,
+                        requested_project_root.as_deref(),
+                    );
                     if let Some(refusal) = refusal.as_ref() {
                         super::board::auto_file_structured_operation_refusal(
                             env, &operation, &output, refusal,
@@ -159,7 +165,7 @@ pub(crate) fn dispatch<E: CliEnv>(env: &mut E, prog: &str) -> i32 {
             // depending on the agent noticing it is stuck. Answering the caller
             // comes first — the escalation must never delay or replace the
             // operation's own reply.
-            report_operation_refusal(env, &operation, &message);
+            report_operation_refusal(&operation, &message, requested_project_root.as_deref());
             if let Some(refusal) = failure.refusal.as_ref() {
                 super::board::auto_file_structured_operation_refusal(
                     env, &operation, &message, refusal,
@@ -198,6 +204,28 @@ fn report_undelivered_response<E: CliEnv>(
     RESPONSE_NOT_DELIVERED_EXIT
 }
 
+fn report_operation_refusal(operation: &str, error: &str, requested_project_root: Option<&str>) {
+    // gwtd executes one operation per process; the recorded store belongs to that operation.
+    // An explicit target wins even if resolution failed before a store could be recorded.
+    let project_root = requested_project_root.map(str::to_owned).or_else(|| {
+        gwt_core::paths::operation_project_store()
+            .map(|store| store.project_root.display().to_string())
+    });
+    let session_id = std::env::var(GWT_SESSION_ID_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    crate::error_report::report_error(
+        gwt_core::error_ledger::ErrorKind::OperationRefusal,
+        format!("{operation}: {error}"),
+        gwt_core::error_ledger::ErrorTarget {
+            session_id,
+            project_root,
+            ..gwt_core::error_ledger::ErrorTarget::default()
+        },
+    );
+}
+
 /// Issue #3606: name the project store the operation acted on.
 ///
 /// A `project_root` that resolves no repository identity still produces a
@@ -212,22 +240,6 @@ fn report_undelivered_response<E: CliEnv>(
 /// Absent when the operation never resolved a project store — including when it
 /// failed before doing so. Absence therefore means "no store was touched", not
 /// "the store is fine".
-fn report_operation_refusal<E: CliEnv>(env: &E, operation: &str, error: &str) {
-    let session_id = std::env::var(GWT_SESSION_ID_ENV)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    crate::error_report::report_error(
-        gwt_core::error_ledger::ErrorKind::OperationRefusal,
-        format!("{operation}: {error}"),
-        gwt_core::error_ledger::ErrorTarget {
-            session_id,
-            project_root: Some(env.repo_path().display().to_string()),
-            ..gwt_core::error_ledger::ErrorTarget::default()
-        },
-    );
-}
-
 fn attach_project_store(payload: &mut Value) {
     let Some(store) = gwt_core::paths::operation_project_store() else {
         return;
@@ -1198,6 +1210,7 @@ fn parse(input: &str) -> Result<ParsedEnvelope, CliParseError> {
             id: required_string(params, "id")?,
             text: required_string(params, "text")?,
         }),
+        "pm.capabilities" => CliCommand::Pm(crate::cli::pm::PmCommand::Capabilities),
         "pm.status" => CliCommand::Pm(crate::cli::pm::PmCommand::Status {
             project_root: optional_string(params, "project_root")?,
         }),
@@ -1241,9 +1254,15 @@ fn parse(input: &str) -> Result<ParsedEnvelope, CliParseError> {
         _ => None,
     };
     reject_unconsulted_params(params, &recording.consulted(), &envelope.operation)?;
+    let requested_project_root = params
+        .get("project_root")
+        .and_then(Value::as_str)
+        .filter(|root| !root.trim().is_empty())
+        .map(str::to_owned);
     Ok(ParsedEnvelope {
         operation: envelope.operation,
         command,
+        requested_project_root,
         declared_block,
     })
 }
@@ -1648,13 +1667,21 @@ fn skill_state(
 }
 
 fn errors_list(params: &Map<String, Value>) -> Result<CliCommand, CliParseError> {
-    reject_unknown_params(params, &["since"], "errors.list")?;
+    reject_unknown_params(params, &["since", "scope", "project_root"], "errors.list")?;
     let since = optional_string(params, "since")?;
     if let Some(raw) = since.as_deref() {
         super::diagnostics::errors::parse_since(raw)?;
     }
+    let scope = optional_string(params, "scope")?
+        .as_deref()
+        .map(super::diagnostics::errors::ErrorListScope::parse)
+        .transpose()?
+        .unwrap_or_default();
+    let project_root = optional_string(params, "project_root")?;
     Ok(CliCommand::Diagnostics(DiagnosticsCommand::ErrorsList {
         since,
+        scope,
+        project_root,
     }))
 }
 
@@ -2962,6 +2989,29 @@ mod tests {
             }),
             "operation refusal must land in the error ledger: {listed:?}"
         );
+    }
+
+    #[test]
+    fn operation_refusal_belongs_to_explicit_project_instead_of_caller_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = gwt_core::test_support::ScopedGwtHome::set(temp.path().join("gwt-home"));
+        let caller = temp.path().join("project-a");
+        std::fs::create_dir(&caller).unwrap();
+        // Fail before store recording, so this test does not mutate its process-global cell.
+        let requested = temp.path().join("project-b");
+        let mut env = TestEnv::new(caller);
+        env.stdin = envelope("issue.monitor.status", json!({"project_root": requested}));
+        assert_ne!(super::dispatch(&mut env, "gwtd"), 0);
+        let rows = gwt_core::error_ledger::list_since(None).unwrap();
+        let refusal = rows
+            .iter()
+            .find(|row| {
+                row.kind == gwt_core::error_ledger::ErrorKind::OperationRefusal
+                    && row.message.contains("issue.monitor.status")
+            })
+            .expect("operation refusal");
+        assert_eq!(refusal.scope, gwt_core::error_ledger::ErrorScope::Project);
+        assert_eq!(refusal.target.project_root.as_deref(), requested.to_str());
     }
 
     /// Issue #3814 AC-2/AC-3: the JSON surface must return a structured
@@ -4833,6 +4883,20 @@ mod tests {
         }
     }
 
+    // Issue #4249 FR-003: the PM self-description is a read-only diagnostic.
+    #[test]
+    fn pm_capabilities_parses_and_stays_read_only() {
+        assert!(matches!(
+            ok("pm.capabilities", json!({})),
+            CliCommand::Pm(crate::cli::pm::PmCommand::Capabilities)
+        ));
+        assert!(
+            crate::cli::hook::workflow_policy::is_read_only_json_envelope_operation(
+                "pm.capabilities"
+            )
+        );
+    }
+
     // Issue #3607: PM stop/deregister parse variants.
     #[test]
     fn pm_stop_variants() {
@@ -5901,13 +5965,74 @@ mod tests {
     }
 
     #[test]
+    fn errors_list_filters_scope_and_root_without_cross_project_rows() {
+        use gwt_core::error_ledger::{ErrorKind, ErrorRecord, ErrorTarget};
+        use gwt_core::test_support::ScopedGwtHome;
+        let dir = tempfile::tempdir().unwrap();
+        let _home = ScopedGwtHome::set(dir.path());
+        for root in [Some("/project-a"), Some("/project-b"), None] {
+            gwt_core::error_ledger::record(ErrorRecord::new(
+                ErrorKind::DaemonFault,
+                "fault",
+                ErrorTarget {
+                    project_root: root.map(str::to_owned),
+                    ..Default::default()
+                },
+            ))
+            .unwrap();
+        }
+        let host: ErrorRecord = serde_json::from_value(json!({
+            "schema_version":1,"id":"host","recorded_at":"2026-08-30T00:00:00Z",
+            "kind":"daemon_fault","message":"host","scope":"host","target":{}
+        }))
+        .unwrap();
+        gwt_core::error_ledger::record(host).unwrap();
+        for (params, expected) in [
+            (json!({}), 2),
+            (json!({"scope":"project"}), 2),
+            (json!({"scope":"host"}), 1),
+            (json!({"scope":"unknown"}), 1),
+            (json!({"scope":"all"}), 4),
+            (json!({"project_root":"/project-a","scope":"all"}), 1),
+            (json!({"project_root":"/project-a","scope":"host"}), 1),
+            (json!({"project_root":"/missing"}), 0),
+        ] {
+            let mut env = TestEnv::new(dir.path().to_path_buf());
+            let (_, output) =
+                crate::cli::run_collect(&mut env, ok("errors.list", params.clone())).unwrap();
+            let payload: Value = serde_json::from_str(&output).unwrap();
+            assert_eq!(payload["count"], expected, "{params}");
+            let expected_scope = if params.get("project_root").is_some() {
+                "project"
+            } else {
+                params
+                    .get("scope")
+                    .and_then(Value::as_str)
+                    .unwrap_or("project")
+            };
+            if expected_scope != "all" {
+                for row in payload["errors"].as_array().unwrap() {
+                    assert_eq!(row["scope"], expected_scope, "{params}");
+                }
+            }
+            if params.get("project_root").is_some() && expected > 0 {
+                assert_eq!(payload["errors"][0]["target"]["project_root"], "/project-a");
+            }
+        }
+        assert!(matches!(
+            err("errors.list", json!({"scope":"invalid"})),
+            CliParseError::InvalidValue { flag: "scope", .. }
+        ));
+    }
+
+    #[test]
     fn errors_list_parses_optional_since() {
         assert!(matches!(
             ok("errors.list", json!({})),
-            CliCommand::Diagnostics(DiagnosticsCommand::ErrorsList { since: None })
+            CliCommand::Diagnostics(DiagnosticsCommand::ErrorsList { since: None, .. })
         ));
         match ok("errors.list", json!({"since": "2026-08-30T00:00:00Z"})) {
-            CliCommand::Diagnostics(DiagnosticsCommand::ErrorsList { since }) => {
+            CliCommand::Diagnostics(DiagnosticsCommand::ErrorsList { since, .. }) => {
                 assert_eq!(since.as_deref(), Some("2026-08-30T00:00:00Z"));
             }
             other => panic!("unexpected command: {other:?}"),

@@ -432,6 +432,16 @@ impl AppRuntime {
                 migration_pending = tab.migration_pending,
                 "PM ensure skipped: tab is not a migration-clear Git project"
             );
+            // #4486 AC-7: a Restart re-runs this exact refusal, so the panel
+            // has to say so instead of offering a button that does nothing.
+            Self::record_pm_start_block(
+                &tab.project_root,
+                pm_registry::PmStartBlockKind::MigrationPending,
+                format!(
+                    "the tab is not a migration-clear Git project (kind={:?}, migration_pending={})",
+                    tab.kind, tab.migration_pending
+                ),
+            );
             return Vec::new();
         }
         let project_root = tab.project_root.clone();
@@ -454,6 +464,14 @@ impl AppRuntime {
                     path = %prefs_path.display(),
                     %error,
                     "failed to load PM prefs; skipping PM ensure"
+                );
+                // #4486 AC-7: an unreadable pm.json refuses every Restart the
+                // same way. Recording it is best-effort for the same reason it
+                // is needed — the file may be the thing that is broken.
+                Self::record_pm_start_block(
+                    &project_root,
+                    pm_registry::PmStartBlockKind::PrefsUnreadable,
+                    format!("{} could not be read: {error}", prefs_path.display()),
                 );
                 return Vec::new();
             }
@@ -483,6 +501,15 @@ impl AppRuntime {
         // Refusing here rather than at registration keeps the second store from
         // ever spawning the pane.
         if let Some(window_id) = self.live_pm_window_id_in_another_store(&project_root) {
+            // #4486 AC-7: the refusing condition lives in the *other* store, so
+            // nothing the operator does in this project's panel can clear it.
+            // `repository_registrations` already carries the session id that
+            // `pm.stop` needs; the block is what points at it.
+            Self::record_pm_start_block(
+                &project_root,
+                pm_registry::PmStartBlockKind::AnotherStoreOwnsThePm,
+                "another project store in this repository already owns the resident PM".to_string(),
+            );
             return self.focus_existing_live_work_agent_events(&window_id, canvas_bounds);
         }
         let Some(registration) = prefs.registration else {
@@ -490,6 +517,7 @@ impl AppRuntime {
                 project_root = %project_root.display(),
                 "PM ensure: no registration yet, spawning the resident PM"
             );
+            Self::clear_pm_start_block(&project_root);
             return self.spawn_pm_agent(tab_id, &project_root);
         };
         // FR-003 crash-loop damper: while the backoff floor is in the future
@@ -510,10 +538,42 @@ impl AppRuntime {
             .join(format!("{}.toml", registration.session_id));
         if let Ok(session) = gwt_agent::Session::load_and_migrate(&session_path) {
             if session.worktree_path.exists() {
+                Self::clear_pm_start_block(&project_root);
                 return self.resume_registered_pm_session(tab_id, &project_root, session);
             }
         }
+        Self::clear_pm_start_block(&project_root);
         self.spawn_pm_agent(tab_id, &project_root)
+    }
+
+    /// #4486 AC-7: persist why the PM did not start, for the refusals a
+    /// Restart cannot clear.
+    ///
+    /// Best-effort by design. The gate's job is to report the block, not to
+    /// fail a second way when the project store is itself the problem — a
+    /// `PrefsUnreadable` block would otherwise be the one that can never be
+    /// written.
+    fn record_pm_start_block(
+        project_root: &Path,
+        kind: pm_registry::PmStartBlockKind,
+        reason: String,
+    ) {
+        let prefs_path = pm_registry::pm_prefs_path_for_repo_path(project_root);
+        if let Err(error) = pm_registry::record_pm_start_block(
+            &prefs_path,
+            pm_registry::PmStartBlock::new(kind, reason),
+        ) {
+            tracing::warn!(%error, "failed to record the PM start block");
+        }
+    }
+
+    /// Drop a recorded block once the gate reaches a live, resumed, or
+    /// spawning PM, so it never outlives its cause.
+    fn clear_pm_start_block(project_root: &Path) {
+        let prefs_path = pm_registry::pm_prefs_path_for_repo_path(project_root);
+        if let Err(error) = pm_registry::clear_pm_start_block(&prefs_path) {
+            tracing::warn!(%error, "failed to clear the PM start block");
+        }
     }
 
     /// SPEC-3431 FR-026: the PM settings snapshot for the active project tab.
@@ -537,6 +597,8 @@ impl AppRuntime {
                 running_model: None,
                 running_reasoning: None,
                 is_running: false,
+                // No project in scope, so there is no store to have blocked.
+                start_block: None,
             };
         };
         let prefs_path = pm_registry::pm_prefs_path_for_repo_path(&project_root);
@@ -571,6 +633,12 @@ impl AppRuntime {
                 .as_ref()
                 .and_then(|profile| profile.reasoning.clone()),
             is_running: running_profile.is_some(),
+            // #4486 AC-7: a live PM cannot be blocked, so the panel never has
+            // to reconcile "running" with a stale block.
+            start_block: running_profile
+                .is_none()
+                .then(|| prefs.start_block.clone())
+                .flatten(),
         }
     }
 
@@ -1991,6 +2059,10 @@ impl AppRuntime {
                     running_model: None,
                     running_reasoning: None,
                     is_running: false,
+                    // The PM was just deregistered by an explicit pane close,
+                    // which is not a start refusal. Carry whatever block the
+                    // store already held rather than inventing or erasing one.
+                    start_block: prefs.start_block.clone(),
                 };
                 (true, Some(status))
             }
@@ -2303,7 +2375,8 @@ impl AppRuntime {
                 ),
                 issue_number: None,
             },
-        )]
+        )
+        .with_error_project_root(&context.project_root)]
     }
 
     /// SPEC-3431 FR-026: the launch config for a fresh PM spawn.

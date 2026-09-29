@@ -114,7 +114,7 @@ test.describe("Issue Bridge load recovery", () => {
     ).toContainText("Issue Bridge detail body");
     await expect(
       page.locator(".surface-knowledge .knowledge-detail-pane"),
-    ).toContainText("Launch Agent");
+    ).toContainText("Launch agent");
   });
 
   test("Issue auto refresh stays cache-first while browsing cached issues", async ({
@@ -143,8 +143,11 @@ test.describe("Issue Bridge load recovery", () => {
       ).length >= 2,
     );
 
-    await expect(page.locator(".surface-knowledge .knowledge-status.error")).toHaveCount(0);
-    await expect(page.locator(".surface-knowledge .knowledge-status")).toHaveText("");
+    // SPEC #3885 T-032: the Issue window has no status row; nothing turns red.
+    await expect(page.locator(".surface-knowledge .knowledge-status")).toHaveCount(0);
+    await expect(
+      page.locator(".surface-knowledge [data-action='refresh-knowledge']"),
+    ).not.toHaveAttribute("title", /error|failed/i);
     const refreshFlags = await page.evaluate(() =>
       window.__knowledgeLoadMessages
         .filter((message) => message.kind === "load_knowledge_bridge")
@@ -199,8 +202,9 @@ test.describe("Issue Bridge load recovery", () => {
 
     const issueSurface = page.locator(".workspace-window.surface-knowledge");
     await expect(issueSurface).toBeVisible();
-    const settings = issueSurface.locator(".knowledge-monitor-settings-copy");
-    const effective = issueSurface.locator(".knowledge-monitor-effective-copy");
+    // SPEC #3885 T-032: the settings and held-fallback lines are the two lines
+    // of the ⚙ tooltip.
+    const gear = issueSurface.locator('.knowledge-monitor-bar [data-action="monitor-settings"]');
     const saved = {
       enabled: true,
       state: "active",
@@ -224,25 +228,18 @@ test.describe("Issue Bridge load recovery", () => {
           "codex held until 2026-09-21T08:41:00Z; re-verification launch at 2026-09-15T10:00:00Z",
       },
     });
-    await expect(settings).toHaveText("Agent settings Saved: codex / gpt-5 / high");
-    await expect(effective).toBeVisible();
-    await expect(effective).toHaveText(
-      "Launching with claude / opus / high (codex held until 2026-09-21T08:41:00Z; re-verification launch at 2026-09-15T10:00:00Z)",
+    await expect(gear).toHaveAttribute(
+      "title",
+      [
+        "Agent settings Saved: codex / gpt-5 / high",
+        "Launching with claude / opus / high (codex held until 2026-09-21T08:41:00Z; re-verification launch at 2026-09-15T10:00:00Z)",
+      ].join("\n"),
     );
-    // Operator tokens only: the line reads as secondary copy, like the
-    // settings line above it.
-    const [effectiveColor, mutedToken] = await effective.evaluate((node) => [
-      getComputedStyle(node).color,
-      getComputedStyle(document.documentElement).getPropertyValue("--color-text-muted").trim(),
-    ]);
-    expect(mutedToken).not.toEqual("");
-    expect(effectiveColor).toEqual(await settings.evaluate((node) => getComputedStyle(node).color));
 
     await page.evaluate((status) => {
       window.__issueBridgeFixtureSocket.emit({ kind: "issue_monitor_status", status });
     }, saved);
-    await expect(settings).toHaveText("Agent settings Saved: codex / gpt-5 / high");
-    await expect(effective).toBeHidden();
+    await expect(gear).toHaveAttribute("title", "Agent settings Saved: codex / gpt-5 / high");
 
     expect(consoleErrors).toEqual([]);
     expect(pageErrors).toEqual([]);
@@ -282,8 +279,11 @@ test.describe("Issue Bridge load recovery", () => {
       "Excluded by label: hold",
     );
     await expect(issueSurface.locator("button button")).toHaveCount(0);
-    await expect(issueSurface.locator(".knowledge-monitor-summary")).toContainText(
-      "Queue 3 | Active 1/2",
+    await expect(issueSurface.locator('.knowledge-monitor-bar [data-metric="queue"]')).toHaveText(
+      "Queue 3",
+    );
+    await expect(issueSurface.locator('.knowledge-monitor-bar [data-metric="active"]')).toHaveText(
+      "Active 1/2",
     );
 
     await issueSurface
@@ -343,10 +343,15 @@ test.describe("Issue Bridge load recovery", () => {
     await expect(autoApply).toHaveAttribute("data-enabled", "false");
     await autoApply.click();
     await issueSurface.locator('[data-action="monitor-settings"]').click();
-    await issueSurface.locator(".knowledge-monitor-quick-title").fill(
+    // SPEC #3885 T-033: quick register lives in the "+ New" popover.
+    await issueSurface.locator('[data-action="issue-new"]').click();
+    const popover = page.locator(".modal-backdrop.issue-new-popover.open .modal-shell");
+    await expect(popover).toBeVisible();
+    await popover.locator('[data-role="issue-new-title"]').fill(
       "Investigate flaky release gate",
     );
-    await issueSurface.locator('[data-action="quick-register-launch"]').click();
+    await popover.locator('[data-action="issue-new-register-launch"]').click();
+    await expect(popover).toHaveCount(0);
 
     const messages = await page.evaluate(() => window.__knowledgeLoadMessages);
     expect(messages).toContainEqual({
@@ -379,6 +384,7 @@ test.describe("Issue Bridge load recovery", () => {
       kind: "quick_register_issue",
       title: "Investigate flaky release gate",
       launch: true,
+      auto_merge: false,
     });
     expect(consoleErrors).toEqual([]);
     expect(pageErrors).toEqual([]);
@@ -408,12 +414,13 @@ test.describe("Issue Bridge load recovery", () => {
       issueSurface.locator('[data-issue-number="3098"] .knowledge-row-badge'),
     ).toHaveText("Agent failed");
 
-    const blackout = issueSurface.locator(".knowledge-monitor-blackout");
-    await expect(blackout).toBeVisible();
-    await expect(blackout).toContainText("the fleet has been down since");
-    // FR-017: the per-issue failure is read in the notification center, not
-    // here. The outage renders anyway — it must not be masked by whichever
-    // launch happened to occupy `last_error` first.
+    // SPEC #3885 T-034: the outage is the ⚠ pill (hover: the latest line), not
+    // a banner row. It must not be masked by whichever launch happened to
+    // occupy `last_error` first.
+    await expect(issueSurface.locator(".knowledge-monitor-blackout")).toHaveCount(0);
+    const pill = issueSurface.locator(".knowledge-monitor-pill");
+    await expect(pill).toHaveText("⚠ Error");
+    await expect(pill).toHaveAttribute("title", /the fleet has been down since/);
     await expect(issueSurface.locator(".knowledge-monitor-error")).toHaveCount(
       0,
     );
@@ -434,6 +441,159 @@ test.describe("Issue Bridge load recovery", () => {
     expect(messages).toContainEqual({
       kind: "issue_monitor_requeue",
       issue_number: 3098,
+    });
+    expect(consoleErrors).toEqual([]);
+    expect(pageErrors).toEqual([]);
+  });
+
+  // SPEC #3885 Phase 5 (Issue #4559, T-032..T-035 / AC-23..AC-25): two
+  // toolbar bands, the "+ New" popover on the shared modal primitive, the ⚠
+  // monitor pill, and the detail pane order with its state action band.
+  test("lays the Issue window out as two bands, a + New popover and an AC-first detail pane", async ({
+    page,
+  }) => {
+    const consoleErrors: string[] = [];
+    const pageErrors: string[] = [];
+    page.on("console", (message) => {
+      if (message.type() === "error") consoleErrors.push(message.text());
+    });
+    page.on("pageerror", (error) => pageErrors.push(String(error)));
+
+    await installEmbeddedRoutes(page);
+    await installIssueBridgeBackend(page);
+    await page.goto(APP_URL);
+
+    const issueSurface = page.locator(".workspace-window.surface-knowledge");
+    const root = issueSurface.locator(".issue-bridge-root");
+    await expect(issueSurface.locator(".knowledge-row")).toHaveCount(4);
+
+    // AC-23: exactly two bands; the removed rows are not in the DOM.
+    await expect(root.locator(":scope > .workspace-toolbar")).toHaveCount(1);
+    await expect(root.locator(":scope > .knowledge-monitor-bar")).toHaveCount(1);
+    for (const gone of [
+      ".knowledge-monitor-panel",
+      ".knowledge-monitor-summary",
+      ".knowledge-monitor-quick",
+      ".knowledge-monitor-blackout",
+      ".knowledge-status",
+    ]) {
+      await expect(issueSurface.locator(gone)).toHaveCount(0);
+    }
+    await expect(
+      issueSurface.locator("[data-action='refresh-knowledge']"),
+    ).toHaveAttribute("title", /\d+ cached · Refreshed \d{2}:\d{2}/);
+    const bar = issueSurface.locator(".knowledge-monitor-bar");
+    await page.evaluate(() => {
+      window.__issueBridgeFixtureSocket.emit({
+        kind: "issue_monitor_status",
+        status: {
+          enabled: true,
+          state: "active",
+          queue_len: 3,
+          active_count: 1,
+          max_active_agents: 2,
+          launch_profile_source: "saved",
+          launch_profile_summary: "codex / host",
+        },
+      });
+    });
+    await expect(bar.locator(".knowledge-monitor-pill")).toHaveText("Running");
+    await expect(bar.locator('[data-action="monitor-settings"]')).toHaveAttribute(
+      "title",
+      "Agent settings Saved: codex / host",
+    );
+    await expect(bar.locator('[data-action="monitor-setup"]')).toBeHidden();
+    const barBox = await bar.boundingBox();
+    const toolbarBox = await root.locator(":scope > .workspace-toolbar").boundingBox();
+    expect(barBox && toolbarBox && barBox.y).toBeGreaterThan(toolbarBox?.y ?? 0);
+
+    // AC-25: the detail pane order and the queue action band.
+    await issueSurface.locator('.knowledge-row[data-issue-number="3095"]').click();
+    const pane = issueSurface.locator(".knowledge-detail-pane");
+    await expect(pane.locator(".issue-detail-id")).toContainText("#3095");
+    await expect(pane.locator(".issue-detail-status .knowledge-row-badge")).toHaveText(
+      await issueSurface
+        .locator('.knowledge-row[data-issue-number="3095"] .knowledge-row-badge')
+        .textContent() ?? "",
+    );
+    const band = pane.locator(".issue-detail-actions");
+    await expect(band).toHaveAttribute("data-phase", "queue");
+    await expect(band.locator(":scope > [data-action]")).toHaveText(["Launch now", "Move to top"]);
+    const sections = pane.locator(".issue-detail-body details.knowledge-section");
+    await expect(sections.first()).toHaveAttribute("open", "");
+    await expect(sections.nth(1)).not.toHaveAttribute("open", "");
+    await band.locator('[data-action="move-to-top"]').click();
+
+    await issueSurface.locator('.knowledge-row[data-issue-number="3273"]').click();
+    const gauge = pane.locator('.issue-detail-ac [role="progressbar"]');
+    await expect(gauge).toHaveAttribute("aria-valuenow", "1");
+    await expect(gauge).toHaveAttribute("aria-valuemax", "2");
+    await expect(pane.locator(".issue-detail-ac-count")).toHaveText("1 / 2");
+    const order = await pane.evaluate((node) =>
+      [
+        ".issue-detail-id",
+        ".knowledge-detail-title",
+        ".issue-detail-status",
+        ".issue-detail-actions",
+        ".issue-detail-ac",
+        ".issue-detail-body",
+      ].map((selector) => {
+        const all = [...node.querySelectorAll("*")];
+        return all.indexOf(node.querySelector(selector));
+      }),
+    );
+    expect(order.every((position) => position >= 0)).toBe(true);
+    expect(order).toEqual([...order].sort((left, right) => left - right));
+
+    // AC-24: "+ New" is a .modal-* dialog; Register sends auto_merge and closes.
+    await issueSurface.locator('[data-action="issue-new"]').click();
+    const dialog = page.locator(".modal-backdrop.issue-new-popover.open .modal-shell");
+    await expect(dialog).toBeVisible();
+    await expect(dialog).toHaveAttribute("role", "dialog");
+    await expect(dialog).toHaveAttribute("aria-modal", "true");
+    await expect(dialog.locator('[data-role="issue-new-title"]')).toBeFocused();
+    await page.keyboard.press("Escape");
+    await expect(dialog).toHaveCount(0);
+    await issueSurface.locator('[data-action="issue-new"]').click();
+    await dialog.locator('[data-role="issue-new-title"]').fill("Ship the popover");
+    await dialog.locator('[data-role="issue-new-auto-merge"]').check();
+    await dialog.locator('[data-action="issue-new-register"]').click();
+    await expect(dialog).toHaveCount(0);
+
+    // AC-24: an error turns the pill ⚠ and adds no row to the toolbar.
+    const rootChildren = await root.evaluate((node) => node.childElementCount);
+    await page.evaluate(() => {
+      window.__issueBridgeFixtureSocket.emit({
+        kind: "issue_monitor_status",
+        status: {
+          enabled: true,
+          state: "error",
+          queue_len: 3,
+          active_count: 1,
+          max_active_agents: 2,
+          last_error: "issue #3785: scan failed\nsecond line",
+          launch_profile_source: "saved",
+          launch_profile_summary: "codex / host",
+        },
+      });
+    });
+    await expect(bar.locator(".knowledge-monitor-pill")).toHaveText("⚠ Error");
+    await expect(bar.locator(".knowledge-monitor-pill")).toHaveAttribute(
+      "title",
+      "issue #3785: scan failed",
+    );
+    expect(await root.evaluate((node) => node.childElementCount)).toBe(rootChildren);
+
+    const messages = await page.evaluate(() => window.__knowledgeLoadMessages);
+    expect(messages).toContainEqual({
+      kind: "reorder_issue_monitor_issues",
+      issue_numbers: [3095, 3273, 3094],
+    });
+    expect(messages).toContainEqual({
+      kind: "quick_register_issue",
+      title: "Ship the popover",
+      launch: false,
+      auto_merge: true,
     });
     expect(consoleErrors).toEqual([]);
     expect(pageErrors).toEqual([]);
@@ -846,9 +1006,11 @@ test.describe("SPEC #3170 immediate selection under delayed and reversed respons
 
       // FR-099: a transient semantic failure is silent — no error, no
       // "Searching semantic index" spinner text on the Issue/SPEC surface.
-      const status = page.locator(".surface-knowledge .knowledge-status");
-      await expect(status).not.toContainText("Searching semantic index");
-      await expect(page.locator(".surface-knowledge .knowledge-status.error")).toHaveCount(0);
+      // SPEC #3885 T-032: the Issue window has no status row at all.
+      await expect(page.locator(".surface-knowledge .knowledge-status")).toHaveCount(0);
+      await expect(
+        page.locator(".surface-knowledge [data-action='refresh-knowledge']"),
+      ).not.toHaveAttribute("title", /Searching semantic index/);
       await expect(page.locator(".surface-knowledge .knowledge-row").first()).toBeVisible();
 
       // Row clicks inside the retry window must neither cancel the ladder nor
@@ -870,7 +1032,9 @@ test.describe("SPEC #3170 immediate selection under delayed and reversed respons
       expect(telemetry.searchQueries).toEqual(["latency ladder", "latency ladder"]);
       expect(telemetry.maxSearchOverlap).toBe(1);
       await expect(page.locator(".surface-knowledge .knowledge-status.error")).toHaveCount(0);
-      await expect(status).not.toContainText("Searching semantic index");
+      await expect(
+        page.locator(".surface-knowledge [data-action='refresh-knowledge']"),
+      ).not.toHaveAttribute("title", /Searching semantic index/);
     });
 
     test(`${surface.label}: a retry hop on a non-OPEN socket queues nothing and restarts after reconnect`, async ({
@@ -2019,7 +2183,11 @@ async function installIssueBridgeBackend(
                 sections: [
                   {
                     title: "Description",
-                    body: "Issue Bridge detail body",
+                    // SPEC #3885 T-035: the queued row carries an AC checklist
+                    // so the detail pane's progress gauge has something to count.
+                    body: message.number === 3273
+                      ? ["Issue Bridge detail body", "", "- [x] AC-1: shipped", "- [ ] AC-2: pending"].join("\n")
+                      : "Issue Bridge detail body",
                     body_html: "<p>Issue Bridge detail body</p>",
                   },
                   {
