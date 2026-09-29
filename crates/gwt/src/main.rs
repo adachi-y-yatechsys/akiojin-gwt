@@ -484,7 +484,10 @@ impl EventLoopDispatchTimer {
 
 impl Drop for EventLoopDispatchTimer {
     fn drop(&mut self) {
-        let elapsed_ms = self.started.elapsed().as_millis() as u64;
+        let elapsed = self.started.elapsed();
+        // Issue #4520 AC-2: a startup dispatch past 100 ms reaches perf.startup.
+        gwt::perf::startup::event_loop_stall(self.label.as_str(), elapsed.as_secs_f64() * 1_000.0);
+        let elapsed_ms = elapsed.as_millis() as u64;
         if let Some(message) = gui_event_loop_stall_warning(self.label.as_str(), elapsed_ms) {
             tracing::warn!(
                 target: "gwt.frontend.timing",
