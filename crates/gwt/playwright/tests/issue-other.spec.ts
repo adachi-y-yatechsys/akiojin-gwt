@@ -74,6 +74,25 @@ test("Other stays authoritative under search and queue columns, with no Workspac
   await expect(row(page, "remote-start:feature/remote")).toBeVisible();
 });
 
+test("Other disclosure survives a cache refresh between pointerdown and pointerup", async ({ page }) => {
+  await boot(page);
+  await page.evaluate(() => { (window as any).__otherHoldEntries = true; });
+  await page.locator('[data-action="refresh-knowledge"]').click();
+  await expect.poll(() => page.evaluate(() => (window as any).__otherPendingRefresh)).toBe(true);
+  const other = page.locator("details.issue-other-group");
+  const summary = other.locator("summary");
+  await summary.scrollIntoViewIfNeeded();
+  await other.evaluate(node => { (window as any).__otherBeforeRefresh = node; });
+  const bounds = await summary.boundingBox();
+  await page.mouse.move(bounds!.x + 30, bounds!.y + bounds!.height / 2);
+  await page.mouse.down();
+  await page.evaluate(() => (window as any).__otherRefresh());
+  await expect.poll(() => other.evaluate(node => node === (window as any).__otherBeforeRefresh)).toBe(true);
+  await page.mouse.up();
+  await expect(other).toHaveAttribute("open");
+  await expect(row(page, "other-paused")).toBeVisible();
+});
+
 test("Other keeps branch launch, conversation resume and backend-approved cleanup reachable", async ({ page }) => {
   await boot(page);
   await page.locator(".issue-other-summary").click();
@@ -112,6 +131,7 @@ async function installBackend(page: Page, preset: string) {
   await page.addInitScript(({ preset, projectKey }) => {
     const fixture = window as any;
     fixture.__otherMessages = [];
+    let lastKnowledgeResponse: unknown;
     const issueWindow = {
       id: "tab-other::issue-1", title: "Issues", preset,
       geometry: { x: 50, y: 60, width: 1430, height: 940 },
@@ -164,7 +184,17 @@ async function installBackend(page: Page, preset: string) {
         super();
         setTimeout(() => { this.readyState = 1; this.dispatchEvent(new Event("open")); }, 0);
       }
-      emit(payload: unknown) {
+      emit(payload: any) {
+        if (payload.kind === "knowledge_entries") {
+          lastKnowledgeResponse = payload;
+          fixture.__otherRefresh = () => this.dispatchEvent(new MessageEvent("message", {
+            data: JSON.stringify(lastKnowledgeResponse),
+          }));
+          if (fixture.__otherHoldEntries) {
+            fixture.__otherPendingRefresh = true;
+            return;
+          }
+        }
         setTimeout(() => this.dispatchEvent(new MessageEvent("message", {
           data: JSON.stringify(payload),
         })), 0);

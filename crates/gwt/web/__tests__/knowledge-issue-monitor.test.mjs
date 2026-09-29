@@ -882,3 +882,23 @@ test("queue row move preserves uncached predecessors and waits for server order"
   firstVisibleUp.click();
   assert.deepEqual(sent.at(-1),{kind:"issue_monitor_queue_move",issue_number:1,position:0});
 });
+
+test("Issue refresh preserves the Other disclosure node during user interaction", async (t) => {
+  const { body, surface } = await makeFixture({
+    renderOtherWork(parent) {
+      if (!parent.querySelector(".issue-other-group")) {
+        const other = parent.ownerDocument.createElement("details");
+        other.className = "issue-other-group";
+        parent.appendChild(other);
+      }
+    },
+  });
+  t.after(() => surface.clearKnowledgeBridgeState("win-1"));
+  const other = body.querySelector(".issue-other-group");
+  other.setAttribute("open", "");
+  surface.renderKnowledgeBridge("win-1");
+  assert.ok(body.querySelector(".issue-other-group") === other,
+    "Other disclosure identity survives refresh");
+  assert.equal(other.hasAttribute("open"), true);
+  assert.ok(body.querySelector(".knowledge-list").lastElementChild === other);
+});

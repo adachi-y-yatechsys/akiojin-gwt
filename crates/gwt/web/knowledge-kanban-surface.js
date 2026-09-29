@@ -2807,7 +2807,7 @@ export function createKnowledgeKanbanSurface({
           });
           board.appendChild(column);
         }
-        list.append(feedback, board);
+        list.prepend(feedback, board);
       }
 
       function kanbanEmptyMessage(state, phase) {
@@ -4067,19 +4067,24 @@ export function createKnowledgeKanbanSurface({
 
         renderKnowledgeStatusOnly(windowId, state);
 
-        list.innerHTML = "";
+        // Keep the native disclosure connected while cache projections refresh;
+        // replacing it between pointerdown and pointerup loses the user's click.
+        const other = list.querySelector(".issue-other-group");
+        for (const child of Array.from(list.childNodes)) {
+          if (child !== other) child.remove();
+        }
         const visibleEntries = filteredIssueEntries(state);
         if (splitMode) {
           const pairs = visibleEntries
             .map((entry) => renderIssueSplitPair(windowId, state, entry))
             .filter(Boolean);
           if (pairs.length === 0) {
-            list.appendChild(
-              createNode("div", "knowledge-empty", "No running agents to show side by side"),
+            list.insertBefore(
+              createNode("div", "knowledge-empty", "No running agents to show side by side"), other,
             );
           } else {
             for (const pair of pairs) {
-              list.appendChild(pair);
+              list.insertBefore(pair, other);
             }
           }
         } else {

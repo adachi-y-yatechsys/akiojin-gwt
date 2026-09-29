@@ -5742,6 +5742,9 @@ mod tests {
 
     #[test]
     fn monitor_http_client_rejects_non_loopback_test_override() {
+        let _env_lock = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let temp = TempDir::new().expect("tempdir");
         let _home = ScopedGwtHome::set(temp.path().join("home"));
         let _token = ScopedEnvVar::set("GH_TOKEN", "fixture-only");
