@@ -11504,13 +11504,7 @@ impl IssueMonitorState {
         // Open Issue, so generation counts observations — six delivered Issues
         // nobody had ever closed sat at generations 43-60 and were refused here
         // forever, relaunching up to fifteen times each.
-        let reopened = self
-            .closure_records
-            .get(&issue_number)
-            .is_some_and(|record| {
-                record.state == IssueClosureState::Reopened && record.reopened_after_close
-            });
-        if reopened {
+        if self.issue_reopened_after_close(issue_number) {
             let merged_at = delivery
                 .merged_at
                 .as_deref()
@@ -14463,6 +14457,44 @@ impl IssueMonitorState {
         {
             self.last_error = self.first_failed_issue_banner();
         }
+    }
+
+    /// Issue #4770: `issue.reopen` reopened `issue_number` on GitHub. A scan
+    /// that observed the close left a durable `Closed` record, and nothing but
+    /// the next complete Live scan would ever lift it, so the operator's
+    /// requeue right after the reopen was refused. Only this Issue's record is
+    /// transitioned, through the same revision fence a scan observation uses:
+    /// a reopen older than the recorded close changes nothing. Returns whether
+    /// the Issue is no longer held closed.
+    pub fn record_reopened(&mut self, issue_number: u64, issue_updated_at: Option<String>) -> bool {
+        if !self.issue_is_closed(issue_number) {
+            return false;
+        }
+        self.transition_issue_closure(
+            issue_number,
+            IssueClosureState::Reopened,
+            IssueClosureEvidence::ExplicitRevision,
+            issue_updated_at,
+        );
+        !self.issue_is_closed(issue_number)
+    }
+
+    /// Issue #4770: the Issue was reopened after a scan observed its close and
+    /// dropped every row for it, and no scan has re-admitted it yet. Once a
+    /// scan re-derives its inbox row, that row — not the closure — decides.
+    pub fn reopened_issue_awaits_rescan(&self, issue_number: u64) -> bool {
+        self.issue_reopened_after_close(issue_number)
+            && self.inbox_item(issue_number).is_none()
+            && !self.queue.contains(&issue_number)
+    }
+
+    /// Whether the Issue's closure lineage was Closed and is now Reopened.
+    fn issue_reopened_after_close(&self, issue_number: u64) -> bool {
+        self.closure_records
+            .get(&issue_number)
+            .is_some_and(|record| {
+                record.state == IssueClosureState::Reopened && record.reopened_after_close
+            })
     }
 
     /// Record that the GitHub Issue for `issue_number` was closed (released).
