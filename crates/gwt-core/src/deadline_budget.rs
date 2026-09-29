@@ -10,7 +10,7 @@
 //! resolves the default. Under `cfg(test)` / the `test-support` feature a
 //! budget resolves, in order:
 //!
-//! 1. a thread-scoped pin ([`ScopedDeadlineBudget`]) — exact for a test whose
+//! 1. a thread-scoped pin (`ScopedDeadlineBudget`) — exact for a test whose
 //!    deadline is read on the test thread;
 //! 2. a process-wide pin, the environment variable
 //!    `GWT_TEST_BUDGET_<NAME>_MS` — for a deadline read on another thread
