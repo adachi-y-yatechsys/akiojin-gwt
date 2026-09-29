@@ -677,6 +677,10 @@ test.describe("Issue preview placement", () => {
       ".surface-knowledge [data-issue-number='3671'] .issue-agent-status-elapsed",
     );
     await expect(elapsed).toHaveText("<1m");
+    // Let every incidental re-render (detail / entries replies) land first, so
+    // only the start-time broadcast below can change the label: the render key
+    // itself must notice `runtime_started_at_ms`.
+    await page.waitForTimeout(1000);
 
     await page.evaluate(() =>
       window.__patchWindow("tab-issue::agent-preview", {
