@@ -78,7 +78,7 @@ fn codex_hook_discovery_reuses_the_single_canonical_host_health_result() {
     for mutation in [
         "refresh_managed_gwt_assets_for_agent_with_codex_hook_discovery_mode(",
         "maybe_register_codex_managed_hook_trust_for_launch(",
-        "gwt_agent::Session::new(",
+        "initialize_launch_session(",
     ] {
         assert!(
             health
@@ -88,6 +88,9 @@ fn codex_hook_discovery_reuses_the_single_canonical_host_health_result() {
             "canonical health must precede launch mutation {mutation}"
         );
     }
+    let initializer = fs::read_to_string(repo_root().join("crates/gwt/src/session_launch.rs"))
+        .expect("read extracted Session initializer");
+    assert!(function_source(&initializer, "initialize_launch_session").contains("Session::new("));
 }
 
 fn function_source<'a>(source: &'a str, name: &str) -> &'a str {
@@ -433,7 +436,7 @@ fn windows_ci_runs_the_real_resolver_pty_and_caller_regression_targets() {
     assert!(!workflow.contains("cargo test -p gwt-core terminal::pty"));
     for command in [
         "cargo test -p gwt-core --test windows_process_resolver --test process_adapter_parity",
-        "cargo test -p gwt-core --lib real_bun_global_placeholder_fixture",
+        "cargo test -p gwt-core --test windows_claude_user_agent",
         "cargo test -p gwt-agent --lib real_bun_global_placeholder_fixture",
         "cargo test -p gwt-agent --lib package_runner_resolution_failure_still_emits_an_end_summary",
         "cargo test -p gwt --bin gwt real_bun_global_placeholder_fixture",

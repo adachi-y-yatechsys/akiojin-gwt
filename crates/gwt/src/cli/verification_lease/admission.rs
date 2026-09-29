@@ -110,7 +110,7 @@ impl Admission {
         }
     }
 
-    #[cfg(test)]
+    /// Recorded on the run as its provenance (Issue #4528).
     pub(crate) fn lease_id(&self) -> Option<&str> {
         Some(&self.lease_id)
     }
@@ -1397,5 +1397,28 @@ mod tests {
             lease_root.coordinator.heavy_lease_status().unwrap().pending,
             1
         );
+        // Issue #4746 AC-5: exercise a new admission, not a retry on the
+        // same guard. A deferred caller keeps its place ahead of new arrivals.
+        let before = lease_root.coordinator.heavy_lease_status().unwrap().queue;
+        let later = TargetKey::verification("later-repo", "later-worktree");
+        lease_root
+            .coordinator
+            .reserve_heavy(
+                &later,
+                JobPriority::ManualRebuild,
+                Duration::from_secs(60),
+                Some("later arrival"),
+            )
+            .unwrap();
+        let again = lease_root
+            .admit(&mut env, worktree.path(), Duration::ZERO)
+            .unwrap_err()
+            .to_string();
+        assert!(again.contains("next_turn_reserved: yes"), "{again}");
+        let after = lease_root.coordinator.heavy_lease_status().unwrap().queue;
+        assert_eq!(after.len(), 2);
+        assert_eq!(after[0].target.as_deref(), Some(key.file_stem().as_str()));
+        assert_eq!(after[0].queued_at_ms, before[0].queued_at_ms);
+        assert_eq!(after[1].target.as_deref(), Some(later.file_stem().as_str()));
     }
 }

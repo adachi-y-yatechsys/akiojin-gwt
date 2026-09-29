@@ -1410,6 +1410,53 @@ body {
   display: none !important;
 }
 
+/* SPEC-3885: Other belongs to the Issue list, not an independent window. */
+.issue-other-group {
+  position: static;
+  display: block;
+  flex: 0 0 auto;
+  width: 100%;
+  margin-top: var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  color: var(--color-text);
+  background: var(--color-surface);
+}
+
+.issue-other-summary {
+  padding: var(--space-3);
+  cursor: pointer;
+  font-family: var(--font-body);
+  color: var(--color-text-muted);
+}
+
+.issue-other-group > .workspace-overview-shell {
+  grid-template-columns: minmax(0, 1fr);
+  max-height: 480px;
+  overflow: auto;
+}
+
+.issue-other-group .workspace-overview-list-pane {
+  border-right: 0;
+  overflow: visible;
+}
+
+.issue-other-group .workspace-overview-detail-pane {
+  font-family: var(--font-body);
+  border-top: 1px solid var(--color-border);
+  overflow: visible;
+}
+
+.issue-lane-filter {
+  max-width: 160px;
+  padding: var(--space-1) var(--space-2);
+  font-family: var(--font-body);
+  color: var(--color-text);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+}
+
 .workspace-overview-list-pane {
   overflow-y: auto;
 }
@@ -7055,4 +7102,66 @@ body.route-body {
   display: inline-flex;
   align-items: center;
   text-decoration: none;
+}
+
+/* Issue #4530 candidate pool */
+.knowledge-monitor-pool {
+  flex: 0 0 auto;
+  border-bottom: 1px solid var(--color-border);
+  font-size: var(--type-sm);
+}
+.knowledge-monitor-pool > summary {
+  padding: var(--space-2) var(--space-3);
+  cursor: pointer;
+  color: var(--color-text-muted);
+}
+.knowledge-monitor-pool-content {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  max-height: 300px;
+  overflow: auto;
+}
+.knowledge-monitor-candidate {
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: var(--space-2);
+}
+.knowledge-monitor-candidate-heading,
+.knowledge-monitor-pool-add {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+.knowledge-monitor-candidate-summary {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.knowledge-monitor-pool-field {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  font-size: var(--type-xs);
+}
+.knowledge-monitor-pool-field input {
+  min-width: 0;
+  max-width: 100%;
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font: inherit;
+}
+.knowledge-monitor-pool-message {
+  margin: 0;
+  color: var(--color-text-muted);
+  font-size: var(--type-xs);
+}
+.knowledge-monitor-pool-message:empty {
+  display: none;
 }

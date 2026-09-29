@@ -163,6 +163,10 @@ fn run_status<E: CliEnv>(env: &mut E, out: &mut String) -> Result<i32, SpecOpsEr
 
     let payload = parse_runner_json(&output.stdout)?;
     render_index_status(out, &report, &payload);
+    crate::index_resources::render_index_resources(
+        out,
+        &crate::index_resources::collect_index_resources(),
+    );
     let log_dir = audit_log_dir(&context);
     let _ = audit_status(&log_dir, &context, &report, &payload, 0);
     Ok(0)

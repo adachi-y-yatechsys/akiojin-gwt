@@ -125,17 +125,14 @@ fn pty_start_gate_helper() {
 
 #[test]
 fn agent_bootstrap_spawn_routes_apply_resource_policy_before_release() {
-    let source = include_str!("launch.rs");
+    let source = include_str!("../project_runtime.rs");
     let direct = source
-        .split("pub(crate) fn spawn_process_window_with_console_kind")
+        .split("pub fn spawn_unbound_pane")
         .nth(1)
-        .and_then(|tail| {
-            tail.split("fn spawn_bound_process_window_with_console_kind")
-                .next()
-        })
+        .and_then(|tail| tail.split("pub fn spawn_bound_pane").next())
         .expect("direct spawn route body");
     assert!(
-        direct.contains("resource_policy"),
+        direct.contains("policy_gate"),
         "direct AgentBootstrap route must consult the launch resource policy"
     );
     assert!(
@@ -151,9 +148,9 @@ fn agent_bootstrap_spawn_routes_apply_resource_policy_before_release() {
     assert!(apply < release, "policy must be applied before release");
 
     let bound = source
-        .split("fn spawn_bound_process_window_with_console_kind")
+        .split("pub fn spawn_bound_pane")
         .nth(1)
-        .and_then(|tail| tail.split("fn install_process_window").next())
+        .and_then(|tail| tail.split("#[cfg(test)]").next())
         .expect("bound spawn route body");
     let apply = bound.find("apply_policy(").expect("bound apply_policy");
     let release = bound.find(".release()").expect("bound release");
@@ -168,19 +165,16 @@ fn agent_bootstrap_spawn_routes_apply_resource_policy_before_release() {
 /// so neither spawn route may turn it into `PTY creation failed`.
 #[test]
 fn agent_resource_policy_failure_never_fails_the_spawn_routes() {
-    let source = include_str!("launch.rs");
+    let source = include_str!("../project_runtime.rs");
     let direct = source
-        .split("pub(crate) fn spawn_process_window_with_console_kind")
+        .split("pub fn spawn_unbound_pane")
         .nth(1)
-        .and_then(|tail| {
-            tail.split("fn spawn_bound_process_window_with_console_kind")
-                .next()
-        })
+        .and_then(|tail| tail.split("pub fn spawn_bound_pane").next())
         .expect("direct spawn route body");
     let bound = source
-        .split("fn spawn_bound_process_window_with_console_kind")
+        .split("pub fn spawn_bound_pane")
         .nth(1)
-        .and_then(|tail| tail.split("fn install_process_window").next())
+        .and_then(|tail| tail.split("#[cfg(test)]").next())
         .expect("bound spawn route body");
 
     for (route, body) in [("direct", direct), ("bound", bound)] {
@@ -201,7 +195,7 @@ fn agent_resource_policy_failure_never_fails_the_spawn_routes() {
     // The routes cannot re-introduce the failure path even by editing the
     // statement: the helper owns the call and hands no outcome back.
     let helper = source
-        .split("pub(crate) fn best_effort_apply_policy(")
+        .split("fn best_effort_apply_policy(")
         .nth(1)
         .expect("best-effort helper");
     let signature = &helper[..helper.find('{').expect("helper body")];
@@ -216,7 +210,7 @@ fn agent_resource_policy_failure_never_fails_the_spawn_routes() {
 #[test]
 fn agent_resource_policy_failure_warns_once_and_keeps_the_launch() {
     let events = capture_tracing_events(|| {
-        super::launch::note_unapplied_agent_resource_policy(
+        gwt::project_runtime::note_unapplied_agent_resource_policy_for_test(
             "window-3942",
             Err(gwt_terminal::TerminalError::PtyCreationFailed {
                 reason: "apply process policy: setpriority(pgrp 4242, nice 10): \
@@ -253,7 +247,7 @@ fn agent_resource_policy_failure_warns_once_and_keeps_the_launch() {
     );
 
     let applied = capture_tracing_events(|| {
-        super::launch::note_unapplied_agent_resource_policy("window-3942", Ok(()));
+        gwt::project_runtime::note_unapplied_agent_resource_policy_for_test("window-3942", Ok(()));
     });
     assert!(
         applied.iter().all(|event| !matches!(
@@ -269,6 +263,7 @@ fn gwt_input_trace_markers_exclude_payload_lengths_and_raw_errors() {
     for (source_name, source) in [
         ("embedded_server.rs", include_str!("../embedded_server.rs")),
         ("app_runtime/pty_io.rs", include_str!("pty_io.rs")),
+        ("pane_runtime.rs", include_str!("../pane_runtime.rs")),
     ] {
         for (index, tail) in source
             .split("target: \"gwt_input_trace\"")
@@ -321,11 +316,14 @@ fn backend_gwt_input_trace_markers_use_stage_local_exact_allowlists() {
                     "close_finalizer_registry_deregister_poisoned",
                     vec!["outcome", "stage", "window_id"],
                 ),
-                (
-                    "reader_pane_lock",
-                    vec!["lock_wait_us", "parse_us", "stage", "window_id"],
-                ),
             ]),
+        ),
+        (
+            "pane_runtime.rs",
+            HashMap::from([(
+                "reader_pane_lock",
+                vec!["lock_wait_us", "parse_us", "stage", "window_id"],
+            )]),
         ),
         (
             "embedded_server.rs",
@@ -365,6 +363,7 @@ fn backend_gwt_input_trace_markers_use_stage_local_exact_allowlists() {
     for (source_name, source) in [
         ("embedded_server.rs", include_str!("../embedded_server.rs")),
         ("app_runtime/pty_io.rs", include_str!("pty_io.rs")),
+        ("pane_runtime.rs", include_str!("../pane_runtime.rs")),
     ] {
         let mut actual = HashMap::new();
         for tail in source.split("target: \"gwt_input_trace\"").skip(1) {
@@ -4313,7 +4312,7 @@ fn sample_runtime_with_events(
         // Issue #3633: tests must never leave real daemons behind on the
         // developer's machine, but the ensure pass still has to be observable
         // so the wiring cannot silently disappear again.
-        daemon_supervisor: gwt::daemon_supervisor::DaemonSupervisor::disabled(),
+        daemon_supervisor: Arc::new(gwt::daemon_supervisor::DaemonSupervisor::disabled()),
         pending_continue_work: HashMap::new(),
         pending_fresh_execution_launches: HashMap::new(),
         pending_tool_runtime_migrations: HashMap::new(),
@@ -30936,6 +30935,10 @@ fn active_work_item_view_lifecycle_state_back_compat_default() {
     });
     let view: gwt::ActiveWorkItemView =
         serde_json::from_value(legacy).expect("deserialize legacy active work item");
+    assert_eq!(
+        serde_json::to_value(&view).unwrap()["linked_issue_numbers"],
+        serde_json::json!([])
+    );
     assert_eq!(view.lifecycle_state, "active");
     assert_eq!(view.closed_at, None);
 }
@@ -49749,6 +49752,8 @@ fn app_runtime_autonomous_fallback_epoch_overflow_is_zero_write_error() {
 
 #[test]
 fn app_runtime_full_issue_monitor_scan_migrates_legacy_git_failure_and_persists_marker() {
+    // Verify migration and durable state, independently of host fsync latency.
+    let _clock = gwt_core::operation_deadline::ScopedOperationClock::set(Instant::now());
     let _env_lock = env_test_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -49912,6 +49917,8 @@ fn issue_monitor_scan_failures_prefer_launch_failure_over_merge_query_error() {
 
 #[test]
 fn app_runtime_full_issue_monitor_cache_fallback_does_not_migrate_legacy_failure() {
+    // Verify cache provenance, independently of the prefs commit wall-clock budget.
+    let _clock = gwt_core::operation_deadline::ScopedOperationClock::set(Instant::now());
     let _env_lock = env_test_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -54158,6 +54165,138 @@ fn pool_profile(agent_id: &str) -> gwt::IssueMonitorLaunchProfile {
         windows_shell: None,
         prefer_for: Vec::new(),
     }
+}
+
+#[test]
+fn app_runtime_issue_monitor_profiles_set_preserves_sparse_candidate_settings() {
+    let temp = tempdir().expect("tempdir");
+    let _home = ScopedGwtHome::set(temp.path());
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    init_repo_with_initial_commit(&repo);
+    let prefs_path = gwt::issue_monitor_prefs_path_for_repo_path(&repo);
+    let mut claude = pool_profile("claude");
+    claude.model = Some("saved-claude-model".into());
+    claude.reasoning = Some("high".into());
+    claude.skip_permissions = true;
+    claude.prefer_for = vec!["type:bug".into()];
+    let mut codex = pool_profile("codex");
+    codex.model = Some("saved-codex-model".into());
+    codex.fast_mode = true;
+    let mut seeded = gwt::IssueMonitorPrefs {
+        max_active_agents: 7,
+        launch_usage_threshold_percent: 83,
+        ..Default::default()
+    };
+    seeded.set_launch_profile_pool(vec![claude.clone(), codex.clone()]);
+    gwt::save_issue_monitor_prefs(&prefs_path, &seeded).expect("seed pool");
+    let tab = sample_project_tab("tab-1", "Repo", repo, ProjectKind::Git, &[]);
+    let mut runtime = sample_runtime(temp.path(), vec![tab], Some("tab-1"));
+    let event = serde_json::from_value(serde_json::json!({
+        "kind": "issue_monitor_profiles_set",
+        "profiles": [{"agent_id": "codex", "prefer_for": ["kind:feature"]},
+                     {"agent_id": "claude"}, {"agent_id": "grok"}]
+    }))
+    .expect("candidate editing event");
+    let events = runtime.handle_frontend_event("client-1".into(), event);
+    let errors: Vec<_> = events
+        .iter()
+        .filter_map(|event| match &event.event {
+            BackendEvent::IssueMonitorToast { level, message, .. } if level == "error" => {
+                Some(message)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(errors.is_empty(), "{errors:?}");
+    let saved = gwt::load_issue_monitor_prefs(&prefs_path).expect("reload pool");
+    codex.prefer_for = vec!["kind:feature".into()];
+    assert_eq!(saved.launch_profiles[0], codex);
+    assert_eq!(saved.launch_profiles[1], claude);
+    assert_eq!(saved.launch_profiles[2].agent_id, "grok");
+    assert!(
+        saved.launch_profiles[2].skip_permissions,
+        "new candidate inherits shared settings"
+    );
+    assert_eq!(saved.launch_profile.as_ref(), Some(&codex));
+    assert_eq!(saved.launch_usage_threshold_percent, 83);
+    assert_eq!(saved.max_active_agents, 7);
+    assert_eq!(
+        saved.effect_authority_epoch,
+        seeded.effect_authority_epoch + 1
+    );
+
+    // Removing candidates and changing only the threshold retain the remaining
+    // candidate's provider-specific configuration and its routing tags.
+    let event = serde_json::from_value(serde_json::json!({
+        "kind": "issue_monitor_profiles_set",
+        "profiles": [{"agent_id": "codex"}], "usage_threshold_percent": 71
+    }))
+    .expect("candidate removal event");
+    runtime.handle_frontend_event("client-1".into(), event);
+    let saved = gwt::load_issue_monitor_prefs(&prefs_path).expect("reload reduced pool");
+    assert_eq!(saved.launch_profiles, vec![codex]);
+    assert_eq!(saved.launch_usage_threshold_percent, 71);
+    assert_eq!(saved.max_active_agents, 7);
+}
+
+#[test]
+fn app_runtime_issue_monitor_profiles_set_rejects_invalid_edits_without_writing() {
+    let temp = tempdir().expect("tempdir");
+    let _home = ScopedGwtHome::set(temp.path());
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    init_repo_with_initial_commit(&repo);
+    let prefs_path = gwt::issue_monitor_prefs_path_for_repo_path(&repo);
+    let mut seeded = gwt::IssueMonitorPrefs::default();
+    seeded.set_launch_profile_pool(vec![pool_profile("claude")]);
+    gwt::save_issue_monitor_prefs(&prefs_path, &seeded).expect("seed pool");
+    let tab = sample_project_tab("tab-1", "Repo", repo, ProjectKind::Git, &[]);
+    let mut runtime = sample_runtime(temp.path(), vec![tab], Some("tab-1"));
+    for payload in [
+        serde_json::json!({"profiles": []}),
+        serde_json::json!({"profiles": [{"agent_id": "claude", "prefer_for": ["invalid"]}]}),
+        serde_json::json!({"profiles": [{"agent_id": "claude"}], "usage_threshold_percent": 0}),
+    ] {
+        let before = fs::read(&prefs_path).expect("read prefs");
+        let mut payload = payload;
+        payload["kind"] = "issue_monitor_profiles_set".into();
+        let event = serde_json::from_value(payload).expect("candidate editing event");
+        let events = runtime.handle_frontend_event("client-1".into(), event);
+        assert!(events.iter().any(|event| matches!(
+            &event.event, BackendEvent::IssueMonitorToast { level, .. } if level == "error"
+        )));
+        assert_eq!(fs::read(&prefs_path).expect("reload prefs"), before);
+    }
+}
+
+#[test]
+fn app_runtime_issue_monitor_profiles_set_epoch_overflow_is_zero_write_error() {
+    let temp = tempdir().expect("tempdir");
+    let _home = ScopedGwtHome::set(temp.path());
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    init_repo_with_initial_commit(&repo);
+    let prefs_path = gwt::issue_monitor_prefs_path_for_repo_path(&repo);
+    let mut seeded = gwt::IssueMonitorPrefs {
+        effect_authority_epoch: u64::MAX,
+        ..Default::default()
+    };
+    seeded.set_launch_profile_pool(vec![pool_profile("claude")]);
+    gwt::save_issue_monitor_prefs(&prefs_path, &seeded).expect("seed pool");
+    let before = fs::read(&prefs_path).expect("read prefs");
+    let tab = sample_project_tab("tab-1", "Repo", repo, ProjectKind::Git, &[]);
+    let mut runtime = sample_runtime(temp.path(), vec![tab], Some("tab-1"));
+    let event = serde_json::from_value(serde_json::json!({
+        "kind": "issue_monitor_profiles_set", "profiles": [{"agent_id": "codex"}]
+    }))
+    .expect("candidate editing event");
+    let events = runtime.handle_frontend_event("client-1".into(), event);
+    assert!(events.iter().any(|event| matches!(
+        &event.event, BackendEvent::IssueMonitorToast { level, message, .. }
+            if level == "error" && message.contains("authority epoch exhausted")
+    )));
+    assert_eq!(fs::read(&prefs_path).expect("reload prefs"), before);
 }
 
 #[test]
@@ -60886,6 +61025,7 @@ fn attach_registry_sessions_caps_total_agents_on_the_wire() {
         })
         .collect();
     let mut works = vec![gwt::ActiveWorkItemView {
+        linked_issue_numbers: Vec::new(),
         id: "work-develop-7ea5aa57".to_string(),
         title: "develop".to_string(),
         status_category: "idle".to_string(),
@@ -60976,6 +61116,7 @@ fn attach_registry_sessions_keeps_latest_entry_per_agent_identity() {
     }
 
     let mut works = vec![gwt::ActiveWorkItemView {
+        linked_issue_numbers: Vec::new(),
         id: "work-develop-7ea5aa57".to_string(),
         title: "develop".to_string(),
         status_category: "idle".to_string(),
@@ -61199,6 +61340,7 @@ fn workspace_test_work(
     works: Vec<gwt::ActiveWorkspaceWorkView>,
 ) -> gwt::ActiveWorkItemView {
     gwt::ActiveWorkItemView {
+        linked_issue_numbers: Vec::new(),
         id: "work-shared".to_string(),
         title: "work/shared".to_string(),
         status_category: "idle".to_string(),
@@ -61582,6 +61724,7 @@ fn attach_registry_sessions_recomputes_agent_counters_after_identity_collapse() 
     }
 
     let mut works = vec![gwt::ActiveWorkItemView {
+        linked_issue_numbers: Vec::new(),
         id: "work-develop-7ea5aa57".to_string(),
         title: "develop".to_string(),
         status_category: "active".to_string(),
@@ -61678,6 +61821,7 @@ fn attach_registry_sessions_drops_ghost_agents_without_identity_or_sessions() {
     }
 
     let mut works = vec![gwt::ActiveWorkItemView {
+        linked_issue_numbers: Vec::new(),
         id: "work-work-x-12345678".to_string(),
         title: "work/x".to_string(),
         status_category: "idle".to_string(),
@@ -61804,6 +61948,7 @@ fn attach_registry_sessions_dedupes_agents_sharing_a_conversation() {
     }
 
     let mut works = vec![gwt::ActiveWorkItemView {
+        linked_issue_numbers: Vec::new(),
         id: "work-work-x-12345678".to_string(),
         title: "work/x".to_string(),
         status_category: "idle".to_string(),
@@ -61940,6 +62085,7 @@ fn attach_registry_sessions_filters_agents_from_other_workspace_rows() {
     session_index.insert(other_session.id.as_str(), &other_session);
 
     let mut works = vec![gwt::ActiveWorkItemView {
+        linked_issue_numbers: Vec::new(),
         id: "work-work-issue-206-a0668517".to_string(),
         title: "contribution docs PR".to_string(),
         status_category: "idle".to_string(),
@@ -62186,6 +62332,7 @@ fn resume_branch_index_accepts_existing_worktree_without_branch_evidence() {
 #[test]
 fn active_works_are_sorted_by_latest_update_descending() {
     let row = |id: &str, branch: &str, updated_at: &str| gwt::ActiveWorkItemView {
+        linked_issue_numbers: Vec::new(),
         id: id.to_string(),
         title: branch.to_string(),
         status_category: "idle".to_string(),
@@ -62264,6 +62411,7 @@ fn active_works_are_sorted_by_latest_update_descending() {
 #[test]
 fn mark_merged_active_works_flags_cache_and_pr_state() {
     let row = |branch: Option<&str>, pr_state: Option<&str>| gwt::ActiveWorkItemView {
+        linked_issue_numbers: Vec::new(),
         id: "w".to_string(),
         title: "t".to_string(),
         status_category: "idle".to_string(),
@@ -62334,6 +62482,7 @@ fn dirty_worktree_pr_state_merged_does_not_flag_or_cleanup() {
     fs::write(repo.join("local-change.txt"), "current edits\n").expect("write dirty file");
 
     let mut works = vec![gwt::ActiveWorkItemView {
+        linked_issue_numbers: Vec::new(),
         id: "w-dirty".to_string(),
         title: "Dirty work".to_string(),
         status_category: "idle".to_string(),
@@ -63685,6 +63834,7 @@ fn assign_and_merge_workspace_groups_unifies_same_branch_rows() {
         lifecycle: &str,
     ) -> gwt::ActiveWorkItemView {
         gwt::ActiveWorkItemView {
+            linked_issue_numbers: Vec::new(),
             id: id.to_string(),
             title: id.to_string(),
             status_category: "idle".to_string(),
@@ -63749,6 +63899,8 @@ fn assign_and_merge_workspace_groups_unifies_same_branch_rows() {
         ),
     ];
 
+    works[0].linked_issue_numbers = vec![3885];
+    works[1].linked_issue_numbers = vec![3885, 4556];
     super::assign_and_merge_workspace_groups(&mut works, &root);
 
     assert_eq!(
@@ -63763,6 +63915,7 @@ fn assign_and_merge_workspace_groups_unifies_same_branch_rows() {
                 || work.branch.as_deref() == Some("work/x")
         })
         .expect("grouped row");
+    assert_eq!(group.linked_issue_numbers, vec![3885, 4556]);
     assert_eq!(
         group.id, "work-session-bbbb",
         "newest row is the representative"
@@ -63893,6 +64046,7 @@ fn legacy_workspace_lifecycle_does_not_create_an_implicit_close_target() {
 fn mark_remote_only_flags_fetched_branches_without_local_worktree() {
     fn row(id: &str, branch: Option<&str>, worktree: Option<&str>) -> gwt::ActiveWorkItemView {
         gwt::ActiveWorkItemView {
+            linked_issue_numbers: Vec::new(),
             id: id.to_string(),
             title: id.to_string(),
             status_category: "idle".to_string(),
@@ -63975,6 +64129,7 @@ fn mark_merged_classifies_done_equivalent_for_stale_merged_rows() {
         updated_at: &str,
     ) -> gwt::ActiveWorkItemView {
         gwt::ActiveWorkItemView {
+            linked_issue_numbers: Vec::new(),
             id: id.to_string(),
             title: id.to_string(),
             status_category: "idle".to_string(),
@@ -64052,6 +64207,7 @@ fn mark_merged_classifies_done_equivalent_for_stale_merged_rows() {
 #[test]
 fn mark_cleanup_candidates_exposes_no_changes_reason_without_merged_badge() {
     let mut works = vec![gwt::ActiveWorkItemView {
+        linked_issue_numbers: Vec::new(),
         id: "w-no-changes".to_string(),
         title: "No changes".to_string(),
         status_category: "idle".to_string(),
@@ -64133,6 +64289,7 @@ fn mark_cleanup_candidates_sets_blocked_reason_for_live_agent_and_process() {
     fs::create_dir_all(&live_process_worktree).expect("create live process worktree");
     let mut works = vec![
         gwt::ActiveWorkItemView {
+            linked_issue_numbers: Vec::new(),
             id: "w-live-agent".to_string(),
             title: "Live agent".to_string(),
             status_category: "active".to_string(),
@@ -64165,6 +64322,7 @@ fn mark_cleanup_candidates_sets_blocked_reason_for_live_agent_and_process() {
             updated_at: String::new(),
         },
         gwt::ActiveWorkItemView {
+            linked_issue_numbers: Vec::new(),
             id: "w-live-process".to_string(),
             title: "Live process".to_string(),
             status_category: "idle".to_string(),
@@ -64343,6 +64501,7 @@ fn apply_work_summary_external_sources_prefers_pr_then_ai_then_commit_subject() 
     );
 
     let base = |branch: &str, work_summary: Option<&str>| gwt::ActiveWorkItemView {
+        linked_issue_numbers: Vec::new(),
         id: branch.to_string(),
         title: branch.to_string(),
         status_category: "idle".to_string(),
@@ -69261,6 +69420,7 @@ fn pm_close_completion_stays_with_owner_and_is_dropped_after_owner_closes() {
         running_reasoning: None,
         is_running: false,
         agent_options: Vec::new(),
+        start_block: None,
     };
 
     let after_switch = runtime.handle_window_close_finalized(
@@ -72261,7 +72421,7 @@ fn the_daemon_supervision_tick_keeps_a_runtime_daemon_alive_for_enabled_projects
 
     let tab = sample_project_tab("tab-1", "Repo", repo.clone(), ProjectKind::Git, &[]);
     let mut runtime = sample_runtime(temp.path(), vec![tab], Some("tab-1"));
-    let (spawner, _tasks) = BlockingTaskSpawner::queued();
+    let (spawner, tasks) = BlockingTaskSpawner::queued();
     runtime.blocking_tasks = spawner;
 
     gwt::save_issue_monitor_prefs(
@@ -72290,6 +72450,19 @@ fn the_daemon_supervision_tick_keeps_a_runtime_daemon_alive_for_enabled_projects
     runtime.ensure_runtime_daemons_for_enabled_projects();
     assert_eq!(
         runtime.daemon_supervisor.ensure_attempts(),
+        0,
+        "GUI only enqueues ensure"
+    );
+    runtime.ensure_runtime_daemons_for_enabled_projects();
+    assert_eq!(
+        tasks.lock().unwrap().len(),
+        1,
+        "same project coalesces while queued"
+    );
+    let task = tasks.lock().unwrap().pop().unwrap();
+    task();
+    assert_eq!(
+        runtime.daemon_supervisor.ensure_attempts(),
         1,
         "the tick must own the daemon for an enabled project"
     );
@@ -72297,6 +72470,8 @@ fn the_daemon_supervision_tick_keeps_a_runtime_daemon_alive_for_enabled_projects
     // AC-2 in the topology: supervision is "the tick keeps asking", so a
     // second tick has to ask again rather than trust the first answer.
     runtime.ensure_runtime_daemons_for_enabled_projects();
+    let task = tasks.lock().unwrap().pop().unwrap();
+    task();
     assert_eq!(runtime.daemon_supervisor.ensure_attempts(), 2);
 }
 
@@ -78601,3 +78776,66 @@ include!("pm_project_state_tests.rs");
 include!("project_owned_state_tests.rs");
 
 include!("project_aggregate_tests.rs");
+
+#[test]
+fn active_work_issue_numbers_include_child_record_session_and_branch_links() {
+    let mut session = gwt_agent::Session::new("/repo", "work/shared", gwt_agent::AgentId::Codex);
+    session.id = "linked-session".to_string();
+    session.linked_issue_number = Some(33);
+    let agent = workspace_test_agent_with_conversation(
+        "linked-session",
+        "2026-09-01T00:00:00Z",
+        "conversation",
+    );
+    let mut child = workspace_test_child("child-work", vec![agent]);
+    child.owner = Some("Issue #22".to_string());
+    let mut work = workspace_test_work(vec![], vec![child]);
+    work.branch = Some("origin/work/shared".to_string());
+    work.owner = Some("SPEC #11".to_string());
+    let record = serde_json::from_value(serde_json::json!({
+        "id": "child-work", "title": "Child", "owner": "Issue #55", "status_category": "idle",
+        "created_at": "2026-09-01T00:00:00Z", "updated_at": "2026-09-01T00:00:00Z"
+    }))
+    .unwrap();
+    let mut rows = vec![work];
+    super::workspace_views::attach_active_work_issue_numbers(
+        &mut rows,
+        &[record],
+        &[session],
+        None,
+        &std::collections::HashMap::from([("work/shared".to_string(), 44)]),
+    );
+    assert_eq!(rows[0].linked_issue_numbers, vec![11, 22, 33, 44, 55]);
+    // The metadata remains usable without any Knowledge/Issue page loaded.
+    assert_eq!(
+        serde_json::to_value(&rows[0]).unwrap()["linked_issue_numbers"],
+        serde_json::json!([11, 22, 33, 44, 55])
+    );
+}
+
+#[test]
+fn active_work_issue_numbers_include_registry_sessions_beyond_the_display_cap() {
+    let repo = tempfile::tempdir().unwrap();
+    let _gwt_home = ScopedGwtHome::set(repo.path());
+    init_repo(repo.path());
+    let hash = gwt_core::repo_hash::detect_repo_hash(repo.path()).unwrap();
+    let sessions = (1..=12)
+        .map(|number| {
+            let mut session =
+                gwt_agent::Session::new(repo.path(), "work/shared", gwt_agent::AgentId::Codex);
+            session.id = format!("session-{number}");
+            session.repo_hash = Some(hash.as_str().to_string());
+            session.linked_issue_number = Some(number);
+            session
+        })
+        .collect::<Vec<_>>();
+    let mut rows = vec![workspace_test_work(vec![], vec![])];
+    super::workspace_views::attach_active_work_issue_numbers(
+        &mut rows,
+        &[],
+        &sessions,
+        Some(hash),
+        &std::collections::HashMap::new(),
+    );
+    assert_eq!(rows[0].linked_issue_numbers, (1..=12).collect::<Vec<_>>());
+}

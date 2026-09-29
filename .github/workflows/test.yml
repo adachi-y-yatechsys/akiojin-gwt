@@ -325,13 +325,16 @@ jobs:
           cargo test -p gwt --bin gwt app_runtime::tests::startup_self_heal_converges_legacy_config_without_a_runtime_guard -- --exact --test-threads=1
           cargo test -p gwt --test hook_health_test codex_hook_audit_and_repair_cover_worktree_local_and_workspace_home_copies -- --exact --test-threads=1
         timeout-minutes: 15
+      - name: Run priority roundtrip from Normal and BelowNormal launchers
+        run: cargo test -p gwt-core --test process_priority_roundtrip -- --nocapture
+        timeout-minutes: 15
       - name: Run shared Windows process resolver tests
         run: cargo test -p gwt-core --test windows_process_resolver --test process_adapter_parity
         timeout-minutes: 15
       - name: Run real Claude probe caller regressions
         shell: bash
         run: |
-          cargo test -p gwt-core --lib real_bun_global_placeholder_fixture
+          cargo test -p gwt-core --test windows_claude_user_agent
           cargo test -p gwt-agent --lib real_bun_global_placeholder_fixture
           cargo test -p gwt-agent --lib package_runner_resolution_failure_still_emits_an_end_summary
           cargo test -p gwt --bin gwt real_bun_global_placeholder_fixture
@@ -386,6 +389,14 @@ jobs:
           cargo test -p gwt --lib process::tests -- --test-threads=1
           cargo test -p gwt-core --lib daemon_pipe_name -- --test-threads=1
         timeout-minutes: 20
+      # Issue #4746: Windows uses the in-process verification runner, and
+      # reclaiming an exited workload's stalled driver needs native taskkill.
+      - name: Run Windows verification completion and reclaim regressions
+        shell: bash
+        run: |
+          cargo test -p gwt --lib cli::verification_record::tests::verification_records_exit_while_grandchild_holds_output -- --exact --test-threads=1
+          cargo test -p gwt --lib cli::verification_lease:: -- --test-threads=1
+        timeout-minutes: 15
       # Issue #4078 AC-4: the wait declaration is the only way a Windows agent
       # can tell the Issue Monitor its silence is a wait rather than a stall.
       # Both the acceptance of a declaration and its durable prefs fallback are

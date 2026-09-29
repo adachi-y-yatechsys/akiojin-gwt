@@ -710,3 +710,87 @@ test("A failed row offers a requeue that returns it to the queue without launchi
     );
   }
 });
+
+// #4530: the pool editor is distinct from Agent Settings' head replacement.
+test("candidate pool renders held rows and edits through profiles.set", async (t) => {
+  const { body, surface, sent } = await makeFixture();
+  t.after(() => surface.clearKnowledgeBridgeState("win-1"));
+  const candidates = [
+    { index: 0, agent_id: "claude", summary: "Claude / Sonnet", prefer_for: ["kind:spec"], held_until: "2026-10-01T00:00:00Z" },
+    { index: 1, agent_id: "codex", summary: "Codex / gpt-6-astra", prefer_for: [], held_until: null },
+  ];
+  const status = { launch_profile_candidates: candidates, usage_threshold_percent: 80 };
+  surface.applyIssueMonitorStatus(status);
+  const pool = body.querySelector(".knowledge-monitor-pool");
+  assert.ok(pool, "a collapsible candidate pool editor is present");
+  assert.equal(pool.querySelectorAll(".knowledge-monitor-candidate").length, 2);
+  assert.match(pool.textContent, /Auto/);
+  assert.match(pool.textContent, /Held/);
+  assert.match(pool.textContent, /Claude \/ Sonnet/);
+  const click = (selector) => pool.querySelector(selector).click();
+  const last = () => sent.at(-1);
+  click('[data-pool-action="down"]');
+  assert.deepEqual(last(), { kind: "issue_monitor_profiles_set", profiles: [{ agent_id: "codex" }, { agent_id: "claude" }] });
+  pool.querySelectorAll('[data-pool-action="up"]')[1].click();
+  assert.deepEqual(last().profiles, [{ agent_id: "codex" }, { agent_id: "claude" }]);
+  click('[data-pool-action="remove"]');
+  assert.deepEqual(last().profiles, [{ agent_id: "codex" }]);
+  const threshold = pool.querySelector('[data-pool-field="threshold"]');
+  threshold.value = "70";
+  threshold.dispatchEvent(new window.Event("change", { bubbles: true }));
+  assert.equal(last().usage_threshold_percent, 70);
+  const tags = pool.querySelector('[data-pool-field="prefer-for"]');
+  tags.value = "type:fix, kind:spec";
+  tags.dispatchEvent(new window.Event("change", { bubbles: true }));
+  assert.deepEqual(last().profiles, [{ agent_id: "claude", prefer_for: ["type:fix", "kind:spec"] }, { agent_id: "codex" }]);
+  tags.value = "";
+  tags.dispatchEvent(new window.Event("change", { bubbles: true }));
+  assert.deepEqual(last().profiles[0].prefer_for, []);
+  surface.applyIssueMonitorStatus(status);
+  const agent = pool.querySelector('[data-pool-field="agent"]');
+  agent.value = "grok";
+  const addButton = pool.querySelector('[data-pool-action="add"]');
+  Object.defineProperty(globalThis.document, "activeElement", { configurable: true, value: addButton });
+  surface.applyIssueMonitorStatus(status);
+  assert.equal(pool.querySelector('[data-pool-field="agent"]').value, "grok", "status while the Add button is focused preserves the draft");
+  click('[data-pool-action="add"]');
+  assert.deepEqual(last().profiles, [{ agent_id: "claude" }, { agent_id: "codex" }, { agent_id: "grok" }]);
+});
+
+test("candidate pool prevents empty pools, duplicate additions and invalid inputs", async (t) => {
+  const { body, surface, sent } = await makeFixture();
+  t.after(() => surface.clearKnowledgeBridgeState("win-1"));
+  surface.applyIssueMonitorStatus({ launch_profile_candidates: [{ index: 0, agent_id: "codex", summary: "Codex", prefer_for: [] }], usage_threshold_percent: 80 });
+  const pool = body.querySelector(".knowledge-monitor-pool");
+  assert.ok(pool);
+  assert.equal(pool.querySelector('[data-pool-action="remove"]').disabled, true);
+  assert.equal(pool.querySelector('[data-pool-action="up"]').disabled, true);
+  assert.equal(pool.querySelector('[data-pool-action="down"]').disabled, true);
+  const before = sent.length;
+  const threshold = pool.querySelector('[data-pool-field="threshold"]');
+  threshold.value = "0";
+  threshold.dispatchEvent(new window.Event("change", { bubbles: true }));
+  const tags = pool.querySelector('[data-pool-field="prefer-for"]');
+  tags.value = "not-a-tag";
+  tags.dispatchEvent(new window.Event("change", { bubbles: true }));
+  pool.querySelector('[data-pool-field="agent"]').value = "codex";
+  pool.querySelector('[data-pool-action="add"]').click();
+  assert.equal(sent.length, before, "invalid edits never reach the backend");
+  assert.match(pool.querySelector('[role="status"]').textContent, /already/);
+});
+
+test("pool edits preserve newer server candidates received while an input is focused", async (t) => {
+  const { body, surface, sent, document } = await makeFixture();
+  t.after(() => surface.clearKnowledgeBridgeState("win-1"));
+  const claude = { agent_id: "claude", summary: "Claude", prefer_for: [] };
+  const codex = { agent_id: "codex", summary: "Codex", prefer_for: [] };
+  surface.applyIssueMonitorStatus({ launch_profile_candidates: [claude, codex] });
+  const tags = body.querySelector('[data-pool-field="prefer-for"]');
+  Object.defineProperty(document, "activeElement", { configurable: true, value: tags });
+  surface.applyIssueMonitorStatus({ launch_profile_candidates: [codex, claude, { agent_id: "grok", prefer_for: [] }] });
+  tags.value = "type:fix";
+  tags.dispatchEvent(new window.Event("change", { bubbles: true }));
+  assert.deepEqual(sent.at(-1).profiles, [
+    { agent_id: "codex" }, { agent_id: "claude", prefer_for: ["type:fix"] }, { agent_id: "grok" },
+  ]);
+});

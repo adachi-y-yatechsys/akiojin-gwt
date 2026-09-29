@@ -411,12 +411,29 @@ fn materialize_pm_project_policy(
             ));
         }
         let source = worktree.join(&relative);
-        let content = fs::read_to_string(&source).map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("read opted-in PM policy {}: {error}", source.display()),
-            )
-        })?;
+        // #4486 AC-11: a policy file the project opted into but does not carry
+        // is configuration drift, not a PM failure. Propagating NotFound here
+        // aborted the whole refresh — `refresh_pm_runtime_assets` rolls back to
+        // its snapshot and returns the error — so a repository with no
+        // `AGENTS.md` / `CLAUDE.md` left the resident PM unable to start at all.
+        // Skipping the absent file keeps the PM launchable; every other read
+        // error (permissions, non-UTF8, I/O) still fails the refresh.
+        let content = match fs::read_to_string(&source) {
+            Ok(content) => content,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                tracing::warn!(
+                    path = %source.display(),
+                    "opted-in PM policy file is absent; skipping it for this refresh"
+                );
+                continue;
+            }
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("read opted-in PM policy {}: {error}", source.display()),
+                ));
+            }
+        };
         policy.push_str(&format!("\n### {}\n\n{}\n", relative.display(), content));
     }
     if policy.is_empty() {
@@ -2174,9 +2191,29 @@ mod tests {
             .unwrap()
             .contains("PROJECT-ONLY-SENTINEL"));
         let before = std::fs::read(&skill).unwrap();
+        // #4486 AC-11: an opted-in policy file the project does not carry is
+        // configuration drift, not a refresh failure. This used to return an
+        // error, which left the resident PM unable to start in a repository
+        // with no `AGENTS.md` / `CLAUDE.md` at all.
         std::fs::write(
             &prefs,
             r#"{"settings":{"project_policy_files":["missing.md"]}}"#,
+        )
+        .unwrap();
+        super::refresh_managed_gwt_assets_for_pm_worktree_locked(&worktree)
+            .expect("an absent opted-in policy file must not fail the PM refresh");
+        assert_eq!(
+            std::fs::read(&skill).unwrap(),
+            before,
+            "skipping an absent opt-in leaves the owned runtime leaf policy-free"
+        );
+        // A read failure that is *not* absence still fails the refresh and still
+        // rolls the owned leaf back — opting into a directory reads as an error
+        // on every platform, and none of them report it as NotFound.
+        std::fs::create_dir_all(worktree.join("policy-dir")).unwrap();
+        std::fs::write(
+            &prefs,
+            r#"{"settings":{"project_policy_files":["policy-dir"]}}"#,
         )
         .unwrap();
         assert!(super::refresh_managed_gwt_assets_for_pm_worktree_locked(&worktree).is_err());
@@ -2764,6 +2801,45 @@ mod tests {
         .expect("an aliased uncreated nested Codex home is not shared lifecycle state");
 
         assert!(!worktree.exists());
+    }
+
+    #[test]
+    fn a_managed_asset_write_failure_names_its_route_and_its_path() {
+        // #4486 AC-6: the reason that reaches `worktree_freshness.failure_reason`
+        // has to distinguish the failing path and the failing route (read /
+        // backup / write / delete). Before this, a bare `std::io::Error` carried
+        // neither, so the reason named only the operation that happened to wrap
+        // it ("failed to distribute gwt managed assets: No such file or
+        // directory") — enough to know something broke, not enough to know what
+        // to fix.
+        let temp = tempfile::tempdir().unwrap();
+        let _home = gwt_core::test_support::ScopedGwtHome::set(temp.path());
+        let worktree = temp.path().join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        // `.claude` as a regular file makes every write beneath it fail on every
+        // platform, while still being detected as an existing managed target.
+        let blocker = worktree.join(".claude");
+        std::fs::write(&blocker, b"not a directory").unwrap();
+
+        let error = super::refresh_existing_managed_gwt_assets_for_worktree(&worktree)
+            .expect_err("writing beneath a file must fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("managed asset write failed at"),
+            "the reason must name the write route, got: {message}"
+        );
+        assert!(
+            message.contains(&blocker.display().to_string()),
+            "the reason must name the failing path, got: {message}"
+        );
+        // The route words are distinguishable, so a reader can tell a write
+        // failure from a read, a backup, or a delete.
+        for other in ["read failed at", "backup failed at", "delete failed at"] {
+            assert!(
+                !message.contains(other),
+                "a write failure must not also claim {other}, got: {message}"
+            );
+        }
     }
 
     #[test]

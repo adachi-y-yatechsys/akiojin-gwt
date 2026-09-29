@@ -28,7 +28,7 @@ node_check crates/gwt/web/migration-modal.js
 node_check crates/gwt/web/project-clone-modal.js
 node_check crates/gwt/web/board-surface.js
 node_check crates/gwt/web/agent-kanban-surface.js
-node_check crates/gwt/web/workspace-kanban-surface.js
+node_check crates/gwt/web/issue-other-surface.js
 node_check crates/gwt/web/theme-manager.js
 node_check crates/gwt/web/theme-toggle.js
 node_check crates/gwt/web/hotkey.js
@@ -43,7 +43,7 @@ node_check crates/gwt/web/canvas-wheel-gesture.js
 node_check crates/gwt/web/window-geometry-sync.js
 node_check crates/gwt/web/custom-agent-env-editor.js
 node_check crates/gwt/web/socket-receive-dispatcher.js
-node_check crates/gwt/web/workspace-render-sync.js
+node_check crates/gwt/web/issue-render-sync.js
 node_check crates/gwt/web/render-degradation-banner.js
 node_check crates/gwt/web/interaction-guard.js
 node_check crates/gwt/web/viewport-persist-throttle.js

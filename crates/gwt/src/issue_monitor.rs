@@ -5545,6 +5545,34 @@ pub fn persist_legacy_issue_monitor_shutdown_revoke_fence(prefs_path: &Path) -> 
     )
 }
 
+/// Reserve the existing project authority lock before publishing a daemon endpoint.
+/// This does not interpret or change the fence, so blocked recovery can retain
+/// the lease while serving read-only diagnostics.
+pub(crate) fn acquire_issue_monitor_daemon_lease(
+    prefs_path: &Path,
+) -> io::Result<IssueMonitorAuthorityLease> {
+    with_issue_monitor_prefs_lock(prefs_path, || {
+        let authority_lock = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(issue_monitor_authority_lock_path(prefs_path))?;
+        if let Err(error) = FileExt::try_lock_exclusive(&authority_lock) {
+            if gwt_core::operation_deadline::is_lock_contended(&error) {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "Issue Monitor authority lifetime lease is already held by another daemon",
+                ));
+            }
+            return Err(error);
+        }
+        Ok(IssueMonitorAuthorityLease {
+            lock: authority_lock,
+        })
+    })
+}
+
 /// Establish durable effect authority and hold its process-lifetime lease.
 ///
 /// Current v2 fences use the kernel lock as their liveness identity, so a free
@@ -5565,25 +5593,33 @@ pub fn establish_issue_monitor_authority_fence(
             "current Issue Monitor authority fence must use the current schema and a valid identity",
         ));
     }
+    let lease = acquire_issue_monitor_daemon_lease(prefs_path)?;
+    let prefs = establish_issue_monitor_authority_fence_with_lease(
+        prefs_path,
+        current,
+        is_process_alive,
+        &lease,
+    )?;
+    Ok((prefs, lease))
+}
+
+/// Finish authority recovery without releasing the lease taken before bind.
+pub(crate) fn establish_issue_monitor_authority_fence_with_lease(
+    prefs_path: &Path,
+    current: &IssueMonitorAuthorityFence,
+    is_process_alive: impl Fn(u32) -> bool,
+    _lease: &IssueMonitorAuthorityLease,
+) -> io::Result<IssueMonitorPrefs> {
+    if current.version != ISSUE_MONITOR_AUTHORITY_FENCE_VERSION
+        || current.pid == 0
+        || current.instance_id.trim().is_empty()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "current Issue Monitor authority fence must use the current schema and a valid identity",
+        ));
+    }
     with_issue_monitor_prefs_lock(prefs_path, || {
-        let authority_lock = fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(issue_monitor_authority_lock_path(prefs_path))?;
-        if let Err(error) = FileExt::try_lock_exclusive(&authority_lock) {
-            if gwt_core::operation_deadline::is_lock_contended(&error) {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "Issue Monitor authority lifetime lease is already held by another daemon",
-                ));
-            }
-            return Err(error);
-        }
-        let lease = IssueMonitorAuthorityLease {
-            lock: authority_lock,
-        };
         let mut prefs = load_issue_monitor_prefs_unlocked(prefs_path)?;
         match load_issue_monitor_authority_fence(prefs_path)? {
             IssueMonitorAuthorityFenceState::Missing => {
@@ -5610,7 +5646,7 @@ pub fn establish_issue_monitor_authority_fence(
                 persist_issue_monitor_authority_fence(prefs_path, current)?;
             }
         }
-        Ok((prefs, lease))
+        Ok(prefs)
     })
 }
 
