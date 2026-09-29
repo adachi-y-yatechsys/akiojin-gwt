@@ -2057,20 +2057,22 @@ fn run_monitor_requeue<E: CliEnv>(
             let outcome = monitor.requeue_failed_issue(number, reason, &now);
             let not_held = matches!(outcome, crate::IssueMonitorRequeueOutcome::NotHeld);
             let released_hold = if not_held && monitor.clear_completion_hold(number) {
-                *prefs = monitor.prefs();
                 Some("completion")
             } else if not_held && monitor.reopened_issue_awaits_rescan(number) {
                 // Issue #4770: the scan that observed the close already dropped
                 // this Issue's holds, and `issue.reopen` lifted its closure
-                // record. Nothing is left to release; the scan requested below
-                // returns it to the queue.
+                // record. Nothing is left to release; this explicit recovery
+                // still needs to admit it to the terminal queue.
                 Some("closure")
             } else {
-                if matches!(outcome, crate::IssueMonitorRequeueOutcome::Requeued { .. }) {
-                    *prefs = monitor.prefs();
-                }
                 None
             };
+            if released_hold.is_some()
+                || matches!(outcome, crate::IssueMonitorRequeueOutcome::Requeued { .. })
+            {
+                monitor.terminal_queue_push(&[number], "operator", &now);
+                *prefs = monitor.prefs();
+            }
             Ok((outcome, released_hold))
         })
         .map_err(io_as_api_error)?;
@@ -2343,6 +2345,7 @@ fn run_monitor_release_claim_block(
         );
         let outcome = monitor.release_claim_block(number, reason, now);
         if matches!(outcome, crate::IssueMonitorRequeueOutcome::Requeued { .. }) {
+            monitor.terminal_queue_push(&[number], "operator", now);
             *prefs = monitor.prefs();
         }
         Ok(outcome)
@@ -2428,6 +2431,7 @@ fn run_monitor_release_stranded_launch(
         );
         let outcome = monitor.release_stranded_launch(number, reason, now);
         if matches!(outcome, crate::IssueMonitorRequeueOutcome::Requeued { .. }) {
+            monitor.terminal_queue_push(&[number], "operator", now);
             *prefs = monitor.prefs();
         }
         Ok(outcome)
@@ -5035,6 +5039,18 @@ mod tests {
         let persisted = crate::load_issue_monitor_prefs(&prefs_path).expect("reload prefs");
         assert_eq!(
             persisted
+                .terminal_queues
+                .get(&crate::process::current_hostname())
+                .map(|queue| queue
+                    .entries
+                    .iter()
+                    .map(|entry| entry.number)
+                    .collect::<Vec<_>>())
+                .unwrap_or_default(),
+            vec![4086]
+        );
+        assert_eq!(
+            persisted
                 .released_failures
                 .iter()
                 .map(|release| release.issue_number)
@@ -6015,7 +6031,11 @@ mod tests {
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).expect("repo dir");
         let prefs_path = crate::issue_monitor_prefs_path_for_repo_path(&repo);
-        crate::save_issue_monitor_prefs(&prefs_path, &prefs).expect("save prefs");
+        let mut monitor =
+            crate::IssueMonitorState::with_prefs(crate::IssueMonitorConfig::default(), prefs);
+        monitor.terminal_queue_push(&[8], "operator", "2026-09-01T00:00:00Z");
+        monitor.terminal_queue_remove(&[7], "2026-09-01T00:00:00Z");
+        crate::save_issue_monitor_prefs(&prefs_path, &monitor.prefs()).expect("save prefs");
 
         let mut env = crate::cli::TestEnv::new(repo.clone());
         env.client.seed(IssueSnapshot {
@@ -6069,6 +6089,16 @@ mod tests {
             &mut out,
         )
         .expect("reopen");
+        let persisted = crate::load_issue_monitor_prefs(&prefs_path).expect("reopened prefs");
+        assert_eq!(
+            persisted.terminal_queues[&crate::process::current_hostname()]
+                .entries
+                .iter()
+                .map(|entry| entry.number)
+                .collect::<Vec<_>>(),
+            vec![8],
+            "reopen alone must not admit work"
+        );
         (tmp, repo, env)
     }
 
@@ -6084,6 +6114,23 @@ mod tests {
             &mut out,
         )
         .expect("requeue runs");
+        let prefs =
+            crate::load_issue_monitor_prefs(&crate::issue_monitor_prefs_path_for_repo_path(repo))
+                .expect("requeued prefs");
+        let host = crate::process::current_hostname();
+        assert_eq!(
+            prefs.terminal_queues[&host]
+                .entries
+                .iter()
+                .map(|entry| entry.number)
+                .collect::<Vec<_>>(),
+            vec![8, 7],
+            "explicit recovery appends after existing queued work"
+        );
+        assert!(!prefs
+            .terminal_queue_exclusions
+            .get(&host)
+            .is_some_and(|excluded| excluded.contains(&7)));
         (code, out)
     }
 
@@ -9424,6 +9471,41 @@ mod tests {
         assert!(
             agent_status_blocked_by_claim(&status, 4078).is_none(),
             "an issue with no blocked row has nothing to report"
+        );
+        let tmp = TempDir::new().expect("tempdir");
+        let _home = ScopedGwtHome::set(tmp.path().join("home"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        let prefs_path = crate::issue_monitor_prefs_path_for_repo_path(&repo);
+        crate::save_issue_monitor_prefs(&prefs_path, &crate::IssueMonitorPrefs::default())
+            .expect("seed prefs");
+        let mut out = String::new();
+        assert_eq!(
+            run_monitor_release_claim_block(
+                &prefs_path,
+                &repo,
+                4077,
+                "operator recovery",
+                "2026-09-07T02:09:00Z",
+                &blocked,
+                &mut out
+            )
+            .expect("release"),
+            0
+        );
+        assert_eq!(state_result(&out)["status"], "blocked_by_claim");
+        let prefs = crate::load_issue_monitor_prefs(&prefs_path).expect("requeued prefs");
+        assert_eq!(
+            prefs
+                .terminal_queues
+                .get(&crate::process::current_hostname())
+                .map(|queue| queue
+                    .entries
+                    .iter()
+                    .map(|entry| entry.number)
+                    .collect::<Vec<_>>())
+                .unwrap_or_default(),
+            vec![4077]
         );
     }
 
