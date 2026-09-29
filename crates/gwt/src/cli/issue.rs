@@ -7414,6 +7414,8 @@ mod tests {
                         "issue_updated_at": "2026-08-03T00:00:00Z",
                         "readiness": "not_applicable",
                         "recoverable_merged": false,
+                        "non_agent_attempts": 0,
+                        "tier_input": 0,
                     },
                     {
                         "issue_number": 1,
@@ -7422,6 +7424,8 @@ mod tests {
                         "issue_updated_at": "2026-08-03T00:00:00Z",
                         "readiness": "not_applicable",
                         "recoverable_merged": false,
+                        "non_agent_attempts": 0,
+                        "tier_input": 0,
                     },
                     {
                         "issue_number": 9,
@@ -7429,6 +7433,8 @@ mod tests {
                         "github_state": "open",
                         "readiness": "not_applicable",
                         "recoverable_merged": false,
+                        "non_agent_attempts": 0,
+                        "tier_input": 0,
                     },
                 ],
                 // Issue #3633 AC-5: this branch rebuilds the queue from the

@@ -2816,6 +2816,10 @@ fn try_apply_accepted_issue_monitor_control_with_disk_migration_observed(
     let mut applied = None;
     let mut authority_changed = false;
     let typed_failure = issue_monitor_control_has_typed_failure(&accepted.control);
+    let failure_control = matches!(
+        accepted.control,
+        IssueMonitorControl::LaunchFailed { .. } | IssueMonitorControl::AgentFailed { .. }
+    );
     let monitor_has_exact_receipt = monitor
         .last_control_receipt()
         .is_some_and(|receipt| receipt.control_id == accepted.control_id);
@@ -2843,7 +2847,7 @@ fn try_apply_accepted_issue_monitor_control_with_disk_migration_observed(
                     // then require its complete prefs snapshot to equal the
                     // durable receipt snapshot before ACKing.
                     let mut converged = monitor.clone();
-                    if !typed_failure {
+                    if !failure_control {
                         rebase_issue_monitor_control_candidate(
                             &mut converged,
                             disk,
@@ -2858,11 +2862,11 @@ fn try_apply_accepted_issue_monitor_control_with_disk_migration_observed(
                     );
                     let converged_authority_changed =
                         converged.effect_authority_epoch() != authority_epoch_before;
-                    if typed_failure {
-                        // An exact-source failure consumes that source. Apply
-                        // against the pre-commit volatile projection first;
-                        // rebasing the durable result first would erase the
-                        // identity and misclassify receipt recovery as stale.
+                    if failure_control {
+                        // Failure fences restore the committed retry snapshot,
+                        // and exact-source failures consume their source. Apply
+                        // to the pre-commit projection first so receipt recovery
+                        // neither counts a failure twice nor loses its source.
                         converged.rebase_daemon_driver_prefs(disk);
                     }
                     converged.set_last_control_receipt(receipt.clone());
