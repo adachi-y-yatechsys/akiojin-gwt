@@ -80,6 +80,20 @@ function normalizeStatus(status) {
     runningModel: String(status?.running_model ?? ""),
     runningReasoning: String(status?.running_reasoning ?? ""),
     isRunning: Boolean(status?.is_running),
+    // #4486 AC-7: a start refusal a Restart cannot clear. Absent means the
+    // button is worth offering.
+    startBlock: status?.start_block
+      ? {
+          kind: String(status.start_block.kind ?? ""),
+          reason: String(status.start_block.reason ?? ""),
+          requiredOperation: String(status.start_block.required_operation ?? ""),
+          observedAt: String(status.start_block.observed_at ?? ""),
+          // Trust the payload rather than re-deriving from `kind`: the backend
+          // owns which refusals are permanent, and a panel that guesses would
+          // silently disagree the first time a transient variant is added.
+          restartClearsIt: Boolean(status.start_block.restart_clears_it),
+        }
+      : null,
     agentOptions: options
       .filter((option) => option && option.id)
       .map((option) => ({
@@ -183,6 +197,17 @@ export function createPmSettingsPanel({ document, send, confirm } = {}) {
     ]) {
       control.disabled = !state.available;
     }
+    // #4486 AC-7: when the PM is held back by something a Restart cannot
+    // clear, say so and name the operation that can. Leaving the button live
+    // invites people to press it repeatedly while nothing changes.
+    const block = state.available ? state.startBlock : null;
+    const blockHoldsRestart = Boolean(block) && !block.restartClearsIt;
+    view.startBlockLine.hidden = !block;
+    view.startBlockLine.textContent = block
+      ? `The Project Manager cannot start: ${block.reason}. ` +
+        `Restarting will not clear this. ${block.requiredOperation}`
+      : "";
+    if (blockHoldsRestart) view.restart.disabled = true;
     view.intervalError.hidden = true;
     view.intervalError.textContent = "";
     view.intervalInput.setAttribute("aria-invalid", "false");
@@ -316,6 +341,11 @@ export function createPmSettingsPanel({ document, send, confirm } = {}) {
     section.appendChild(autoField);
     section.appendChild(el("p", "settings-help", AUTO_START_HELP));
 
+    const startBlockLine = el("p", "settings-status");
+    startBlockLine.dataset.role = "pm-start-block";
+    startBlockLine.hidden = true;
+    section.appendChild(startBlockLine);
+
     const restart = el("button", "wizard-button", "Restart Project Manager");
     restart.type = "button";
     restart.dataset.role = "pm-restart";
@@ -332,6 +362,7 @@ export function createPmSettingsPanel({ document, send, confirm } = {}) {
       pendingChip,
       restart,
       runningLine,
+      startBlockLine,
     };
 
     agentSelect.addEventListener("change", () => sendProfile(view));
@@ -347,6 +378,9 @@ export function createPmSettingsPanel({ document, send, confirm } = {}) {
     });
     restart.addEventListener("click", () => {
       if (!state.available) return;
+      // Guard the action as well as the control: a stale render or a
+      // programmatic click must not spend a restart on a block it cannot clear.
+      if (state.startBlock && !state.startBlock.restartClearsIt) return;
       if (!ask(RESTART_CONFIRM)) return;
       dispatch({ kind: "restart_pm_agent" });
     });

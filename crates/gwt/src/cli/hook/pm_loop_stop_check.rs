@@ -601,6 +601,7 @@ mod tests {
                 }),
                 settings: crate::pm_registry::PmSettings::default(),
                 worktree_freshness: None,
+                start_block: None,
             },
         )
         .expect("seed PM registration");
@@ -988,13 +989,24 @@ mod tests {
                 worktree.join(path)
             }
         };
-        // Opt-in policy is read after runtime assets have been regenerated.
-        // A missing source therefore exercises the late rollback boundary.
+        // Opt-in policy is read after runtime assets have been regenerated, so
+        // a failure there exercises the late rollback boundary.
+        //
+        // #4486 AC-11 made an *absent* opted-in file a skip rather than a
+        // failure, because a repository with no AGENTS.md / CLAUDE.md must
+        // still be able to start its PM. The boundary this test covers is
+        // unchanged, so only the trigger moves: opting into a directory reads
+        // as an error on every platform, and never as NotFound, so it reaches
+        // the same late failure the rest of the assertions describe.
+        // The opted-in path is resolved against the PM *worktree*, not the
+        // project repo, so the directory has to exist there to be reached.
+        std::fs::create_dir_all(worktree.join("policy-dir"))
+            .expect("seed a policy path that is a directory");
         crate::pm_registry::mutate_pm_prefs(
             &crate::pm_registry::pm_prefs_path_for_repo_path(&repo),
-            |prefs| prefs.settings.project_policy_files = vec!["missing-policy.md".into()],
+            |prefs| prefs.settings.project_policy_files = vec!["policy-dir".into()],
         )
-        .expect("opt into a missing policy file");
+        .expect("opt into an unreadable policy path");
         std::fs::write(
             runtime.join(".codex/skills/gwt-pm/SKILL.md"),
             b"prior runtime guidance\n",
@@ -1011,7 +1023,7 @@ mod tests {
         let prior_runtime = snapshot_worktree(&runtime);
 
         let error = handle_user_prompt_submit(&worktree)
-            .expect_err("missing opted-in policy must fail after runtime regeneration");
+            .expect_err("an unreadable opted-in policy must fail after runtime regeneration");
         assert!(
             error.to_string().contains("read opted-in PM policy"),
             "{error}"

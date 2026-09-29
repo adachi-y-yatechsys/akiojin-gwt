@@ -1,5 +1,6 @@
 //! gwt-skills: Embedded skill bundling, distribution, and hooks management for gwt.
 
+pub mod asset_io;
 pub mod assets;
 pub mod codex_home;
 pub mod codex_hook_trust;
@@ -16,6 +17,7 @@ pub mod registry;
 pub mod settings_local;
 pub mod validate;
 
+pub use asset_io::{AssetIoError, AssetRoute};
 pub use codex_home::{
     codex_env_key, codex_home_for_worktree, codex_provider_id,
     materialize as materialize_codex_home, render_config_toml as render_codex_config_toml,

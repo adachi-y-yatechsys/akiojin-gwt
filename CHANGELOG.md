@@ -1,6 +1,102 @@
 # Changelog
 
 All notable changes to this project will be documented in this file.
+## [9.104.0] - 2026-09-28
+
+### Bug Fixes
+
+- **gui:** 中断状態から復帰した窓のステータス表示に旧クラスが残らないようにする
+- **execution:** Prepared世代の認証済み復旧と失敗launch回収を修正
+- **startup:** 重い初期化を分離しトレイの即時応答を保証する
+- **gui:** Semantic search 状態文言を契約テストが走査する区間へ戻す
+- **execution:** Prepared世代の復旧と失敗launch回収を修正
+- **issue-monitor:** Merge 不能な Delivering PR と merge-watch timeout で起動枠を解放する
+- **issue-monitor:** Unix 限定 daemon テストの AutonomousIssueRecord に delivering_since を追加する
+- **issue-monitor:** Daemon テストの AutonomousIssueRecord 初期化子に delivering_since を追加する
+- **issue-monitor:** Readback 失敗時も merge-watch timeout を評価し、再レビューで起点を捨てる
+- **errors:** エラーの帰属とプロジェクト別観測を分離する
+- **pr:** 停滞判定に経過時間とCI待機猶予を追加
+- 優先度テストで継承した開始クラスを許容する
+- **test:** WindowsのPATH fixtureを専用プロセスへ隔離する
+- **test:** Windows CI契約を隔離後のテストtargetへ追随する
+- **gui:** Other統合後の回帰テストと投影処理を修正する
+- **pm:** Managed asset の失敗に経路とパスを持たせる
+- **verify:** 子終了後のEOF待ちと検証lease回収を修正
+- **pm:** 欠損した opt-in policy ファイルで PM 起動を止めない
+
+### Documentation
+
+- **agents:** Prompt-audit で検出した陳腐化した指示を解消する
+- **skills:** 期限切れの transition alias と重複した検索スキルを撤去する
+
+### Features
+
+- **canvas:** 既存ウィンドウの保存対象を冪等に切り替える
+- **runtime:** 中断状態を追加しMonitorの占有枠を保持する
+- **launch-wizard:** Claudeモデル表示を版数なしにして復元値を正規化
+- **launch-wizard:** Claude モデル行をバージョンレスにする
+- **gui:** Issue ウィンドウを 2 段の操作帯と AC 先頭の詳細ペインに再構成する
+- **pm:** PM 権限の自己記述と Issue Monitor の停止理由を追加する
+- **gui:** Issue一覧へOtherとWorkspace操作を統合する
+- **gui:** Issue Monitorの候補プール設定を追加
+- **pm:** Restart で解消しない PM 起動拒否を pm.status に出す
+- **verify:** Verify.run の外部シグナル終了を FAIL と分け lease id を記録する
+
+### Miscellaneous Tasks
+
+- **work:** Record issue 3340 delivery progress
+- **work:** 作業イベント記録を追加する
+- **execution:** 契約ルートを持たない旧 Host の拒否を有効化する
+- **work:** Record issue 3340 delivery
+- **work:** Issue #1921 T447 の Work event を記録
+- **work:** Issue #4730 の Work event を記録
+- **work:** Issue #4559 の Work イベントを記録する
+- **work:** Issue #4559 の Work イベントを記録する
+- **work:** Issue #4726 の作業イベントを記録する
+- **work:** Issue #4726 の作業イベントを記録する
+- **work:** Issue #4726 の作業イベントを記録する
+- **work:** Issue #4735 の検証段階を記録する
+- **work:** Issue #4249 の Work event を記録
+- **work:** Issue #4249 の Work event を記録
+- **work:** Issue #4249 の Work event を記録
+- **ci:** Windows全体反復検証を期限fixture是正へ移管する
+- **work:** プロジェクト実行所有の作業目的を記録
+- **work:** Phase 1のマージ済み配送情報を記録
+- **work:** 移行テストの検証結果と配送裁定を記録
+- **work:** 検証修正の最終作業記録を追加
+- **work:** 検証修正の配送状態を記録
+- **work:** 作業イベントを記録
+- **work:** 配送完了の作業イベントを記録
+- **work:** 候補プール設定PRの配送記録を保存
+- **work:** 作業イベント記録を保存
+- **work:** 作業イベント記録を保存
+
+### Refactor
+
+- **runtime:** プロジェクト監督の処理をGUIから分離しdaemon起動を保護
+
+### Styling
+
+- **pm:** Asset_io と distribute に rustfmt を適用する
+
+### Testing
+
+- **pm:** 再生成失敗 fixture を Windows でも成立する妨害へ置き換える
+- **e2e:** Exact relaunch の resume identity と再束縛を headed で検証する
+- **issue-monitor:** HEAD 前進の補償 disarm 後は再レビュー待ちの Idle に留まることを固定する
+- **issue-monitor:** Mock gh に mergeability readback の応答を追加する
+- Windows優先度roundtripを両起点で再現する
+- **runtime:** 抽出先へ監査テストとrustdocを追随
+- **runtime:** Session初期化の抽出後も起動前検査の順序を監査
+- **monitor:** 移行テストを永続化の実時間から独立させる
+- **verify:** Windows回収前のプロセス生存を確認
+- **github:** Windowsの接続拒否をtimeoutに先行して観測する
+- **pm:** Late rollback テストのトリガーを読めないパスへ移す
+
+### Revert
+
+- Prompt-audit の skill 削除分（A / B）を差し戻す
+
 ## [9.103.0] - 2026-09-27
 
 ### Bug Fixes

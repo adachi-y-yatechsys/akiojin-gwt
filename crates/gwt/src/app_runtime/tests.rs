@@ -49752,6 +49752,8 @@ fn app_runtime_autonomous_fallback_epoch_overflow_is_zero_write_error() {
 
 #[test]
 fn app_runtime_full_issue_monitor_scan_migrates_legacy_git_failure_and_persists_marker() {
+    // Verify migration and durable state, independently of host fsync latency.
+    let _clock = gwt_core::operation_deadline::ScopedOperationClock::set(Instant::now());
     let _env_lock = env_test_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -49915,6 +49917,8 @@ fn issue_monitor_scan_failures_prefer_launch_failure_over_merge_query_error() {
 
 #[test]
 fn app_runtime_full_issue_monitor_cache_fallback_does_not_migrate_legacy_failure() {
+    // Verify cache provenance, independently of the prefs commit wall-clock budget.
+    let _clock = gwt_core::operation_deadline::ScopedOperationClock::set(Instant::now());
     let _env_lock = env_test_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -54161,6 +54165,138 @@ fn pool_profile(agent_id: &str) -> gwt::IssueMonitorLaunchProfile {
         windows_shell: None,
         prefer_for: Vec::new(),
     }
+}
+
+#[test]
+fn app_runtime_issue_monitor_profiles_set_preserves_sparse_candidate_settings() {
+    let temp = tempdir().expect("tempdir");
+    let _home = ScopedGwtHome::set(temp.path());
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    init_repo_with_initial_commit(&repo);
+    let prefs_path = gwt::issue_monitor_prefs_path_for_repo_path(&repo);
+    let mut claude = pool_profile("claude");
+    claude.model = Some("saved-claude-model".into());
+    claude.reasoning = Some("high".into());
+    claude.skip_permissions = true;
+    claude.prefer_for = vec!["type:bug".into()];
+    let mut codex = pool_profile("codex");
+    codex.model = Some("saved-codex-model".into());
+    codex.fast_mode = true;
+    let mut seeded = gwt::IssueMonitorPrefs {
+        max_active_agents: 7,
+        launch_usage_threshold_percent: 83,
+        ..Default::default()
+    };
+    seeded.set_launch_profile_pool(vec![claude.clone(), codex.clone()]);
+    gwt::save_issue_monitor_prefs(&prefs_path, &seeded).expect("seed pool");
+    let tab = sample_project_tab("tab-1", "Repo", repo, ProjectKind::Git, &[]);
+    let mut runtime = sample_runtime(temp.path(), vec![tab], Some("tab-1"));
+    let event = serde_json::from_value(serde_json::json!({
+        "kind": "issue_monitor_profiles_set",
+        "profiles": [{"agent_id": "codex", "prefer_for": ["kind:feature"]},
+                     {"agent_id": "claude"}, {"agent_id": "grok"}]
+    }))
+    .expect("candidate editing event");
+    let events = runtime.handle_frontend_event("client-1".into(), event);
+    let errors: Vec<_> = events
+        .iter()
+        .filter_map(|event| match &event.event {
+            BackendEvent::IssueMonitorToast { level, message, .. } if level == "error" => {
+                Some(message)
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(errors.is_empty(), "{errors:?}");
+    let saved = gwt::load_issue_monitor_prefs(&prefs_path).expect("reload pool");
+    codex.prefer_for = vec!["kind:feature".into()];
+    assert_eq!(saved.launch_profiles[0], codex);
+    assert_eq!(saved.launch_profiles[1], claude);
+    assert_eq!(saved.launch_profiles[2].agent_id, "grok");
+    assert!(
+        saved.launch_profiles[2].skip_permissions,
+        "new candidate inherits shared settings"
+    );
+    assert_eq!(saved.launch_profile.as_ref(), Some(&codex));
+    assert_eq!(saved.launch_usage_threshold_percent, 83);
+    assert_eq!(saved.max_active_agents, 7);
+    assert_eq!(
+        saved.effect_authority_epoch,
+        seeded.effect_authority_epoch + 1
+    );
+
+    // Removing candidates and changing only the threshold retain the remaining
+    // candidate's provider-specific configuration and its routing tags.
+    let event = serde_json::from_value(serde_json::json!({
+        "kind": "issue_monitor_profiles_set",
+        "profiles": [{"agent_id": "codex"}], "usage_threshold_percent": 71
+    }))
+    .expect("candidate removal event");
+    runtime.handle_frontend_event("client-1".into(), event);
+    let saved = gwt::load_issue_monitor_prefs(&prefs_path).expect("reload reduced pool");
+    assert_eq!(saved.launch_profiles, vec![codex]);
+    assert_eq!(saved.launch_usage_threshold_percent, 71);
+    assert_eq!(saved.max_active_agents, 7);
+}
+
+#[test]
+fn app_runtime_issue_monitor_profiles_set_rejects_invalid_edits_without_writing() {
+    let temp = tempdir().expect("tempdir");
+    let _home = ScopedGwtHome::set(temp.path());
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    init_repo_with_initial_commit(&repo);
+    let prefs_path = gwt::issue_monitor_prefs_path_for_repo_path(&repo);
+    let mut seeded = gwt::IssueMonitorPrefs::default();
+    seeded.set_launch_profile_pool(vec![pool_profile("claude")]);
+    gwt::save_issue_monitor_prefs(&prefs_path, &seeded).expect("seed pool");
+    let tab = sample_project_tab("tab-1", "Repo", repo, ProjectKind::Git, &[]);
+    let mut runtime = sample_runtime(temp.path(), vec![tab], Some("tab-1"));
+    for payload in [
+        serde_json::json!({"profiles": []}),
+        serde_json::json!({"profiles": [{"agent_id": "claude", "prefer_for": ["invalid"]}]}),
+        serde_json::json!({"profiles": [{"agent_id": "claude"}], "usage_threshold_percent": 0}),
+    ] {
+        let before = fs::read(&prefs_path).expect("read prefs");
+        let mut payload = payload;
+        payload["kind"] = "issue_monitor_profiles_set".into();
+        let event = serde_json::from_value(payload).expect("candidate editing event");
+        let events = runtime.handle_frontend_event("client-1".into(), event);
+        assert!(events.iter().any(|event| matches!(
+            &event.event, BackendEvent::IssueMonitorToast { level, .. } if level == "error"
+        )));
+        assert_eq!(fs::read(&prefs_path).expect("reload prefs"), before);
+    }
+}
+
+#[test]
+fn app_runtime_issue_monitor_profiles_set_epoch_overflow_is_zero_write_error() {
+    let temp = tempdir().expect("tempdir");
+    let _home = ScopedGwtHome::set(temp.path());
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    init_repo_with_initial_commit(&repo);
+    let prefs_path = gwt::issue_monitor_prefs_path_for_repo_path(&repo);
+    let mut seeded = gwt::IssueMonitorPrefs {
+        effect_authority_epoch: u64::MAX,
+        ..Default::default()
+    };
+    seeded.set_launch_profile_pool(vec![pool_profile("claude")]);
+    gwt::save_issue_monitor_prefs(&prefs_path, &seeded).expect("seed pool");
+    let before = fs::read(&prefs_path).expect("read prefs");
+    let tab = sample_project_tab("tab-1", "Repo", repo, ProjectKind::Git, &[]);
+    let mut runtime = sample_runtime(temp.path(), vec![tab], Some("tab-1"));
+    let event = serde_json::from_value(serde_json::json!({
+        "kind": "issue_monitor_profiles_set", "profiles": [{"agent_id": "codex"}]
+    }))
+    .expect("candidate editing event");
+    let events = runtime.handle_frontend_event("client-1".into(), event);
+    assert!(events.iter().any(|event| matches!(
+        &event.event, BackendEvent::IssueMonitorToast { level, message, .. }
+            if level == "error" && message.contains("authority epoch exhausted")
+    )));
+    assert_eq!(fs::read(&prefs_path).expect("reload prefs"), before);
 }
 
 #[test]
@@ -66703,6 +66839,142 @@ fn pm_refresh_resolves_managed_asset_collisions_from_old_head() {
     assert_eq!(git_stdout(&pm_worktree, &["rev-parse", "HEAD"]), commit_c);
 }
 
+/// SPEC #4486 AC-1/AC-2: a Claude Code plugin layout tracks `.claude/` entries
+/// as links into the same checkout, including directory links and multi-hop
+/// chains. Advancing the PM onto such a base and advancing again must stay
+/// fresh, keep every link a link, leave the link targets untouched, and still
+/// register the PM launch.
+#[cfg(unix)]
+#[test]
+fn pm_refresh_stays_fresh_across_tracked_in_worktree_plugin_symlinks() {
+    use std::os::unix::fs::symlink;
+    let _env_lock = env_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().expect("tempdir");
+    let _home = ScopedEnvVar::set("HOME", temp.path());
+    let _userprofile = ScopedEnvVar::set("USERPROFILE", temp.path());
+    let _gwt_home = ScopedGwtHome::set(temp.path().join(".gwt"));
+    let repo = temp.path().join("repo");
+    let origin = init_git_clone_with_origin(&repo);
+    let seed = temp.path().join("seed");
+    let pm_worktree = create_detached_pm_worktree_fixture(&repo);
+    gwt::pm_registry::refresh_pm_worktree_for_repo_path(&repo).expect("seed PM worktree");
+
+    let plugin = ".claude-plugin/plugins/tool";
+    let files = [
+        (format!("{plugin}/agents/helper.md"), "helper agent\n"),
+        (format!("{plugin}/commands/status.md"), "status command\n"),
+        (
+            format!("{plugin}/skills/tool-usage/SKILL.md"),
+            "usage skill\n",
+        ),
+    ];
+    for (relative, body) in &files {
+        fs::create_dir_all(seed.join(relative).parent().unwrap()).unwrap();
+        fs::write(seed.join(relative), body).unwrap();
+    }
+    let links = [
+        (
+            ".agents/skills/tool-usage",
+            "../../.claude-plugin/plugins/tool/skills/tool-usage",
+        ),
+        // Multi-hop: .claude -> .agents -> .claude-plugin, all inside the checkout.
+        (
+            ".claude/skills/tool-usage",
+            "../../.agents/skills/tool-usage",
+        ),
+        // A project link that happens to use the gwt- prefix is still project-owned.
+        (
+            ".claude/skills/gwt-tool-extra",
+            "../../.agents/skills/tool-usage",
+        ),
+        (
+            ".claude/agents/helper.md",
+            "../../.claude-plugin/plugins/tool/agents/helper.md",
+        ),
+        (
+            ".claude/commands/status.md",
+            "../../.claude-plugin/plugins/tool/commands/status.md",
+        ),
+    ];
+    for (relative, target) in links {
+        fs::create_dir_all(seed.join(relative).parent().unwrap()).unwrap();
+        symlink(target, seed.join(relative)).unwrap();
+    }
+    run_git(&seed, &["add", "--all"]);
+    run_git(
+        &seed,
+        &["commit", "-qm", "add plugin layout with in-tree links"],
+    );
+    run_git(&seed, &["push", origin.to_str().unwrap(), "develop"]);
+    let commit_b = git_stdout(&seed, &["rev-parse", "HEAD"]);
+
+    let outcome = gwt::pm_registry::refresh_pm_worktree_for_repo_path(&repo)
+        .expect("refresh must return its freshness");
+    assert!(
+        outcome.is_fresh(),
+        "in-worktree plugin links must not block PM refresh: {outcome:?}"
+    );
+    assert_eq!(git_stdout(&pm_worktree, &["rev-parse", "HEAD"]), commit_b);
+
+    let commit_c = advance_origin_develop_by_one_commit(&repo, &origin);
+    let repeated = gwt::pm_registry::refresh_pm_worktree_for_repo_path(&repo).unwrap();
+    assert!(
+        repeated.is_fresh(),
+        "a second refresh across the plugin links must stay fresh: {repeated:?}"
+    );
+    assert_eq!(git_stdout(&pm_worktree, &["rev-parse", "HEAD"]), commit_c);
+
+    for (relative, target) in links {
+        assert_eq!(
+            fs::read_link(pm_worktree.join(relative)).unwrap(),
+            PathBuf::from(target),
+            "project link {relative} must stay a link"
+        );
+    }
+    for (relative, body) in &files {
+        assert_eq!(
+            fs::read_to_string(pm_worktree.join(relative)).unwrap(),
+            *body
+        );
+    }
+    assert_eq!(
+        git_stdout(
+            &pm_worktree,
+            &[
+                "status",
+                "--porcelain",
+                "--",
+                ".claude",
+                ".agents",
+                ".claude-plugin"
+            ]
+        ),
+        "",
+        "PM refresh must not modify project-owned plugin files"
+    );
+    let prefs_path = gwt::pm_registry::pm_prefs_path_for_repo_path(&repo);
+    assert_eq!(
+        gwt::pm_registry::load_pm_prefs(&prefs_path)
+            .unwrap()
+            .worktree_freshness
+            .map(|state| state.state),
+        Some(gwt::pm_registry::PmWorktreeFreshnessState::Fresh)
+    );
+
+    let tab = sample_project_tab("tab-1", "Repo", repo.clone(), ProjectKind::Git, &[]);
+    let (mut runtime, _events) = sample_runtime_with_events(temp.path(), vec![tab], Some("tab-1"));
+    runtime.register_pm_after_launch(&repo, "pm-plugin-links", "claude", &pm_worktree);
+    assert_eq!(
+        gwt::pm_registry::load_pm_prefs(&prefs_path)
+            .unwrap()
+            .registration
+            .map(|registration| registration.session_id),
+        Some("pm-plugin-links".to_string())
+    );
+}
+
 // Issue #4564: the fixture used to write a *file* at `runtime/.claude/skills/
 // gwt-pm`. That only obstructed on Unix, where snapshotting the generated
 // `gwt-pm/SKILL.md` leaf through a file fails with ENOTDIR. Windows reports
@@ -69284,6 +69556,7 @@ fn pm_close_completion_stays_with_owner_and_is_dropped_after_owner_closes() {
         running_reasoning: None,
         is_running: false,
         agent_options: Vec::new(),
+        start_block: None,
     };
 
     let after_switch = runtime.handle_window_close_finalized(

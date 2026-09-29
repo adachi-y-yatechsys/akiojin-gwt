@@ -5897,6 +5897,68 @@ impl AppRuntime {
         }
     }
 
+    fn issue_monitor_profiles_set_events(
+        &mut self,
+        context: &ProjectContext,
+        client_id: &str,
+        patches: Vec<gwt::IssueMonitorLaunchProfilePatch>,
+        usage_threshold_percent: Option<u8>,
+    ) -> Vec<OutboundEvent> {
+        let resolve = |prefs: &gwt::IssueMonitorPrefs| {
+            let pool = prefs.launch_profile_pool();
+            let (profiles, _) = gwt::merge_issue_monitor_profiles_set(
+                &pool,
+                prefs.launch_profile.as_ref().or(pool.first()),
+                &patches,
+            );
+            gwt::validate_monitor_profiles_set(&profiles, usage_threshold_percent)
+                .map_err(|error| error.to_string())?;
+            Ok::<_, String>(profiles)
+        };
+        let prefs_path = gwt::issue_monitor_prefs_path_for_repo_path(&context.project_root);
+        let profiles = match gwt::load_issue_monitor_prefs(&prefs_path)
+            .map_err(|error| error.to_string())
+            .and_then(|prefs| resolve(&prefs))
+        {
+            Ok(profiles) => profiles,
+            Err(error) => {
+                return self.issue_monitor_control_error_events(
+                    Some(&context.project_root),
+                    Some(client_id),
+                    gwt::runtime_daemon_events::IssueMonitorControlPublishError::Rejected(error),
+                    "profiles-set",
+                    None,
+                );
+            }
+        };
+        let publication = self.publish_project_issue_monitor_control(
+            context,
+            serde_json::json!({ "profiles_set": {
+                "profiles": profiles,
+                "usage_threshold_percent": usage_threshold_percent,
+            }}),
+        );
+        self.issue_monitor_authorizing_control_result_events(
+            context,
+            client_id,
+            publication,
+            "profiles-set",
+            |monitor| {
+                // Re-resolve omitted fields against the locked current prefs;
+                // a concurrent settings save must not be replaced by our read.
+                let profiles = resolve(&monitor.prefs())?;
+                monitor
+                    .advance_effect_authority_epoch()
+                    .ok_or_else(|| "authority epoch exhausted".to_string())?;
+                monitor.set_launch_profile_pool(profiles);
+                if let Some(percent) = usage_threshold_percent {
+                    monitor.set_launch_usage_threshold_percent(percent);
+                }
+                Ok(())
+            },
+        )
+    }
+
     fn issue_monitor_authorizing_control_result_events(
         &mut self,
         context: &ProjectContext,
@@ -8975,6 +9037,15 @@ impl AppRuntime {
                     },
                 )
             }
+            FrontendEvent::IssueMonitorProfilesSet {
+                profiles,
+                usage_threshold_percent,
+            } => self.issue_monitor_profiles_set_events(
+                context,
+                &client_id,
+                profiles,
+                usage_threshold_percent,
+            ),
             FrontendEvent::SetIssueMonitorMaxActiveAgents { max_active_agents } => {
                 let publication = self.publish_project_issue_monitor_control(
                     context,
