@@ -79321,6 +79321,24 @@ fn termination_class_requires_exact_exit_and_readable_bridge_evidence() {
             },
         },
     };
+    let mut session = gwt_agent::Session::new(
+        &identity.worktree_path,
+        &identity.branch,
+        identity.agent_id.clone(),
+    );
+    session.id = identity.session_id.clone();
+    session.repo_hash = identity.repo_hash.clone();
+    session.linked_issue_number = identity.linked_issue_number;
+    session
+        .set_execution_binding(Some(identity.execution_binding.clone()))
+        .unwrap();
+    assert_eq!(
+        gwt_agent::SessionExecutionIdentity::from_session(&session)
+            .unwrap()
+            .as_ref(),
+        Some(&identity)
+    );
+    session.save(dir.path()).unwrap();
     let path = gwt_agent::runtime_state_path(dir.path(), &identity.session_id);
     let state = gwt_agent::SessionRuntimeState::for_execution_process(
         gwt_agent::AgentStatus::Running,
@@ -79332,7 +79350,12 @@ fn termination_class_requires_exact_exit_and_readable_bridge_evidence() {
     );
     state.save(&path).unwrap();
     let classify = |exit, incarnation| {
-        AppRuntime::classify_issue_monitor_termination(dir.path(), &identity, incarnation, exit)
+        AppRuntime::classify_issue_monitor_termination(
+            dir.path(),
+            &identity.session_id,
+            incarnation,
+            exit,
+        )
     };
     assert_eq!(classify(false, 7), Unknown);
     assert_eq!(classify(true, 8), Unknown);
@@ -79350,4 +79373,84 @@ fn termination_class_requires_exact_exit_and_readable_bridge_evidence() {
         .save(&path)
         .unwrap();
     assert_eq!(classify(true, 7), Unknown);
+    // A completed genesis launch need not appear in the Wizard cache. Exercise
+    // the real incarnation-fenced event, not only the pure receipt classifier.
+    let _home = ScopedGwtHome::set(dir.path());
+    let project = dir.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    init_repo_without_origin(&project);
+    run_git(
+        &project,
+        &["remote", "add", "origin", "file:///termination-fixture"],
+    );
+    for fault in [false, true] {
+        let tab = sample_project_tab_with_window_at(
+            "tab-1",
+            "agent-1",
+            project.clone(),
+            WindowPreset::Agent,
+            WindowProcessStatus::Running,
+        );
+        let mut app = sample_runtime(dir.path(), vec![tab], Some("tab-1"));
+        let window_id = "tab-1::agent-1";
+        let mut active = sample_active_agent_session("tab-1", window_id);
+        active.session_id = identity.session_id.clone();
+        active.worktree_path = project.clone();
+        active.agent_project_root = project.display().to_string();
+        app.active_agent_sessions.insert(window_id.into(), active);
+        session.save(&app.sessions_dir).unwrap();
+        app.launch_wizard_cache.forget_session(&session.id);
+        assert!(app.launch_wizard_cache.session_by_id(&session.id).is_none());
+        insert_exited_test_pane_runtime(&mut app, window_id, 1);
+        let incarnation = app.runtimes[window_id].incarnation;
+        let runtime_path = gwt_agent::runtime_state_path(&app.sessions_dir, &session.id);
+        gwt_agent::SessionRuntimeState::for_execution_process(
+            gwt_agent::AgentStatus::Running,
+            &identity,
+            incarnation,
+            100,
+            123,
+            101,
+        )
+        .save(&runtime_path)
+        .unwrap();
+        gwt_agent::SessionBridgeObservation::capture(&runtime_path, &session.id)
+            .unwrap()
+            .unwrap()
+            .record(gwt_agent::HostBridgeKind::WorkspaceUpdate, fault)
+            .unwrap();
+        let prefs_path = gwt::issue_monitor_prefs_path_for_repo_path(&project);
+        let mut prefs = gwt::IssueMonitorPrefs {
+            enabled: true,
+            autonomous_mode: true,
+            launch_auto: true,
+            launched_issues: vec![gwt::IssueMonitorLaunchedIssue {
+                issue_number: 4774,
+                window_id: window_id.into(),
+            }],
+            autonomous_records: vec![issue_monitor_autonomous_record(
+                4774,
+                gwt::AutonomousPhase::Implementing,
+                0,
+            )],
+            ..Default::default()
+        };
+        prefs.record_tier_launch(4774, 0);
+        gwt::save_issue_monitor_prefs(&prefs_path, &prefs).unwrap();
+        app.blocking_tasks = BlockingTaskSpawner::queued().0;
+        app.handle_runtime_status_event(
+            window_id.into(),
+            incarnation,
+            WindowProcessStatus::Error,
+            Some("Process exited with status 1".into()),
+            true,
+        );
+        let after = gwt::load_issue_monitor_prefs(&prefs_path).unwrap();
+        assert_eq!(after.autonomous_records[0].attempts, 1);
+        assert_eq!(
+            after.autonomous_records[0].non_agent_attempts,
+            u32::from(fault)
+        );
+        assert_eq!(after.issue_tiers[&4774].unknown_failures, 0);
+    }
 }

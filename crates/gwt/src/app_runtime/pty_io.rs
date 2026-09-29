@@ -693,6 +693,17 @@ impl AppRuntime {
             Unavailable(String),
         }
 
+        // Capture only local evidence at the close ACK boundary. Durable
+        // diagnosis stays on the existing background finalizer and does not
+        // grant or replace its independent terminalization authority.
+        let termination_receipt = self
+            .active_agent_sessions
+            .get(window_id)
+            .zip(self.runtimes.get(window_id))
+            .and_then(|(active, runtime)| {
+                let has_exit = runtime.pane.lock().ok()?.last_exit().is_some();
+                Some((active.session_id.clone(), runtime.incarnation, has_exit))
+            });
         let mut runtime = self.runtimes.remove(window_id);
         let closing_pty = runtime.as_ref().map(|runtime| Arc::clone(&runtime.pty));
         if let Some(runtime) = runtime.as_ref() {
@@ -827,22 +838,15 @@ impl AppRuntime {
         let scheduler_window_id = window_id.clone();
         let task: Box<dyn FnOnce() + Send + 'static> = Box::new(move || {
             let started = Instant::now();
-            // Capture evidence before forced teardown can manufacture an exit.
-            let termination_classification = exact_terminal
+            let termination_classification = termination_receipt
                 .as_ref()
-                .and_then(|(identity, incarnation)| {
-                    incarnation.map(|incarnation| {
-                        let has_exit = runtime
-                            .as_ref()
-                            .and_then(|runtime| runtime.pane.lock().ok())
-                            .is_some_and(|pane| pane.last_exit().is_some());
-                        Self::classify_issue_monitor_termination(
-                            &sessions_dir,
-                            identity,
-                            incarnation,
-                            has_exit,
-                        )
-                    })
+                .map(|(session_id, incarnation, has_exit)| {
+                    Self::classify_issue_monitor_termination(
+                        &sessions_dir,
+                        session_id,
+                        *incarnation,
+                        *has_exit,
+                    )
                 })
                 .unwrap_or(gwt::IssueMonitorFailureClass::Unknown);
             let mut finalizer_ok = true;

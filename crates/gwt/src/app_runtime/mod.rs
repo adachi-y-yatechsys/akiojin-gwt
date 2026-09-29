@@ -4909,7 +4909,7 @@ impl AppRuntime {
 
     fn classify_issue_monitor_termination(
         sessions_dir: &Path,
-        identity: &gwt_agent::SessionExecutionIdentity,
+        session_id: &str,
         incarnation: u64,
         has_exit_receipt: bool,
     ) -> gwt::IssueMonitorFailureClass {
@@ -4917,11 +4917,22 @@ impl AppRuntime {
         if !has_exit_receipt {
             return Unknown;
         }
-        let path = gwt_agent::runtime_state_path(sessions_dir, &identity.session_id);
+        // The Wizard cache intentionally excludes unsettled genesis launches;
+        // its availability cannot determine the producing Session's diagnosis.
+        let Ok(session) =
+            gwt_agent::Session::load(&sessions_dir.join(format!("{session_id}.toml")))
+        else {
+            return Unknown;
+        };
+        let Ok(Some(identity)) = gwt_agent::SessionExecutionIdentity::from_session(&session) else {
+            return Unknown;
+        };
+        let path = gwt_agent::runtime_state_path(sessions_dir, session_id);
         let Ok(runtime) = gwt_agent::SessionRuntimeState::load(&path) else {
             return Unknown;
         };
-        if runtime.execution_identity.as_ref() != Some(identity)
+        if identity.session_id != session_id
+            || runtime.execution_identity.as_ref() != Some(&identity)
             || runtime.runtime_incarnation != Some(incarnation)
         {
             return Unknown;
@@ -4939,13 +4950,11 @@ impl AppRuntime {
     ) -> gwt::IssueMonitorFailureClass {
         let classification = (|| {
             let active = self.active_agent_sessions.get(window_id)?;
-            let session = self.launch_wizard_cache.session_by_id(&active.session_id)?;
-            let identity = gwt_agent::SessionExecutionIdentity::from_session(session).ok()??;
             let runtime = self.runtimes.get(window_id)?;
             let has_exit = runtime.pane.lock().ok()?.last_exit().is_some();
             Some(Self::classify_issue_monitor_termination(
                 &self.sessions_dir,
-                &identity,
+                &active.session_id,
                 runtime.incarnation,
                 has_exit,
             ))
