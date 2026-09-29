@@ -2022,22 +2022,30 @@ fn run_monitor_requeue<E: CliEnv>(
         out.push('\n');
         return Ok(1);
     }
-    let (prefs, (outcome, completion_hold_cleared)) =
+    let (prefs, (outcome, released_hold)) =
         crate::try_mutate_issue_monitor_prefs(&prefs_path, |prefs| {
             let mut monitor = crate::IssueMonitorState::with_prefs(
                 crate::IssueMonitorConfig::default(),
                 prefs.clone(),
             );
             let outcome = monitor.requeue_failed_issue(number, reason, &now);
-            let completion_hold_cleared =
-                matches!(outcome, crate::IssueMonitorRequeueOutcome::NotHeld)
-                    && monitor.clear_completion_hold(number);
-            if matches!(outcome, crate::IssueMonitorRequeueOutcome::Requeued { .. })
-                || completion_hold_cleared
-            {
+            let not_held = matches!(outcome, crate::IssueMonitorRequeueOutcome::NotHeld);
+            let released_hold = if not_held && monitor.clear_completion_hold(number) {
                 *prefs = monitor.prefs();
-            }
-            Ok((outcome, completion_hold_cleared))
+                Some("completion")
+            } else if not_held && monitor.reopened_issue_awaits_rescan(number) {
+                // Issue #4770: the scan that observed the close already dropped
+                // this Issue's holds, and `issue.reopen` lifted its closure
+                // record. Nothing is left to release; the scan requested below
+                // returns it to the queue.
+                Some("closure")
+            } else {
+                if matches!(outcome, crate::IssueMonitorRequeueOutcome::Requeued { .. }) {
+                    *prefs = monitor.prefs();
+                }
+                None
+            };
+            Ok((outcome, released_hold))
         })
         .map_err(io_as_api_error)?;
 
@@ -2064,7 +2072,7 @@ fn run_monitor_requeue<E: CliEnv>(
             return Ok(1);
         }
         crate::IssueMonitorRequeueOutcome::NotHeld => {
-            if completion_hold_cleared {
+            if let Some(released_hold) = released_hold {
                 let delivery =
                     issue_monitor_scan_delivery(request_immediate_monitor_scan(&project_root));
                 out.push_str(
@@ -2072,7 +2080,7 @@ fn run_monitor_requeue<E: CliEnv>(
                         "number": number,
                         "status": "requeued",
                         "reason": reason,
-                        "released_hold": "completion",
+                        "released_hold": released_hold,
                         "released_at": now,
                         "scan_requested": delivery.scan_requested,
                         "scan_delivery": delivery.scan_delivery,
@@ -3877,6 +3885,9 @@ fn run_issue_set_state<E: CliEnv>(
     // as the state it is compared against.
     let current = refresh_issue_cache(env, issue)?.snapshot;
     if current.state == target {
+        // A replay after a lost response still reaches the Monitor, so a
+        // notification that failed the first time is repaired here.
+        notify_monitor_of_reopen(env, &current)?;
         // `reason` describes what was written, and nothing was: echoing the
         // requested one here would claim a rationale GitHub never recorded.
         write_issue_state_result(out, number, target, false, None, None);
@@ -3905,9 +3916,43 @@ fn run_issue_set_state<E: CliEnv>(
     );
     // One-way flow: the cache is refreshed from the post-write server state so
     // the UI and the Monitor never read a state this operation already changed.
-    let _ = refresh_issue_cache(env, issue)?;
+    let written = refresh_issue_cache(env, issue)?.snapshot;
+    notify_monitor_of_reopen(env, &written)?;
     write_issue_state_result(out, number, target, true, reason, comment_id);
     Ok(0)
+}
+
+/// Issue #4770: lift the Monitor's durable `Closed` record for an Issue that is
+/// now Open, so `issue.monitor.requeue` right after `issue.reopen` is not
+/// refused. Only this Issue's record moves — no candidate scan runs — and the
+/// prefs file is written only when a `Closed` record was actually lifted.
+fn notify_monitor_of_reopen<E: CliEnv>(
+    env: &E,
+    snapshot: &IssueSnapshot,
+) -> Result<(), SpecOpsError> {
+    if snapshot.state != IssueState::Open {
+        return Ok(());
+    }
+    // No resolvable project root means no Monitor store to hold the Issue.
+    let Ok(project_root) = issue_monitor_project_root(env, None) else {
+        return Ok(());
+    };
+    let prefs_path = crate::issue_monitor_prefs_path_for_repo_path(&project_root);
+    if !prefs_path.exists() {
+        return Ok(());
+    }
+    crate::try_mutate_issue_monitor_prefs(&prefs_path, |prefs| {
+        let mut monitor = crate::IssueMonitorState::with_prefs(
+            crate::IssueMonitorConfig::default(),
+            prefs.clone(),
+        );
+        if monitor.record_reopened(snapshot.number.0, Some(snapshot.updated_at.0.clone())) {
+            *prefs = monitor.prefs();
+        }
+        Ok(())
+    })
+    .map_err(io_as_api_error)?;
+    Ok(())
 }
 
 fn write_issue_state_result(
@@ -5931,6 +5976,144 @@ mod tests {
         assert_eq!(code, 0, "{out}");
         let result = state_result(&out);
         assert_eq!(result["status"], "requeued", "{out}");
+    }
+
+    /// Issue #4770: close, then let a Monitor scan observe the closure, then
+    /// reopen. The scan cleared the Issue's holds and left a durable `Closed` closure
+    /// record, which `issue.reopen` never updated, so the requeue that
+    /// follows answered `not_held`.
+    fn close_scan_reopen(
+        prefs: crate::IssueMonitorPrefs,
+    ) -> (TempDir, PathBuf, crate::cli::TestEnv) {
+        let tmp = TempDir::new().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        let prefs_path = crate::issue_monitor_prefs_path_for_repo_path(&repo);
+        crate::save_issue_monitor_prefs(&prefs_path, &prefs).expect("save prefs");
+
+        let mut env = crate::cli::TestEnv::new(repo.clone());
+        env.client.seed(IssueSnapshot {
+            number: IssueNumber(7),
+            title: "Closed by mistake".to_string(),
+            body: "Original body".to_string(),
+            labels: vec!["bug".to_string()],
+            state: IssueState::Open,
+            updated_at: UpdatedAt::new("2026-09-01T00:00:00Z"),
+            comments: vec![],
+        });
+        let mut out = String::new();
+        run(
+            &mut env,
+            IssueCommand::Close {
+                number: 7,
+                reason: Some(gwt_github::client::IssueCloseReason::NotPlanned),
+                comment: None,
+            },
+            &mut out,
+        )
+        .expect("close");
+
+        let mut monitor = crate::IssueMonitorState::with_prefs(
+            crate::IssueMonitorConfig::default(),
+            crate::load_issue_monitor_prefs(&prefs_path).expect("load prefs"),
+        );
+        crate::scan_issue_monitor_candidates(
+            &mut monitor,
+            &[crate::IssueMonitorIssue {
+                number: 7,
+                title: "Closed by mistake".to_string(),
+                labels: vec!["bug".to_string()],
+                state: crate::IssueMonitorIssueState::Closed,
+                body: None,
+                url: None,
+                readiness: crate::IssueMonitorReadiness::default(),
+                updated_at: None,
+            }],
+            "2026-09-01T00:00:10Z",
+        );
+        crate::save_issue_monitor_prefs(&prefs_path, &monitor.prefs()).expect("save scan");
+
+        let mut out = String::new();
+        run(
+            &mut env,
+            IssueCommand::Reopen {
+                number: 7,
+                comment: None,
+            },
+            &mut out,
+        )
+        .expect("reopen");
+        (tmp, repo, env)
+    }
+
+    fn requeue_seven(env: &mut crate::cli::TestEnv, repo: &std::path::Path) -> (i32, String) {
+        let mut out = String::new();
+        let code = run(
+            env,
+            IssueCommand::MonitorRequeue {
+                project_root: Some(repo.to_path_buf()),
+                number: 7,
+                reason: "reopened after the Monitor observed the close".to_string(),
+            },
+            &mut out,
+        )
+        .expect("requeue runs");
+        (code, out)
+    }
+
+    #[test]
+    fn reopen_after_a_monitor_scan_observed_the_close_still_requeues() {
+        let _env_lock = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = TempDir::new().expect("home");
+        let _home = ScopedGwtHome::set(home.path());
+        let (_tmp, repo, mut env) = close_scan_reopen(crate::IssueMonitorPrefs {
+            enabled: true,
+            failed_issues: vec![crate::IssueMonitorFailedIssue {
+                issue_number: 7,
+                message: "agent window closed without a PR".to_string(),
+                window_id: None,
+            }],
+            ..crate::IssueMonitorPrefs::default()
+        });
+
+        let (code, out) = requeue_seven(&mut env, &repo);
+
+        assert_eq!(code, 0, "{out}");
+        let result = state_result(&out);
+        assert_eq!(result["status"], "requeued", "{out}");
+        assert_eq!(result["released_hold"], "closure", "{out}");
+    }
+
+    #[test]
+    fn reopen_after_a_monitor_scan_observed_the_close_releases_the_completion_hold() {
+        let _env_lock = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = TempDir::new().expect("home");
+        let _home = ScopedGwtHome::set(home.path());
+        let (_tmp, repo, mut env) = close_scan_reopen(crate::IssueMonitorPrefs {
+            enabled: true,
+            merged_issues: vec![7],
+            issue_completion_migration_version:
+                crate::issue_monitor::ISSUE_COMPLETION_MIGRATION_VERSION,
+            completion_records: vec![crate::issue_monitor::IssueCompletionRecord {
+                issue_number: 7,
+                generation: 1,
+                state: crate::issue_monitor::IssueCompletionState::Completed,
+                issue_updated_at: Some("2026-09-01T00:00:00Z".to_string()),
+                evidence: crate::issue_monitor::IssueCompletionEvidence::LinkedPr,
+            }],
+            ..crate::IssueMonitorPrefs::default()
+        });
+
+        let (code, out) = requeue_seven(&mut env, &repo);
+
+        assert_eq!(code, 0, "{out}");
+        let result = state_result(&out);
+        assert_eq!(result["status"], "requeued", "{out}");
+        assert_eq!(result["released_hold"], "completion", "{out}");
     }
 
     #[test]
