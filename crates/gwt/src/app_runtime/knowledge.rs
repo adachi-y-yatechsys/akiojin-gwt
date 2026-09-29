@@ -606,6 +606,7 @@ mod monitor_snapshot_cache_tests {
     #[test]
     fn stale_inbox_queued_state_is_not_terminal_membership() {
         let directory = tempfile::tempdir().expect("tempdir");
+        let _gwt_home = gwt_core::test_support::ScopedGwtHome::set(directory.path());
         let mut cache = KnowledgeMonitorSnapshotCache::default();
         cache.replace(
             directory.path(),
