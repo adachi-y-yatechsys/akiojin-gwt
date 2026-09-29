@@ -5,7 +5,11 @@ import { APP_URL, installEmbeddedRoutes } from "./_helpers/embedded-frontend";
 // A browser-check Project URL uses the isolated binary's assets; without one the
 // shared embedded frontend fixture serves this checkout for local development.
 const errors = new WeakMap<Page, string[]>();
-const liveUrl = process.env.GWT_PLAYWRIGHT_BASE_URL;
+const configuredUrl = process.env.GWT_PLAYWRIGHT_BASE_URL;
+// A browser-check URL may point at the Hub; these fixtures exercise Project assets.
+const liveUrl = configuredUrl
+  ? new URL(new URL(configuredUrl).pathname === "/" ? new URL(APP_URL).pathname : new URL(configuredUrl).pathname, configuredUrl).toString()
+  : undefined;
 
 test.use({ viewport: { width: 1600, height: 1100 } });
 test.beforeEach(async ({ page }, info) => {
@@ -42,7 +46,7 @@ async function messages(page: Page, kind: string) {
   ), kind);
 }
 
-test("Other stays authoritative under search and filters, with no Workspace surface", async ({ page }) => {
+test("Other stays authoritative under search and queue columns, with no Workspace surface", async ({ page }) => {
   await boot(page);
   const other = page.locator("details.issue-other-group");
   await expect(other).not.toHaveAttribute("open");
@@ -63,16 +67,30 @@ test("Other stays authoritative under search and filters, with no Workspace surf
   await expect(page.locator(".knowledge-row")).toHaveCount(0);
   await expect(row(page, "other-paused")).toBeVisible();
   await expect(row(page, "linked-visible")).toHaveCount(0);
-  await page.locator('[data-issue-filter="closed"]').click();
+  await expect(page.locator("[data-issue-filter], [data-issue-lane-filter]")).toHaveCount(0);
+  await expect(page.locator("[data-queue-column]")).toHaveCount(4);
   await expect(row(page, "linked-uncached")).toHaveCount(0);
   await expect(row(page, "other-paused")).toBeVisible();
-
-  await page.locator("[data-issue-lane-filter]").selectOption("remote");
-  await expect(row(page, "other-paused")).toHaveCount(0);
   await expect(row(page, "remote-start:feature/remote")).toBeVisible();
-  await page.locator("[data-issue-lane-filter]").selectOption("paused");
+});
+
+test("Other disclosure survives a cache refresh between pointerdown and pointerup", async ({ page }) => {
+  await boot(page);
+  await page.evaluate(() => { (window as any).__otherHoldEntries = true; });
+  await page.locator('[data-action="refresh-knowledge"]').click();
+  await expect.poll(() => page.evaluate(() => (window as any).__otherPendingRefresh)).toBe(true);
+  const other = page.locator("details.issue-other-group");
+  const summary = other.locator("summary");
+  await summary.scrollIntoViewIfNeeded();
+  await other.evaluate(node => { (window as any).__otherBeforeRefresh = node; });
+  const bounds = await summary.boundingBox();
+  await page.mouse.move(bounds!.x + 30, bounds!.y + bounds!.height / 2);
+  await page.mouse.down();
+  await page.evaluate(() => (window as any).__otherRefresh());
+  await expect.poll(() => other.evaluate(node => node === (window as any).__otherBeforeRefresh)).toBe(true);
+  await page.mouse.up();
+  await expect(other).toHaveAttribute("open");
   await expect(row(page, "other-paused")).toBeVisible();
-  await expect(row(page, "remote-start:feature/remote")).toHaveCount(0);
 });
 
 test("Other keeps branch launch, conversation resume and backend-approved cleanup reachable", async ({ page }) => {
@@ -113,6 +131,7 @@ async function installBackend(page: Page, preset: string) {
   await page.addInitScript(({ preset, projectKey }) => {
     const fixture = window as any;
     fixture.__otherMessages = [];
+    let lastKnowledgeResponse: unknown;
     const issueWindow = {
       id: "tab-other::issue-1", title: "Issues", preset,
       geometry: { x: 50, y: 60, width: 1430, height: 940 },
@@ -165,7 +184,17 @@ async function installBackend(page: Page, preset: string) {
         super();
         setTimeout(() => { this.readyState = 1; this.dispatchEvent(new Event("open")); }, 0);
       }
-      emit(payload: unknown) {
+      emit(payload: any) {
+        if (payload.kind === "knowledge_entries") {
+          lastKnowledgeResponse = payload;
+          fixture.__otherRefresh = () => this.dispatchEvent(new MessageEvent("message", {
+            data: JSON.stringify(lastKnowledgeResponse),
+          }));
+          if (fixture.__otherHoldEntries) {
+            fixture.__otherPendingRefresh = true;
+            return;
+          }
+        }
         setTimeout(() => this.dispatchEvent(new MessageEvent("message", {
           data: JSON.stringify(payload),
         })), 0);

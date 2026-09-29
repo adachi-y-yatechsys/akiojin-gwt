@@ -114,6 +114,7 @@ fn bind_answer_delivery(
 
 /// Drive one issue into an in-flight autonomous launch holding an active slot.
 fn launch_autonomous(monitor: &mut IssueMonitorState, issue: &IssueMonitorIssue) {
+    monitor.terminal_queue_push(&[issue.number], "operator", NOW);
     gwt::scan_issue_monitor_candidates(monitor, std::slice::from_ref(issue), NOW);
     let decision = monitor.prepare_autonomous_candidate(issue, &verified(), NOW);
     assert_eq!(decision, EligibilityDecision::Eligible);
@@ -258,6 +259,7 @@ fn parking_a_question_lets_the_next_ready_issue_launch_immediately() {
     monitor.set_gui_connected(true);
     let blocked = auto_issue(42);
     let next_ready = auto_issue(43);
+    monitor.terminal_queue_push(&[42, 43], "operator", NOW);
     gwt::scan_issue_monitor_candidates(&mut monitor, &[blocked.clone(), next_ready], NOW);
     monitor.prepare_autonomous_candidate(&blocked, &verified(), NOW);
     monitor.complete_active_launch(42, "tab-1::agent-1");

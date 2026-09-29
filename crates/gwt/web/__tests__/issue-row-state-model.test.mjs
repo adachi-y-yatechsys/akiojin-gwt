@@ -511,7 +511,7 @@ test("every rendered Issue row has one primary badge, at most two secondary item
     knowledgeEntry(51, { state: "closed" }),
   ]);
 
-  fixture.body.querySelector('[data-issue-filter="all"]').click();
+  // #4499: all states are visible in the queue columns.
   const rows = [...fixture.body.querySelectorAll(".knowledge-row")];
   assert.equal(rows.length, 8);
   for (const row of rows) {
@@ -665,8 +665,9 @@ test("row actions dispatch from the visible buttons and from the overflow menu",
   menu44.open = true;
   menu44.querySelector('[data-action="move-up"]').click();
   assert.deepEqual(fixture.sent.at(-1), {
-    kind: "reorder_issue_monitor_issues",
-    issue_numbers: [44, 42],
+    kind: "issue_monitor_queue_move",
+    issue_number: 44,
+    position: 0,
   });
   assert.equal(
     fixture.body.querySelector('[data-issue-number="44"] .knowledge-row-menu').hasAttribute("open"),
