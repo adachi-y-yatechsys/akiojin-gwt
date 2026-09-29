@@ -33,9 +33,12 @@ test.describe("Legacy SPEC preset Work Item compatibility", () => {
       "Semantic search work items",
     );
     await expect(page.locator(".surface-knowledge .kanban-board")).toHaveCount(0);
-    await expect(page.locator(".surface-knowledge .knowledge-row")).toHaveCount(5);
+    // SPEC #4499 AC-1 / AC-18: no open/closed filter; a closed item sits in Done.
+    await expect(page.locator(".surface-knowledge .knowledge-row")).toHaveCount(6);
     await expect(page.getByText("SPEC Issue Kanban View")).toBeVisible();
-    await expect(page.getByText("Merge Kanban implementation bundle")).toHaveCount(0);
+    await expect(
+      page.locator(".surface-knowledge [data-queue-column='done'] .knowledge-row[data-issue-number='2470']"),
+    ).toBeVisible();
   });
 });
 
@@ -65,7 +68,7 @@ test.describe("Issue Bridge load recovery", () => {
     await expect(
       page.locator(".surface-knowledge .kanban-column[data-phase='implementation']"),
     ).toHaveCount(0);
-    await expect(page.locator(".surface-knowledge .knowledge-row")).toHaveCount(4);
+    await expect(page.locator(".surface-knowledge .knowledge-row")).toHaveCount(5);
     await expect(page.locator(".surface-knowledge .knowledge-heading")).toHaveText(
       "Cached work items",
     );
@@ -73,12 +76,16 @@ test.describe("Issue Bridge load recovery", () => {
       "placeholder",
       "Semantic search work items",
     );
-    await expect(page.getByText("Closed issue hidden by default")).toHaveCount(0);
+    await expect(
+      page.locator(".surface-knowledge [data-queue-column='done'] .knowledge-row[data-issue-number='3094']"),
+    ).toBeVisible();
     await expect(page.getByText("Design-required work item shares Issue list")).toBeVisible();
     await expect(page.getByText("(plain)")).toHaveCount(0);
   });
 
-  test("Issue state filter defaults to open and can show closed or all issues", async ({
+  // SPEC #4499 AC-1 / AC-18: the open/closed/all filter is gone; the Done column
+  // carries closed issues, so every cached issue is on the board.
+  test("closed issues sit in the Done column with no state filter", async ({
     page,
   }) => {
     await installEmbeddedRoutes(page);
@@ -86,17 +93,11 @@ test.describe("Issue Bridge load recovery", () => {
 
     await page.goto(APP_URL);
 
-    await expect(page.locator(".surface-knowledge .knowledge-row")).toHaveCount(4);
-    await expect(page.getByText("Closed issue hidden by default")).toHaveCount(0);
-
-    await page.locator(".surface-knowledge [data-issue-filter='closed']").click();
-
-    await expect(page.locator(".surface-knowledge .knowledge-row")).toHaveCount(1);
-    await expect(page.getByText("Closed issue hidden by default")).toBeVisible();
-
-    await page.locator(".surface-knowledge [data-issue-filter='all']").click();
-
     await expect(page.locator(".surface-knowledge .knowledge-row")).toHaveCount(5);
+    await expect(page.locator(".surface-knowledge [data-issue-filter]")).toHaveCount(0);
+    const done = page.locator(".surface-knowledge [data-queue-column='done']");
+    await expect(done.locator(".knowledge-row")).toHaveCount(1);
+    await expect(done).toContainText("Closed issue hidden by default");
   });
 
   test("selecting an Issue row renders cached detail in the right pane", async ({
@@ -128,7 +129,7 @@ test.describe("Issue Bridge load recovery", () => {
 
     await page.goto(APP_URL);
 
-    await expect(page.locator(".surface-knowledge .knowledge-row")).toHaveCount(4);
+    await expect(page.locator(".surface-knowledge .knowledge-row")).toHaveCount(5);
     await page.locator(".surface-knowledge .knowledge-row[data-issue-number='3095']").click();
     await expect(
       page.locator(".surface-knowledge .knowledge-detail-pane"),
@@ -165,7 +166,7 @@ test.describe("Issue Bridge load recovery", () => {
     await page.goto(APP_URL);
 
     await expect(page.locator(".surface-knowledge .knowledge-list")).toBeVisible();
-    await expect(page.locator(".surface-knowledge .knowledge-row")).toHaveCount(4);
+    await expect(page.locator(".surface-knowledge .knowledge-row")).toHaveCount(5);
   });
 
   test("manual refresh recovers a stale empty loading state", async ({ page }) => {
@@ -180,7 +181,7 @@ test.describe("Issue Bridge load recovery", () => {
     await expect(refresh).toBeEnabled();
     await refresh.click();
 
-    await expect(page.locator(".surface-knowledge .knowledge-row")).toHaveCount(4);
+    await expect(page.locator(".surface-knowledge .knowledge-row")).toHaveCount(5);
   });
 
   // Issue #4366 AC-6 / AC-6b: a provider hold never rewrites the saved Agent
@@ -359,9 +360,11 @@ test.describe("Issue Bridge load recovery", () => {
       issue_number: 3273,
       linked_issue_kind: "spec",
     });
+    // SPEC #4499 T-303: queue order moves through issue.monitor.queue.move.
     expect(messages).toContainEqual({
-      kind: "reorder_issue_monitor_issues",
-      issue_numbers: [3095, 3273, 3094],
+      kind: "issue_monitor_queue_move",
+      issue_number: 3095,
+      position: 0,
     });
     expect(messages).toContainEqual({
       kind: "set_issue_monitor_max_active_agents",
@@ -465,7 +468,7 @@ test.describe("Issue Bridge load recovery", () => {
 
     const issueSurface = page.locator(".workspace-window.surface-knowledge");
     const root = issueSurface.locator(".issue-bridge-root");
-    await expect(issueSurface.locator(".knowledge-row")).toHaveCount(4);
+    await expect(issueSurface.locator(".knowledge-row")).toHaveCount(5);
 
     // AC-23: exactly two bands; the removed rows are not in the DOM.
     await expect(root.locator(":scope > .workspace-toolbar")).toHaveCount(1);
@@ -585,9 +588,11 @@ test.describe("Issue Bridge load recovery", () => {
     expect(await root.evaluate((node) => node.childElementCount)).toBe(rootChildren);
 
     const messages = await page.evaluate(() => window.__knowledgeLoadMessages);
+    // SPEC #4499 T-303: queue order moves through issue.monitor.queue.move.
     expect(messages).toContainEqual({
-      kind: "reorder_issue_monitor_issues",
-      issue_numbers: [3095, 3273, 3094],
+      kind: "issue_monitor_queue_move",
+      issue_number: 3095,
+      position: 0,
     });
     expect(messages).toContainEqual({
       kind: "quick_register_issue",
@@ -619,7 +624,7 @@ test.describe("Issue Bridge load recovery", () => {
     await expect(page.locator(".surface-knowledge .knowledge-heading")).toHaveText(
       "Cached work items",
     );
-    await expect(page.locator(".surface-knowledge .knowledge-row")).toHaveCount(4);
+    await expect(page.locator(".surface-knowledge .knowledge-row")).toHaveCount(5);
     expect(consoleErrors).toEqual([]);
     expect(pageErrors).toEqual([]);
   });

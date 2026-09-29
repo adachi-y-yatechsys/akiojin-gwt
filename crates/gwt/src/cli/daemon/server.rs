@@ -1807,6 +1807,14 @@ enum IssueMonitorControl {
     TerminalQueuePush(Vec<u64>),
     /// SPEC #3165 TQ-9: remove Issues from this terminal's explicit queue.
     TerminalQueueRemove(Vec<u64>),
+    TerminalQueueMove {
+        issue_number: u64,
+        position: usize,
+    },
+    TerminalQueueAutoRefill {
+        enabled: bool,
+        limit: usize,
+    },
     /// SPEC-3431 FR-006: request one immediate scan without changing any
     /// state. The PM's `launch_now` writes the new priority order to prefs
     /// (the SOT the driver re-reads each scan) and then sends this so the
@@ -2523,6 +2531,14 @@ fn apply_routine_issue_monitor_control(
                 "operator",
                 &chrono::Utc::now().to_rfc3339(),
             );
+            true
+        }
+        IssueMonitorControl::TerminalQueueMove {
+            issue_number,
+            position,
+        } => monitor.terminal_queue_move(issue_number, position, &chrono::Utc::now().to_rfc3339()),
+        IssueMonitorControl::TerminalQueueAutoRefill { enabled, limit } => {
+            monitor.set_terminal_queue_auto_refill(enabled, limit);
             true
         }
         IssueMonitorControl::TerminalQueueRemove(issue_numbers) => {
@@ -3352,6 +3368,18 @@ fn decode_issue_monitor_control_in_repo(
                     .collect::<Option<Vec<_>>>()?;
                 return Some(IssueMonitorControl::TerminalQueuePush(issue_numbers));
             }
+            if let Some(move_entry) = payload.get("terminal_queue_move") {
+                return Some(IssueMonitorControl::TerminalQueueMove {
+                    issue_number: move_entry.get("issue_number")?.as_u64()?,
+                    position: usize::try_from(move_entry.get("position")?.as_u64()?).ok()?,
+                });
+            }
+            if let Some(refill) = payload.get("terminal_queue_auto_refill") {
+                return Some(IssueMonitorControl::TerminalQueueAutoRefill {
+                    enabled: refill.get("enabled")?.as_bool()?,
+                    limit: usize::try_from(refill.get("limit")?.as_u64()?).ok()?,
+                });
+            }
             if let Some(remove) = payload.get("terminal_queue_remove") {
                 let issue_numbers = remove
                     .get("issue_numbers")?
@@ -4097,7 +4125,15 @@ fn issue_monitor_http_client_with_repository(
     let (owner, repo) =
         crate::issue_monitor_worker::github_remote_owner_and_repo(&scope.project_root)
             .map_err(|error| error.to_string())?;
-    let client = HttpIssueClient::from_gh_auth(&owner, &repo).map_err(|error| error.to_string())?;
+    let client = HttpIssueClient::from_owner_environment_with_deadline(
+        &owner,
+        &repo,
+        &gwt_github::client::ResolutionDeadline::new(
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        ),
+    )
+    .map_err(|error| error.to_string())?;
     Ok((
         client,
         gwt_github::client::RepositoryIdentity::new(owner, repo),
@@ -5736,6 +5772,30 @@ mod tests {
         assert_eq!(reclaimed.auth_token, ours.auth_token);
     }
 
+    #[test]
+    fn monitor_http_client_rejects_non_loopback_test_override() {
+        let _env_lock = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = TempDir::new().expect("tempdir");
+        let _home = ScopedGwtHome::set(temp.path().join("home"));
+        let _token = ScopedEnvVar::set("GH_TOKEN", "fixture-only");
+        let _mode = ScopedEnvVar::set("GWT_OWNER_GITHUB_TEST_MODE", "loopback-v1");
+        let _rest = ScopedEnvVar::set("GWT_OWNER_GITHUB_REST_BASE", "https://example.invalid");
+        let _graphql =
+            ScopedEnvVar::set("GWT_OWNER_GITHUB_GRAPHQL_URL", "http://127.0.0.1:1/graphql");
+        let _owner_token = ScopedEnvVar::set("GWT_OWNER_GITHUB_TOKEN", "fixture-only");
+        let fake_gh = write_fake_gh_issue_list(temp.path());
+        let _path = prepend_fake_gh_to_path(&fake_gh);
+        let _gh = ScopedEnvVar::set("GWT_TEST_GH", &fake_gh);
+        init_git_repo(temp.path());
+        git_remote_add_origin(temp.path(), "https://github.com/fixture/queue.git");
+        let error = super::issue_monitor_http_client(&sample_scope(&temp))
+            .err()
+            .expect("non-loopback test override must fail closed");
+        assert!(error.contains("loopback"), "{error}");
+    }
+
     fn sample_endpoint(scope: RuntimeScope, socket_path: &Path, token: &str) -> DaemonEndpoint {
         DaemonEndpoint::new(
             scope,
@@ -6860,6 +6920,7 @@ exit 0
             enabled: true,
             ..crate::IssueMonitorConfig::default()
         });
+        monitor.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
         monitor.record_candidate(sample_issue_monitor_issue(42));
         assert!(monitor.apply_confirmed_claim(
             42,
@@ -6947,6 +7008,7 @@ exit 0
             enabled: true,
             ..crate::IssueMonitorConfig::default()
         });
+        claim_monitor.terminal_queue_push(&[44], "test", "2026-07-27T00:00:00Z");
         claim_monitor.record_candidate(sample_issue_monitor_issue(44));
         super::publish_issue_monitor_payloads(&hub, &mut claim_monitor, &project_store);
         assert_eq!(
@@ -7400,6 +7462,28 @@ exit 0
 
         assert_eq!(projected, monitor.agent_status());
         assert_eq!(projected.max_active, 3);
+    }
+
+    fn scheduled_issue_monitor_prefs(
+        mut prefs: crate::IssueMonitorPrefs,
+        numbers: &[u64],
+    ) -> crate::IssueMonitorPrefs {
+        let queue = prefs
+            .terminal_queues
+            .entry(crate::process::current_hostname())
+            .or_default();
+        for number in numbers {
+            if !queue.entries.iter().any(|entry| entry.number == *number) {
+                queue
+                    .entries
+                    .push(crate::issue_monitor::IssueMonitorTerminalQueueEntry {
+                        number: *number,
+                        queued_at: "2026-07-27T00:00:00Z".to_string(),
+                        queued_by: "test".to_string(),
+                    });
+            }
+        }
+        prefs
     }
 
     fn sample_issue_monitor_profile() -> crate::IssueMonitorLaunchProfile {
@@ -8744,6 +8828,7 @@ exit 0
             }],
             ..crate::IssueMonitorPrefs::default()
         };
+        let initial = scheduled_issue_monitor_prefs(initial, &[77]);
         crate::save_issue_monitor_prefs(&prefs_path, &initial).expect("seed durable journal");
         let mut monitor = crate::IssueMonitorState::with_prefs(
             crate::IssueMonitorConfig::default(),
@@ -8809,6 +8894,7 @@ exit 0
             }],
             ..crate::IssueMonitorPrefs::default()
         };
+        let initial = scheduled_issue_monitor_prefs(initial, &[77]);
         crate::save_issue_monitor_prefs(&prefs_path, &initial).expect("seed durable journal");
         let mut monitor = crate::IssueMonitorState::with_prefs(
             crate::IssueMonitorConfig::default(),
@@ -8848,6 +8934,7 @@ exit 0
             enabled: true,
             ..crate::IssueMonitorConfig::default()
         });
+        monitor.terminal_queue_push(&[42], "test", "2026-07-02T00:00:00Z");
         monitor.set_gui_connected(true);
         monitor.record_claimed(
             crate::IssueMonitorIssue {
@@ -8893,6 +8980,7 @@ exit 0
             enabled: true,
             ..crate::IssueMonitorConfig::default()
         });
+        monitor.terminal_queue_push(&[42], "test", "2026-07-02T00:00:00Z");
         monitor.set_gui_connected(true);
         monitor.record_claimed(
             crate::IssueMonitorIssue {
@@ -8938,6 +9026,7 @@ exit 0
             enabled: true,
             ..crate::IssueMonitorConfig::default()
         });
+        monitor.terminal_queue_push(&[42], "test", "2026-07-02T00:00:00Z");
         monitor.set_gui_connected(true);
         monitor.record_claimed(
             crate::IssueMonitorIssue {
@@ -9049,6 +9138,7 @@ exit 0
             ..crate::IssueMonitorConfig::default()
         });
         monitor.set_gui_connected(true);
+        monitor.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
         monitor.record_claimed(sample_issue_monitor_issue(42), "claim-directory-trust");
         monitor
             .next_launch_request("2026-08-29T00:00:00Z")
@@ -9100,6 +9190,7 @@ exit 0
             ..crate::IssueMonitorConfig::default()
         });
         monitor.set_gui_connected(true);
+        monitor.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
         monitor.record_claimed(sample_issue_monitor_issue(42), "claim-successor");
         monitor
             .next_launch_request("2026-08-29T00:00:00Z")
@@ -9141,6 +9232,7 @@ exit 0
                     ..crate::IssueMonitorConfig::default()
                 });
                 monitor.set_gui_connected(true);
+                monitor.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
                 monitor.record_claimed(sample_issue_monitor_issue(42), "claim-agent-match");
                 monitor
                     .next_launch_request("2026-08-13T00:00:00Z")
@@ -9162,6 +9254,7 @@ exit 0
                     enabled: true,
                     ..crate::IssueMonitorConfig::default()
                 });
+                monitor.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
                 monitor.record_candidate(sample_issue_monitor_issue(42));
                 assert!(monitor.apply_confirmed_claim(
                     42,
@@ -9208,6 +9301,7 @@ exit 0
                     ..crate::IssueMonitorConfig::default()
                 });
                 monitor.set_gui_connected(true);
+                monitor.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
                 monitor.record_claimed(sample_issue_monitor_issue(42), "claim-agent-live");
                 monitor
                     .next_launch_request("2026-08-13T00:00:00Z")
@@ -9229,6 +9323,7 @@ exit 0
                     enabled: true,
                     ..crate::IssueMonitorConfig::default()
                 });
+                monitor.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
                 monitor.record_candidate(sample_issue_monitor_issue(42));
                 assert!(monitor.apply_confirmed_claim(
                     42,
@@ -9285,6 +9380,7 @@ exit 0
             ..crate::IssueMonitorConfig::default()
         });
         monitor.set_gui_connected(true);
+        monitor.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
         monitor.record_claimed(sample_issue_monitor_issue(42), "claim-replay");
         monitor
             .next_launch_request("2026-08-13T00:00:00Z")
@@ -9366,6 +9462,7 @@ exit 0
             },
         );
         monitor.set_gui_connected(true);
+        monitor.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
         monitor.record_claimed(sample_issue_monitor_issue(42), "claim-a");
         monitor
             .next_launch_request("2026-08-16T00:00:00Z")
@@ -9449,8 +9546,11 @@ exit 0
             },
         );
         monitor.set_gui_connected(true);
+        monitor.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
         monitor.record_candidate(sample_issue_monitor_issue(42));
+        monitor.terminal_queue_push(&[43], "test", "2026-07-27T00:00:00Z");
         monitor.record_candidate(sample_issue_monitor_issue(43));
+        monitor.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
         monitor.record_claimed(sample_issue_monitor_issue(42), "claim-a");
         monitor
             .next_launch_request("2026-08-16T00:00:00Z")
@@ -9494,7 +9594,9 @@ exit 0
             prefs,
         );
         restored.set_gui_connected(true);
+        restored.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
         restored.record_candidate(sample_issue_monitor_issue(42));
+        restored.terminal_queue_push(&[43], "test", "2026-07-27T00:00:00Z");
         restored.record_candidate(sample_issue_monitor_issue(43));
 
         // Issue #4366 AC-4: the hold admits one re-verification launch every
@@ -9561,6 +9663,7 @@ exit 0
             },
         );
         monitor.set_gui_connected(true);
+        monitor.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
         monitor.record_candidate(sample_issue_monitor_issue(42));
         monitor
             .next_launch_request("2026-08-16T00:00:00Z")
@@ -9596,6 +9699,7 @@ exit 0
             Some(&resets_at)
         );
         assert_eq!(monitor.status_view_at(&before_reset).quota_hold, None);
+        monitor.terminal_queue_push(&[43], "test", "2026-07-27T00:00:00Z");
         monitor.record_candidate(sample_issue_monitor_issue(43));
         assert_eq!(
             monitor
@@ -9627,6 +9731,7 @@ exit 0
             },
         );
         monitor.set_gui_connected(true);
+        monitor.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
         monitor.record_candidate(sample_issue_monitor_issue(42));
         monitor
             .next_launch_request("2026-08-16T00:00:00Z")
@@ -9656,6 +9761,7 @@ exit 0
             monitor.status_view_at("2026-08-22T03:00:00Z").quota_hold,
             None
         );
+        monitor.terminal_queue_push(&[43], "test", "2026-07-27T00:00:00Z");
         monitor.record_candidate(sample_issue_monitor_issue(43));
         assert_eq!(
             monitor
@@ -9722,6 +9828,7 @@ exit 0
             );
             monitor.set_gui_connected(true);
             if control_name == "launch_failed" {
+                monitor.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
                 monitor.record_candidate(sample_issue_monitor_issue(42));
                 assert!(monitor.apply_confirmed_claim(
                     42,
@@ -9739,6 +9846,7 @@ exit 0
                     |_| false,
                 ));
             } else {
+                monitor.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
                 monitor.record_claimed(sample_issue_monitor_issue(42), "claim-a");
                 monitor
                     .next_launch_request("2026-08-13T00:00:00Z")
@@ -9880,6 +9988,7 @@ exit 0
             enabled: true,
             ..crate::IssueMonitorConfig::default()
         });
+        monitor.terminal_queue_push(&[42], "test", "2026-07-02T00:00:00Z");
         monitor.set_autonomous_mode(true);
         monitor.set_gui_connected(true);
         monitor.record_claimed(
@@ -9941,6 +10050,7 @@ exit 0
             enabled: true,
             ..crate::IssueMonitorConfig::default()
         });
+        monitor.terminal_queue_push(&[42], "test", "2026-07-02T00:00:00Z");
         monitor.set_gui_connected(true);
         monitor.record_claimed(
             crate::IssueMonitorIssue {
@@ -10039,6 +10149,24 @@ exit 0
     // scan and nothing else. It carries no authority (it changes no config),
     // and it must leave every piece of monitor state untouched — the launch
     // itself still goes through the ordinary claim/slot path on that scan.
+    #[test]
+    fn kanban_queue_controls_decode() {
+        for payload in [
+            serde_json::json!({"terminal_queue_move":{"issue_number":42,"position":0}}),
+            serde_json::json!({"terminal_queue_auto_refill":{"enabled":true,"limit":5}}),
+        ] {
+            assert!(
+                decode_issue_monitor_control(crate::runtime_daemon_events::issue_monitor_payload(
+                    "control",
+                    payload,
+                    std::process::id() + 1,
+                ))
+                .is_some(),
+                "Kanban control reaches daemon"
+            );
+        }
+    }
+
     #[test]
     fn issue_monitor_scan_now_decodes_and_only_requests_a_scan() {
         let payload = crate::runtime_daemon_events::issue_monitor_payload(
@@ -10870,6 +10998,7 @@ exit 0
             }],
             ..crate::IssueMonitorPrefs::default()
         };
+        let prefs = scheduled_issue_monitor_prefs(prefs, &[44]);
         crate::save_issue_monitor_prefs(
             &crate::issue_monitor_prefs_path_for_repo_path(&scope.project_root),
             &prefs,
@@ -11001,6 +11130,7 @@ exit 0
                 .collect(),
             ..crate::IssueMonitorPrefs::default()
         };
+        let prefs = scheduled_issue_monitor_prefs(prefs, &[QUEUED_ISSUE]);
         crate::save_issue_monitor_prefs(
             &crate::issue_monitor_prefs_path_for_repo_path(&scope.project_root),
             &prefs,
@@ -11111,6 +11241,7 @@ exit 0
             launch_profile: Some(sample_issue_monitor_profile()),
             ..crate::IssueMonitorPrefs::default()
         };
+        let prefs = scheduled_issue_monitor_prefs(prefs, &[43]);
         crate::save_issue_monitor_prefs(
             &crate::issue_monitor_prefs_path_for_repo_path(&scope.project_root),
             &prefs,
@@ -11193,6 +11324,7 @@ exit 0
             launch_profile: Some(sample_issue_monitor_profile()),
             ..crate::IssueMonitorPrefs::default()
         };
+        let prefs = scheduled_issue_monitor_prefs(prefs, &[44]);
         crate::save_issue_monitor_prefs(
             &crate::issue_monitor_prefs_path_for_repo_path(&scope.project_root),
             &prefs,
@@ -11356,6 +11488,7 @@ exit 0
             launch_profile: Some(sample_issue_monitor_profile()),
             ..crate::IssueMonitorPrefs::default()
         };
+        let prefs = scheduled_issue_monitor_prefs(prefs, &[44]);
         crate::save_issue_monitor_prefs(
             &crate::issue_monitor_prefs_path_for_repo_path(&scope.project_root),
             &prefs,
@@ -11463,6 +11596,7 @@ exit 0
             }],
             ..crate::IssueMonitorPrefs::default()
         };
+        let prefs = scheduled_issue_monitor_prefs(prefs, &[44]);
         crate::save_issue_monitor_prefs(
             &crate::issue_monitor_prefs_path_for_repo_path(&scope.project_root),
             &prefs,
@@ -11591,6 +11725,7 @@ exit 0
             launch_profile: Some(sample_issue_monitor_profile()),
             ..crate::IssueMonitorPrefs::default()
         };
+        let prefs = scheduled_issue_monitor_prefs(prefs, &queued);
         crate::save_issue_monitor_prefs(
             &crate::issue_monitor_prefs_path_for_repo_path(&scope.project_root),
             &prefs,
@@ -11801,6 +11936,7 @@ exit 0
             launch_profile: Some(sample_issue_monitor_profile()),
             ..crate::IssueMonitorPrefs::default()
         };
+        let prefs = scheduled_issue_monitor_prefs(prefs, &[44]);
         crate::save_issue_monitor_prefs(
             &crate::issue_monitor_prefs_path_for_repo_path(&scope.project_root),
             &prefs,
@@ -11935,6 +12071,7 @@ exit 0
                 ..crate::IssueMonitorPrefs::default()
             },
         );
+        preserved.terminal_queue_push(&[43], "test", "2026-07-27T00:00:00Z");
         preserved.set_gui_connected(true);
         crate::save_issue_monitor_prefs(
             &crate::issue_monitor_prefs_path_for_repo_path(&scope.project_root),
@@ -12025,6 +12162,7 @@ exit 0
                 ..crate::IssueMonitorPrefs::default()
             },
         );
+        preserved.terminal_queue_push(&[43], "test", "2026-07-27T00:00:00Z");
         preserved.set_gui_connected(true);
         crate::save_issue_monitor_prefs(
             &crate::issue_monitor_prefs_path_for_repo_path(&scope.project_root),
@@ -12317,6 +12455,10 @@ exit 0
                 // AC-4: a human reopens #43 (the live row comes back Open at a
                 // newer revision). The same merge must not fire again.
                 let _reopened = ScopedEnvVar::set("GWT_FAKE_GH_REVISION", "2026-09-02T00:00:00Z");
+                // Reopening on GitHub does not implicitly schedule another launch.
+                monitor.terminal_queue_push(&[43], "test", "2026-09-02T00:00:00Z");
+                crate::save_issue_monitor_prefs(prefs_path, &monitor.prefs())
+                    .expect("queue reopened issue");
                 let monitor =
                     super::scan_issue_monitor_once_blocking(scope.clone(), monitor, false)
                         .expect("second scan");
@@ -12516,6 +12658,7 @@ exit 0
         .expect("scope");
         let prefs_path = crate::issue_monitor_prefs_path_for_repo_path(&scope.project_root);
         let legacy = legacy_failed_prefs(&scope.project_root);
+        let legacy = scheduled_issue_monitor_prefs(legacy, &[43]);
         crate::save_issue_monitor_prefs(&prefs_path, &legacy).expect("seed legacy prefs");
         let monitor =
             crate::IssueMonitorState::with_prefs(crate::IssueMonitorConfig::default(), legacy);
@@ -12587,9 +12730,11 @@ exit 0
             r#"{"enabled":true,"max_active_agents":1,"priority_order":[43],"merged_issues":[43]}"#,
         )
         .expect("legacy completion prefs");
-        crate::save_issue_monitor_prefs(&prefs_path, &legacy).expect("seed legacy completion");
-        let monitor =
+        let mut monitor =
             crate::IssueMonitorState::with_prefs(crate::IssueMonitorConfig::default(), legacy);
+        monitor.terminal_queue_push(&[43], "test", "2026-07-02T00:00:00Z");
+        crate::save_issue_monitor_prefs(&prefs_path, &monitor.prefs())
+            .expect("seed legacy completion");
 
         let mut monitor = super::scan_issue_monitor_once_blocking(scope, monitor, false)
             .expect("ScanNow live revalidation succeeds");
@@ -14360,6 +14505,7 @@ exit 1
             enabled: true,
             ..crate::IssueMonitorConfig::default()
         });
+        seeded.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
         seeded.record_candidate(sample_issue_monitor_issue(42));
         assert!(seeded.apply_confirmed_claim(
             42,
@@ -15019,6 +15165,7 @@ exit 1
             effect_authority_epoch: 7,
             ..crate::IssueMonitorPrefs::default()
         };
+        let initial = scheduled_issue_monitor_prefs(initial, &[42]);
         crate::save_issue_monitor_prefs(&prefs_path, &initial).expect("seed prefs");
         let mut canonical = crate::IssueMonitorState::with_prefs(
             crate::IssueMonitorConfig::default(),
@@ -15065,6 +15212,7 @@ exit 1
             effect_authority_epoch: 7,
             ..crate::IssueMonitorPrefs::default()
         };
+        let initial = scheduled_issue_monitor_prefs(initial, &[42]);
         crate::save_issue_monitor_prefs(&prefs_path, &initial).expect("seed prefs");
         let lock = issue_monitor_prefs_lock_for_test(&prefs_path);
         let mut canonical = crate::IssueMonitorState::with_prefs(
@@ -15337,12 +15485,15 @@ exit 1
         );
         crate::save_issue_monitor_prefs(
             &prefs_path,
-            &crate::IssueMonitorPrefs {
-                enabled: true,
-                effect_authority_epoch: 7,
-                pending_effects: vec![grant],
-                ..crate::IssueMonitorPrefs::default()
-            },
+            &scheduled_issue_monitor_prefs(
+                crate::IssueMonitorPrefs {
+                    enabled: true,
+                    effect_authority_epoch: 7,
+                    pending_effects: vec![grant],
+                    ..crate::IssueMonitorPrefs::default()
+                },
+                &[42],
+            ),
         )
         .expect("seed prepared grant");
         let client_marker = temp.path().join("claim-http-client-started");
@@ -15524,6 +15675,7 @@ exit 1
             pending_effects: vec![grant.clone(), safety.clone()],
             ..crate::IssueMonitorPrefs::default()
         };
+        let prefs = scheduled_issue_monitor_prefs(prefs, &[42]);
         crate::save_issue_monitor_prefs(&prefs_path, &prefs).expect("seed prefs");
         let mut monitor =
             crate::IssueMonitorState::with_prefs(crate::IssueMonitorConfig::default(), prefs);
@@ -15608,6 +15760,7 @@ exit 1
         };
         let mut canonical =
             crate::IssueMonitorState::with_prefs(crate::IssueMonitorConfig::default(), initial);
+        canonical.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
         canonical.record_candidate(sample_issue_monitor_issue(42));
         canonical.set_autonomous_phase(42, crate::AutonomousPhase::Implementing);
         crate::save_issue_monitor_prefs(&prefs_path, &canonical.prefs()).expect("seed prefs");
@@ -15645,6 +15798,7 @@ exit 1
         let mut reloaded =
             crate::IssueMonitorState::with_prefs(crate::IssueMonitorConfig::default(), persisted);
         reloaded.set_gui_connected(true);
+        reloaded.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
         reloaded.record_candidate(sample_issue_monitor_issue(42));
         let request = reloaded
             .next_launch_request("2026-08-13T01:00:00Z")
@@ -16461,6 +16615,7 @@ exit 1
             pending_effects: vec![effect.clone()],
             ..crate::IssueMonitorPrefs::default()
         };
+        let prefs = scheduled_issue_monitor_prefs(prefs, &[42]);
         crate::save_issue_monitor_prefs(&prefs_path, &prefs).expect("seed prefs");
         let mut monitor =
             crate::IssueMonitorState::with_prefs(crate::IssueMonitorConfig::default(), prefs);
@@ -16495,6 +16650,7 @@ exit 1
             enabled: true,
             ..crate::IssueMonitorConfig::default()
         });
+        monitor.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
         monitor.record_candidate(sample_issue_monitor_issue(42));
         let effect = crate::PendingIssueMonitorEffect::prepared(
             "claim-effect-42",
@@ -16566,6 +16722,7 @@ exit 1
             ..crate::IssueMonitorConfig::default()
         });
         monitor.set_gui_connected(true);
+        monitor.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
         monitor.record_candidate(sample_issue_monitor_issue(42));
         assert_eq!(
             monitor.prepare_claim_effects_with_probe("host/session", now, 1, |_| false),
@@ -16586,6 +16743,7 @@ exit 1
         };
 
         let mut latest = monitor.clone();
+        latest.terminal_queue_push(&[43], "test", "2026-07-27T00:00:00Z");
         latest.record_candidate(sample_issue_monitor_issue(43));
         latest.complete_active_launch(43, "tab-1::agent-43");
         crate::save_issue_monitor_prefs(&prefs_path, &latest.prefs())
@@ -16631,6 +16789,7 @@ exit 1
         );
         assert_eq!(restored.active_issue_numbers(), vec![43]);
         // Candidate rows are refreshed by the next scan, not stored in prefs.
+        restored.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
         restored.record_candidate(sample_issue_monitor_issue(42));
         assert_eq!(restored.queued_issue_numbers(), vec![42]);
         assert!(persisted.launching_issues.is_empty());
@@ -16658,6 +16817,7 @@ exit 1
             enabled: true,
             ..crate::IssueMonitorConfig::default()
         });
+        monitor.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
         monitor.record_candidate(sample_issue_monitor_issue(42));
         let key = monitor
             .prepare_pending_effect(
@@ -16728,6 +16888,7 @@ exit 1
             ..crate::IssueMonitorConfig::default()
         });
         let mut issue = sample_issue_monitor_issue(42);
+        monitor.terminal_queue_push(&[issue.number], "test", "2026-07-27T00:00:00Z");
         monitor.record_candidate(issue.clone());
         let key = monitor
             .prepare_pending_effect(
@@ -16746,6 +16907,7 @@ exit 1
         let attempting = monitor.pending_effects()[0].clone();
 
         issue.labels.push("hold".to_string());
+        monitor.terminal_queue_push(&[issue.number], "test", "2026-07-27T00:00:00Z");
         monitor.record_candidate(issue);
         crate::save_issue_monitor_prefs(&prefs_path, &monitor.prefs())
             .expect("persist excluded state");
@@ -16804,6 +16966,7 @@ exit 1
             let mut issue = sample_issue_monitor_issue(42);
             issue.labels.push("gwt-spec".to_string());
             issue.readiness = crate::IssueMonitorReadiness::Ready;
+            monitor.terminal_queue_push(&[issue.number], "test", "2026-07-27T00:00:00Z");
             monitor.record_candidate(issue.clone());
             let key = monitor
                 .prepare_pending_effect(
@@ -16829,6 +16992,7 @@ exit 1
                 issue.readiness = crate::IssueMonitorReadiness::NotReady;
             }
             let mut scanned = monitor.clone();
+            scanned.terminal_queue_push(&[issue.number], "test", "2026-07-27T00:00:00Z");
             scanned.record_candidate(issue);
             assert!(super::commit_issue_monitor_scan_if_current(
                 &prefs_path,
@@ -16906,6 +17070,7 @@ exit 1
             enabled: true,
             ..crate::IssueMonitorConfig::default()
         });
+        monitor.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
         monitor.record_candidate(sample_issue_monitor_issue(42));
         assert!(monitor.apply_confirmed_claim(
             42,
@@ -17311,6 +17476,7 @@ exit 1
             pending_effects: vec![claim.clone()],
             ..crate::IssueMonitorPrefs::default()
         };
+        let prefs = scheduled_issue_monitor_prefs(prefs, &[42]);
         crate::save_issue_monitor_prefs(&prefs_path, &prefs).expect("seed prefs");
         let mut monitor =
             crate::IssueMonitorState::with_prefs(crate::IssueMonitorConfig::default(), prefs);
@@ -19662,6 +19828,7 @@ exit 1
                     ..crate::IssueMonitorConfig::default()
                 });
                 seeded.set_gui_connected(true);
+                seeded.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
                 seeded.record_claimed(sample_issue_monitor_issue(42), "claim-agent-max");
                 seeded
                     .next_launch_request("2026-08-13T00:00:00Z")
@@ -19688,6 +19855,7 @@ exit 1
                     enabled: true,
                     ..crate::IssueMonitorConfig::default()
                 });
+                seeded.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
                 seeded.record_candidate(sample_issue_monitor_issue(42));
                 assert!(seeded.apply_confirmed_claim(
                     42,

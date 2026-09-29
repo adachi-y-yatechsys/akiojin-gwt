@@ -1377,7 +1377,7 @@ test("500-row selection keeps list node identity and updates the right pane with
     surface.renderKnowledgeBridge("win-1");
 
     const list = element.querySelector(".knowledge-list");
-    const originalRows = [...list.children];
+    const originalRows = [...list.querySelectorAll(".knowledge-row")];
     assert.equal(originalRows.length, 500);
     const samples = [];
     for (let index = 0; index < 40; index += 1) {
@@ -1398,7 +1398,7 @@ test("500-row selection keeps list node identity and updates the right pane with
     }
 
     assert.deepEqual(
-      [...list.children],
+      [...list.querySelectorAll(".knowledge-row")],
       originalRows,
       "selection must not replace or reorder any list row node",
     );

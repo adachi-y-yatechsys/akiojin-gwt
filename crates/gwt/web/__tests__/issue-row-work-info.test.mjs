@@ -155,7 +155,7 @@ function applyEntries(surface, load, entries) {
   });
 }
 
-test("Issue lane filter applies Work lanes and renders Other after the Issue rows", async (t) => {
+test("Issue board replaces redundant Work lane filter and keeps Other after the board", async (t) => {
   const otherCalls = [];
   const projection = { active_works: [
     workRow({ id: "running" }),
@@ -171,15 +171,9 @@ test("Issue lane filter applies Work lanes and renders Other after the Issue row
     knowledgeEntry(2, [{ id: "paused" }]),
   ]);
   const filter = fixture.body.querySelector("[data-issue-lane-filter]");
-  assert.ok(filter, "all five former Workspace lanes are available in Issue");
-  assert.deepEqual(Array.from(filter.options).map(option => option.value),
-    ["all", "running", "paused", "needs_attention", "remote", "closed"]);
-  // linkedom's select.value has no setter; Chromium exercises native selection in E2E.
-  Object.defineProperty(filter, "value", { value: "paused", configurable: true });
-  filter.dispatchEvent(new fixture.window.Event("change"));
-  assert.equal(fixture.body.querySelectorAll(".knowledge-row").length, 1);
-  assert.match(fixture.body.querySelector(".knowledge-row").textContent, /Issue 2/);
-  assert.equal(otherCalls.at(-1).options.laneFilter, "paused");
+  assert.equal(filter, null, "queue columns replace the lane filter");
+  assert.equal(fixture.body.querySelectorAll(".knowledge-row").length, 2);
+  assert.equal(otherCalls.at(-1).options.laneFilter, "all");
   assert.equal(fixture.body.querySelector(".knowledge-list").lastElementChild.className, "issue-other-group");
 });
 
