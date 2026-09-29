@@ -73,6 +73,7 @@ fn reviewed_monitor() -> IssueMonitorState {
             ..IssueMonitorPrefs::default()
         },
     );
+    monitor.terminal_queue_push(&[42], "operator", "2026-06-29T00:00:00Z");
     gwt::scan_issue_monitor_candidates(&mut monitor, &[auto_issue()], "2026-06-29T00:00:00Z");
     monitor.capture_acceptance_snapshot(
         42,

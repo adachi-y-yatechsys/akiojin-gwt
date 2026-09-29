@@ -26,6 +26,37 @@ use std::{
     path::{Path, PathBuf},
 };
 
+// Lifecycle tests schedule their exact fixture issues before scanning; queue
+// admission itself is tested against the raw scanner in the unit suite.
+fn admit_test_candidates(monitor: &mut IssueMonitorState, issues: &[IssueMonitorIssue], now: &str) {
+    monitor.terminal_queue_push(
+        &issues.iter().map(|issue| issue.number).collect::<Vec<_>>(),
+        "test",
+        now,
+    );
+    monitor.set_priority_order(monitor.prefs().priority_order);
+}
+
+fn scan_queued_candidates(
+    monitor: &mut IssueMonitorState,
+    issues: &[IssueMonitorIssue],
+    now: &str,
+) -> gwt::issue_monitor::IssueMonitorScanSummary {
+    admit_test_candidates(monitor, issues, now);
+    scan_issue_monitor_candidates(monitor, issues, now)
+}
+
+fn scan_queued_candidates_with_provenance(
+    monitor: &mut IssueMonitorState,
+    issues: &[IssueMonitorIssue],
+    source: IssueMonitorCandidateSource,
+    root: &Path,
+    now: &str,
+) -> gwt::issue_monitor::IssueMonitorScanSummary {
+    admit_test_candidates(monitor, issues, now);
+    scan_issue_monitor_candidates_with_provenance(monitor, issues, source, root, now)
+}
+
 fn issue(number: u64, labels: &[&str]) -> IssueMonitorIssue {
     IssueMonitorIssue {
         number,
@@ -132,6 +163,7 @@ fn needs_human_monitor(issue_number: u64) -> IssueMonitorState {
         enabled: true,
         ..IssueMonitorConfig::default()
     });
+    monitor.terminal_queue_push(&[issue_number], "test", "2026-08-01T00:00:00Z");
     monitor.record_candidate(issue(issue_number, &["bug"]));
     monitor.escalate_to_needs_human(
         issue_number,
@@ -167,19 +199,20 @@ fn question_handoff(
 }
 
 #[test]
-fn monitor_config_defaults_to_disabled_and_accepts_ordinary_open_issues() {
+fn monitor_config_defaults_to_disabled_and_requires_explicit_queue_membership() {
     let config = IssueMonitorConfig::default();
 
     assert!(!config.enabled);
-    assert!(is_auto_improve_candidate(&issue(1, &["bug"]), &config));
+    assert!(!is_auto_improve_candidate(&issue(1, &["bug"]), false));
+    assert!(is_auto_improve_candidate(&issue(1, &["bug"]), true));
     assert!(is_auto_improve_candidate(
         &issue(2, &["auto-improve"]),
-        &config
+        true
     ));
 
     let mut closed = issue(3, &["auto-improve"]);
     closed.state = IssueMonitorIssueState::Closed;
-    assert!(!is_auto_improve_candidate(&closed, &config));
+    assert!(!is_auto_improve_candidate(&closed, true));
 }
 
 #[test]
@@ -190,7 +223,9 @@ fn legacy_issue_monitor_state_without_exclusion_reason_preserves_runtime_contrac
         ..IssueMonitorConfig::default()
     });
     monitor.set_gui_connected(true);
+    monitor.terminal_queue_push(&[42], "test", "2026-08-01T00:00:00Z");
     monitor.record_candidate(issue(42, &["bug"]));
+    monitor.terminal_queue_push(&[43], "test", "2026-08-01T00:00:00Z");
     monitor.record_candidate(issue(43, &["enhancement"]));
     assert!(monitor.queued_issue_numbers().iter().all(|number| monitor
         .inbox_item(*number)
@@ -231,7 +266,10 @@ fn legacy_issue_monitor_state_without_exclusion_reason_preserves_runtime_contrac
     let second = restored
         .next_launch_request("2026-08-05T00:02:00Z")
         .expect("next queued candidate launches after requeue frees the slot");
-    assert_eq!(second.issue_number, 43);
+    // The explicit terminal order survives serialization and remains the
+    // admission order when a launched issue returns to pending.
+    assert_eq!(restored.local_terminal_queue_numbers(), vec![42, 43]);
+    assert_eq!(second.issue_number, 42);
 }
 
 #[test]
@@ -245,6 +283,7 @@ fn exclusion_states_are_snake_case_and_non_terminal_for_requeue() {
             ..IssueMonitorConfig::default()
         });
         monitor.set_gui_connected(true);
+        monitor.terminal_queue_push(&[42], "test", "2026-08-01T00:00:00Z");
         monitor.record_candidate(issue(42, &["bug"]));
         monitor
             .next_launch_request("2026-08-05T00:00:00Z")
@@ -312,6 +351,7 @@ fn monitor_maps_gwt_spec_label_to_spec_launch_kind() {
         ..IssueMonitorConfig::default()
     });
     monitor.set_gui_connected(true);
+    monitor.terminal_queue_push(&[3165], "test", "2026-08-01T00:00:00Z");
     monitor.record_claimed(issue(3165, &["gwt-spec"]), "claim-spec");
 
     let launch = monitor
@@ -341,6 +381,7 @@ fn claimed_issue_waits_in_queue_until_gui_is_connected() {
         ..IssueMonitorConfig::default()
     });
 
+    monitor.terminal_queue_push(&[42], "test", "2026-08-01T00:00:00Z");
     monitor.record_claimed(issue(42, &["auto-improve"]), "claim-a");
 
     assert_eq!(monitor.queue_len(), 1);
@@ -360,7 +401,9 @@ fn monitor_runs_one_active_launch_and_keeps_remaining_items_queued() {
         ..IssueMonitorConfig::default()
     });
     monitor.set_gui_connected(true);
+    monitor.terminal_queue_push(&[42], "test", "2026-08-01T00:00:00Z");
     monitor.record_claimed(issue(42, &["auto-improve"]), "claim-a");
+    monitor.terminal_queue_push(&[43], "test", "2026-08-01T00:00:00Z");
     monitor.record_claimed(issue(43, &["auto-improve"]), "claim-b");
 
     let first = monitor
@@ -406,8 +449,11 @@ fn monitor_allows_active_launches_up_to_configured_max() {
         ..IssueMonitorConfig::default()
     });
     monitor.set_gui_connected(true);
+    monitor.terminal_queue_push(&[42], "test", "2026-08-01T00:00:00Z");
     monitor.record_claimed(issue(42, &["bug"]), "claim-a");
+    monitor.terminal_queue_push(&[43], "test", "2026-08-01T00:00:00Z");
     monitor.record_claimed(issue(43, &["enhancement"]), "claim-b");
+    monitor.terminal_queue_push(&[44], "test", "2026-08-01T00:00:00Z");
     monitor.record_claimed(issue(44, &["question"]), "claim-c");
 
     let first = monitor
@@ -433,8 +479,11 @@ fn monitor_reorders_queued_issues_without_preempting_active_launches() {
         ..IssueMonitorConfig::default()
     });
     monitor.set_gui_connected(true);
+    monitor.terminal_queue_push(&[42], "test", "2026-08-01T00:00:00Z");
     monitor.record_claimed(issue(42, &["bug"]), "claim-a");
+    monitor.terminal_queue_push(&[43], "test", "2026-08-01T00:00:00Z");
     monitor.record_claimed(issue(43, &["enhancement"]), "claim-b");
+    monitor.terminal_queue_push(&[44], "test", "2026-08-01T00:00:00Z");
     monitor.record_claimed(issue(44, &["question"]), "claim-c");
     let active = monitor
         .next_launch_request("2026-07-02T00:00:00Z")
@@ -468,8 +517,11 @@ fn monitor_reorders_visible_inbox_to_match_queue_priority() {
         enabled: true,
         ..IssueMonitorConfig::default()
     });
+    monitor.terminal_queue_push(&[42], "test", "2026-08-01T00:00:00Z");
     monitor.record_candidate(issue(42, &["bug"]));
+    monitor.terminal_queue_push(&[43], "test", "2026-08-01T00:00:00Z");
     monitor.record_candidate(issue(43, &["enhancement"]));
+    monitor.terminal_queue_push(&[44], "test", "2026-08-01T00:00:00Z");
     monitor.record_candidate(issue(44, &["question"]));
 
     monitor.reorder_queued_issues(&[44, 42, 43]);
@@ -534,12 +586,14 @@ fn claimed_active_launch_stays_launching_when_scan_refreshes_claim() {
         ..IssueMonitorConfig::default()
     });
     monitor.set_gui_connected(true);
+    monitor.terminal_queue_push(&[42], "test", "2026-08-01T00:00:00Z");
     monitor.record_claimed(issue(42, &["auto-improve"]), "claim-a");
     let first = monitor
         .next_launch_request("2026-07-02T00:00:00Z")
         .expect("launch request");
     assert_eq!(first.issue_number, 42);
 
+    monitor.terminal_queue_push(&[42], "test", "2026-08-01T00:00:00Z");
     monitor.record_claimed(issue(42, &["auto-improve"]), "claim-a-refresh");
 
     assert_eq!(monitor.queue_len(), 0);
@@ -556,6 +610,7 @@ fn failed_launch_marks_inbox_failed_and_clears_active_launch() {
         ..IssueMonitorConfig::default()
     });
     monitor.set_gui_connected(true);
+    monitor.terminal_queue_push(&[42], "test", "2026-08-01T00:00:00Z");
     monitor.record_claimed(issue(42, &["auto-improve"]), "claim-a");
     let first = monitor
         .next_launch_request("2026-07-02T00:00:00Z")
@@ -594,7 +649,9 @@ fn agent_runtime_failure_marks_launched_issue_failed_and_persists_error() {
         ..IssueMonitorConfig::default()
     });
     monitor.set_gui_connected(true);
+    monitor.terminal_queue_push(&[42], "test", "2026-08-01T00:00:00Z");
     monitor.record_claimed(issue(42, &["auto-improve"]), "claim-a");
+    monitor.terminal_queue_push(&[43], "test", "2026-08-01T00:00:00Z");
     monitor.record_claimed(issue(43, &["bug"]), "claim-b");
     let first = monitor
         .next_launch_request("2026-07-02T00:00:00Z")
@@ -633,7 +690,7 @@ fn agent_runtime_failure_marks_launched_issue_failed_and_persists_error() {
 
     let mut restored =
         IssueMonitorState::with_prefs(IssueMonitorConfig::default(), monitor.prefs());
-    scan_issue_monitor_candidates(
+    scan_queued_candidates(
         &mut restored,
         &[issue(42, &["bug"])],
         "2026-06-23T10:03:00Z",
@@ -656,6 +713,7 @@ fn agent_runtime_failure_matches_raw_and_combined_window_ids() {
         ..IssueMonitorConfig::default()
     });
     monitor.set_gui_connected(true);
+    monitor.terminal_queue_push(&[42], "test", "2026-08-01T00:00:00Z");
     monitor.record_claimed(issue(42, &["auto-improve"]), "claim-a");
     monitor
         .next_launch_request("2026-07-02T00:00:00Z")
@@ -681,8 +739,11 @@ fn max_active_increase_allows_more_queued_launches_without_rescan() {
         ..IssueMonitorConfig::default()
     });
     monitor.set_gui_connected(true);
+    monitor.terminal_queue_push(&[42], "test", "2026-08-01T00:00:00Z");
     monitor.record_claimed(issue(42, &["auto-improve"]), "claim-a");
+    monitor.terminal_queue_push(&[43], "test", "2026-08-01T00:00:00Z");
     monitor.record_claimed(issue(43, &["auto-improve"]), "claim-b");
+    monitor.terminal_queue_push(&[44], "test", "2026-08-01T00:00:00Z");
     monitor.record_claimed(issue(44, &["auto-improve"]), "claim-c");
 
     let first = monitor
@@ -719,7 +780,7 @@ fn claim_capacity_cap_prevents_multiple_preconfigured_launches() {
         ..IssueMonitorConfig::default()
     });
     monitor.set_gui_connected(true);
-    scan_issue_monitor_candidates(
+    scan_queued_candidates(
         &mut monitor,
         &[
             issue(42, &["bug"]),
@@ -759,7 +820,7 @@ fn claim_capacity_zero_keeps_queue_visible_without_claiming_or_launching() {
         ..IssueMonitorConfig::default()
     });
     monitor.set_gui_connected(true);
-    scan_issue_monitor_candidates(&mut monitor, &[issue(42, &["bug"])], "2026-06-23T10:01:00Z");
+    scan_queued_candidates(&mut monitor, &[issue(42, &["bug"])], "2026-06-23T10:01:00Z");
 
     let launches = monitor.claim_next_launch_requests_with_active_cap(
         &client,
@@ -788,6 +849,7 @@ fn blocked_claim_is_visible_in_inbox_without_queueing_launch() {
         ..IssueMonitorConfig::default()
     });
     let candidate = issue(42, &["auto-improve"]);
+    monitor.terminal_queue_push(&[candidate.number], "test", "2026-08-01T00:00:00Z");
     monitor.record_candidate(candidate.clone());
 
     assert!(monitor.record_blocked_by_claim(
@@ -816,7 +878,7 @@ fn scan_candidates_queues_all_open_issues_without_claiming_at_scan_time() {
         ..IssueMonitorConfig::default()
     });
 
-    let summary = scan_issue_monitor_candidates(
+    let summary = scan_queued_candidates(
         &mut monitor,
         &[issue(42, &["auto-improve"]), issue(43, &["bug"])],
         "2026-06-23T10:00:00Z",
@@ -850,7 +912,7 @@ fn scan_candidates_exposes_not_ready_and_exact_hold_without_consuming_queue_slot
     let on_hold_alias = issue(45, &["on-hold"]);
     let blocked_alias = issue(46, &["blocked"]);
 
-    let summary = scan_issue_monitor_candidates(
+    let summary = scan_queued_candidates(
         &mut monitor,
         &[
             ready_spec,
@@ -911,7 +973,7 @@ fn scan_candidates_requeues_when_readiness_or_hold_exclusion_is_removed() {
     let mut candidate = issue(42, &["gwt-spec"]);
     candidate.readiness = IssueMonitorReadiness::NotReady;
 
-    scan_issue_monitor_candidates(
+    scan_queued_candidates(
         &mut monitor,
         std::slice::from_ref(&candidate),
         "2026-08-05T10:00:00Z",
@@ -923,7 +985,7 @@ fn scan_candidates_requeues_when_readiness_or_hold_exclusion_is_removed() {
     );
 
     candidate.readiness = IssueMonitorReadiness::Ready;
-    scan_issue_monitor_candidates(
+    scan_queued_candidates(
         &mut monitor,
         std::slice::from_ref(&candidate),
         "2026-08-05T10:01:00Z",
@@ -934,7 +996,7 @@ fn scan_candidates_requeues_when_readiness_or_hold_exclusion_is_removed() {
     assert_eq!(ready.exclusion_reason, None);
 
     candidate.labels.push("hold".to_string());
-    scan_issue_monitor_candidates(
+    scan_queued_candidates(
         &mut monitor,
         std::slice::from_ref(&candidate),
         "2026-08-05T10:02:00Z",
@@ -946,7 +1008,7 @@ fn scan_candidates_requeues_when_readiness_or_hold_exclusion_is_removed() {
     );
 
     candidate.labels.retain(|label| label != "hold");
-    scan_issue_monitor_candidates(
+    scan_queued_candidates(
         &mut monitor,
         std::slice::from_ref(&candidate),
         "2026-08-05T10:03:00Z",
@@ -956,7 +1018,7 @@ fn scan_candidates_requeues_when_readiness_or_hold_exclusion_is_removed() {
     assert_eq!(requeued.state, MonitorInboxState::Queued);
     assert_eq!(requeued.exclusion_reason, None);
 
-    scan_issue_monitor_candidates(
+    scan_queued_candidates(
         &mut monitor,
         std::slice::from_ref(&candidate),
         "2026-08-05T10:04:00Z",
@@ -972,7 +1034,7 @@ fn readiness_and_hold_changes_do_not_cancel_in_flight_or_terminal_work() {
     });
     let mut candidate = issue(42, &["gwt-spec"]);
     candidate.readiness = IssueMonitorReadiness::Ready;
-    scan_issue_monitor_candidates(
+    scan_queued_candidates(
         &mut monitor,
         std::slice::from_ref(&candidate),
         "2026-08-05T10:00:00Z",
@@ -987,7 +1049,7 @@ fn readiness_and_hold_changes_do_not_cancel_in_flight_or_terminal_work() {
 
     candidate.labels.push("hold".to_string());
     candidate.readiness = IssueMonitorReadiness::NotReady;
-    scan_issue_monitor_candidates(
+    scan_queued_candidates(
         &mut monitor,
         std::slice::from_ref(&candidate),
         "2026-08-05T10:01:00Z",
@@ -999,7 +1061,7 @@ fn readiness_and_hold_changes_do_not_cancel_in_flight_or_terminal_work() {
     );
 
     monitor.complete_active_launch(42, "tab::agent-42");
-    scan_issue_monitor_candidates(
+    scan_queued_candidates(
         &mut monitor,
         std::slice::from_ref(&candidate),
         "2026-08-05T10:01:30Z",
@@ -1012,7 +1074,7 @@ fn readiness_and_hold_changes_do_not_cancel_in_flight_or_terminal_work() {
 
     candidate.labels.retain(|label| label != "hold");
     candidate.readiness = IssueMonitorReadiness::ReadyWithCompletedTasks;
-    scan_issue_monitor_candidates(
+    scan_queued_candidates(
         &mut monitor,
         std::slice::from_ref(&candidate),
         "2026-08-05T10:01:45Z",
@@ -1020,7 +1082,7 @@ fn readiness_and_hold_changes_do_not_cancel_in_flight_or_terminal_work() {
     monitor.record_merged(42);
     candidate.labels.push("hold".to_string());
     candidate.readiness = IssueMonitorReadiness::NotReady;
-    scan_issue_monitor_candidates(
+    scan_queued_candidates(
         &mut monitor,
         std::slice::from_ref(&candidate),
         "2026-08-05T10:02:00Z",
@@ -1042,7 +1104,7 @@ fn scan_exclusion_retains_attempting_claim_for_late_result_reconciliation() {
         monitor.set_gui_connected(true);
         let mut candidate = issue(42, &["gwt-spec"]);
         candidate.readiness = IssueMonitorReadiness::Ready;
-        scan_issue_monitor_candidates(
+        scan_queued_candidates(
             &mut monitor,
             std::slice::from_ref(&candidate),
             "2026-08-05T10:00:00Z",
@@ -1070,7 +1132,7 @@ fn scan_exclusion_retains_attempting_claim_for_late_result_reconciliation() {
         } else {
             candidate.readiness = IssueMonitorReadiness::NotReady;
         }
-        scan_issue_monitor_candidates(
+        scan_queued_candidates(
             &mut monitor,
             std::slice::from_ref(&candidate),
             "2026-08-05T10:01:00Z",
@@ -1126,7 +1188,7 @@ fn autonomous_pre_gate_keeps_not_ready_and_hold_exclusions_non_terminal() {
         if exclusion == "hold" {
             candidate.labels.push("hold".to_string());
         }
-        scan_issue_monitor_candidates(
+        scan_queued_candidates(
             &mut monitor,
             std::slice::from_ref(&candidate),
             "2026-08-05T10:00:00Z",
@@ -1151,7 +1213,7 @@ fn scan_candidates_ignores_claims_until_launch_time() {
         ..IssueMonitorConfig::default()
     });
 
-    let summary = scan_issue_monitor_candidates(
+    let summary = scan_queued_candidates(
         &mut monitor,
         &[issue(42, &["auto-improve"])],
         "2026-06-23T10:01:00Z",
@@ -1183,7 +1245,7 @@ fn agent_and_gui_status_share_projection_and_preserve_auto_apply_override() {
                 ..IssueMonitorPrefs::default()
             },
         );
-        scan_issue_monitor_candidates(&mut monitor, &[], "2026-07-27T10:00:00Z");
+        scan_queued_candidates(&mut monitor, &[], "2026-07-27T10:00:00Z");
 
         let gui = monitor.status_view_at(now);
         let agent = serde_json::to_value(monitor.agent_status_at(now)).expect("serialize status");
@@ -1213,7 +1275,7 @@ fn status_view_at_keeps_existing_state_before_three_poll_intervals() {
         poll_interval_secs: 10,
         ..IssueMonitorConfig::default()
     });
-    scan_issue_monitor_candidates(&mut monitor, &[], "2026-07-27T10:00:00Z");
+    scan_queued_candidates(&mut monitor, &[], "2026-07-27T10:00:00Z");
 
     let status = monitor.status_view_at("2026-07-27T10:00:29Z");
 
@@ -1229,7 +1291,7 @@ fn status_view_at_marks_scan_stalled_at_three_poll_intervals() {
         poll_interval_secs: 10,
         ..IssueMonitorConfig::default()
     });
-    scan_issue_monitor_candidates(&mut monitor, &[], "2026-07-27T10:00:00Z");
+    scan_queued_candidates(&mut monitor, &[], "2026-07-27T10:00:00Z");
 
     let status = monitor.status_view_at("2026-07-27T10:00:30Z");
 
@@ -1265,7 +1327,7 @@ fn status_view_at_fails_open_for_invalid_or_future_scan_timestamp() {
             poll_interval_secs: 10,
             ..IssueMonitorConfig::default()
         });
-        scan_issue_monitor_candidates(&mut monitor, &[], last_scan_at);
+        scan_queued_candidates(&mut monitor, &[], last_scan_at);
 
         let status = monitor.status_view_at("2026-07-27T10:00:30Z");
 
@@ -1285,7 +1347,7 @@ fn scan_error_keeps_visible_queue_candidates() {
         enabled: true,
         ..IssueMonitorConfig::default()
     });
-    scan_issue_monitor_candidates(&mut monitor, &[issue(42, &["bug"])], "2026-06-23T10:01:00Z");
+    scan_queued_candidates(&mut monitor, &[issue(42, &["bug"])], "2026-06-23T10:01:00Z");
 
     monitor.record_scan_error(
         "2026-06-23T10:02:00Z",
@@ -1311,7 +1373,7 @@ fn launch_auth_required_keeps_visible_queue_with_blocking_error() {
         enabled: true,
         ..IssueMonitorConfig::default()
     });
-    scan_issue_monitor_candidates(&mut monitor, &[issue(42, &["bug"])], "2026-06-23T10:01:00Z");
+    scan_queued_candidates(&mut monitor, &[issue(42, &["bug"])], "2026-06-23T10:01:00Z");
 
     monitor.record_launch_auth_required("2026-06-23T10:02:00Z");
 
@@ -1346,7 +1408,7 @@ fn monitor_claims_queue_head_just_in_time_and_skips_blocked_claims() {
         ..IssueMonitorConfig::default()
     });
     monitor.set_gui_connected(true);
-    scan_issue_monitor_candidates(
+    scan_queued_candidates(
         &mut monitor,
         &[issue(42, &["bug"]), issue(43, &["enhancement"])],
         "2026-06-23T10:01:00Z",
@@ -1469,13 +1531,13 @@ fn live_scan_with_resolvable_git_migrates_exact_failure_and_requeues_open_issue(
         IssueMonitorConfig::default(),
         legacy_failed_prefs(repo.path(), 42),
     );
-    scan_issue_monitor_candidates(&mut monitor, &[issue(42, &["bug"])], "2026-07-21T00:00:00Z");
+    scan_queued_candidates(&mut monitor, &[issue(42, &["bug"])], "2026-07-21T00:00:00Z");
     assert_eq!(
         monitor.inbox_item(42).map(|item| item.state),
         Some(MonitorInboxState::AgentFailed)
     );
 
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut monitor,
         &[issue(42, &["bug"])],
         IssueMonitorCandidateSource::Live,
@@ -1503,7 +1565,7 @@ fn live_migration_removes_absent_or_closed_failed_rows_without_queueing() {
             IssueMonitorConfig::default(),
             legacy_failed_prefs(repo.path(), 42),
         );
-        scan_issue_monitor_candidates(&mut monitor, &[issue(42, &["bug"])], "2026-07-21T00:00:00Z");
+        scan_queued_candidates(&mut monitor, &[issue(42, &["bug"])], "2026-07-21T00:00:00Z");
         let mut candidates = Vec::new();
         if let Some(state) = fresh {
             let mut candidate = issue(42, &["bug"]);
@@ -1511,7 +1573,7 @@ fn live_migration_removes_absent_or_closed_failed_rows_without_queueing() {
             candidates.push(candidate);
         }
 
-        scan_issue_monitor_candidates_with_provenance(
+        scan_queued_candidates_with_provenance(
             &mut monitor,
             &candidates,
             IssueMonitorCandidateSource::Live,
@@ -1533,7 +1595,7 @@ fn live_migration_removes_absent_or_closed_failed_rows_without_queueing() {
 fn cache_fallback_scan_keeps_the_last_observed_queued_row_when_its_cache_entry_is_missing() {
     let repo = tempfile::tempdir().expect("tempdir");
     let mut monitor = IssueMonitorState::new(IssueMonitorConfig::default());
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut monitor,
         &[issue(4080, &["bug", "auto-merge"])],
         IssueMonitorCandidateSource::Live,
@@ -1545,7 +1607,7 @@ fn cache_fallback_scan_keeps_the_last_observed_queued_row_when_its_cache_entry_i
         Some(MonitorInboxState::Queued)
     );
 
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut monitor,
         &[],
         IssueMonitorCandidateSource::Cache,
@@ -1565,6 +1627,7 @@ fn cache_fallback_scan_keeps_the_last_observed_queued_row_when_its_cache_entry_i
 fn explicit_closed_candidate_removes_all_current_needs_human_state() {
     let repo = tempfile::tempdir().expect("tempdir");
     let mut monitor = needs_human_monitor(42);
+    monitor.terminal_queue_push(&[99], "test", "2026-08-01T00:00:00Z");
     monitor.record_candidate(issue(99, &["bug"]));
     monitor.escalate_to_needs_human(
         99,
@@ -1575,7 +1638,7 @@ fn explicit_closed_candidate_removes_all_current_needs_human_state() {
     closed.state = IssueMonitorIssueState::Closed;
     closed.updated_at = Some("2026-08-02T00:00:00Z".to_string());
 
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut monitor,
         &[closed],
         IssueMonitorCandidateSource::Cache,
@@ -1627,7 +1690,7 @@ fn explicit_close_neutralizes_undelivered_handoffs_but_preserves_delivered_histo
     let mut closed = issue(42, &["bug"]);
     closed.state = IssueMonitorIssueState::Closed;
 
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut monitor,
         &[closed],
         IssueMonitorCandidateSource::Cache,
@@ -1670,7 +1733,7 @@ fn complete_live_absence_neutralizes_orphan_undelivered_handoffs() {
         ),
     ]);
 
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut monitor,
         &[],
         IssueMonitorCandidateSource::Live,
@@ -1698,7 +1761,7 @@ fn only_complete_live_absence_is_authoritative_closure_evidence() {
         IssueMonitorCandidateSource::Cache,
         IssueMonitorCandidateSource::LiveIncomplete,
     ] {
-        scan_issue_monitor_candidates_with_provenance(
+        scan_queued_candidates_with_provenance(
             &mut monitor,
             &[],
             source,
@@ -1711,7 +1774,7 @@ fn only_complete_live_absence_is_authoritative_closure_evidence() {
         );
     }
 
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut monitor,
         &[],
         IssueMonitorCandidateSource::Live,
@@ -1731,7 +1794,7 @@ fn baseline_live_open_fact_does_not_clear_legacy_needs_human_during_rebase() {
     let mut monitor = needs_human_monitor(42);
     let legacy_prefs = monitor.prefs();
 
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut monitor,
         &[issue(42, &["bug"])],
         IssueMonitorCandidateSource::Live,
@@ -1758,7 +1821,7 @@ fn closure_survives_stale_rebase_and_newer_complete_live_reopen() {
         IssueMonitorState::with_prefs(IssueMonitorConfig::default(), stale_prefs.clone());
     let mut initial_live = issue(42, &["bug"]);
     initial_live.updated_at = Some("2026-08-01T00:00:00Z".to_string());
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut closed_monitor,
         &[initial_live],
         IssueMonitorCandidateSource::Live,
@@ -1768,7 +1831,7 @@ fn closure_survives_stale_rebase_and_newer_complete_live_reopen() {
     let mut closed = issue(42, &["bug"]);
     closed.state = IssueMonitorIssueState::Closed;
     closed.updated_at = Some("2026-08-02T00:00:00Z".to_string());
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut closed_monitor,
         &[closed],
         IssueMonitorCandidateSource::Cache,
@@ -1782,7 +1845,7 @@ fn closure_survives_stale_rebase_and_newer_complete_live_reopen() {
         IssueMonitorState::with_prefs(IssueMonitorConfig::default(), stale_prefs.clone());
     let mut concurrently_reopened = issue(42, &["bug"]);
     concurrently_reopened.updated_at = Some("2026-08-03T00:00:00Z".to_string());
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut later_live,
         &[concurrently_reopened],
         IssueMonitorCandidateSource::Live,
@@ -1809,7 +1872,7 @@ fn closure_survives_stale_rebase_and_newer_complete_live_reopen() {
 
     let mut restarted =
         IssueMonitorState::with_prefs(IssueMonitorConfig::default(), closed_monitor.prefs());
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut restarted,
         &[issue(42, &["bug"])],
         IssueMonitorCandidateSource::Cache,
@@ -1820,7 +1883,7 @@ fn closure_survives_stale_rebase_and_newer_complete_live_reopen() {
         restarted.inbox_item(42).is_none(),
         "a cached open row cannot supersede a durable closure"
     );
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut restarted,
         &[issue(42, &["bug"])],
         IssueMonitorCandidateSource::Live,
@@ -1834,7 +1897,7 @@ fn closure_survives_stale_rebase_and_newer_complete_live_reopen() {
 
     let mut reopened = issue(42, &["bug"]);
     reopened.updated_at = Some("2026-08-03T00:00:00Z".to_string());
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut restarted,
         &[reopened.clone()],
         IssueMonitorCandidateSource::Live,
@@ -1849,7 +1912,7 @@ fn closure_survives_stale_rebase_and_newer_complete_live_reopen() {
 
     let mut still_open = issue(42, &["bug"]);
     still_open.updated_at = Some("2026-08-04T00:00:00Z".to_string());
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut restarted,
         &[still_open],
         IssueMonitorCandidateSource::Live,
@@ -1860,7 +1923,7 @@ fn closure_survives_stale_rebase_and_newer_complete_live_reopen() {
     let mut stale_closed = issue(42, &["bug"]);
     stale_closed.state = IssueMonitorIssueState::Closed;
     stale_closed.updated_at = Some("2026-08-03T12:00:00Z".to_string());
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut restarted,
         &[stale_closed],
         IssueMonitorCandidateSource::Cache,
@@ -1881,7 +1944,7 @@ fn newer_explicit_closed_revision_rejects_an_older_live_open_row() {
 
     let mut initial_live = issue(42, &["bug"]);
     initial_live.updated_at = Some("2026-08-01T00:00:00Z".to_string());
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut monitor,
         &[initial_live],
         IssueMonitorCandidateSource::Live,
@@ -1893,7 +1956,7 @@ fn newer_explicit_closed_revision_rejects_an_older_live_open_row() {
         let mut closed = issue(42, &["bug"]);
         closed.state = IssueMonitorIssueState::Closed;
         closed.updated_at = Some(revision.to_string());
-        scan_issue_monitor_candidates_with_provenance(
+        scan_queued_candidates_with_provenance(
             &mut monitor,
             &[closed],
             IssueMonitorCandidateSource::Cache,
@@ -1904,7 +1967,7 @@ fn newer_explicit_closed_revision_rejects_an_older_live_open_row() {
 
     let mut stale_live = issue(42, &["bug"]);
     stale_live.updated_at = Some("2026-08-03T00:00:00Z".to_string());
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut monitor,
         &[stale_live],
         IssueMonitorCandidateSource::Live,
@@ -1925,7 +1988,7 @@ fn valid_live_open_revision_recovers_from_a_malformed_closed_floor() {
     let mut closed = issue(42, &["bug"]);
     closed.state = IssueMonitorIssueState::Closed;
     closed.updated_at = Some("malformed-revision".to_string());
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut monitor,
         &[closed],
         IssueMonitorCandidateSource::Cache,
@@ -1935,7 +1998,7 @@ fn valid_live_open_revision_recovers_from_a_malformed_closed_floor() {
 
     let mut live_open = issue(42, &["bug"]);
     live_open.updated_at = Some("2026-08-05T00:00:00Z".to_string());
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut monitor,
         &[live_open],
         IssueMonitorCandidateSource::Live,
@@ -1957,14 +2020,14 @@ fn live_absence_preserves_a_newer_explicit_closed_revision() {
     let mut closed = issue(42, &["bug"]);
     closed.state = IssueMonitorIssueState::Closed;
     closed.updated_at = Some("2026-08-04T00:00:00Z".to_string());
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut monitor,
         &[closed],
         IssueMonitorCandidateSource::Cache,
         repo.path(),
         "2026-08-04T00:01:00Z",
     );
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut monitor,
         &[],
         IssueMonitorCandidateSource::Live,
@@ -1974,7 +2037,7 @@ fn live_absence_preserves_a_newer_explicit_closed_revision() {
 
     let mut stale_live = issue(42, &["bug"]);
     stale_live.updated_at = Some("2026-08-03T00:00:00Z".to_string());
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut monitor,
         &[stale_live],
         IssueMonitorCandidateSource::Live,
@@ -1997,7 +2060,7 @@ fn explicit_closed_after_absence_blocks_same_revision_live_open() {
     let mut closed = open.clone();
     closed.state = IssueMonitorIssueState::Closed;
     for issues in [vec![open.clone()], vec![], vec![closed], vec![open]] {
-        scan_issue_monitor_candidates_with_provenance(
+        scan_queued_candidates_with_provenance(
             &mut monitor,
             &issues,
             IssueMonitorCandidateSource::Live,
@@ -2015,7 +2078,7 @@ fn next_live_scan_recovers_same_revision_open_after_inferred_absence() {
     let mut open = issue(42, &["bug"]);
     open.updated_at = Some("2026-09-09T12:00:00Z".to_string());
     for issues in [vec![open.clone()], vec![]] {
-        scan_issue_monitor_candidates_with_provenance(
+        scan_queued_candidates_with_provenance(
             &mut monitor,
             &issues,
             IssueMonitorCandidateSource::Live,
@@ -2027,7 +2090,7 @@ fn next_live_scan_recovers_same_revision_open_after_inferred_absence() {
     assert!(monitor.inbox_item(42).is_none());
 
     for _ in 0..2 {
-        scan_issue_monitor_candidates_with_provenance(
+        scan_queued_candidates_with_provenance(
             &mut monitor,
             std::slice::from_ref(&open),
             IssueMonitorCandidateSource::Live,
@@ -2050,7 +2113,7 @@ fn same_state_rebase_combines_generation_with_the_newest_explicit_revision_floor
     let mut closed = issue(42, &["bug"]);
     closed.state = IssueMonitorIssueState::Closed;
     closed.updated_at = Some("2026-08-04T00:00:00Z".to_string());
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut explicit_monitor,
         &[closed],
         IssueMonitorCandidateSource::Cache,
@@ -2060,7 +2123,7 @@ fn same_state_rebase_combines_generation_with_the_newest_explicit_revision_floor
 
     let mut absence_monitor = needs_human_monitor(42);
     for observed_at in ["2099-08-05T00:00:00Z", "2099-08-06T00:00:00Z"] {
-        scan_issue_monitor_candidates_with_provenance(
+        scan_queued_candidates_with_provenance(
             &mut absence_monitor,
             &[],
             IssueMonitorCandidateSource::Live,
@@ -2072,7 +2135,7 @@ fn same_state_rebase_combines_generation_with_the_newest_explicit_revision_floor
 
     let mut stale_live = issue(42, &["bug"]);
     stale_live.updated_at = Some("2026-08-03T00:00:00Z".to_string());
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut absence_monitor,
         &[stale_live],
         IssueMonitorCandidateSource::Live,
@@ -2179,14 +2242,14 @@ fn live_open_at_the_absence_floor_revision_returns_the_issue_to_the_inbox() {
     let repo = tempfile::tempdir().expect("tempdir");
     let mut monitor = IssueMonitorState::new(IssueMonitorConfig::default());
     let open = issue(42, &["bug"]);
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut monitor,
         std::slice::from_ref(&open),
         IssueMonitorCandidateSource::Live,
         repo.path(),
         "2026-08-01T00:01:00Z",
     );
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut monitor,
         &[],
         IssueMonitorCandidateSource::Live,
@@ -2198,7 +2261,7 @@ fn live_open_at_the_absence_floor_revision_returns_the_issue_to_the_inbox() {
         "the absence closes the row"
     );
 
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut monitor,
         &[open],
         IssueMonitorCandidateSource::Live,
@@ -2238,13 +2301,7 @@ fn status_names_open_issues_a_closure_record_holds_out_of_the_inbox() {
         ),
     ] {
         let issues = if observed { vec![open.clone()] } else { vec![] };
-        scan_issue_monitor_candidates_with_provenance(
-            &mut monitor,
-            &issues,
-            source,
-            repo.path(),
-            at,
-        );
+        scan_queued_candidates_with_provenance(&mut monitor, &issues, source, repo.path(), at);
     }
 
     assert!(
@@ -2253,7 +2310,7 @@ fn status_names_open_issues_a_closure_record_holds_out_of_the_inbox() {
     );
     assert_eq!(monitor.agent_status().closure_held, vec![42]);
 
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut monitor,
         &[open],
         IssueMonitorCandidateSource::Live,
@@ -2419,7 +2476,7 @@ fn explicit_closed_evidence_survives_equivalent_timestamp_absence_rebase() {
     ));
     let mut open = issue(42, &["bug"]);
     open.updated_at = Some("2026-09-09T12:00:00Z".to_string());
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut monitor,
         &[open],
         IssueMonitorCandidateSource::Live,
@@ -2435,21 +2492,21 @@ fn complete_live_open_reopens_after_adopted_absence_across_clock_domains() {
     let mut monitor = needs_human_monitor(42);
     let mut initial_live = issue(42, &["bug"]);
     initial_live.updated_at = Some("2026-08-01T00:00:00Z".to_string());
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut monitor,
         &[initial_live],
         IssueMonitorCandidateSource::Live,
         repo.path(),
         "2026-08-01T00:00:00Z",
     );
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut monitor,
         &[],
         IssueMonitorCandidateSource::Live,
         repo.path(),
         "2026-08-02T00:00:00Z",
     );
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut monitor,
         &[],
         IssueMonitorCandidateSource::Live,
@@ -2459,7 +2516,7 @@ fn complete_live_open_reopens_after_adopted_absence_across_clock_domains() {
 
     let mut live_open = issue(42, &["bug"]);
     live_open.updated_at = Some("2026-08-03T00:00:00Z".to_string());
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut monitor,
         &[live_open],
         IssueMonitorCandidateSource::Live,
@@ -2480,7 +2537,7 @@ fn complete_live_open_reopens_after_an_adopted_direct_release() {
     let mut monitor = needs_human_monitor(42);
     let mut initial_live = issue(42, &["bug"]);
     initial_live.updated_at = Some("2026-08-01T00:00:00Z".to_string());
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut monitor,
         &[initial_live],
         IssueMonitorCandidateSource::Live,
@@ -2491,7 +2548,7 @@ fn complete_live_open_reopens_after_an_adopted_direct_release() {
 
     let mut live_open = issue(42, &["bug"]);
     live_open.updated_at = Some("2026-08-02T00:00:00Z".to_string());
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut monitor,
         &[live_open],
         IssueMonitorCandidateSource::Live,
@@ -2514,7 +2571,7 @@ fn unseen_live_open_loses_to_concurrent_absence_until_the_next_live_scan() {
     let mut stale_monitor =
         IssueMonitorState::with_prefs(IssueMonitorConfig::default(), stale_prefs);
 
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut closing_monitor,
         &[],
         IssueMonitorCandidateSource::Live,
@@ -2525,7 +2582,7 @@ fn unseen_live_open_loses_to_concurrent_absence_until_the_next_live_scan() {
 
     let mut open = issue(42, &["bug"]);
     open.updated_at = Some("2026-08-26T12:01:00Z".to_string());
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut stale_monitor,
         std::slice::from_ref(&open),
         IssueMonitorCandidateSource::Live,
@@ -2538,7 +2595,7 @@ fn unseen_live_open_loses_to_concurrent_absence_until_the_next_live_scan() {
         "an unseen stale writer loses its generation tie to Closed"
     );
 
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut stale_monitor,
         &[open],
         IssueMonitorCandidateSource::Live,
@@ -2560,7 +2617,7 @@ fn cache_or_failed_resolver_does_not_mutate_legacy_migration_state() {
         IssueMonitorConfig::default(),
         legacy_failed_prefs(repo.path(), 42),
     );
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut cached,
         std::slice::from_ref(&candidate),
         IssueMonitorCandidateSource::Cache,
@@ -2582,7 +2639,7 @@ fn cache_or_failed_resolver_does_not_mutate_legacy_migration_state() {
         IssueMonitorConfig::default(),
         legacy_failed_prefs(non_repo.path(), 42),
     );
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut unresolved,
         &[candidate],
         IssueMonitorCandidateSource::Live,
@@ -2652,7 +2709,7 @@ fn migration_preserves_windows_needs_human_and_all_unrelated_prefs() {
         delivering_since: None,
     });
     let mut monitor = IssueMonitorState::with_prefs(IssueMonitorConfig::default(), prefs);
-    scan_issue_monitor_candidates(
+    scan_queued_candidates(
         &mut monitor,
         &[
             issue(42, &["bug"]),
@@ -2669,7 +2726,7 @@ fn migration_preserves_windows_needs_human_and_all_unrelated_prefs() {
         .expect("needs-human row")
         .state = MonitorInboxState::NeedsHuman;
 
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut monitor,
         &[
             issue(42, &["bug"]),
@@ -2725,13 +2782,13 @@ fn migration_rederives_banner_from_unrelated_failure() {
         window_id: None,
     });
     let mut monitor = IssueMonitorState::with_prefs(IssueMonitorConfig::default(), prefs);
-    scan_issue_monitor_candidates(
+    scan_queued_candidates(
         &mut monitor,
         &[issue(42, &["bug"]), issue(99, &["bug"])],
         "2026-07-21T00:00:00Z",
     );
 
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut monitor,
         &[issue(42, &["bug"]), issue(99, &["bug"])],
         IssueMonitorCandidateSource::Live,
@@ -2754,7 +2811,7 @@ fn legacy_failure_migration_is_one_shot_even_when_no_initial_target_exists() {
         ..IssueMonitorPrefs::default()
     };
     let mut monitor = IssueMonitorState::with_prefs(IssueMonitorConfig::default(), prefs);
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut monitor,
         &[issue(42, &["bug"])],
         IssueMonitorCandidateSource::Live,
@@ -2767,7 +2824,7 @@ fn legacy_failure_migration_is_one_shot_even_when_no_initial_target_exists() {
     );
 
     monitor.record_launch_failed(42, legacy_3272_failure(repo.path()));
-    scan_issue_monitor_candidates_with_provenance(
+    scan_queued_candidates_with_provenance(
         &mut monitor,
         &[issue(42, &["bug"])],
         IssueMonitorCandidateSource::Live,
@@ -2807,6 +2864,7 @@ fn a_readiness_refresh_failure_lands_on_its_own_row_not_on_the_whole_scan() {
         }],
     };
 
+    admit_test_candidates(&mut monitor, &loaded.issues, "2026-08-01T00:00:00Z");
     scan_loaded_issue_monitor_candidates(
         &mut monitor,
         &loaded,
@@ -2853,6 +2911,7 @@ fn legacy_3272_recovery_respects_priority_capacity_and_idempotency() {
         live_error: None,
         readiness_failures: Vec::new(),
     };
+    admit_test_candidates(&mut monitor, &loaded.issues, "2026-08-01T00:00:00Z");
     scan_loaded_issue_monitor_candidates(
         &mut monitor,
         &loaded,
@@ -2933,7 +2992,7 @@ fn newer_disk_migration_is_adopted_but_equal_marker_keeps_fresh_failure() {
             ..IssueMonitorPrefs::default()
         },
     );
-    scan_issue_monitor_candidates(&mut state, &[issue(42, &["bug"])], "2026-07-21T00:00:00Z");
+    scan_queued_candidates(&mut state, &[issue(42, &["bug"])], "2026-07-21T00:00:00Z");
     assert!(state.adopt_newer_legacy_git_launch_failure_migration_from_prefs(&disk));
     assert!(state.inbox_item(42).is_none(), "stale failed row removed");
     assert_eq!(state.prefs().failed_issues, vec![unrelated]);
@@ -2962,7 +3021,7 @@ fn newer_disk_failure_adoption_cancels_stale_pending_launch_and_reconciles_inbox
         },
     );
     state.set_gui_connected(true);
-    scan_issue_monitor_candidates(&mut state, &[issue(99, &["bug"])], "2026-07-21T00:00:00Z");
+    scan_queued_candidates(&mut state, &[issue(99, &["bug"])], "2026-07-21T00:00:00Z");
     let client = FakeIssueClient::new();
     client.seed(github_issue_number(99, vec![]));
     let launches = state.claim_next_launch_requests_with_active_cap(
@@ -3014,7 +3073,7 @@ fn newer_disk_failure_adoption_preserves_real_launched_window_across_roundtrip_a
             ..IssueMonitorPrefs::default()
         },
     );
-    scan_issue_monitor_candidates(&mut state, &[issue(42, &["bug"])], "2026-07-21T00:00:00Z");
+    scan_queued_candidates(&mut state, &[issue(42, &["bug"])], "2026-07-21T00:00:00Z");
     assert_eq!(
         state.inbox_item(42).map(|item| item.state),
         Some(MonitorInboxState::Launched)
@@ -3046,7 +3105,7 @@ fn newer_disk_failure_adoption_preserves_real_launched_window_across_roundtrip_a
     assert_eq!(persisted.launched_issues[0].window_id, "tab::agent-42");
 
     let mut restored = IssueMonitorState::with_prefs(IssueMonitorConfig::default(), persisted);
-    scan_issue_monitor_candidates(
+    scan_queued_candidates(
         &mut restored,
         &[issue(42, &["bug"])],
         "2026-07-21T00:01:00Z",
@@ -3134,7 +3193,7 @@ fn prefs_newer_disk_failure_adoption_preserves_real_launch_and_reconciles_unboun
     save_issue_monitor_prefs(&path, &outgoing).expect("save adopted prefs");
     let loaded = load_issue_monitor_prefs(&path).expect("reload adopted prefs");
     let mut state = IssueMonitorState::with_prefs(IssueMonitorConfig::default(), loaded);
-    scan_issue_monitor_candidates(
+    scan_queued_candidates(
         &mut state,
         &[
             issue(42, &["bug"]),
@@ -3182,7 +3241,7 @@ fn the_last_scan_time_survives_a_prefs_roundtrip() {
         enabled: true,
         ..IssueMonitorConfig::default()
     });
-    scan_issue_monitor_candidates(&mut monitor, &[], "2026-07-27T10:00:00Z");
+    scan_queued_candidates(&mut monitor, &[], "2026-07-27T10:00:00Z");
 
     let prefs = monitor.prefs();
     assert_eq!(prefs.last_scan_at.as_deref(), Some("2026-07-27T10:00:00Z"));
@@ -3225,7 +3284,7 @@ fn agent_status_at_flags_a_scan_that_stopped_advancing() {
         poll_interval_secs: 10,
         ..IssueMonitorConfig::default()
     });
-    scan_issue_monitor_candidates(&mut monitor, &[], "2026-07-27T10:00:00Z");
+    scan_queued_candidates(&mut monitor, &[], "2026-07-27T10:00:00Z");
 
     let current = monitor.agent_status_at("2026-07-27T10:00:29Z");
     assert_eq!(
@@ -3305,7 +3364,7 @@ fn expired_claim_block_requeues_and_launches_on_next_claim_cycle() {
         ..IssueMonitorConfig::default()
     });
     monitor.set_gui_connected(true);
-    scan_issue_monitor_candidates(&mut monitor, &[issue(42, &["bug"])], "2026-06-23T10:01:00Z");
+    scan_queued_candidates(&mut monitor, &[issue(42, &["bug"])], "2026-06-23T10:01:00Z");
 
     let launches =
         monitor.claim_next_launch_requests(&client, "host-a/session-a", "2026-06-23T10:01:00Z");
@@ -3319,7 +3378,7 @@ fn expired_claim_block_requeues_and_launches_on_next_claim_cycle() {
     );
 
     // A scan between the claim cycles must not resurrect or erase the hold.
-    scan_issue_monitor_candidates(&mut monitor, &[issue(42, &["bug"])], "2026-06-23T10:31:00Z");
+    scan_queued_candidates(&mut monitor, &[issue(42, &["bug"])], "2026-06-23T10:31:00Z");
 
     let launches =
         monitor.claim_next_launch_requests(&client, "host-a/session-a", "2026-06-23T10:31:00Z");
@@ -3376,7 +3435,7 @@ fn issue_3287_expired_old_format_claims_recover_after_current_claim_lapses() {
         ..IssueMonitorConfig::default()
     });
     monitor.set_gui_connected(true);
-    scan_issue_monitor_candidates(
+    scan_queued_candidates(
         &mut monitor,
         &[issue(3287, &["auto-improve"])],
         "2026-08-19T04:20:00Z",
@@ -3432,7 +3491,7 @@ fn expired_pre_identity_migration_claims_do_not_block_launch() {
         ..IssueMonitorConfig::default()
     });
     monitor.set_gui_connected(true);
-    scan_issue_monitor_candidates(
+    scan_queued_candidates(
         &mut monitor,
         &[issue(3287, &["auto-improve"])],
         "2026-08-19T00:17:00Z",
@@ -3460,7 +3519,7 @@ fn operator_release_of_a_claim_block_is_adopted_cross_process_and_requeues() {
         ..IssueMonitorConfig::default()
     });
     let candidate = issue(42, &["bug"]);
-    scan_issue_monitor_candidates(
+    scan_queued_candidates(
         &mut daemon,
         std::slice::from_ref(&candidate),
         "2026-08-19T00:00:00Z",
@@ -3510,7 +3569,7 @@ fn claim_block_release_refuses_while_a_launch_is_live() {
         ..IssueMonitorConfig::default()
     });
     monitor.set_gui_connected(true);
-    scan_issue_monitor_candidates(&mut monitor, &[issue(42, &["bug"])], "2026-06-23T10:01:00Z");
+    scan_queued_candidates(&mut monitor, &[issue(42, &["bug"])], "2026-06-23T10:01:00Z");
     let launches =
         monitor.claim_next_launch_requests(&client, "host-a/session-a", "2026-06-23T10:01:00Z");
     assert_eq!(launches.len(), 1, "the launch must be live for this test");
@@ -3561,7 +3620,7 @@ fn stop_releases_the_confirmed_github_claim_so_the_next_scan_can_reclaim() {
         ..IssueMonitorConfig::default()
     });
     monitor.set_gui_connected(true);
-    scan_issue_monitor_candidates(&mut monitor, &[issue(42, &["bug"])], "2026-09-07T02:00:00Z");
+    scan_queued_candidates(&mut monitor, &[issue(42, &["bug"])], "2026-09-07T02:00:00Z");
 
     let launches = monitor.claim_next_launch_requests_with_active_cap(
         &client,
@@ -3621,7 +3680,7 @@ fn stop_releases_the_confirmed_github_claim_so_the_next_scan_can_reclaim() {
         ..IssueMonitorConfig::default()
     });
     relaunch.set_gui_connected(true);
-    scan_issue_monitor_candidates(
+    scan_queued_candidates(
         &mut relaunch,
         &[issue(42, &["bug"])],
         "2026-09-07T02:16:00Z",
@@ -3705,6 +3764,7 @@ fn status_inbox_reports_claim_expiry_and_exclusion_reason() {
         ..IssueMonitorConfig::default()
     });
     let candidate = issue(42, &["bug"]);
+    monitor.terminal_queue_push(&[candidate.number], "test", "2026-08-01T00:00:00Z");
     monitor.record_candidate(candidate.clone());
     assert!(monitor.record_blocked_by_claim(
         candidate,
@@ -3750,6 +3810,7 @@ fn a_claim_block_is_revalidated_once_the_issue_changed_under_it() {
     });
     let mut candidate = issue(42, &["bug"]);
     candidate.updated_at = Some("2026-09-07T02:08:00Z".to_string());
+    monitor.terminal_queue_push(&[candidate.number], "test", "2026-08-01T00:00:00Z");
     monitor.record_candidate(candidate.clone());
     assert!(monitor.record_blocked_by_claim(
         candidate.clone(),
@@ -3770,6 +3831,7 @@ fn a_claim_block_is_revalidated_once_the_issue_changed_under_it() {
     // The foreign monitor released its claim: the comment edit moved the Issue.
     let mut refreshed = candidate;
     refreshed.updated_at = Some("2026-09-07T02:12:00Z".to_string());
+    monitor.terminal_queue_push(&[refreshed.number], "test", "2026-08-01T00:00:00Z");
     monitor.record_candidate(refreshed);
 
     assert_eq!(
@@ -3821,7 +3883,7 @@ fn a_deliberate_launch_hold_is_not_a_blackout() {
         "9.91.0",
         "2026-08-17T00:00:00Z",
     );
-    scan_issue_monitor_candidates(&mut monitor, &[], "2026-08-17T00:00:00Z");
+    scan_queued_candidates(&mut monitor, &[], "2026-08-17T00:00:00Z");
 
     assert_eq!(
         monitor
@@ -3834,7 +3896,7 @@ fn a_deliberate_launch_hold_is_not_a_blackout() {
     // Clearing the drain re-arms the check: the onset starts at the first scan
     // that sees a fleet which could be launching and is not.
     monitor.clear_update_drain();
-    scan_issue_monitor_candidates(&mut monitor, &[], "2026-08-17T01:00:00Z");
+    scan_queued_candidates(&mut monitor, &[], "2026-08-17T01:00:00Z");
 
     assert!(
         monitor
@@ -3851,7 +3913,7 @@ fn a_deliberate_launch_hold_is_not_a_blackout() {
 fn a_detached_gui_is_not_a_blackout() {
     let mut monitor = blacked_out_monitor();
     monitor.set_gui_connected(false);
-    scan_issue_monitor_candidates(&mut monitor, &[], "2026-08-17T00:00:00Z");
+    scan_queued_candidates(&mut monitor, &[], "2026-08-17T00:00:00Z");
 
     assert_eq!(
         monitor
@@ -3867,7 +3929,7 @@ fn a_detached_gui_is_not_a_blackout() {
 #[test]
 fn agent_status_at_escalates_a_fleet_with_no_agent_running() {
     let mut monitor = blacked_out_monitor();
-    scan_issue_monitor_candidates(&mut monitor, &[], "2026-08-17T00:00:00Z");
+    scan_queued_candidates(&mut monitor, &[], "2026-08-17T00:00:00Z");
 
     assert_eq!(
         monitor
@@ -3898,14 +3960,14 @@ fn agent_status_at_escalates_a_fleet_with_no_agent_running() {
 #[test]
 fn a_running_agent_clears_the_blackout_clock() {
     let mut monitor = blacked_out_monitor();
-    scan_issue_monitor_candidates(&mut monitor, &[], "2026-08-17T00:00:00Z");
+    scan_queued_candidates(&mut monitor, &[], "2026-08-17T00:00:00Z");
     assert!(monitor
         .agent_status_at("2026-08-17T00:01:00Z")
         .agent_blackout
         .is_some());
 
     monitor.complete_active_launch(42, "tab-1::agent-1");
-    scan_issue_monitor_candidates(&mut monitor, &[], "2026-08-17T00:01:10Z");
+    scan_queued_candidates(&mut monitor, &[], "2026-08-17T00:01:10Z");
     assert_eq!(
         monitor
             .agent_status_at("2026-08-17T00:02:00Z")
@@ -3925,7 +3987,7 @@ fn an_empty_backlog_is_not_a_blackout() {
         ..IssueMonitorConfig::default()
     });
     monitor.set_gui_connected(true);
-    scan_issue_monitor_candidates(&mut monitor, &[], "2026-08-17T00:00:00Z");
+    scan_queued_candidates(&mut monitor, &[], "2026-08-17T00:00:00Z");
 
     assert_eq!(
         monitor
@@ -3939,7 +4001,7 @@ fn an_empty_backlog_is_not_a_blackout() {
 #[test]
 fn a_disabled_monitor_never_reports_a_blackout() {
     let mut monitor = blacked_out_monitor();
-    scan_issue_monitor_candidates(&mut monitor, &[], "2026-08-17T00:00:00Z");
+    scan_queued_candidates(&mut monitor, &[], "2026-08-17T00:00:00Z");
     monitor.set_enabled(false);
 
     assert_eq!(
@@ -3972,8 +4034,9 @@ fn work_parked_until_a_quota_reset_is_not_a_blackout() {
         },
     );
     monitor.set_gui_connected(true);
+    monitor.terminal_queue_push(&[42], "test", "2026-08-01T00:00:00Z");
     monitor.record_candidate(issue(42, &["auto-improve"]));
-    scan_issue_monitor_candidates(&mut monitor, &[], "2026-08-17T00:00:00Z");
+    scan_queued_candidates(&mut monitor, &[], "2026-08-17T00:00:00Z");
 
     assert_eq!(
         monitor
@@ -3990,7 +4053,7 @@ fn work_parked_until_a_quota_reset_is_not_a_blackout() {
 #[test]
 fn the_blackout_onset_survives_a_prefs_roundtrip() {
     let mut monitor = blacked_out_monitor();
-    scan_issue_monitor_candidates(&mut monitor, &[], "2026-08-17T00:00:00Z");
+    scan_queued_candidates(&mut monitor, &[], "2026-08-17T00:00:00Z");
 
     let prefs = monitor.prefs();
     assert_eq!(
@@ -4020,7 +4083,7 @@ fn the_blackout_onset_survives_a_prefs_roundtrip() {
 #[test]
 fn a_recorded_error_does_not_hide_the_agent_blackout() {
     let mut monitor = blacked_out_monitor();
-    scan_issue_monitor_candidates(&mut monitor, &[], "2026-08-17T00:00:00Z");
+    scan_queued_candidates(&mut monitor, &[], "2026-08-17T00:00:00Z");
     monitor.record_scan_error("2026-08-17T00:01:00Z", "issue #2338: generation exists");
 
     let status = monitor.agent_status_at("2026-08-17T00:02:00Z");

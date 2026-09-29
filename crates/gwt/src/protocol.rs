@@ -907,6 +907,14 @@ pub enum FrontendEvent {
     IssueMonitorQueueRemove {
         issue_numbers: Vec<u64>,
     },
+    IssueMonitorQueueMove {
+        issue_number: u64,
+        position: usize,
+    },
+    SetIssueMonitorAutoRefill {
+        enabled: bool,
+        limit: usize,
+    },
     ListIssueMonitor,
     QuickRegisterIssue {
         title: String,

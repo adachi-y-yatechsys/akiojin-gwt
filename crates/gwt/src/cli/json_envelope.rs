@@ -692,6 +692,14 @@ fn parse(input: &str) -> Result<ParsedEnvelope, CliParseError> {
             number: required_u64(params, "number")?,
             position: required_usize(params, "position")?,
         }),
+        "issue.monitor.queue.auto_refill" => {
+            CliCommand::Issue(IssueCommand::MonitorQueueAutoRefill {
+                project_root: optional_path(params, "project_root")?,
+                enabled: optional_bool(params, "enabled")?
+                    .ok_or(CliParseError::MissingFlag("enabled"))?,
+                limit: required_usize(params, "limit")?,
+            })
+        }
         "issue.monitor.config.set" | "issue.monitor.config-set" => {
             let enabled = optional_bool(params, "enabled")?;
             let autonomous_mode = optional_bool(params, "autonomous_mode")?;
@@ -3944,6 +3952,41 @@ mod tests {
                 "enabled|autonomous_mode|max_active|auto_close_merged_issues|auto_apply_updates|launch_agent|update_drain"
             )
         ));
+    }
+
+    #[test]
+    fn issue_monitor_queue_auto_refill_persists_without_changing_other_preferences() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _home = gwt_core::test_support::ScopedGwtHome::set(tmp.path().join("home"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        let path = crate::issue_monitor_prefs_path_for_repo_path(&repo);
+        crate::save_issue_monitor_prefs(
+            &path,
+            &crate::IssueMonitorPrefs {
+                enabled: true,
+                priority_order: vec![7, 42],
+                ..Default::default()
+            },
+        )
+        .expect("seed prefs");
+        let mut env = TestEnv::new(repo);
+        let command = ok(
+            "issue.monitor.queue.auto_refill",
+            json!({"enabled": true, "limit": 3}),
+        );
+        let CliCommand::Issue(command) = command else {
+            panic!("issue command")
+        };
+        let mut out = String::new();
+        crate::cli::issue::run(&mut env, command, &mut out).expect("auto refill config");
+        let prefs = crate::load_issue_monitor_prefs(&path).expect("prefs");
+        assert!(prefs.terminal_queue_auto_refill);
+        assert_eq!(prefs.terminal_queue_auto_refill_limit, 3);
+        assert!(prefs.enabled);
+        assert_eq!(prefs.priority_order, vec![7, 42]);
+        let _ = err("issue.monitor.queue.auto_refill", json!({"enabled": true}));
+        let _ = err("issue.monitor.queue.auto_refill", json!({"limit": 3}));
     }
 
     // SPEC-3431 T-020 (FR-006): launch_now is the PM's launch instruction —

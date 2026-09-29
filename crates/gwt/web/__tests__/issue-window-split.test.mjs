@@ -250,7 +250,14 @@ test("T-018: switching back to list restores the status rows and the read-only m
     workspaceWindows: [previewWindow("agent-1", 3671), previewWindow("agent-2", 3672)],
   });
   applyEntries(fx.surface, fx.load, [knowledgeEntry(3671), knowledgeEntry(3672)], 3671);
+  click(fx.body.querySelector('[data-issue-detail-view="output"]'));
   click(viewButton(fx.body, "split"));
+  fx.body.querySelector('.issue-split-header').click();
+  assert.equal(fx.body.querySelectorAll(".issue-preview").length, 0,
+    "detail-only selection must not steal the interactive Split terminal");
+  assert.ok(fx.terminalMounts.every((mount) => mount.options.readOnly === false || !mount.root.isConnected));
+  assert.equal(fx.body.querySelectorAll("[data-issue-detail-view]").length, 0,
+    "Split preserves its Issue detail view");
   fx.terminalMounts.length = 0;
   const before = fx.sent.length;
 
@@ -302,6 +309,11 @@ test("US-4 / FR-003a: a Windowized agent's pair shows the canvas face, not a sec
     ],
     3671,
   );
+  click(fx.body.querySelector('[data-issue-detail-view="output"]'));
+  const detail = fx.body.querySelector(".knowledge-detail-pane");
+  assert.match(detail.querySelector(".issue-preview-empty")?.textContent || "", /Shown on canvas/);
+  assert.ok(detail.querySelector('[data-action="focus-canvas-window"]'));
+  assert.equal(detail.querySelectorAll(".terminal-root").length, 0);
   fx.terminalMounts.length = 0;
 
   click(viewButton(fx.body, "split"));

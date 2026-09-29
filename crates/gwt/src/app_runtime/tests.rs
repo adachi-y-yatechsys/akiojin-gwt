@@ -8579,6 +8579,13 @@ fn legacy_issue_monitor_git_failure(project_root: &Path) -> String {
     )
 }
 
+// #4499: cache membership alone does not authorize monitor admission.
+fn queued_issue_monitor_prefs(issue_numbers: &[u64]) -> gwt::IssueMonitorPrefs {
+    let mut monitor = gwt::IssueMonitorState::new(gwt::IssueMonitorConfig::default());
+    monitor.terminal_queue_push(issue_numbers, "operator", "2026-07-28T00:00:00Z");
+    monitor.prefs()
+}
+
 fn legacy_issue_monitor_failed_prefs(
     project_root: &Path,
     issue_number: u64,
@@ -8591,7 +8598,7 @@ fn legacy_issue_monitor_failed_prefs(
             message: legacy_issue_monitor_git_failure(project_root),
             window_id: None,
         }],
-        ..gwt::IssueMonitorPrefs::default()
+        ..queued_issue_monitor_prefs(&[issue_number])
     }
 }
 
@@ -23863,6 +23870,7 @@ fn fresh_execution_session_start_acks_durable_issue_monitor_launch_delivery() {
         enabled: true,
         ..gwt::IssueMonitorConfig::default()
     });
+    monitor.terminal_queue_push(&[fixture.owner.number], "operator", "2026-07-28T00:00:00Z");
     monitor.record_candidate(gwt::IssueMonitorIssue {
         number: fixture.owner.number,
         title: "fresh linked-owner launch".to_string(),
@@ -28484,7 +28492,7 @@ fn app_runtime_issue_monitor_launch_complete_marks_issue_launched_and_keeps_acti
         &gwt::IssueMonitorPrefs {
             enabled: true,
             max_active_agents: 1,
-            ..gwt::IssueMonitorPrefs::default()
+            ..queued_issue_monitor_prefs(&[42])
         },
     )
     .expect("save issue monitor prefs");
@@ -28699,7 +28707,7 @@ fn app_runtime_closing_issue_monitor_window_returns_issue_to_pending() {
         &gwt::IssueMonitorPrefs {
             enabled: true,
             max_active_agents: 1,
-            ..gwt::IssueMonitorPrefs::default()
+            ..queued_issue_monitor_prefs(&[42])
         },
     )
     .expect("save issue monitor prefs");
@@ -28864,7 +28872,7 @@ fn app_runtime_runtime_error_marks_issue_monitor_launched_issue_failed() {
                 issue_number: 42,
                 window_id: window_id.clone(),
             }],
-            ..gwt::IssueMonitorPrefs::default()
+            ..queued_issue_monitor_prefs(&[42])
         },
     )
     .expect("save issue monitor prefs");
@@ -28974,7 +28982,7 @@ fn app_runtime_hook_error_marks_issue_monitor_launched_issue_failed_with_hook_me
                 issue_number: 42,
                 window_id: window_id.clone(),
             }],
-            ..gwt::IssueMonitorPrefs::default()
+            ..queued_issue_monitor_prefs(&[42])
         },
     )
     .expect("save issue monitor prefs");
@@ -43054,6 +43062,7 @@ fn app_runtime_knowledge_load_joins_latest_project_monitor_snapshot() {
     let mut held = pm_wake_inbox_item(44, gwt::MonitorInboxState::HoldExcluded);
     held.exclusion_reason = Some("Excluded by label: hold".to_string());
     let mut monitor = gwt::IssueMonitorState::new(gwt::IssueMonitorConfig::default());
+    monitor.terminal_queue_push(&[42, 43], "operator", "2026-07-28T00:00:00Z");
     monitor.inbox = vec![
         pm_wake_inbox_item(42, gwt::MonitorInboxState::Queued),
         pm_wake_inbox_item(99, gwt::MonitorInboxState::Launching),
@@ -47262,6 +47271,7 @@ fn app_runtime_provider_quota_fallback_persists_the_reported_provider() {
         "the saved Claude profile must not project the Codex hold"
     );
     restored.set_gui_connected(true);
+    restored.terminal_queue_push(&[43], "operator", "2026-07-28T00:00:00Z");
     restored.record_candidate(gwt::IssueMonitorIssue {
         number: 43,
         title: "Healthy provider candidate".to_string(),
@@ -47757,7 +47767,7 @@ fn app_runtime_local_driver_locked_latest_state_preserves_proposal_fence_result_
             effect_authority_epoch: 7,
             launch_profile: Some(sample_issue_monitor_launch_profile()),
             pending_effects: vec![preserved.clone()],
-            ..gwt::IssueMonitorPrefs::default()
+            ..queued_issue_monitor_prefs(&[42])
         },
     )
     .expect("seed latest disk authority");
@@ -47908,7 +47918,7 @@ fn app_runtime_local_driver_slow_persist_does_not_silently_drop_prepared_proposa
             enabled: true,
             effect_authority_epoch: 7,
             launch_profile: Some(sample_issue_monitor_launch_profile()),
-            ..gwt::IssueMonitorPrefs::default()
+            ..queued_issue_monitor_prefs(&[42])
         },
     )
     .expect("seed disk authority");
@@ -48056,6 +48066,7 @@ fn app_runtime_local_driver_surfaces_remote_claim_failures_in_the_monitor_snapsh
         };
         let mut monitor =
             gwt::IssueMonitorState::with_prefs(gwt::IssueMonitorConfig::default(), prefs);
+        monitor.terminal_queue_push(&[42], "operator", "2026-07-28T00:00:00Z");
         monitor
             .prepare_pending_effect(
                 "claim-effect-42",
@@ -48137,6 +48148,7 @@ fn app_runtime_compatibility_claim_driver_defers_while_scheduled_lease_is_held()
             ..gwt::IssueMonitorPrefs::default()
         },
     );
+    monitor.terminal_queue_push(&[42], "operator", "2026-07-28T00:00:00Z");
     monitor
         .prepare_pending_effect(
             "claim-effect-42",
@@ -48213,6 +48225,7 @@ fn app_runtime_local_claim_result_cannot_revive_candidate_excluded_after_attempt
         readiness: gwt::IssueMonitorReadiness::NotApplicable,
         updated_at: None,
     };
+    monitor.terminal_queue_push(&[42], "operator", "2026-07-28T00:00:00Z");
     monitor.record_candidate(issue.clone());
     let key = monitor
         .prepare_pending_effect(
@@ -48360,6 +48373,7 @@ fn app_runtime_lifecycle_publish_failure_uses_latest_state_fallback_with_outbox_
             ..gwt::IssueMonitorPrefs::default()
         },
     );
+    monitor.terminal_queue_push(&[42], "operator", "2026-07-28T00:00:00Z");
     monitor.record_candidate(gwt::IssueMonitorIssue {
         number: 42,
         title: "Issue Monitor lifecycle fallback".to_string(),
@@ -48906,6 +48920,7 @@ fn app_runtime_update_drain_blocking_lists_running_agent_panes_and_pending_claim
     runtime.rebuild_window_lookup();
 
     let mut monitor = gwt::IssueMonitorState::new(gwt::IssueMonitorConfig::default());
+    monitor.terminal_queue_push(&[42], "operator", "2026-07-28T00:00:00Z");
     monitor
         .prepare_pending_effect(
             "claim-effect-42",
@@ -49853,7 +49868,7 @@ fn app_runtime_issue_monitor_reconciliation_error_survives_rebase_scan() {
                 issue_number: 43,
                 window_id: "window-43".to_string(),
             }],
-            ..gwt::IssueMonitorPrefs::default()
+            ..queued_issue_monitor_prefs(&[43])
         },
     )
     .expect("seed launched issue");
@@ -50548,6 +50563,11 @@ fn app_runtime_issue_monitor_reorder_persists_and_reorders_cached_inbox() {
             ))
             .expect("write issue cache");
     }
+    gwt::save_issue_monitor_prefs(
+        &gwt::issue_monitor_prefs_path_for_repo_path(&repo),
+        &queued_issue_monitor_prefs(&[3165, 3166, 3167]),
+    )
+    .expect("seed explicitly queued issues");
     let tab = sample_project_tab("tab-1", "Repo", repo.clone(), ProjectKind::Git, &[]);
     let mut runtime = sample_runtime(temp.path(), vec![tab], Some("tab-1"));
 
@@ -50574,7 +50594,7 @@ fn app_runtime_issue_monitor_reorder_persists_and_reorders_cached_inbox() {
 }
 
 #[test]
-fn app_runtime_quick_register_issue_creates_issue_cache_and_inbox_entry() {
+fn app_runtime_quick_register_issue_creates_cache_entry_without_queue_admission() {
     let _env_lock = env_test_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -50651,12 +50671,16 @@ fn app_runtime_quick_register_issue_creates_issue_cache_and_inbox_entry() {
             _ => None,
         })
         .expect("issue monitor inbox");
-    let item = inbox
-        .iter()
-        .find(|item| item.issue.number == 1)
-        .expect("registered issue appears in monitor inbox");
-    assert_eq!(item.issue.title, "Investigate Intake registration");
-    assert_eq!(item.state, gwt::MonitorInboxState::Queued);
+    assert!(
+        inbox.iter().all(|item| item.issue.number != 1),
+        "registration without launch leaves the cached Issue in Backlog"
+    );
+    let prefs = gwt::load_issue_monitor_prefs(&gwt::issue_monitor_prefs_path_for_repo_path(&repo))
+        .expect("load registration prefs");
+    assert!(prefs
+        .terminal_queues
+        .values()
+        .all(|queue| queue.entries.is_empty()));
 }
 
 // SPEC #3885 T-033 (FR-022): the "+ New" popover's auto-merge checkbox labels
@@ -50924,6 +50948,7 @@ fn durable_issue_monitor_delivery_materializes_one_window_and_replay_only_acks()
         enabled: true,
         ..gwt::IssueMonitorConfig::default()
     });
+    monitor.terminal_queue_push(&[3165], "operator", "2026-07-28T00:00:00Z");
     monitor.record_candidate(gwt::IssueMonitorIssue {
         number: 3165,
         title: "SPEC: durable delivery".to_string(),
@@ -51024,6 +51049,7 @@ fn durable_delivery_fallback_commit_budget_is_an_explicit_runtime_dependency() {
         enabled: true,
         ..gwt::IssueMonitorConfig::default()
     });
+    monitor.terminal_queue_push(&[3165], "operator", "2026-07-28T00:00:00Z");
     monitor.record_candidate(gwt::IssueMonitorIssue {
         number: 3165,
         title: "SPEC: budgeted durable delivery".to_string(),
@@ -51128,6 +51154,7 @@ fn durable_issue_monitor_delivery_preserves_live_materializer_and_replays_after_
         enabled: true,
         ..gwt::IssueMonitorConfig::default()
     });
+    monitor.terminal_queue_push(&[3165], "operator", "2026-07-28T00:00:00Z");
     monitor.record_candidate(gwt::IssueMonitorIssue {
         number: 3165,
         title: "SPEC: abandoned durable delivery".to_string(),
@@ -51271,6 +51298,7 @@ fn competing_issue_monitor_subscribers_materialize_one_durable_delivery() {
         enabled: true,
         ..gwt::IssueMonitorConfig::default()
     });
+    monitor.terminal_queue_push(&[3165], "operator", "2026-07-28T00:00:00Z");
     monitor.record_candidate(gwt::IssueMonitorIssue {
         number: 3165,
         title: "SPEC: competing subscribers".to_string(),
@@ -51368,6 +51396,7 @@ fn durable_issue_monitor_delivery_restart_recovers_only_exact_bound_window() {
         enabled: true,
         ..gwt::IssueMonitorConfig::default()
     });
+    monitor.terminal_queue_push(&[3165], "operator", "2026-07-28T00:00:00Z");
     monitor.record_candidate(gwt::IssueMonitorIssue {
         number: 3165,
         title: "SPEC: durable delivery".to_string(),
@@ -51507,7 +51536,7 @@ fn app_runtime_issue_monitor_pending_launch_error_marks_issue_row_failed() {
         &gwt::IssueMonitorPrefs {
             enabled: true,
             max_active_agents: 5,
-            ..gwt::IssueMonitorPrefs::default()
+            ..queued_issue_monitor_prefs(&[42])
         },
     )
     .expect("save issue monitor prefs");
@@ -51976,6 +52005,7 @@ fn monitor_relaunch_fixture(
                 ..gwt::IssueMonitorPrefs::default()
             },
         );
+        monitor.terminal_queue_push(&[3165], "operator", "2026-07-28T00:00:00Z");
         monitor.record_candidate(gwt::IssueMonitorIssue {
             number: 3165,
             title: "SPEC: monitor relaunch safety".to_string(),
@@ -59802,6 +59832,7 @@ fn issue_monitor_codex_trust_preflight_failure_keeps_actual_delivery_provenance(
         enabled: true,
         ..gwt::IssueMonitorConfig::default()
     });
+    monitor.terminal_queue_push(&[42], "operator", "2026-07-28T00:00:00Z");
     monitor.record_candidate(gwt::IssueMonitorIssue {
         number: 42,
         title: "Codex trust preflight failure".to_string(),
@@ -71706,6 +71737,9 @@ fn periodic_wake_uses_the_scheduled_snapshot_for_queue_only_work() {
         gwt::IssueMonitorConfig::default(),
         gwt::load_issue_monitor_prefs(&monitor_prefs_path).expect("prefs"),
     );
+    monitor.terminal_queue_push(&[42], "operator", "2026-07-28T00:00:00Z");
+    gwt::save_issue_monitor_prefs(&monitor_prefs_path, &monitor.prefs())
+        .expect("persist scheduled queue membership");
     gwt::scan_issue_monitor_candidates(
         &mut monitor,
         &[pm_wake_inbox_item(42, gwt::MonitorInboxState::Queued).issue],
@@ -73065,7 +73099,7 @@ fn scheduled_scan_completion_rebases_ephemeral_queue_on_latest_controls() {
     let initial = gwt::IssueMonitorPrefs {
         enabled: true,
         max_active_agents: 1,
-        ..gwt::IssueMonitorPrefs::default()
+        ..queued_issue_monitor_prefs(&[43])
     };
     gwt::save_issue_monitor_prefs(&prefs_path, &initial).expect("seed prefs");
     let mut scanned =
@@ -73079,7 +73113,7 @@ fn scheduled_scan_completion_rebases_ephemeral_queue_on_latest_controls() {
         enabled: true,
         max_active_agents: 4,
         priority_order: vec![43],
-        ..gwt::IssueMonitorPrefs::default()
+        ..queued_issue_monitor_prefs(&[43])
     };
     gwt::save_issue_monitor_prefs(&prefs_path, &latest).expect("concurrent controls");
     let tab = sample_project_tab("tab-1", "Repo", repo.clone(), ProjectKind::Git, &[]);
@@ -73226,7 +73260,7 @@ fn seed_scheduled_scan_claim_fixture(
             enabled: true,
             autonomous_mode: true,
             launch_profile,
-            ..gwt::IssueMonitorPrefs::default()
+            ..queued_issue_monitor_prefs(&[43])
         },
     )
     .expect("seed enabled prefs");
@@ -73913,7 +73947,7 @@ fn scheduled_tick_advances_autonomous_launch_without_an_external_daemon() {
             enabled: true,
             autonomous_mode: true,
             launch_profile: Some(sample_issue_monitor_launch_profile()),
-            ..gwt::IssueMonitorPrefs::default()
+            ..queued_issue_monitor_prefs(&[43])
         },
     )
     .expect("seed enabled autonomous prefs");

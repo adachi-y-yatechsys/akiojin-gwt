@@ -68,6 +68,7 @@ fn launched_monitor() -> IssueMonitorState {
             ..IssueMonitorPrefs::default()
         },
     );
+    monitor.terminal_queue_push(&[42], "operator", NOW);
     scan_issue_monitor_candidates(&mut monitor, &[issue(42)], NOW);
     monitor.complete_active_launch(42, "tab-1::window-1");
     monitor
