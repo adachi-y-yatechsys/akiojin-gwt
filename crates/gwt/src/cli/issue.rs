@@ -2610,6 +2610,7 @@ fn apply_monitor_config_set(
     auto_apply_updates: Option<bool>,
     launch_agent: Option<&str>,
     update_drain: Option<crate::IssueMonitorUpdateDrainControl>,
+    caller_is_resident_pm: bool,
 ) -> io::Result<()> {
     validate_monitor_config_set(
         enabled,
@@ -2619,6 +2620,7 @@ fn apply_monitor_config_set(
         auto_apply_updates,
         launch_agent,
         update_drain.as_ref(),
+        caller_is_resident_pm,
     )?;
     let mut candidate =
         crate::IssueMonitorState::with_prefs(crate::IssueMonitorConfig::default(), prefs.clone());
@@ -2676,6 +2678,7 @@ pub(crate) fn apply_update_drain(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_monitor_config_set(
     enabled: Option<bool>,
     autonomous_mode: Option<bool>,
@@ -2684,6 +2687,7 @@ fn validate_monitor_config_set(
     auto_apply_updates: Option<bool>,
     launch_agent: Option<&str>,
     update_drain: Option<&crate::IssueMonitorUpdateDrainControl>,
+    caller_is_resident_pm: bool,
 ) -> io::Result<()> {
     if launch_agent.is_some_and(|agent| agent.trim().is_empty()) {
         return Err(io::Error::new(
@@ -2705,11 +2709,17 @@ fn validate_monitor_config_set(
         ));
     }
     // Issue #3814: policy lives in the command handler so both JSON dispatch
-    // and direct callers receive the same effect-free GUI-only ON refusal.
-    if enabled == Some(true) || autonomous_mode == Some(true) {
+    // and direct callers receive the same effect-free ON refusal.
+    //
+    // SPEC #4778 AC-1: the resident PM is exempt. A fleet that only a GUI click
+    // can restart leaves the PM unable to recover the very thing it supervises,
+    // which is the deadlock the user asked us to remove. Every other JSON caller
+    // still needs the GUI, so the gate keeps its original purpose.
+    if !caller_is_resident_pm && (enabled == Some(true) || autonomous_mode == Some(true)) {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "enabling Issue Monitor or autonomous mode requires an explicit GUI action",
+            "enabling Issue Monitor or autonomous mode requires an explicit GUI action, or the \
+             resident PM for this repository",
         ));
     }
     if max_active == Some(0) {
@@ -2738,6 +2748,9 @@ fn run_monitor_config_set<E: CliEnv>(
     out: &mut String,
 ) -> Result<i32, SpecOpsError> {
     let project_root = issue_monitor_project_root(env, project_root)?;
+    // SPEC #4778 AC-1: resolved once, here, so the refusal and the local
+    // fallback below cannot disagree about who the caller is.
+    let caller_is_resident_pm = super::pm::caller_is_registered_pm(&project_root);
     validate_monitor_config_set(
         enabled,
         autonomous_mode,
@@ -2746,6 +2759,7 @@ fn run_monitor_config_set<E: CliEnv>(
         auto_apply_updates,
         launch_agent,
         update_drain.as_ref(),
+        caller_is_resident_pm,
     )
     .map_err(io_as_api_error)?;
     // Issue #3923 AC-5: a switch needs a saved profile to switch. Refuse
@@ -2775,6 +2789,11 @@ fn run_monitor_config_set<E: CliEnv>(
                 "auto_apply_updates": auto_apply_updates,
                 "launch_agent": launch_agent,
                 "update_drain": update_drain,
+                // SPEC #4778 AC-1: the daemon re-checks this against the PM
+                // registry, so the handler's verdict is carried, not trusted.
+                "resident_pm_session": caller_is_resident_pm
+                    .then(super::pm::ambient_session_id)
+                    .flatten(),
             }
         }),
         std::process::id(),
@@ -2795,6 +2814,7 @@ fn run_monitor_config_set<E: CliEnv>(
                 auto_apply_updates,
                 launch_agent,
                 update_drain.clone(),
+                caller_is_resident_pm,
             )
         })
         .map_err(io_as_api_error)?;
@@ -8524,10 +8544,97 @@ mod tests {
         }
     }
 
-    /// Issue #3814 AC-2/AC-3: registered PM identity must not open a hidden
-    /// JSON path around the GUI-only ON boundary, and rejection is effect-free.
+    /// SPEC #4778 AC-1 (supersedes Issue #3814 AC-2/AC-3).
+    ///
+    /// #3814 closed the JSON path to ON so that nothing could start the fleet
+    /// without a person. The resident PM *is* that person's standing delegate,
+    /// and a PM that cannot restart the fleet it supervises is the deadlock the
+    /// user asked us to remove, so the registered PM is now the one exemption.
+    /// Everything else stays refused, and a refusal stays effect-free.
     #[test]
-    fn issue_monitor_config_set_rejects_pm_on_direction_without_changing_status() {
+    fn issue_monitor_config_set_lets_the_resident_pm_turn_the_monitor_back_on() {
+        use gwt_core::test_support::ScopedEnvVar;
+
+        let _env_lock = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = TempDir::new().expect("tempdir");
+        let _home = ScopedGwtHome::set(tmp.path().join("home"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        let prefs_path = crate::issue_monitor_prefs_path_for_repo_path(&repo);
+        crate::save_issue_monitor_prefs(
+            &prefs_path,
+            &crate::IssueMonitorPrefs {
+                enabled: false,
+                autonomous_mode: false,
+                max_active_agents: 3,
+                ..crate::IssueMonitorPrefs::default()
+            },
+        )
+        .expect("save prefs");
+
+        let pm_prefs_path = crate::pm_registry::pm_prefs_path_for_repo_path(&repo);
+        crate::pm_registry::try_register_pm(
+            &pm_prefs_path,
+            crate::pm_registry::PmRegistration {
+                session_id: "pm-session".to_string(),
+                agent_id: "claude".to_string(),
+                worktree_path: repo.to_string_lossy().into_owned(),
+                created_at: None,
+                consecutive_crashes: 0,
+                next_not_before: None,
+            },
+            |_| false,
+        )
+        .expect("register PM");
+        let _pm = ScopedEnvVar::set(gwt_agent::GWT_SESSION_ID_ENV, "pm-session");
+        let mut env = crate::cli::TestEnv::new(repo.clone());
+
+        for (enabled, autonomous_mode) in [(Some(true), None), (None, Some(true))] {
+            let mut out = String::new();
+            run(
+                &mut env,
+                IssueCommand::MonitorConfigSet {
+                    project_root: Some(repo.clone()),
+                    enabled,
+                    autonomous_mode,
+                    max_active: None,
+                    auto_close_merged_issues: None,
+                    auto_apply_updates: None,
+                    launch_agent: None,
+                    update_drain: None,
+                },
+                &mut out,
+            )
+            .expect("the resident PM may turn the Issue Monitor on");
+        }
+
+        let mut status_out = String::new();
+        run(
+            &mut env,
+            IssueCommand::MonitorStatus {
+                project_root: Some(repo),
+            },
+            &mut status_out,
+        )
+        .expect("status after the PM enabled the monitor");
+        let status: serde_json::Value =
+            serde_json::from_str(status_out.trim()).expect("status JSON");
+        assert_eq!(status["enabled"], true, "the PM's ON must persist");
+        assert_eq!(
+            status["autonomous_mode"], true,
+            "the PM's autonomous ON must persist"
+        );
+    }
+
+    /// SPEC #4778 AC-1: the exemption is the registered PM and nobody else.
+    ///
+    /// An ambient session id that is not a registration for this repository is
+    /// exactly the stray envelope #3814 was written against, so it keeps the
+    /// original refusal and the original effect-free guarantee.
+    #[test]
+    fn issue_monitor_config_set_still_refuses_on_from_a_caller_that_is_not_the_resident_pm() {
         use gwt_core::test_support::ScopedEnvVar;
 
         let _env_lock = crate::env_test_lock()
@@ -8550,6 +8657,7 @@ mod tests {
         .expect("save prefs");
         let before = std::fs::read(&prefs_path).expect("prefs bytes");
 
+        // Registered PM exists, but the caller is a different session.
         let pm_prefs_path = crate::pm_registry::pm_prefs_path_for_repo_path(&repo);
         crate::pm_registry::try_register_pm(
             &pm_prefs_path,
@@ -8564,11 +8672,7 @@ mod tests {
             |_| false,
         )
         .expect("register PM");
-        assert!(crate::pm_registry::session_is_registered_pm(
-            &pm_prefs_path,
-            "pm-session"
-        ));
-        let _pm = ScopedEnvVar::set(gwt_agent::GWT_SESSION_ID_ENV, "pm-session");
+        let _other = ScopedEnvVar::set(gwt_agent::GWT_SESSION_ID_ENV, "some-other-session");
         let mut env = crate::cli::TestEnv::new(repo.clone());
 
         for (enabled, autonomous_mode) in [(Some(true), None), (None, Some(true))] {
@@ -8587,7 +8691,7 @@ mod tests {
                 },
                 &mut out,
             );
-            assert!(result.is_err(), "PM JSON ON request must be refused");
+            assert!(result.is_err(), "a non-PM JSON ON request must be refused");
             assert!(out.is_empty(), "a refusal must not report applied state");
             assert_eq!(
                 std::fs::read(&prefs_path).expect("prefs bytes after refusal"),
