@@ -139,7 +139,7 @@ impl HookKind {
 /// session identity is intentionally kept out of this permissive event shape;
 /// managed hook paths must parse the raw payload and promote the raw
 /// `session_id` into a required session id type before using it.
-/// Parsed through [`RawHookEvent`] so a payload carrying both the snake_case
+/// Parsed through `RawHookEvent` so a payload carrying both the snake_case
 /// and camelCase spelling of a key is accepted (Issue #4768).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(from = "RawHookEvent")]
