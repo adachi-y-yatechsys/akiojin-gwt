@@ -1494,6 +1494,9 @@ impl AppRuntime {
         let mut events = self.update_resume_notice_events();
 
         let resume_started = Instant::now();
+        let resume_phase = gwt::perf::startup::PhaseTimer::start(
+            gwt::perf::startup::StartupPhase::RestoreDrainResume,
+        );
         let pending = std::mem::take(&mut self.pending_startup_auto_resume_sessions);
         // Issue #4143 (AC-4): exactly one summary line per startup. Only the
         // drain that follows a queued sweep has something to report; a later
@@ -1528,10 +1531,15 @@ impl AppRuntime {
             self.defer_restore_summary("startup restore", &previous_windows, 0, admission);
         }
         let resume_ms = resume_started.elapsed().as_millis() as u64;
+        drop(resume_phase);
 
         let pm_ensure_started = Instant::now();
+        let pm_ensure_phase = gwt::perf::startup::PhaseTimer::start(
+            gwt::perf::startup::StartupPhase::RestoreDrainPmEnsure,
+        );
         events.extend(self.startup_pm_ensure_ready_events());
         let pm_ensure_ms = pm_ensure_started.elapsed().as_millis() as u64;
+        drop(pm_ensure_phase);
 
         // Issue #4375 AC-4: the drain's internals, not just its total.
         log_restore_drain_breakdown(total, resume_ms, pm_ensure_ms);

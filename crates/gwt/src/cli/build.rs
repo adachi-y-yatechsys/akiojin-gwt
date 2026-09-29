@@ -2027,6 +2027,7 @@ mod tests {
                 execution_binding: binding,
                 lease_id: None,
                 worktree_fingerprint: plan.worktree_fingerprint.clone(),
+                verified_head: None,
                 commands: vec![crate::cli::verification_record::VerificationCommandResult {
                     headed_e2e: None,
                     terminated_by_signal: None,

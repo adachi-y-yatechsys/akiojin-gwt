@@ -367,6 +367,10 @@ pub struct VerificationRunRecord {
     /// Worktree fingerprint at run time: normalized HEAD + tracked changes (see
     /// [`worktree_fingerprint`]). Completion recomputes and compares.
     pub worktree_fingerprint: String,
+    /// Diagnostic provenance only; freshness still uses the full fingerprint.
+    /// Omission preserves legacy record serialization and integrity hashes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verified_head: Option<String>,
     pub commands: Vec<VerificationCommandResult>,
     pub all_passed: bool,
     /// Conditional dispositions for exact failures. Raw command exits and
@@ -780,7 +784,7 @@ pub fn save(worktree: &Path, record: &VerificationRunRecord) -> io::Result<()> {
 }
 
 /// Compute the worktree fingerprint at **content level**: sha256 over
-/// HEAD (skipping canonical Work shard addition-only commits), the full
+/// HEAD (skipping canonical Work shard additions and source-identical merges), the full
 /// `git diff HEAD` content (staged and
 /// unstaged tracked changes), and every untracked file's path and bytes —
 /// all with `.gwt/` excluded (the coordination bookkeeping under `.gwt/`
@@ -905,14 +909,18 @@ fn validate_quarantine_requests(
     Ok(())
 }
 
-/// PR metadata adds immutable shards after verification. Skip only regular-file
-/// shard additions, never source changes, rewrites, empty commits or merges.
+/// PR metadata commits and base merges share one rule: the first-parent diff
+/// must contain only canonical regular-file Work shard additions. A merge with
+/// an identical tree also qualifies. All repository source is conservatively
+/// treated as verification input, so ANY source change invalidates evidence,
+/// even when the feature branch's own diff against its base is unchanged.
+/// Shard rewrites/deletions and ordinary empty commits remain invalidating.
 /// If Git cannot prove the exception, retain the commit as the freshness anchor.
 fn verification_head(worktree: &Path, head: &str) -> String {
     let mut anchor = head.trim().to_string();
     while let Ok(line) = git_stdout(worktree, &["rev-list", "--parents", "-n", "1", &anchor]) {
         let parents: Vec<_> = line.split_whitespace().collect();
-        if parents.len() != 2 {
+        if parents.len() < 2 {
             break;
         }
         let Ok(diff) = gwt_core::process::hidden_command("git")
@@ -931,7 +939,14 @@ fn verification_head(worktree: &Path, head: &str) -> String {
         else {
             break;
         };
-        if !diff.status.success() || diff.stdout.is_empty() {
+        if !diff.status.success() {
+            break;
+        }
+        if diff.stdout.is_empty() {
+            if parents.len() > 2 {
+                anchor = parents[1].to_string();
+                continue;
+            }
             break;
         }
         let Some(bytes) = diff.stdout.strip_suffix(&[0]) else {
@@ -3432,7 +3447,7 @@ where
     // Snapshot owner, plan, and worktree together. Commands deliberately run
     // outside the lease; the final commit reacquires it and rejects any
     // interleaving writer by invalidating the evidence snapshot.
-    let (owner_number, execution_binding, plan_snapshot, fingerprint_before) =
+    let (owner_number, execution_binding, plan_snapshot, fingerprint_before, verified_head) =
         crate::cli::trusted_store::with_write_lease(worktree, || {
             let (owner_number, execution_binding) = if let Some(authority) = authority {
                 (authority.owner_number, authority.execution_binding.clone())
@@ -3449,7 +3464,14 @@ where
             if let Some(authority) = authority {
                 revalidate_verification_caller_authority(worktree, session_id, authority)?;
             }
-            Ok((owner_number, execution_binding, plan, fingerprint))
+            let verified_head = current_head_sha(worktree).ok();
+            Ok((
+                owner_number,
+                execution_binding,
+                plan,
+                fingerprint,
+                verified_head,
+            ))
         })
         .map_err(|err| {
             if err.kind() == ErrorKind::PermissionDenied {
@@ -3650,6 +3672,7 @@ where
         execution_binding: execution_binding.clone(),
         lease_id: options.lease_id.take(),
         worktree_fingerprint: fingerprint_before.clone(),
+        verified_head,
         commands: results,
         all_passed,
         quarantined_failures,
@@ -3749,6 +3772,46 @@ fn is_canonical_trivial_plan(plan: &VerificationPlanRecord) -> bool {
         )
 }
 
+/// Explain committed source drift without weakening the fingerprint decision.
+/// Legacy records, dirty-only edits and unavailable Git history retain the
+/// generic stale diagnosis. Never use this diagnostic diff to accept evidence.
+fn stale_fingerprint_status(worktree: &Path, verified_head: Option<&str>) -> EvidenceStatus {
+    let Some(head) = verified_head else {
+        return EvidenceStatus::StaleFingerprint;
+    };
+    let output = gwt_core::process::hidden_command("git")
+        .args([
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            head,
+            "HEAD",
+            "--",
+            ".",
+            ":(exclude).gwt",
+        ])
+        .current_dir(worktree)
+        .output();
+    let Ok(output) = output else {
+        return EvidenceStatus::StaleFingerprint;
+    };
+    if !output.status.success() {
+        return EvidenceStatus::StaleFingerprint;
+    }
+    let paths: Vec<_> = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .collect();
+    if paths.is_empty() {
+        EvidenceStatus::StaleFingerprint
+    } else {
+        EvidenceStatus::StaleFingerprintFiles(paths)
+    }
+}
+
 /// Evidence status consumed by completion and PR handoff gates (T-111/T-112).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EvidenceStatus {
@@ -3764,6 +3827,8 @@ pub enum EvidenceStatus {
     /// The record belongs to a legacy/predecessor execution generation.
     WrongGeneration,
     StaleFingerprint,
+    /// Committed source changes since the recorded verification HEAD.
+    StaleFingerprintFiles(Vec<String>),
     Failing,
     Unreadable,
     /// P9a (T-122): the stored integrity hash does not match the content —
@@ -3801,7 +3866,13 @@ impl EvidenceStatus {
                 "the verification record belongs to a legacy, predecessor, or superseded execution binding — register the plan and rerun `verify.run` from the current generation"
             }
             Self::StaleFingerprint => {
-                "the worktree changed after the last verification run (stale evidence): source/verification inputs or a commit other than canonical Work shard additions changed — rerun `verify.run`; pr.create shard-addition-only commits preserve evidence and do not require another run"
+                "the worktree changed after the last verification run (stale evidence): source/verification inputs or non-exempt history changed — rerun `verify.run`; pr.create shard-addition-only commits and base merges with identical trees or only canonical shard additions preserve evidence"
+            }
+            Self::StaleFingerprintFiles(paths) => {
+                return format!(
+                    "the worktree changed after the last verification run (stale evidence): committed files intersect verification inputs (all repository source): {} — rerun `verify.run`",
+                    paths.iter().map(|path| format!("{path:?}")).collect::<Vec<_>>().join(", ")
+                );
             }
             Self::Failing => {
                 "the last verification run has failing commands — fix the failures and rerun `verify.run`"
@@ -4240,7 +4311,7 @@ fn evaluate_evidence_snapshot_inner(
         worktree_fingerprint_excluding(worktree, generated_outputs.as_deref().unwrap_or_default())
             .unwrap_or_else(|_| "no-git".to_string());
     if record.worktree_fingerprint != current_fingerprint {
-        return EvidenceStatus::StaleFingerprint;
+        return stale_fingerprint_status(worktree, record.verified_head.as_deref());
     }
     // The consumed plan must cover the run's source, but source mutation
     // during/after execution remains the primary stale-evidence diagnosis.
@@ -5084,6 +5155,7 @@ pub(crate) mod tests {
             execution_binding: None,
             lease_id: None,
             worktree_fingerprint: fingerprint.to_string(),
+            verified_head: None,
             commands: vec![VerificationCommandResult {
                 headed_e2e: None,
                 terminated_by_signal: None,
@@ -6032,6 +6104,7 @@ mod tests {
             execution_binding: None,
             lease_id: None,
             worktree_fingerprint: "abc".to_string(),
+            verified_head: None,
             commands: vec![VerificationCommandResult {
                 headed_e2e: None,
                 terminated_by_signal: None,
@@ -6872,6 +6945,61 @@ mod tests {
         assert!(EvidenceStatus::StaleFingerprint
             .describe()
             .contains("pr.create"));
+    }
+
+    #[test]
+    fn fingerprint_preserves_base_merges_without_source_changes() {
+        let fixture = WorkEventGitFixture::tracked_shards();
+        fixture.git_ok(&["branch", "develop"]);
+        fixture.git_ok(&["commit", "--allow-empty", "-qm", "feature history"]);
+        plan_and_run(&fixture.repo, "sess-merge", &["git --version".to_string()]);
+        let record = load(&fixture.repo).unwrap().unwrap();
+
+        fixture.git_ok(&["checkout", "-q", "develop"]);
+        fixture.git_ok(&["commit", "--allow-empty", "-qm", "base history"]);
+        fixture.git_ok(&["checkout", "-q", "main"]);
+        fixture.git_ok(&["merge", "--no-ff", "-qm", "sync base", "develop"]);
+        assert_eq!(
+            evaluate_evidence(&fixture.repo, "sess-merge", None),
+            EvidenceStatus::Fresh,
+            "a base merge with an identical tree must preserve verification"
+        );
+
+        fixture.git_ok(&["checkout", "-q", "develop"]);
+        fixture.write_event_shard("base-delivery", b"{\"id\":\"base-delivery\"}\n");
+        fixture.stage_event_shards();
+        fixture.commit("chore(work): base delivery");
+        fixture.git_ok(&["checkout", "-q", "main"]);
+        fixture.git_ok(&["merge", "--no-ff", "-qm", "sync base delivery", "develop"]);
+        assert_eq!(
+            evaluate_evidence(&fixture.repo, "sess-merge", None),
+            EvidenceStatus::Fresh,
+            "base merges and pr.create must share the shard-addition rule"
+        );
+        assert_eq!(load(&fixture.repo).unwrap().unwrap(), record);
+    }
+
+    #[test]
+    fn fingerprint_rejects_base_merge_source_changes_and_names_paths() {
+        let fixture = WorkEventGitFixture::tracked_shards();
+        fixture.git_ok(&["branch", "develop"]);
+        fixture.git_ok(&["commit", "--allow-empty", "-qm", "feature history"]);
+        plan_and_run(&fixture.repo, "sess-merge", &["git --version".to_string()]);
+        fixture.git_ok(&["checkout", "-q", "develop"]);
+        fs::write(fixture.repo.join("src.txt"), "changed base source\n").unwrap();
+        fixture.git_ok(&["add", "src.txt"]);
+        fixture.commit("fix: change base source");
+        fixture.git_ok(&["checkout", "-q", "main"]);
+        fixture.git_ok(&["merge", "--no-ff", "-qm", "sync changed base", "develop"]);
+
+        let status = evaluate_evidence(&fixture.repo, "sess-merge", None);
+        assert_ne!(status, EvidenceStatus::Fresh);
+        assert!(
+            status.describe().contains("src.txt"),
+            "{}",
+            status.describe()
+        );
+        assert!(status.describe().contains("verify.run"));
     }
 
     // Freshness: a tracked-file change after the run invalidates evidence,
