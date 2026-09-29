@@ -369,6 +369,28 @@ settings で別 provider を保存すると同じプールに追加されます�
 Priority の変更と daemon 不在時の設定変更は、実行中 instance の next scan/rebase で
 反映されます。
 
+`issue.monitor.tiers.set` に `{"auto":true}` を渡すと、エージェント・モデル・
+推論レベルの自動選択を有効にできます。候補プールを設定しなくても、Codex Luna /
+Claude Haiku、Codex Sol / Claude Sonnet、Codex Astra / Claude Opus の3段を使えます。
+段は0始まりで、エージェントの成果に由来する失敗回数・Issueに保持した下限・SPEC Issueなら1の最大値を使い、
+最上段で頭打ちになります。再試行の許可条件と終端処理は従来どおりです。
+各段のprovider選択は既存の候補選択規則を使い、候補がなければ次の段へ進みます。
+通常の自動起動は、現在のモデルと推論レベルを反映するため新しいセッションを使います。
+回答済みhandoffは元のセッションへ配送し、段の履歴は変更しません。
+インフラ障害や終了証拠のない終了では段を上げません。ただし、従来の再試行予算と
+backoffに使う総試行回数には数えます。
+
+`issue.monitor.tiers.set` の `tiers` にプロファイル配列の配列を渡すと段を変更でき、
+省略すると既定に戻ります。`{"auto":false}` で保存済みの手動プールに戻ります。
+`issue.monitor.tier.set` の `number` と `tier` でIssueの段の下限を引き上げ、
+次回起動にも保持できます。`issue.monitor.tiers` は設定・Issue履歴・最下段での
+着地率を返します（着地の観測がなければ `null`）。判定不能な終了の累計も確認できます。
+`issue.monitor.status` の各行には `launch_tier` と `landing_tier` に加え、総試行回数の
+`attempts`、段に数えなかった `non_agent_attempts`、差分の `tier_input` が表示されます。
+着地は、担当Issueとセッションが一致するWorkの `done` 更新成功を指します。
+Issueのcloseやcancelだけでは数えません。エージェントによる完了宣言を測るため、
+後からPRが失敗すると着地率は楽観的になります。この指標にPRのマージは不要です。
+
 ホストの空き容量も同じ snapshot に含まれます。`issue.monitor.status` の
 `disk_space` は worktree と verification coordinator が置かれた volume を列挙し、
 空きが 20 GiB または 5% を下回ると `warning` を載せるため、`verify.run` が

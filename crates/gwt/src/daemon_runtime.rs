@@ -683,14 +683,69 @@ pub fn fetch_host_contract_via_agent_bridge(
     }
 }
 
+// A diagnostic lives beside the launch runtime sidecar, so hook rewrites
+// cannot erase it. It is evidence only and grants no execution authority.
+struct HostBridgeObservation {
+    kind: gwt_agent::HostBridgeKind,
+    observation: Option<gwt_agent::SessionBridgeObservation>,
+}
+
+impl HostBridgeObservation {
+    fn begin(kind: gwt_agent::HostBridgeKind) -> Self {
+        let observation = std::env::var_os(gwt_agent::GWT_SESSION_RUNTIME_PATH_ENV)
+            .zip(std::env::var(gwt_agent::GWT_SESSION_ID_ENV).ok())
+            .and_then(|(path, session_id)| {
+                match gwt_agent::SessionBridgeObservation::capture(std::path::Path::new(&path), &session_id) {
+                    Ok(observation) => observation,
+                    Err(error) => {
+                        tracing::warn!(%error, "could not capture launch bridge diagnostic identity");
+                        None
+                    }
+                }
+            });
+        Self { kind, observation }
+    }
+
+    fn record(&self, transport_failed: bool) {
+        if let Some(observation) = &self.observation {
+            if let Err(error) = observation.record(self.kind, transport_failed) {
+                tracing::error!(%error, "could not persist launch bridge diagnostic receipt");
+                eprintln!("gwt: launch bridge diagnostic receipt could not be persisted: {error}");
+            }
+        }
+    }
+
+    fn require_contract(&self, stage: &str) -> std::io::Result<()> {
+        match crate::cli::host_contract::preflight(stage) {
+            Ok(_) => Ok(()),
+            Err(verdict) if !verdict.refuses() => Ok(()),
+            Err(verdict) => {
+                if matches!(
+                    verdict.outcome,
+                    crate::cli::host_contract::HostContractOutcome::Unavailable { .. }
+                ) {
+                    self.record(true);
+                }
+                Err(std::io::Error::other(format!(
+                    "host contract preflight refused `{stage}`: {}",
+                    verdict.describe()
+                )))
+            }
+        }
+    }
+}
+
 pub fn send_execution_adoption_via_agent_bridge(
     target: &HookForwardTarget,
     request: &crate::AgentExecutionAdoptionRequest,
     expected_session: &gwt_agent::Session,
 ) -> Result<crate::AgentExecutionAdoptionReceipt, String> {
+    let observation = HostBridgeObservation::begin(gwt_agent::HostBridgeKind::ExecutionAdoption);
     // SPEC #3248 FR-242: adoption transfers an execution binding and reissues
     // the capability, so the receiving Host proves its contract first.
-    crate::cli::host_contract::require("execution-adoption").map_err(|error| error.to_string())?;
+    observation
+        .require_contract("execution-adoption")
+        .map_err(|error| error.to_string())?;
     let mut url = target.execution_continuation_url()?;
     url.set_path("/internal/execution-adoption");
     let client = reqwest::blocking::Client::builder()
@@ -698,15 +753,16 @@ pub fn send_execution_adoption_via_agent_bridge(
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|_| {
+            observation.record(true);
             "Host adoption bridge client is unavailable; no local fallback was attempted"
         })?;
     let response = client.post(url).bearer_auth(&target.token).json(request).send()
-        .map_err(|_| "Host adoption bridge is unavailable; no local fallback was attempted; inspect execution.status before retrying")?;
+        .map_err(|_| { observation.record(true); "Host adoption bridge is unavailable; no local fallback was attempted; inspect execution.status before retrying" })?;
     let status = response.status();
     if !status.is_success() {
         let body = read_bounded_agent_bridge_error_body(response,
             "Host adoption rejection body could not be read safely; no local fallback was attempted")
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| { observation.record(true); error.to_string() })?;
         let diagnostic = serde_json::from_slice::<WorkspaceBridgeDiagnosticResponse>(&body).ok();
         let reason = if diagnostic.as_ref().and_then(|error| error.code.as_deref())
             == Some("execution_binding_mismatch")
@@ -746,6 +802,7 @@ pub fn send_execution_adoption_via_agent_bridge(
     {
         return Err("Host adoption bridge returned mismatched authority evidence".into());
     }
+    observation.record(false);
     Ok(receipt)
 }
 
@@ -761,122 +818,139 @@ pub(crate) fn send_execution_continuation_via_agent_bridge_detailed(
     target: &HookForwardTarget,
     request: &crate::AgentExecutionContinuationRequest,
 ) -> Result<crate::AgentExecutionContinuationReceipt, AgentBridgeFailure> {
-    // SPEC #3248 FR-242: this request asks the Host to mint a successor
-    // generation, bind the Session to it and issue the capability. The
-    // contract is proven first, so a Host that cannot carry that authority is
-    // never asked to create it.
-    crate::cli::host_contract::require("execution-continuation").map_err(|error| {
-        let mut failure = AgentBridgeFailure::new(
-            AgentBridgeFailureReason::AuthorityMismatch,
-            "the running Host does not serve the required execution contract",
-        );
-        failure.diagnostic_reason = Some(error.to_string());
-        failure
-    })?;
-    let url = target.execution_continuation_url().map_err(|_| {
-        AgentBridgeFailure::new(
-            AgentBridgeFailureReason::TransportFailure,
-            "Host continuation bridge target is invalid",
-        )
-    })?;
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|_| {
+    let observation =
+        HostBridgeObservation::begin(gwt_agent::HostBridgeKind::ExecutionContinuation);
+    let result = (|| {
+        // SPEC #3248 FR-242: this request asks the Host to mint a successor
+        // generation, bind the Session to it and issue the capability. The
+        // contract is proven first, so a Host that cannot carry that authority is
+        // never asked to create it.
+        observation
+            .require_contract("execution-continuation")
+            .map_err(|error| {
+                let mut failure = AgentBridgeFailure::new(
+                    AgentBridgeFailureReason::AuthorityMismatch,
+                    "the running Host does not serve the required execution contract",
+                );
+                failure.diagnostic_reason = Some(error.to_string());
+                failure
+            })?;
+        let url = target.execution_continuation_url().map_err(|_| {
             AgentBridgeFailure::new(
                 AgentBridgeFailureReason::TransportFailure,
-                "failed to build the Host continuation bridge client",
+                "Host continuation bridge target is invalid",
             )
         })?;
-    let response = client
-        .post(url)
-        .bearer_auth(&target.token)
-        .json(request)
-        .send()
-        .map_err(|_| {
-            AgentBridgeFailure::new(
-                AgentBridgeFailureReason::TransportFailure,
-                "Host continuation bridge is unavailable; no local fallback was attempted",
-            )
-        })?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = read_bounded_agent_bridge_error_body(
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| {
+                AgentBridgeFailure::new(
+                    AgentBridgeFailureReason::TransportFailure,
+                    "failed to build the Host continuation bridge client",
+                )
+            })?;
+        let response = client
+            .post(url)
+            .bearer_auth(&target.token)
+            .json(request)
+            .send()
+            .map_err(|_| {
+                AgentBridgeFailure::new(
+                    AgentBridgeFailureReason::TransportFailure,
+                    "Host continuation bridge is unavailable; no local fallback was attempted",
+                )
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = read_bounded_agent_bridge_error_body(
             response,
             "Host continuation bridge rejection body could not be read safely; no local fallback was attempted",
         )?;
-        let diagnostic = serde_json::from_slice::<WorkspaceBridgeDiagnosticResponse>(&body).ok();
-        let diagnostic_code = diagnostic
-            .as_ref()
-            .and_then(|error| safe_bridge_token(&error.code));
-        let diagnostic_reason = diagnostic
-            .as_ref()
-            .and_then(|error| safe_bridge_token(&error.reason));
-        let reason = if diagnostic_code.as_deref() == Some("execution_binding_mismatch")
-            || diagnostic_reason.as_deref() == Some("authority_mismatch")
+            let diagnostic =
+                serde_json::from_slice::<WorkspaceBridgeDiagnosticResponse>(&body).ok();
+            let diagnostic_code = diagnostic
+                .as_ref()
+                .and_then(|error| safe_bridge_token(&error.code));
+            let diagnostic_reason = diagnostic
+                .as_ref()
+                .and_then(|error| safe_bridge_token(&error.reason));
+            let reason = if diagnostic_code.as_deref() == Some("execution_binding_mismatch")
+                || diagnostic_reason.as_deref() == Some("authority_mismatch")
+            {
+                AgentBridgeFailureReason::AuthorityMismatch
+            } else if is_retryable_bridge_status(status) {
+                // Issue #3696: a Host that is momentarily busy or restarting is not
+                // refusing the operation. Reporting these as OperationRejected made
+                // them a `permission` escalation — an alarm the owner cannot act on
+                // for something the caller clears by retrying.
+                AgentBridgeFailureReason::TransportFailure
+            } else {
+                AgentBridgeFailureReason::OperationRejected
+            };
+            return Err(AgentBridgeFailure::rejected(
+                reason,
+                status,
+                diagnostic.as_ref(),
+                false,
+                "Host continuation bridge rejected the operation; no local fallback was attempted",
+            ));
+        }
+        let receipt = response
+            .json::<crate::AgentExecutionContinuationReceipt>()
+            .map_err(|_| {
+                AgentBridgeFailure::new(
+                    AgentBridgeFailureReason::ReceiptMismatch,
+                    "Host continuation bridge returned an invalid success response",
+                )
+            })?;
+        if receipt.schema_version != crate::AGENT_EXECUTION_CONTINUATION_SCHEMA_VERSION
+            || receipt.operation_id != request.operation_id
+            || receipt.generation_id != receipt.execution_binding.generation_id
+            || receipt.capability_generation == 0
+            || !receipt.validated
         {
-            AgentBridgeFailureReason::AuthorityMismatch
-        } else if is_retryable_bridge_status(status) {
-            // Issue #3696: a Host that is momentarily busy or restarting is not
-            // refusing the operation. Reporting these as OperationRejected made
-            // them a `permission` escalation — an alarm the owner cannot act on
-            // for something the caller clears by retrying.
-            AgentBridgeFailureReason::TransportFailure
-        } else {
-            AgentBridgeFailureReason::OperationRejected
-        };
-        return Err(AgentBridgeFailure::rejected(
-            reason,
-            status,
-            diagnostic.as_ref(),
-            false,
-            "Host continuation bridge rejected the operation; no local fallback was attempted",
-        ));
-    }
-    let receipt = response
-        .json::<crate::AgentExecutionContinuationReceipt>()
-        .map_err(|_| {
-            AgentBridgeFailure::new(
+            return Err(AgentBridgeFailure::new(
                 AgentBridgeFailureReason::ReceiptMismatch,
-                "Host continuation bridge returned an invalid success response",
-            )
-        })?;
-    if receipt.schema_version != crate::AGENT_EXECUTION_CONTINUATION_SCHEMA_VERSION
-        || receipt.operation_id != request.operation_id
-        || receipt.generation_id != receipt.execution_binding.generation_id
-        || receipt.capability_generation == 0
-        || !receipt.validated
-    {
-        return Err(AgentBridgeFailure::new(
-            AgentBridgeFailureReason::ReceiptMismatch,
-            "Host continuation bridge returned mismatched authority evidence",
-        ));
+                "Host continuation bridge returned mismatched authority evidence",
+            ));
+        }
+        Ok(receipt)
+    })();
+    match &result {
+        Ok(_) => observation.record(false),
+        Err(error) if error.reason() == AgentBridgeFailureReason::TransportFailure => {
+            observation.record(true)
+        }
+        Err(_) => {}
     }
-    Ok(receipt)
+    result
 }
 
 pub(crate) fn send_workspace_update_via_agent_bridge_detailed(
     target: &HookForwardTarget,
     request: &crate::AgentWorkspaceUpdateRequest,
 ) -> Result<crate::AgentWorkspaceUpdateReceipt, AgentBridgeFailure> {
-    let url = target.workspace_update_url().map_err(|_| {
-        AgentBridgeFailure::new(
-            AgentBridgeFailureReason::TransportFailure,
-            "Host workspace bridge target is invalid",
-        )
-    })?;
-    let client = reqwest::blocking::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|_| {
+    let observation = HostBridgeObservation::begin(gwt_agent::HostBridgeKind::WorkspaceUpdate);
+    let result = (|| {
+        let url = target.workspace_update_url().map_err(|_| {
             AgentBridgeFailure::new(
                 AgentBridgeFailureReason::TransportFailure,
-                "failed to build the Host workspace bridge client",
+                "Host workspace bridge target is invalid",
             )
         })?;
-    let response = client
+        let client = reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(Duration::from_secs(10))
+            .build()
+            .map_err(|_| {
+                AgentBridgeFailure::new(
+                    AgentBridgeFailureReason::TransportFailure,
+                    "failed to build the Host workspace bridge client",
+                )
+            })?;
+        let response = client
         .post(url)
         .bearer_auth(&target.token)
         .json(request)
@@ -887,46 +961,47 @@ pub(crate) fn send_workspace_update_via_agent_bridge_detailed(
                 "Host workspace bridge is unavailable; the update was not retried locally and its outcome may be unknown",
             )
         })?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = read_bounded_agent_bridge_error_body(
+        let status = response.status();
+        if !status.is_success() {
+            let body = read_bounded_agent_bridge_error_body(
             response,
             "Host workspace bridge rejection body could not be read safely; no local fallback was attempted",
         )?;
-        let diagnostic = serde_json::from_slice::<WorkspaceBridgeDiagnosticResponse>(&body).ok();
-        let strict = serde_json::from_slice::<WorkspaceBridgeErrorResponse>(&body).ok();
-        let exact_workspace_ensure_required = strict.as_ref().is_some_and(|error| {
-            status == reqwest::StatusCode::CONFLICT
-                && error.code == crate::AgentWorkspaceUpdateErrorCode::WorkspaceEnsureRequired
-                && error.reason == "workspace_ensure_required"
-        });
-        let diagnostic_code = diagnostic
-            .as_ref()
-            .and_then(|error| safe_bridge_token(&error.code))
-            .as_deref()
-            .and_then(parse_workspace_update_error_code);
-        let diagnostic_reason = diagnostic
-            .as_ref()
-            .and_then(|error| safe_bridge_token(&error.reason));
-        let reason = if exact_workspace_ensure_required {
-            AgentBridgeFailureReason::WorkspaceEnsureRequired
-        } else if diagnostic_code
-            == Some(crate::AgentWorkspaceUpdateErrorCode::ExecutionBindingMismatch)
-            || diagnostic_reason.as_deref() == Some("authority_mismatch")
-        {
-            AgentBridgeFailureReason::AuthorityMismatch
-        } else {
-            AgentBridgeFailureReason::OperationRejected
-        };
-        return Err(AgentBridgeFailure::rejected(
-            reason,
-            status,
-            diagnostic.as_ref(),
-            exact_workspace_ensure_required,
-            "Host workspace bridge rejected the update; no local fallback was attempted",
-        ));
-    }
-    let receipt = response
+            let diagnostic =
+                serde_json::from_slice::<WorkspaceBridgeDiagnosticResponse>(&body).ok();
+            let strict = serde_json::from_slice::<WorkspaceBridgeErrorResponse>(&body).ok();
+            let exact_workspace_ensure_required = strict.as_ref().is_some_and(|error| {
+                status == reqwest::StatusCode::CONFLICT
+                    && error.code == crate::AgentWorkspaceUpdateErrorCode::WorkspaceEnsureRequired
+                    && error.reason == "workspace_ensure_required"
+            });
+            let diagnostic_code = diagnostic
+                .as_ref()
+                .and_then(|error| safe_bridge_token(&error.code))
+                .as_deref()
+                .and_then(parse_workspace_update_error_code);
+            let diagnostic_reason = diagnostic
+                .as_ref()
+                .and_then(|error| safe_bridge_token(&error.reason));
+            let reason = if exact_workspace_ensure_required {
+                AgentBridgeFailureReason::WorkspaceEnsureRequired
+            } else if diagnostic_code
+                == Some(crate::AgentWorkspaceUpdateErrorCode::ExecutionBindingMismatch)
+                || diagnostic_reason.as_deref() == Some("authority_mismatch")
+            {
+                AgentBridgeFailureReason::AuthorityMismatch
+            } else {
+                AgentBridgeFailureReason::OperationRejected
+            };
+            return Err(AgentBridgeFailure::rejected(
+                reason,
+                status,
+                diagnostic.as_ref(),
+                exact_workspace_ensure_required,
+                "Host workspace bridge rejected the update; no local fallback was attempted",
+            ));
+        }
+        let receipt = response
         .json::<crate::AgentWorkspaceUpdateReceipt>()
         .map_err(|_| {
             AgentBridgeFailure::new(
@@ -934,16 +1009,25 @@ pub(crate) fn send_workspace_update_via_agent_bridge_detailed(
                 "Host workspace bridge returned an invalid success response; no local fallback was attempted",
             )
         })?;
-    if receipt.schema_version != crate::AGENT_WORKSPACE_UPDATE_SCHEMA_VERSION
-        || receipt.work_id.trim().is_empty()
-        || receipt.journal_entry_id.trim().is_empty()
-    {
-        return Err(AgentBridgeFailure::new(
+        if receipt.schema_version != crate::AGENT_WORKSPACE_UPDATE_SCHEMA_VERSION
+            || receipt.work_id.trim().is_empty()
+            || receipt.journal_entry_id.trim().is_empty()
+        {
+            return Err(AgentBridgeFailure::new(
             AgentBridgeFailureReason::ReceiptMismatch,
             "Host workspace bridge returned invalid receipt evidence; no local fallback was attempted",
         ));
+        }
+        Ok(receipt)
+    })();
+    match &result {
+        Ok(_) => observation.record(false),
+        Err(error) if error.reason() == AgentBridgeFailureReason::TransportFailure => {
+            observation.record(true)
+        }
+        Err(_) => {}
     }
-    Ok(receipt)
+    result
 }
 
 pub fn send_workspace_update_via_agent_bridge(
@@ -959,7 +1043,13 @@ pub fn send_work_terminalization_via_agent_bridge(
     request: &crate::AgentWorkTerminalizationRequest,
 ) -> Result<crate::AgentWorkTerminalizationReceipt, String> {
     let url = target.work_terminalization_url()?;
-    send_terminalization_via_agent_bridge(target, url, request).map_err(|error| error.to_string())
+    send_terminalization_via_agent_bridge(
+        target,
+        url,
+        request,
+        gwt_agent::HostBridgeKind::WorkTerminalization,
+    )
+    .map_err(|error| error.to_string())
 }
 
 pub(crate) fn send_blocked_build_abort_terminalization_via_agent_bridge(
@@ -974,25 +1064,33 @@ pub(crate) fn send_blocked_build_abort_terminalization_via_agent_bridge(
                 "Host build abort terminalization bridge target is invalid",
             )
         })?;
-    send_terminalization_via_agent_bridge(target, url, request)
+    send_terminalization_via_agent_bridge(
+        target,
+        url,
+        request,
+        gwt_agent::HostBridgeKind::BuildAbortTerminalization,
+    )
 }
 
 fn send_terminalization_via_agent_bridge(
     target: &HookForwardTarget,
     url: Url,
     request: &impl Serialize,
+    bridge: gwt_agent::HostBridgeKind,
 ) -> Result<crate::AgentWorkTerminalizationReceipt, AgentBridgeFailure> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|_| {
-            AgentBridgeFailure::new(
-                AgentBridgeFailureReason::TransportFailure,
-                "failed to build the Host Work terminalization bridge client",
-            )
-        })?;
-    let response = client
+    let observation = HostBridgeObservation::begin(bridge);
+    let result = (|| {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|_| {
+                AgentBridgeFailure::new(
+                    AgentBridgeFailureReason::TransportFailure,
+                    "failed to build the Host Work terminalization bridge client",
+                )
+            })?;
+        let response = client
         .post(url)
         .bearer_auth(&target.token)
         .json(request)
@@ -1003,38 +1101,39 @@ fn send_terminalization_via_agent_bridge(
                 "Host Work terminalization bridge is unavailable; the close was not retried locally and its outcome may be unknown",
             )
         })?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = read_bounded_agent_bridge_error_body(
+        let status = response.status();
+        if !status.is_success() {
+            let body = read_bounded_agent_bridge_error_body(
             response,
             "Host Work terminalization bridge rejection body could not be read safely; no local fallback was attempted",
         )?;
-        let diagnostic = serde_json::from_slice::<WorkspaceBridgeDiagnosticResponse>(&body).ok();
-        let diagnostic_code = diagnostic
-            .as_ref()
-            .and_then(|error| safe_bridge_token(&error.code))
-            .as_deref()
-            .and_then(parse_workspace_update_error_code);
-        let diagnostic_reason = diagnostic
-            .as_ref()
-            .and_then(|error| safe_bridge_token(&error.reason));
-        let reason = if diagnostic_code
-            == Some(crate::AgentWorkspaceUpdateErrorCode::ExecutionBindingMismatch)
-            || diagnostic_reason.as_deref() == Some("authority_mismatch")
-        {
-            AgentBridgeFailureReason::AuthorityMismatch
-        } else {
-            AgentBridgeFailureReason::OperationRejected
-        };
-        return Err(AgentBridgeFailure::rejected(
+            let diagnostic =
+                serde_json::from_slice::<WorkspaceBridgeDiagnosticResponse>(&body).ok();
+            let diagnostic_code = diagnostic
+                .as_ref()
+                .and_then(|error| safe_bridge_token(&error.code))
+                .as_deref()
+                .and_then(parse_workspace_update_error_code);
+            let diagnostic_reason = diagnostic
+                .as_ref()
+                .and_then(|error| safe_bridge_token(&error.reason));
+            let reason = if diagnostic_code
+                == Some(crate::AgentWorkspaceUpdateErrorCode::ExecutionBindingMismatch)
+                || diagnostic_reason.as_deref() == Some("authority_mismatch")
+            {
+                AgentBridgeFailureReason::AuthorityMismatch
+            } else {
+                AgentBridgeFailureReason::OperationRejected
+            };
+            return Err(AgentBridgeFailure::rejected(
             reason,
             status,
             diagnostic.as_ref(),
             false,
             "Host Work terminalization bridge rejected the close; no local fallback was attempted",
         ));
-    }
-    let receipt = response
+        }
+        let receipt = response
         .json::<crate::AgentWorkTerminalizationReceipt>()
         .map_err(|_| {
             AgentBridgeFailure::new(
@@ -1042,13 +1141,22 @@ fn send_terminalization_via_agent_bridge(
                 "Host Work terminalization bridge returned an invalid success response; no local fallback was attempted",
             )
         })?;
-    if receipt.schema_version != crate::AGENT_WORK_TERMINALIZATION_SCHEMA_VERSION {
-        return Err(AgentBridgeFailure::new(
+        if receipt.schema_version != crate::AGENT_WORK_TERMINALIZATION_SCHEMA_VERSION {
+            return Err(AgentBridgeFailure::new(
             AgentBridgeFailureReason::ReceiptMismatch,
             "Host Work terminalization bridge returned an unsupported response schema; no local fallback was attempted",
         ));
+        }
+        Ok(receipt)
+    })();
+    match &result {
+        Ok(_) => observation.record(false),
+        Err(error) if error.reason() == AgentBridgeFailureReason::TransportFailure => {
+            observation.record(true)
+        }
+        Err(_) => {}
     }
-    Ok(receipt)
+    result
 }
 
 // Host contract compatibility policy: checkout clients can be newer than the
@@ -1061,6 +1169,7 @@ pub(crate) fn send_work_materialization_probe_via_agent_bridge(
     target: &HookForwardTarget,
     request: &crate::AgentWorkMaterializationProbeRequest,
 ) -> Result<crate::AgentWorkMaterializationProbeReceipt, AgentBridgeRequestError> {
+    let observation = HostBridgeObservation::begin(gwt_agent::HostBridgeKind::WorkMaterialization);
     let url = target
         .work_materialization_probe_url()
         .map_err(AgentBridgeRequestError::NotSent)?;
@@ -1069,6 +1178,7 @@ pub(crate) fn send_work_materialization_probe_via_agent_bridge(
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|_| {
+            observation.record(true);
             AgentBridgeRequestError::NotSent(
                 "failed to build the Host Work materialization probe client".to_string(),
             )
@@ -1079,6 +1189,7 @@ pub(crate) fn send_work_materialization_probe_via_agent_bridge(
         .json(request)
         .send()
         .map_err(|_| {
+            observation.record(true);
             AgentBridgeRequestError::Unknown(
                 "Host Work materialization probe is unavailable; no build lifecycle state was created"
                     .to_string(),
@@ -1093,7 +1204,7 @@ pub(crate) fn send_work_materialization_probe_via_agent_bridge(
             response,
             "Host Work materialization probe rejection body could not be read safely; no build lifecycle state was created",
         )
-        .map_err(|error| AgentBridgeRequestError::Unknown(error.to_string()))?;
+        .map_err(|error| { observation.record(true); AgentBridgeRequestError::Unknown(error.to_string()) })?;
         return match serde_json::from_slice::<WorkspaceBridgeErrorResponse>(&body) {
             Ok(error) => Err(AgentBridgeRequestError::Rejected(
                 crate::AgentWorkspaceUpdateError::new(
@@ -1123,6 +1234,7 @@ pub(crate) fn send_work_materialization_probe_via_agent_bridge(
                 .to_string(),
         ));
     }
+    observation.record(false);
     Ok(receipt)
 }
 
@@ -2460,6 +2572,77 @@ mod tests {
         assert!(!error.to_string().contains("private-host-message-sentinel"));
         assert!(!error.to_string().contains("probe-private-token"));
         server.receive();
+    }
+
+    #[test]
+    fn workspace_bridge_transport_receipt_clears_after_validated_success() {
+        let _lock = env_test_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let mut session =
+            gwt_agent::Session::new(dir.path(), "work/test", gwt_agent::AgentId::Codex);
+        session.repo_hash = Some("repo".into());
+        session.linked_issue_number = Some(4774);
+        session
+            .set_execution_binding(Some(gwt_agent::SessionExecutionBinding {
+                schema_version: gwt_agent::SessionExecutionBinding::CURRENT_SCHEMA_VERSION,
+                session_id: session.id.clone(),
+                repo_hash: "repo".into(),
+                owner_kind: "issue".into(),
+                owner_number: 4774,
+                capability_generation: 1,
+                identity: gwt_agent::ExecutionBindingIdentity {
+                    generation_id: "generation".into(),
+                    binding_id: "binding".into(),
+                    ledger_head_hash: "head".into(),
+                },
+            }))
+            .unwrap();
+        let identity = gwt_agent::SessionExecutionIdentity::from_session(&session)
+            .unwrap()
+            .unwrap();
+        let path = gwt_agent::runtime_state_path(dir.path(), &session.id);
+        let runtime = gwt_agent::SessionRuntimeState::for_execution_process(
+            gwt_agent::AgentStatus::Running,
+            &identity,
+            7,
+            100,
+            123,
+            101,
+        );
+        runtime.save(&path).unwrap();
+        let _session = ScopedEnvVar::set(GWT_SESSION_ID_ENV, &session.id);
+        let _path = ScopedEnvVar::set(GWT_SESSION_RUNTIME_PATH_ENV, &path);
+        let request = crate::AgentWorkspaceUpdateRequest {
+            schema_version: crate::AGENT_WORKSPACE_UPDATE_SCHEMA_VERSION,
+            claimed_session_id: session.id.clone(),
+            observation: crate::AgentRuntimeObservation {
+                cwd: "/workspace/repo".into(),
+                git_toplevel: "/workspace/repo".into(),
+                repo_hash: "repo".into(),
+                branch: "work/test".into(),
+            },
+            intent: crate::AgentWorkspaceUpdateIntent::default(),
+        };
+        let unavailable = HookForwardTarget {
+            url: "http://127.0.0.1:1/internal/hook-live".into(),
+            token: "test".into(),
+        };
+        assert!(send_workspace_update_via_agent_bridge_detailed(&unavailable, &request).is_err());
+        assert!(gwt_agent::has_unresolved_host_bridge_fault(&path, &runtime).unwrap());
+        let success = BindingProbeServer::start(
+            StatusCode::OK,
+            serde_json::json!({
+                "schema_version": crate::AGENT_WORKSPACE_UPDATE_SCHEMA_VERSION,
+                "work_id": "work", "journal_entry_id": "entry",
+            }),
+        );
+        let target = HookForwardTarget {
+            url: success.forward_url.clone(),
+            token: "test".into(),
+        };
+        send_workspace_update_via_agent_bridge_detailed(&target, &request).unwrap();
+        success.receive();
+        assert!(!gwt_agent::has_unresolved_host_bridge_fault(&path, &runtime).unwrap());
     }
 
     #[test]

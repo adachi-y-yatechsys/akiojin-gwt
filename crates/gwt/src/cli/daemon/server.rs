@@ -1901,6 +1901,7 @@ enum IssueMonitorControl {
     WindowClosed {
         window_id: String,
         target: Option<crate::IssueMonitorStopTarget>,
+        classification: Option<crate::IssueMonitorFailureClass>,
     },
     /// Issue #4084 AC-1: the GUI published the complete agent-window canvas
     /// for one project tab. The scan classifies idle windows against it;
@@ -2409,6 +2410,14 @@ fn try_apply_typed_issue_monitor_failure(
             failure: Some(crate::IssueMonitorFailure::CodexDirectoryTrustPrompt),
             ..
         } => Some(false),
+        IssueMonitorControl::LaunchFailed {
+            failure: Some(crate::IssueMonitorFailure::Termination { .. }),
+            ..
+        } => Some(false),
+        control @ IssueMonitorControl::AgentFailed {
+            failure: Some(crate::IssueMonitorFailure::Termination { .. }),
+            ..
+        } => Some(apply_routine_issue_monitor_control(monitor, control, now)),
         _ => unreachable!("typed failure helper requires typed failure control"),
     }
 }
@@ -2581,6 +2590,7 @@ fn apply_routine_issue_monitor_control(
             // the agent has to be running to be refused.
             Some(crate::IssueMonitorFailure::ProviderUsageLimit { .. }) => false,
             Some(crate::IssueMonitorFailure::CodexDirectoryTrustPrompt) => false,
+            Some(crate::IssueMonitorFailure::Termination { .. }) => false,
             None => monitor.record_launch_failed_delivery_at(
                 issue_number,
                 message,
@@ -2641,11 +2651,23 @@ fn apply_routine_issue_monitor_control(
                 };
                 monitor.try_escalate_codex_directory_trust_prompt(issue_number, &window_id, message)
             }
-            None => {
-                if let Some(issue_number) = issue_number {
-                    monitor.record_agent_issue_failed_at(issue_number, message, now);
-                } else {
-                    monitor.record_agent_window_failed_at(&window_id, message, now);
+            termination => {
+                let classification = match termination {
+                    Some(crate::IssueMonitorFailure::Termination { classification }) => {
+                        classification
+                    }
+                    None => crate::IssueMonitorFailureClass::Unknown,
+                    _ => unreachable!("other typed failures are handled above"),
+                };
+                if let Some(issue_number) =
+                    issue_number.or_else(|| monitor.launched_window_issue(&window_id))
+                {
+                    monitor.record_agent_issue_failed_classified_at(
+                        issue_number,
+                        message,
+                        classification,
+                        now,
+                    );
                 }
                 true
             }
@@ -2664,8 +2686,14 @@ fn apply_routine_issue_monitor_control(
                 crate::IssueMonitorProviderQuotaHoldClearOutcome::Cleared { .. }
             )
         }
-        IssueMonitorControl::WindowClosed { target, .. } => match target {
-            Some(target) => monitor.requeue_exact_window(&target).is_some(),
+        IssueMonitorControl::WindowClosed {
+            target,
+            classification,
+            ..
+        } => match target {
+            Some(target) => monitor
+                .requeue_exact_window_classified(&target, classification.unwrap_or_default())
+                .is_some(),
             // Pre-generation publishers can still be decoded for wire
             // compatibility, but a window id alone is not authority to revoke
             // a possibly newer same-id launch.
@@ -3289,7 +3317,17 @@ fn decode_issue_monitor_control(payload: serde_json::Value) -> Option<IssueMonit
                             .map(str::to_string),
                         window_id: Some(window_id.clone()),
                     });
-                return Some(IssueMonitorControl::WindowClosed { window_id, target });
+                let classification = window_closed
+                    .get("classification")
+                    .filter(|value| !value.is_null())
+                    .map(|value| serde_json::from_value(value.clone()))
+                    .transpose()
+                    .ok()?;
+                return Some(IssueMonitorControl::WindowClosed {
+                    window_id,
+                    target,
+                    classification,
+                });
             }
             if let Some(snapshot) = payload.get("window_snapshot") {
                 let snapshot =
@@ -4082,7 +4120,8 @@ fn issue_monitor_http_client_with_repository(
     let (owner, repo) =
         crate::issue_monitor_worker::github_remote_owner_and_repo(&scope.project_root)
             .map_err(|error| error.to_string())?;
-    let client = HttpIssueClient::from_gh_auth(&owner, &repo).map_err(|error| error.to_string())?;
+    let client = HttpIssueClient::from_runtime_environment(&owner, &repo)
+        .map_err(|error| error.to_string())?;
     Ok((
         client,
         gwt_github::client::RepositoryIdentity::new(owner, repo),
@@ -5722,6 +5761,25 @@ mod tests {
             RuntimeTarget::Host,
         )
         .expect("scope")
+    }
+
+    #[test]
+    fn runtime_factory_override_daemon_rejects_partial_configuration() {
+        let _lock = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _token = ScopedEnvVar::set("GH_TOKEN", "fixture-only-token");
+        let _mode = ScopedEnvVar::set("GWT_OWNER_GITHUB_TEST_MODE", "loopback-v1");
+        let _rest = ScopedEnvVar::unset("GWT_OWNER_GITHUB_REST_BASE");
+        let _graphql = ScopedEnvVar::unset("GWT_OWNER_GITHUB_GRAPHQL_URL");
+        let _owner_token = ScopedEnvVar::unset("GWT_OWNER_GITHUB_TOKEN");
+        let temp = TempDir::new().expect("repo");
+        init_git_repo(temp.path());
+        git_remote_add_origin(temp.path(), "https://github.com/fixture/repo.git");
+        let result = super::issue_monitor_http_client(&sample_scope(&temp));
+        assert!(result
+            .err()
+            .is_some_and(|error| error.contains("complete owner GitHub test override")));
     }
 
     fn init_git_repo(path: &Path) {
@@ -8375,6 +8433,14 @@ exit 0
             .expect("current exact close decodes");
         assert!(apply_issue_monitor_control(&mut monitor, current));
         assert_eq!(monitor.active_count(), 0, "current close releases the slot");
+        let record = monitor
+            .autonomous_record(42)
+            .expect("close spends an attempt");
+        assert_eq!(record.attempts, 1);
+        assert_eq!(
+            record.non_agent_attempts, 1,
+            "a close without exit evidence is unknown"
+        );
     }
 
     // Issue #3927 (SPEC #3340 T-630): the internal terminal-delivery control
@@ -8482,6 +8548,7 @@ exit 0
             &prefs_path,
             &mut stale_daemon,
             IssueMonitorControl::WindowClosed {
+                classification: None,
                 window_id: "tab-1::agent-42".to_string(),
                 target: Some(crate::IssueMonitorStopTarget {
                     issue_number: 42,
@@ -8573,6 +8640,7 @@ exit 0
                 phase: crate::AutonomousPhase::Implementing,
                 active_launch_id: None,
                 attempts: 1,
+                non_agent_attempts: 0,
                 acceptance_snapshot: None,
                 retry_not_before: None,
                 retry_hold_reason: None,
@@ -8683,6 +8751,7 @@ exit 0
                 phase: crate::AutonomousPhase::Reviewing,
                 active_launch_id: Some("review-42".to_string()),
                 attempts: 1,
+                non_agent_attempts: 0,
                 acceptance_snapshot: None,
                 retry_not_before: None,
                 retry_hold_reason: None,
@@ -8939,6 +9008,35 @@ exit 0
             item.error_message.as_deref(),
             Some("Stop-block hit an error")
         );
+    }
+
+    #[test]
+    fn termination_control_keeps_infrastructure_out_of_tier_input() {
+        let mut monitor = crate::IssueMonitorState::with_prefs(
+            crate::IssueMonitorConfig::default(),
+            crate::IssueMonitorPrefs {
+                autonomous_mode: true,
+                ..Default::default()
+            },
+        );
+        monitor.set_autonomous_phase(42, crate::AutonomousPhase::Implementing);
+        let control =
+            decode_issue_monitor_control(crate::runtime_daemon_events::issue_monitor_payload(
+                "control",
+                serde_json::json!({"agent_failed": {
+                    "issue_number": 42,
+                    "window_id": "tab-1::agent-42",
+                    "message": "agent exited",
+                    "failure": {"kind": "termination", "classification": "infrastructure"}
+                }}),
+                std::process::id() + 1,
+            ))
+            .expect("typed termination decodes");
+        assert!(apply_issue_monitor_control(&mut monitor, control));
+        let record = monitor.autonomous_record(42).expect("retry record");
+        assert_eq!(record.attempts, 1);
+        assert_eq!(record.non_agent_attempts, 1);
+        assert!(record.retry_not_before.is_some());
     }
 
     #[test]
@@ -12731,6 +12829,7 @@ exit 0
                     phase: crate::AutonomousPhase::Implementing,
                     active_launch_id: None,
                     attempts: 1,
+                    non_agent_attempts: 0,
                     acceptance_snapshot: None,
                     retry_not_before: None,
                     retry_hold_reason: None,
@@ -13222,6 +13321,7 @@ exit 1
                     phase: crate::AutonomousPhase::Reviewing,
                     active_launch_id: None,
                     attempts: 1,
+                    non_agent_attempts: 0,
                     acceptance_snapshot: None,
                     retry_not_before: None,
                     retry_hold_reason: None,
@@ -15463,6 +15563,15 @@ exit 1
         let mut canonical =
             crate::IssueMonitorState::with_prefs(crate::IssueMonitorConfig::default(), initial);
         canonical.record_candidate(sample_issue_monitor_issue(42));
+        canonical.set_gui_connected(true);
+        assert!(canonical.apply_confirmed_claim(
+            42,
+            "failed-claim",
+            "fixture-owner",
+            "failed-claim-effect",
+            "2026-08-12T23:59:00Z",
+        ));
+        canonical.complete_active_launch_at(42, "tab-1::agent-1", "2026-08-12T23:59:01Z");
         canonical.set_autonomous_phase(42, crate::AutonomousPhase::Implementing);
         crate::save_issue_monitor_prefs(&prefs_path, &canonical.prefs()).expect("seed prefs");
 
@@ -15490,6 +15599,21 @@ exit 1
 
         let persisted =
             crate::load_issue_monitor_prefs(&prefs_path).expect("reload committed scan");
+        assert!(
+            persisted.launched_issues.is_empty() && persisted.launch_bindings.is_empty(),
+            "a stale pre-failure disk snapshot cannot restore the exited launch"
+        );
+        let retry = persisted
+            .autonomous_records
+            .iter()
+            .find(|record| record.issue_number == 42)
+            .expect("retry record");
+        assert_eq!(retry.attempts, 1);
+        assert_eq!(
+            retry.retry_not_before.as_deref(),
+            Some("2026-08-13T00:01:00Z")
+        );
+        assert_eq!(retry.phase, crate::AutonomousPhase::Idle);
         assert_eq!(
             persisted.queued_launch_session_strategies.get(&42),
             Some(&crate::IssueMonitorLaunchSessionStrategy::FreshRequired),
@@ -15500,13 +15624,63 @@ exit 1
             crate::IssueMonitorState::with_prefs(crate::IssueMonitorConfig::default(), persisted);
         reloaded.set_gui_connected(true);
         reloaded.record_candidate(sample_issue_monitor_issue(42));
+        let mut prepared_retry = reloaded.clone();
+        prepared_retry.set_autonomous_phase(42, crate::AutonomousPhase::Implementing);
+        prepared_retry.clear_retry_hold(42);
+        let refreshed_acceptance = crate::issue_monitor_gate::AcceptanceSnapshot {
+            ids: vec!["AC-2".to_string()],
+            visual_surface: false,
+        };
+        prepared_retry.capture_acceptance_snapshot(42, refreshed_acceptance.clone());
+        assert!(super::commit_issue_monitor_scan_if_current(
+            &prefs_path,
+            &mut reloaded,
+            prepared_retry,
+            7,
+        ));
+        assert_eq!(
+            reloaded
+                .autonomous_record(42)
+                .expect("prepared retry")
+                .phase,
+            crate::AutonomousPhase::Implementing,
+            "the same retry attempt's preparation must survive its release fence"
+        );
+        assert_eq!(
+            reloaded.autonomous_record(42).unwrap().acceptance_snapshot,
+            Some(refreshed_acceptance)
+        );
+        let mut stale_retry = reloaded.clone();
+        assert!(reloaded.apply_confirmed_claim(
+            42,
+            "successor-claim",
+            "fixture-owner",
+            "successor-effect",
+            "2026-08-13T01:00:00Z",
+        ));
         let request = reloaded
-            .next_launch_request("2026-08-13T01:00:00Z")
-            .expect("retry becomes the next launch request after reload");
+            .take_pending_launch_requests()
+            .into_iter()
+            .next()
+            .expect("the confirmed successor claim authorizes a fresh launch");
         assert_eq!(
             request.launch_session_strategy,
             crate::IssueMonitorLaunchSessionStrategy::FreshRequired
         );
+        assert!(reloaded.prefs().released_failures.is_empty());
+        reloaded.complete_active_launch_at(42, "tab-1::agent-2", "2026-08-13T01:00:01Z");
+        reloaded.clear_retry_hold(42);
+        reloaded.set_autonomous_phase(42, crate::AutonomousPhase::Implementing);
+        stale_retry.rebase_gui_observer_prefs(&reloaded.prefs());
+        assert!(stale_retry.prefs().released_failures.is_empty());
+        assert_eq!(
+            stale_retry.launched_window_id(42).as_deref(),
+            Some("tab-1::agent-2")
+        );
+        let successor = stale_retry.autonomous_record(42).expect("successor record");
+        assert_eq!(successor.attempts, 1);
+        assert_eq!(successor.retry_not_before, None);
+        assert_eq!(successor.phase, crate::AutonomousPhase::Implementing);
     }
 
     #[test]
@@ -15939,6 +16113,7 @@ exit 1
                 phase: crate::AutonomousPhase::Reviewing,
                 active_launch_id: None,
                 attempts: 1,
+                non_agent_attempts: 0,
                 acceptance_snapshot: None,
                 retry_not_before: None,
                 retry_hold_reason: None,
@@ -16006,6 +16181,7 @@ exit 1
                 phase: crate::AutonomousPhase::Reviewing,
                 active_launch_id: None,
                 attempts: 1,
+                non_agent_attempts: 0,
                 acceptance_snapshot: None,
                 retry_not_before: None,
                 retry_hold_reason: None,
@@ -16126,6 +16302,7 @@ exit 1
                     phase: crate::AutonomousPhase::Reviewing,
                     active_launch_id: None,
                     attempts: 1,
+                    non_agent_attempts: 0,
                     acceptance_snapshot: None,
                     retry_not_before: None,
                     retry_hold_reason: None,
@@ -16146,6 +16323,7 @@ exit 1
                     phase: crate::AutonomousPhase::Reviewing,
                     active_launch_id: None,
                     attempts: 1,
+                    non_agent_attempts: 0,
                     acceptance_snapshot: None,
                     retry_not_before: None,
                     retry_hold_reason: None,
@@ -16216,6 +16394,7 @@ exit 1
                 phase: crate::AutonomousPhase::Reviewing,
                 active_launch_id: None,
                 attempts: 1,
+                non_agent_attempts: 0,
                 acceptance_snapshot: None,
                 retry_not_before: None,
                 retry_hold_reason: None,
@@ -16924,6 +17103,7 @@ exit 1
                 phase: crate::AutonomousPhase::Reviewing,
                 active_launch_id: None,
                 attempts: 1,
+                non_agent_attempts: 0,
                 acceptance_snapshot: None,
                 retry_not_before: None,
                 retry_hold_reason: None,
@@ -17069,6 +17249,7 @@ exit 1
                 phase: crate::AutonomousPhase::Delivering,
                 active_launch_id: None,
                 attempts: 1,
+                non_agent_attempts: 0,
                 acceptance_snapshot: None,
                 retry_not_before: None,
                 retry_hold_reason: None,
@@ -17206,6 +17387,7 @@ exit 1
                 phase: crate::AutonomousPhase::Reviewing,
                 active_launch_id: None,
                 attempts: 1,
+                non_agent_attempts: 0,
                 acceptance_snapshot: None,
                 retry_not_before: None,
                 retry_hold_reason: None,
@@ -17562,6 +17744,7 @@ exit 1
             phase,
             active_launch_id: None,
             attempts,
+            non_agent_attempts: 0,
             acceptance_snapshot: None,
             retry_not_before: None,
             retry_hold_reason: None,
@@ -17799,6 +17982,7 @@ exit 1
                     phase: crate::AutonomousPhase::NeedsHuman,
                     active_launch_id: None,
                     attempts: 6,
+                    non_agent_attempts: 0,
                     acceptance_snapshot: None,
                     retry_not_before: None,
                     retry_hold_reason: None,
@@ -18817,6 +19001,7 @@ exit 1
                     phase: crate::AutonomousPhase::Implementing,
                     active_launch_id: None,
                     attempts: 1,
+                    non_agent_attempts: 0,
                     acceptance_snapshot: None,
                     retry_not_before: None,
                     retry_hold_reason: None,
@@ -19109,6 +19294,7 @@ exit 1
             phase: crate::AutonomousPhase::NeedsHuman,
             active_launch_id: None,
             attempts: 6,
+            non_agent_attempts: 0,
             acceptance_snapshot: None,
             retry_not_before: None,
             retry_hold_reason: None,

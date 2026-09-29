@@ -375,6 +375,29 @@ const GRAPHQL_BUDGET_ARGS: [&str; 2] = ["api", "graphql"];
 const REST_BUDGET_ARGS: [&str; 2] = ["api", "repos"];
 
 impl HttpIssueClient<ReqwestTransport> {
+    const OWNER_ENV_KEYS: [&'static str; 4] = [
+        "GWT_OWNER_GITHUB_TEST_MODE",
+        "GWT_OWNER_GITHUB_REST_BASE",
+        "GWT_OWNER_GITHUB_GRAPHQL_URL",
+        "GWT_OWNER_GITHUB_TOKEN",
+    ];
+
+    /// Keep ordinary authentication unchanged while allowing the existing
+    /// explicit debug-only loopback contract on runtime launch surfaces.
+    pub fn from_runtime_environment(owner: &str, repo: &str) -> Result<Self, ApiError> {
+        if Self::OWNER_ENV_KEYS
+            .iter()
+            .all(|key| std::env::var(key).is_err())
+        {
+            return Self::from_gh_auth(owner, repo);
+        }
+        Self::from_owner_environment_with_deadline(
+            owner,
+            repo,
+            &ResolutionDeadline::new(Duration::from_secs(5), Duration::from_secs(30)),
+        )
+    }
+
     /// Construct an [`HttpIssueClient`] using `gh auth token` for credentials
     /// and the default [`ReqwestTransport`].
     pub fn from_gh_auth(owner: &str, repo: &str) -> Result<Self, ApiError> {
@@ -402,11 +425,7 @@ impl HttpIssueClient<ReqwestTransport> {
         deadline: &ResolutionDeadline,
     ) -> Result<Self, ApiError> {
         deadline.remaining("owner client construction")?;
-        const MODE: &str = "GWT_OWNER_GITHUB_TEST_MODE";
-        const REST: &str = "GWT_OWNER_GITHUB_REST_BASE";
-        const GRAPHQL: &str = "GWT_OWNER_GITHUB_GRAPHQL_URL";
-        const TOKEN: &str = "GWT_OWNER_GITHUB_TOKEN";
-        let values = [MODE, REST, GRAPHQL, TOKEN].map(std::env::var);
+        let values = Self::OWNER_ENV_KEYS.map(std::env::var);
         if values.iter().all(Result::is_err) {
             return Self::from_gh_auth_with_deadline(owner, repo, deadline);
         }

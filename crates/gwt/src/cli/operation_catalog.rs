@@ -278,6 +278,18 @@ pub const OPERATIONS: &[Operation] = &[
         aliases: &["issue.monitor.priority-set"],
     },
     Operation {
+        name: "issue.monitor.tiers",
+        aliases: &[],
+    },
+    Operation {
+        name: "issue.monitor.tiers.set",
+        aliases: &[],
+    },
+    Operation {
+        name: "issue.monitor.tier.set",
+        aliases: &[],
+    },
+    Operation {
         name: "issue.monitor.profiles",
         aliases: &[],
     },

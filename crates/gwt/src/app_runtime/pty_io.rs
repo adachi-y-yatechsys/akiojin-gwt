@@ -827,6 +827,24 @@ impl AppRuntime {
         let scheduler_window_id = window_id.clone();
         let task: Box<dyn FnOnce() + Send + 'static> = Box::new(move || {
             let started = Instant::now();
+            // Capture evidence before forced teardown can manufacture an exit.
+            let termination_classification = exact_terminal
+                .as_ref()
+                .and_then(|(identity, incarnation)| {
+                    incarnation.map(|incarnation| {
+                        let has_exit = runtime
+                            .as_ref()
+                            .and_then(|runtime| runtime.pane.lock().ok())
+                            .is_some_and(|pane| pane.last_exit().is_some());
+                        Self::classify_issue_monitor_termination(
+                            &sessions_dir,
+                            identity,
+                            incarnation,
+                            has_exit,
+                        )
+                    })
+                })
+                .unwrap_or(gwt::IssueMonitorFailureClass::Unknown);
             let mut finalizer_ok = true;
             tracing::info!(
                 target: "gwt.pane.teardown",
@@ -1110,10 +1128,11 @@ impl AppRuntime {
                             closing_window_generation,
                         ) =>
                     {
-                        Self::finalize_issue_monitor_window_close_in_background(
+                        Self::finalize_issue_monitor_window_close_classified_in_background(
                             project_root,
                             &target,
                             fallback_commit_timeout,
+                            termination_classification,
                         )
                     }
                     (_, Ok(_)) => WindowCloseMonitorResult::Noop,

@@ -399,6 +399,33 @@ in the GUI appends it to the same pool. All operations accept an optional
 daemon-absent configuration changes become visible to running instances on the
 next scan/rebase.
 
+Automatic profile selection is opt-in with `issue.monitor.tiers.set` and
+`{"auto":true}`. It supplies three tiers without requiring a profile pool:
+Codex Luna / Claude Haiku, Codex Sol / Claude Sonnet, then Codex Astra / Claude
+Opus. Tier indices start at 0. The selected tier is the maximum of the agent
+failure count, the Issue's retained floor, and 1 for a `gwt-spec` Issue, capped
+at the last tier. Retry admission and terminal handling retain their existing
+rules. Eligible providers are selected within each tier using the existing
+pool rules; if none is eligible, the next tier is tried. Normal automatic
+launches start a fresh session to apply the current model and effort. Answered
+handoffs still return to their original session without changing tier history.
+Infrastructure failures and terminations without exit evidence do not raise
+the tier. They still count toward the existing retry budget and backoff.
+
+`issue.monitor.tiers.set` also accepts `tiers`, an ordered array of profile
+arrays. Omitting `tiers` restores the defaults. `{"auto":false}` restores the
+existing manual pool. `issue.monitor.tier.set` with `number` and `tier` raises
+an Issue's persistent minimum tier. `issue.monitor.tiers` reports the
+configuration, Issue history and lowest-tier landing rate (`null` until a
+landing is observed), plus the count of unclassified terminations.
+`issue.monitor.status` exposes `launch_tier`, `landing_tier`, total `attempts`,
+excluded `non_agent_attempts`, and their difference `tier_input` on each
+observed Issue row.
+Landing means a successful Work `done` update from the matching owner and
+session; closing or cancelling an Issue alone does not count. It measures
+agent-declared completion, so the rate can be optimistic if the PR fails later.
+PR merge is not required for this metric.
+
 Host free space is part of the same snapshot: `disk_space` in
 `issue.monitor.status` lists the volumes the worktrees and the verification
 coordinator live on and carries a `warning` once one of them falls below
