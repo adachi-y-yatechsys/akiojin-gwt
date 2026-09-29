@@ -300,7 +300,10 @@ pub(crate) fn changed_source_paths_since(
     )?);
     Ok(paths
         .into_iter()
-        .filter(|path| !path.starts_with(".gwt/") && !path.starts_with("tasks/"))
+        .filter(|path| {
+            super::delivery_paths::classify_path(path.as_bytes())
+                == super::delivery_paths::DeliveryPath::Product
+        })
         .collect())
 }
 

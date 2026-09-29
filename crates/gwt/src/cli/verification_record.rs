@@ -39,6 +39,7 @@ use gwt_github::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::delivery_paths::{classify_path, DeliveryPath, BOOKKEEPING_GIT_EXCLUDE};
 use super::CliEnv;
 use crate::cli::execution_state;
 
@@ -960,7 +961,7 @@ fn verification_head(worktree: &Path, head: &str) -> String {
                 && metadata[0] == b":000000"
                 && matches!(metadata[1], b"100644" | b"100755")
                 && metadata[4] == b"A"
-                && is_canonical_bucketed_work_event_shard(entry[1])
+                && classify_path(entry[1]) == DeliveryPath::WorkEventShard
         });
         if !additions_only || !remainder.is_empty() {
             break;
@@ -992,7 +993,7 @@ pub(crate) fn worktree_fingerprint_excluding(
         "HEAD".to_string(),
         "--".to_string(),
         ".".to_string(),
-        ":(exclude).gwt".to_string(),
+        BOOKKEEPING_GIT_EXCLUDE.to_string(),
     ];
     diff_args.extend(
         generated_outputs
@@ -1015,7 +1016,7 @@ pub(crate) fn worktree_fingerprint_excluding(
         "-uall".to_string(),
         "--".to_string(),
         ".".to_string(),
-        ":(exclude).gwt".to_string(),
+        BOOKKEEPING_GIT_EXCLUDE.to_string(),
     ];
     status_args.extend(
         generated_outputs
@@ -2355,7 +2356,7 @@ pub(crate) fn work_event_settlement_blocker_description_with_gate(
         None => reason,
     };
     format!(
-        "Work event settlement is not closed: {reason}. Commit `{WORK_EVENT_STORE_RELATIVE}/` (or legacy `{WORK_EVENT_LOG_RELATIVE}`) with the related source changes (or use the exact `chore(work):` prefix for a bookkeeping-only commit), push the commit that contains it to its configured upstream, and retry. If `.gwt/` is broadly ignored, force-add every exact canonical shard individually; never force-add the event directory.{}",
+        "Work event settlement is not closed: {reason}. This is a bookkeeping delivery requirement, separate from product verification evidence. Commit `{WORK_EVENT_STORE_RELATIVE}/` (or legacy `{WORK_EVENT_LOG_RELATIVE}`) with the related source changes (or use the exact `chore(work):` prefix for a bookkeeping-only commit), push the commit that contains it to its configured upstream, and retry. If `.gwt/` is broadly ignored, force-add every exact canonical shard individually; never force-add the event directory.{}",
         identity_gate_escape_suffix(identity_gate_closed)
     )
 }
@@ -2411,7 +2412,7 @@ pub(crate) fn certify_pr_delivery_event(
 }
 
 fn is_certified_pr_delivery_event(worktree: &Path, relative: &[u8]) -> bool {
-    if !is_canonical_bucketed_work_event_shard(relative) {
+    if classify_path(relative) != DeliveryPath::WorkEventShard {
         return false;
     }
     let Ok(relative) = std::str::from_utf8(relative) else {
@@ -2493,7 +2494,7 @@ fn work_event_path_states(worktree: &Path) -> Result<Vec<WorkEventPathState>, ()
         .split(|byte| *byte == 0)
         .filter(|path| !path.is_empty())
         .any(|path| {
-            is_canonical_bucketed_work_event_shard(path)
+            classify_path(path) == DeliveryPath::WorkEventShard
                 && !is_certified_pr_delivery_event(worktree, path)
         })
     {
@@ -2502,42 +2503,6 @@ fn work_event_path_states(worktree: &Path) -> Result<Vec<WorkEventPathState>, ()
     states.sort_unstable();
     states.dedup();
     Ok(states)
-}
-
-fn is_canonical_bucketed_work_event_shard(path: &[u8]) -> bool {
-    let mut components = path.split(|byte| *byte == b'/');
-    let Some(gwt) = components.next() else {
-        return false;
-    };
-    let Some(work) = components.next() else {
-        return false;
-    };
-    let Some(events) = components.next() else {
-        return false;
-    };
-    let Some(bucket) = components.next() else {
-        return false;
-    };
-    let Some(file_name) = components.next() else {
-        return false;
-    };
-    if components.next().is_some()
-        || (gwt, work, events) != (b".gwt", b"work", b"events")
-        || bucket.len() != 2
-        || !bucket
-            .iter()
-            .all(|byte| byte.is_ascii_digit() || matches!(*byte, b'a'..=b'f'))
-    {
-        return false;
-    }
-    let Some(digest) = file_name.strip_suffix(b".jsonl") else {
-        return false;
-    };
-    digest.len() == 64
-        && digest
-            .iter()
-            .all(|byte| byte.is_ascii_digit() || matches!(*byte, b'a'..=b'f'))
-        && bucket == &digest[..2]
 }
 
 fn event_commit_has_non_bookkeeping_change(
@@ -2574,7 +2539,10 @@ fn event_commit_has_non_bookkeeping_change(
                 .is_some_and(|suffix| suffix.first() == Some(&b'/'))
         {
             saw_event_path = true;
-        } else if !path.starts_with(b".gwt/") {
+        } else if matches!(
+            classify_path(path),
+            DeliveryPath::Product | DeliveryPath::TaskNotes
+        ) {
             saw_non_bookkeeping = true;
         }
     }
@@ -3866,7 +3834,7 @@ impl EvidenceStatus {
                 "the verification record belongs to a legacy, predecessor, or superseded execution binding — register the plan and rerun `verify.run` from the current generation"
             }
             Self::StaleFingerprint => {
-                "the worktree changed after the last verification run (stale evidence): source/verification inputs or non-exempt history changed — rerun `verify.run`; pr.create shard-addition-only commits and base merges with identical trees or only canonical shard additions preserve evidence"
+                "the worktree changed after the last verification run (stale evidence): source/verification inputs or non-exempt history changed — rerun `verify.run`; pr.create/pr.edit/pr.ready shard-addition-only commits and base merges with identical trees or only canonical shard additions preserve evidence"
             }
             Self::StaleFingerprintFiles(paths) => {
                 return format!(
@@ -9374,6 +9342,12 @@ mod tests {
             WorkEventSettlementStatus::Blocked(WorkEventSettlementBlocker::PathDirty { states })
         );
         assert_eq!(status.severity(), WorkEventSettlementSeverity::Blocked);
+        let WorkEventSettlementStatus::Blocked(blocker) = &status else {
+            unreachable!()
+        };
+        let message = work_event_settlement_blocker_description_with_gate(blocker, false, None);
+        assert!(message.contains("bookkeeping delivery"), "{message}");
+        assert!(message.contains("verification evidence"), "{message}");
     }
 
     #[test]

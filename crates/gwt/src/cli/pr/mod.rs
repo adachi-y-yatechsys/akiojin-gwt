@@ -684,6 +684,7 @@ pub(super) fn run<E: CliEnv>(
                         &pr,
                         mutation_binding.as_ref(),
                         head.as_deref(),
+                        false,
                     )?;
                     Ok(pr)
                 },
@@ -723,7 +724,7 @@ pub(super) fn run<E: CliEnv>(
                     if mutation_binding.is_some() {
                         record_explicit_pr_metadata(env, &pr, mutation_binding.as_ref())?;
                     } else {
-                        sync_edited_workspace_pr_metadata(env, &pr);
+                        sync_edited_workspace_pr_metadata(env, &pr)?;
                     }
                     Ok(pr)
                 },
@@ -872,8 +873,8 @@ pub(super) fn run<E: CliEnv>(
     Ok(code)
 }
 
-fn sync_edited_workspace_pr_metadata<E: CliEnv>(env: &E, pr: &PrStatus) {
-    sync_workspace_pr_metadata_for_target(env, pr, None, true);
+fn sync_edited_workspace_pr_metadata<E: CliEnv>(env: &E, pr: &PrStatus) -> std::io::Result<()> {
+    record_mutated_workspace_pr_metadata(env, pr, None, None, true)
 }
 
 // Explicit-number mutations can target somebody else's PR. The current-PR
@@ -891,7 +892,7 @@ fn record_explicit_pr_metadata<E: CliEnv>(
         ))
     })?;
     if current.is_some_and(|current| current.number == pr.number) {
-        record_mutated_workspace_pr_metadata(env, pr, binding, None)?;
+        record_mutated_workspace_pr_metadata(env, pr, binding, None, false)?;
     }
     Ok(())
 }
@@ -904,41 +905,43 @@ fn record_mutated_workspace_pr_metadata<E: CliEnv>(
     pr: &PrStatus,
     binding: Option<&gwt_agent::SessionExecutionBinding>,
     requested_head: Option<&str>,
+    require_existing_pr: bool,
 ) -> std::io::Result<()> {
-    let Some(binding) = binding else {
-        if let Some(event) = sync_workspace_pr_metadata(env, pr, requested_head) {
-            crate::cli::verification_record::certify_pr_delivery_event(env.repo_path(), &event)?;
-        }
-        return Ok(());
-    };
     let result = (|| {
-        let branch = current_branch_name(env.repo_path())
-            .ok_or_else(|| std::io::Error::other("current branch is unavailable"))?;
-        if requested_head.is_some_and(|head| {
-            !requested_head_matches_workspace_branch(env.repo_path(), head, Some(&branch))
-        }) {
-            return Ok(());
-        }
         let worktree = gwt_core::paths::resolve_current_worktree_root(env.repo_path());
-        let owner = match binding.owner_kind.as_str() {
-            "issue" => format!("Issue #{}", binding.owner_number),
-            "spec" => format!("SPEC-{}", binding.owner_number),
-            _ => return Err(std::io::Error::other("invalid execution owner kind")),
+        // Every successful mutation certifies the exact event returned by its
+        // writer, including legacy/unbound edits. Read-only synchronization
+        // and agent-authored events do not acquire this producer provenance.
+        let event = if let Some(binding) = binding {
+            let branch = current_branch_name(env.repo_path())
+                .ok_or_else(|| std::io::Error::other("current branch is unavailable"))?;
+            if requested_head.is_some_and(|head| {
+                !requested_head_matches_workspace_branch(env.repo_path(), head, Some(&branch))
+            }) {
+                return Ok(());
+            }
+            let owner = match binding.owner_kind.as_str() {
+                "issue" => format!("Issue #{}", binding.owner_number),
+                "spec" => format!("SPEC-{}", binding.owner_number),
+                _ => return Err(std::io::Error::other("invalid execution owner kind")),
+            };
+            let container = gwt_core::workspace_projection::WorkspaceExecutionContainerRef {
+                branch: Some(branch),
+                worktree_path: Some(std::fs::canonicalize(&worktree)?),
+                pr_number: Some(pr.number),
+                pr_url: Some(pr.url.clone()),
+                pr_state: Some(pr.state.to_string()),
+            };
+            gwt_core::workspace_projection::record_workspace_pr_metadata_for_execution(
+                &worktree,
+                &owner,
+                &binding.session_id,
+                &container,
+            )
+            .map_err(|error| std::io::Error::other(error.to_string()))?
+        } else {
+            sync_workspace_pr_metadata_for_target(env, pr, requested_head, require_existing_pr)
         };
-        let container = gwt_core::workspace_projection::WorkspaceExecutionContainerRef {
-            branch: Some(branch),
-            worktree_path: Some(std::fs::canonicalize(&worktree)?),
-            pr_number: Some(pr.number),
-            pr_url: Some(pr.url.clone()),
-            pr_state: Some(pr.state.to_string()),
-        };
-        let event = gwt_core::workspace_projection::record_workspace_pr_metadata_for_execution(
-            &worktree,
-            &owner,
-            &binding.session_id,
-            &container,
-        )
-        .map_err(|error| std::io::Error::other(error.to_string()))?;
         if let Some(event) = event {
             crate::cli::verification_record::certify_pr_delivery_event(&worktree, &event)?;
         }
@@ -2408,6 +2411,11 @@ mod tests {
 
         // A real source change must still refuse completion with this same run.
         std::fs::write(fixture.repo.join("src.txt"), "changed source\n").unwrap();
+        assert_eq!(
+            crate::cli::verification_record::evaluate_evidence(&fixture.repo, session_id, Some(42)),
+            crate::cli::verification_record::EvidenceStatus::StaleFingerprint,
+            "uncommitted product changes must remain protected"
+        );
         git(&["add", "--", "src.txt"]);
         fixture.commit("fix: change source after verification");
         fixture.push();
@@ -2462,6 +2470,40 @@ mod tests {
                 .unwrap()
                 .content_hash,
             verified.content_hash
+        );
+
+        // #4758 / #4556: a post-delivery edit without an execution binding
+        // uses the existing Work/PR target rather than the generation writer.
+        // Its metadata must not create another delivery/verification cycle.
+        let mut merged_pr = seeded_pr();
+        merged_pr.state = gwt_git::pr_status::PrState::Merged;
+        sync_edited_workspace_pr_metadata(&env, &merged_pr).unwrap();
+        for _ in 0..2 {
+            let receipt = crate::cli::verification_record::save_work_event_settlement_record(
+                &fixture.repo,
+                session_id,
+                false,
+            )
+            .unwrap();
+            assert!(
+                receipt.status.is_settled(),
+                "post-delivery PR editing must close in one cycle: {:?}",
+                receipt.status
+            );
+            assert!(!receipt.obligation_open);
+            sync_edited_workspace_pr_metadata(&env, &merged_pr).unwrap();
+        }
+        assert_eq!(
+            crate::cli::verification_record::evaluate_evidence(&fixture.repo, session_id, Some(42)),
+            crate::cli::verification_record::EvidenceStatus::Fresh
+        );
+        assert_eq!(
+            crate::cli::hook::work_event_settlement_stop_check::handle_with_input(
+                &fixture.repo,
+                r#"{"stop_hook_active":false}"#,
+                Some(session_id),
+            ),
+            crate::cli::hook::HookOutput::Silent
         );
 
         // The same kind and metadata are not proof of a delivery operation.
