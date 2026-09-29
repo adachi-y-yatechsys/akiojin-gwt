@@ -22,7 +22,13 @@ export type ExactRelaunchInvocation = {
  * Never writes durable gwt Sessions, execution ledgers, or Work records.
  * Each invocation owns a fresh HOME, retained as evidence after cleanup.
  */
-export async function startExactRelaunchFixture(testInfo: TestInfo) {
+export type ExactRelaunchSetup = {
+  prepare?: (context: { home: string; bin: string; project: string; env: NodeJS.ProcessEnv }) => Promise<void>;
+  monitorPreferences?: Record<string, unknown>;
+  beforeStart?: (context: { home: string; project: string; env: NodeJS.ProcessEnv; preferences: string }) => Promise<void>;
+};
+
+export async function startExactRelaunchFixture(testInfo: TestInfo, setup: ExactRelaunchSetup = {}) {
   if (process.platform === "win32") throw new Error("Exact relaunch fixture requires POSIX executables");
   const root = resolve(process.env.GWT_PLAYWRIGHT_CHECKOUT_ROOT ?? process.cwd());
   const gwt = join(root, "target/debug/gwt");
@@ -120,6 +126,7 @@ readline.createInterface({input:process.stdin}).on('line', line => {
     GIT_TERMINAL_PROMPT: "0", GH_PROMPT_DISABLED: "1",
     GWT_HOOK_BIN: "gwtd", GWT_PROJECT_ROOT: project,
   });
+  await setup.prepare?.({ home, bin, project, env });
   const status = spawnSync(gwtd, [], {
     cwd: project, env, encoding: "utf8", timeout: 30_000,
     input: JSON.stringify({ schema_version: 1, operation: "issue.monitor.status", params: {} }),
@@ -133,11 +140,13 @@ readline.createInterface({input:process.stdin}).on('line', line => {
   const preferences = join(state, "projects", hash, "project-state");
   await mkdir(preferences, { recursive: true });
   await writeFile(join(preferences, "pm.json"), JSON.stringify({ settings: { auto_start: false } }));
-  await writeFile(join(preferences, "issue-monitor.json"), JSON.stringify({ enabled: false, max_active_agents: 1, priority_order: [] }));
+  await writeFile(join(preferences, "issue-monitor.json"), JSON.stringify({ enabled: false, max_active_agents: 1, priority_order: [], ...setup.monitorPreferences }));
   await writeFile(join(state, "session.json"), JSON.stringify({
     tabs: [{ id: "exact-relaunch", title: "exact-relaunch", project_root: project, kind: "git" }],
     active_tab_id: "exact-relaunch", recent_projects: [],
   }));
+
+  await setup.beforeStart?.({ home, project, env, preferences });
 
   let child: ChildProcess | undefined;
   let incarnation = 0;

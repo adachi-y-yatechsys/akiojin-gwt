@@ -5676,6 +5676,10 @@ impl AppRuntime {
                 }
                 let monitor = *monitor;
                 if let Some(project_root) = project_root {
+                    self.replace_knowledge_terminal_queue(
+                        project_root,
+                        &monitor.status_view().terminal_queue,
+                    );
                     self.replace_knowledge_monitor_snapshot(project_root, &monitor.inbox);
                 }
                 // The worker already loaded and committed the canonical prefs.
@@ -6334,6 +6338,7 @@ impl AppRuntime {
         gwt::scan_issue_monitor_candidates(&mut monitor, &issues, &now);
         // Cache-backed quick view: a read model, not monitor-driven activity —
         // it must not feed (or reset) the PM wake fingerprint.
+        self.replace_knowledge_terminal_queue(project_root, &monitor.status_view().terminal_queue);
         self.replace_knowledge_monitor_snapshot(project_root, &monitor.inbox);
         self.issue_monitor_snapshot_events_without_wake(client_id, Some(project_root), monitor)
     }
@@ -7217,6 +7222,10 @@ impl AppRuntime {
         // so display refreshes cannot reset the wake baseline.
         let mut events = Vec::new();
         if let Some(project_root) = project_root {
+            self.replace_knowledge_terminal_queue(
+                project_root,
+                &monitor.status_view().terminal_queue,
+            );
             self.replace_knowledge_monitor_snapshot(project_root, &monitor.inbox);
             events.extend(self.pm_wake_events(project_root, &monitor.inbox));
         }
@@ -7233,6 +7242,7 @@ impl AppRuntime {
         project_root: &Path,
         status: Box<gwt::IssueMonitorStatusView>,
     ) -> Vec<OutboundEvent> {
+        self.replace_knowledge_terminal_queue(project_root, &status.terminal_queue);
         let Some(context) = self.project_context_for_root(project_root) else {
             return Vec::new();
         };
@@ -8038,6 +8048,8 @@ impl AppRuntime {
             | FrontendEvent::IssueMonitorLaunchNow { .. }
             | FrontendEvent::IssueMonitorQueuePush { .. }
             | FrontendEvent::IssueMonitorQueueRemove { .. }
+            | FrontendEvent::IssueMonitorQueueMove { .. }
+            | FrontendEvent::SetIssueMonitorAutoRefill { .. }
             | FrontendEvent::IssueMonitorRequeue { .. }
             | FrontendEvent::IssueMonitorConfigureIssue { .. }
             | FrontendEvent::QuickRegisterIssue { .. } => {
@@ -9110,6 +9122,43 @@ impl AppRuntime {
                     "queue-remove",
                     |monitor| {
                         monitor.terminal_queue_remove(&issue_numbers, &now);
+                    },
+                )
+            }
+            FrontendEvent::IssueMonitorQueueMove {
+                issue_number,
+                position,
+            } => {
+                let publication = self.publish_project_issue_monitor_control(
+                    context,
+                    serde_json::json!({"terminal_queue_move": {"issue_number": issue_number, "position": position}}),
+                );
+                self.issue_monitor_control_result_events(
+                    context,
+                    &client_id,
+                    publication,
+                    "queue-move",
+                    |monitor| {
+                        monitor.terminal_queue_move(
+                            issue_number,
+                            position,
+                            &chrono::Utc::now().to_rfc3339(),
+                        );
+                    },
+                )
+            }
+            FrontendEvent::SetIssueMonitorAutoRefill { enabled, limit } => {
+                let publication = self.publish_project_issue_monitor_control(
+                    context,
+                    serde_json::json!({"terminal_queue_auto_refill": {"enabled": enabled, "limit": limit}}),
+                );
+                self.issue_monitor_control_result_events(
+                    context,
+                    &client_id,
+                    publication,
+                    "auto-refill",
+                    |monitor| {
+                        monitor.set_terminal_queue_auto_refill(enabled, limit);
                     },
                 )
             }

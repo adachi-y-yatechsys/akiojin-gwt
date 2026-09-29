@@ -297,8 +297,8 @@ fn embedded_web_issue_surface_exposes_monitor_priority_and_concurrency_controls(
         "Issue Monitor must let users change max active agents"
     );
     assert!(
-        surface_js.contains("reorder_issue_monitor_issues"),
-        "Issue Monitor must send priority reorder events"
+        surface_js.contains("issue_monitor_queue_move"),
+        "Issue Monitor must send terminal queue move events"
     );
     assert!(
         surface_js.contains("↑")
