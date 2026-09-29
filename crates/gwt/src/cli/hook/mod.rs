@@ -139,13 +139,13 @@ impl HookKind {
 /// session identity is intentionally kept out of this permissive event shape;
 /// managed hook paths must parse the raw payload and promote the raw
 /// `session_id` into a required session id type before using it.
+/// Parsed through [`RawHookEvent`] so a payload carrying both the snake_case
+/// and camelCase spelling of a key is accepted (Issue #4768).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(from = "RawHookEvent")]
 pub struct HookEvent {
-    #[serde(alias = "toolName")]
     pub tool_name: Option<String>,
-    #[serde(alias = "toolInput")]
     pub tool_input: Option<serde_json::Value>,
-    #[serde(alias = "transcriptPath")]
     pub transcript_path: Option<String>,
     pub cwd: Option<String>,
 }
@@ -766,6 +766,20 @@ mod tests {
     use crate::cli::test_support::{commands_for_event, ScopedEnvVar};
 
     use super::*;
+
+    /// Issue #4768: policy hooks parse the same Grok payload that carries
+    /// `toolName` and `tool_name` together.
+    #[test]
+    fn hook_event_accepts_grok_payload_with_both_key_spellings() {
+        let event = HookEvent::read_from_str(
+            r#"{"sessionId":"g","session_id":"g","toolName":"run_command","tool_name":"Bash","toolInput":{"command":"pwd"},"tool_input":{"command":"ls"}}"#,
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(event.tool_name.as_deref(), Some("Bash"));
+        assert_eq!(event.command(), Some("ls"));
+    }
 
     #[test]
     fn resident_pm_policy_recognizes_nested_cwd_only_under_canonical_pm_worktree() {
