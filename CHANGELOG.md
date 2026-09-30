@@ -1,6 +1,36 @@
 # Changelog
 
 All notable changes to this project will be documented in this file.
+## [9.106.0] - 2026-09-30
+
+### Bug Fixes
+
+- **test:** 継続診断とdaemon準備・deadline検証の実時間依存を解消
+- **test:** 子 gwtd と resolver テストの daemon 起動予算を明示的に渡す
+- **issue-monitor:** 終了分類で起動キャッシュに依存しない
+- **issue-monitor:** 失敗通知の再送で試行を二重計上しない
+- **issue-monitor:** 終了診断でpaneロックを待たない
+- **workspace:** 同一 branch 行の代表選択を時刻の文字列比較から実時刻比較に直す
+- Monitor再起動のhook配送とActivated候補のACKを修復
+- MonitorのBlocked Resumeをfreshへ切り替えscan復旧を非同期化
+- **hooks:** UTF-16復号を固定長チャンクAPIへ更新
+
+### Features
+
+- **issue-monitor:** 自動モデル段選択と障害別昇格を追加
+
+### Miscellaneous Tasks
+
+- **work:** 自動モデル段選択の検証引継ぎを記録
+- **work:** Work イベント記録を追加
+- **work:** 再起動修正の継承と受け入れ条件監査を記録
+
+### Testing
+
+- Readiness再試行回数の期待を製品契約に合わせる
+- **issue-monitor:** 失敗済み binding の再採用テストを明示投入キュー前提に合わせる
+- 管理hookの検査をEncodedCommandの復号後に行う
+
 ## [9.105.0] - 2026-09-30
 
 ### Bug Fixes
