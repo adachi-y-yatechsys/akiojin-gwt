@@ -34978,7 +34978,7 @@ mod tests {
             },
         );
         monitor.set_gui_connected(true);
-        monitor.record_candidate(issue(42));
+        scan_queued_candidates(&mut monitor, &[issue(42)], "2026-09-29T00:00:00Z");
         assert!(monitor.apply_confirmed_claim(
             42,
             "failed-claim",
