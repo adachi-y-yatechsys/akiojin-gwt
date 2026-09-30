@@ -351,6 +351,14 @@ fn handle_at(
          Build a stalled-item inventory covering `needs_human`, decision waits, ownerless PRs, \
          red or escalation-due PRs, and quiet agents; advance at least one item with a concrete \
          action or user handoff. \
+         Sweep orphan agent windows every cycle: compare `active_session_count` against \
+         `gui_status.active_count` and the rows `pane.list` returns. A window the Monitor no \
+         longer tracks keeps burning a provider session and can crowd the launch path, and no \
+         other snapshot reports it — only that gap does. Close each orphan with `pane.close`, \
+         and when a row still claims a window that is gone, release the slot with \
+         `issue.monitor.stop` (it needs `reason`; `pane.close` alone leaves the row holding the \
+         slot), then `issue.monitor.requeue` that Issue, because the stop counts as a failed \
+         attempt against it. \
          Treat that required advance or handoff as a reportable milestone or escalation under \
          the shared conditional-reporting clause below. \
          Re-report every unresolved wait in every cycle using the window title and required user \
@@ -816,6 +824,17 @@ mod tests {
             "`board.post` with a mention or `pm.message.send`",
             "never inject launch or bootstrap instructions past the Issue Monitor",
             "A launch left idle without a directive is never a no-change cycle",
+            // An orphan window is reported by no snapshot except the gap
+            // between the session count and the tracked launches, so the
+            // sweep has to be named in the highest-frequency prompt or a
+            // fresh PM session never performs it.
+            "Sweep orphan agent windows every cycle",
+            "compare `active_session_count` against `gui_status.active_count`",
+            "keeps burning a provider session",
+            "Close each orphan with `pane.close`",
+            "release the slot with `issue.monitor.stop`",
+            "`pane.close` alone leaves the row holding the slot",
+            "the stop counts as a failed attempt against it",
         ] {
             assert!(
                 reason.contains(phrase),
