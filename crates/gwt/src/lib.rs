@@ -29,6 +29,7 @@ pub mod file_content;
 pub mod file_tree;
 pub mod gui_single_instance;
 pub mod handlers;
+pub mod index_resources;
 pub mod index_search;
 mod index_status_projection;
 pub mod index_worker;

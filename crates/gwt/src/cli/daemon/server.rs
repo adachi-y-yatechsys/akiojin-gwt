@@ -61,67 +61,47 @@ const ISSUE_MONITOR_SCAN_TIMEOUT: Duration = Duration::from_secs(60);
 /// Issue #3933 AC-3: the ceiling on a candidate-proportional scan budget, so a
 /// pathological in-flight count cannot let one scan run unbounded.
 const ISSUE_MONITOR_SCAN_BUDGET_CEILING: Duration = Duration::from_secs(300);
-const ISSUE_MONITOR_PREFS_TIMEOUT: Duration = Duration::from_millis(250);
+/// The prefs read-lock-modify-write budget (Issue #4033, SPEC #4740).
+const ISSUE_MONITOR_PREFS_BUDGET: gwt_core::deadline_budget::DeadlineBudget =
+    gwt_core::deadline_budget::DeadlineBudget::new(
+        "ISSUE_MONITOR_PREFS",
+        Duration::from_millis(250),
+    );
 const ISSUE_MONITOR_STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const ISSUE_MONITOR_AUTHORITY_RETRY_DELAY: Duration = Duration::from_millis(50);
 const DAEMON_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
-#[cfg(all(test, unix))]
-thread_local! {
-    /// Per-test prefs budget (Issue #4033).
-    ///
-    /// Deliberately thread-local rather than an environment variable: a dozen
-    /// sibling tests hold the prefs lock and depend on the *default* budget
-    /// expiring quickly, and none of them take the process-wide env lock. A
-    /// global override would silently make those tests wait out a relaxed
-    /// budget instead. One test per thread makes this override exact.
-    static ISSUE_MONITOR_PREFS_TIMEOUT_OVERRIDE: std::cell::Cell<Option<Duration>> =
-        const { std::cell::Cell::new(None) };
-}
-
 /// Pin the prefs budget for the current test thread until dropped.
+///
+/// Thread-scoped on purpose: sibling tests hold the prefs lock and pin the
+/// short budget they assert on, and none of them take the process-wide env
+/// lock. A prefs transaction that runs on another thread is pinned through
+/// `GWT_TEST_BUDGET_ISSUE_MONITOR_PREFS_MS` under the env lock instead.
 #[cfg(all(test, unix))]
-struct ScopedIssueMonitorPrefsTimeout {
-    previous: Option<Duration>,
-}
+struct ScopedIssueMonitorPrefsTimeout(
+    #[allow(dead_code)] gwt_core::deadline_budget::ScopedDeadlineBudget,
+);
 
 #[cfg(all(test, unix))]
 impl ScopedIssueMonitorPrefsTimeout {
     fn set(timeout: Duration) -> Self {
-        Self {
-            previous: ISSUE_MONITOR_PREFS_TIMEOUT_OVERRIDE
-                .with(|current| current.replace(Some(timeout))),
-        }
-    }
-}
-
-#[cfg(all(test, unix))]
-impl Drop for ScopedIssueMonitorPrefsTimeout {
-    fn drop(&mut self) {
-        ISSUE_MONITOR_PREFS_TIMEOUT_OVERRIDE.with(|current| current.set(self.previous));
+        Self(gwt_core::deadline_budget::ScopedDeadlineBudget::pin(
+            &ISSUE_MONITOR_PREFS_BUDGET,
+            timeout,
+        ))
     }
 }
 
 /// The single seam for the prefs read-lock-modify-write budget.
 ///
-/// Issue #4033: every prefs transaction must go through this accessor, not
-/// through [`ISSUE_MONITOR_PREFS_TIMEOUT`] directly. A test that asserts on a
-/// transaction's *outcome* is otherwise asserting on how fast the runner's
-/// filesystem happened to be that minute, and a loaded CI host silently
-/// converts a passing state machine into a failing one.
+/// Issue #4033: every prefs transaction must go through this accessor. A test
+/// that asserts on a transaction's *outcome* is otherwise asserting on how
+/// fast the runner's filesystem happened to be that minute, and a loaded CI
+/// host silently converts a passing state machine into a failing one. SPEC
+/// #4740 load mode (`GWT_TEST_SHRINK_BUDGETS=1`) shrinks it to expose tests
+/// that still lean on the default.
 fn issue_monitor_prefs_timeout() -> Duration {
-    #[cfg(all(test, unix))]
-    if let Some(timeout) = ISSUE_MONITOR_PREFS_TIMEOUT_OVERRIDE.with(std::cell::Cell::get) {
-        return timeout;
-    }
-    #[cfg(all(test, unix))]
-    if let Some(timeout) = std::env::var_os("GWT_TEST_ISSUE_MONITOR_PREFS_TIMEOUT_MS")
-        .and_then(|value| value.to_string_lossy().parse::<u64>().ok())
-        .filter(|timeout| *timeout <= 60_000)
-    {
-        return Duration::from_millis(timeout);
-    }
-    ISSUE_MONITOR_PREFS_TIMEOUT
+    ISSUE_MONITOR_PREFS_BUDGET.resolve()
 }
 
 /// How often a serving daemon re-checks that its endpoint descriptor is still
@@ -983,7 +963,7 @@ fn spawn_issue_monitor_worker_with_lease(
                                 completion.reject(IssueMonitorControlQueueError::Rejected);
                                 continue;
                             };
-                            if let Some(control) = decode_issue_monitor_control(payload) {
+                            if let Some(control) = decode_issue_monitor_control_in_repo(payload, Some(&scope.project_root)) {
                                 let Some(next_revision) = revision.checked_add(1) else {
                                     tracing::error!("issue monitor revision exhausted; stopping worker");
                                     completion.reject(IssueMonitorControlQueueError::Closed);
@@ -1827,6 +1807,14 @@ enum IssueMonitorControl {
     TerminalQueuePush(Vec<u64>),
     /// SPEC #3165 TQ-9: remove Issues from this terminal's explicit queue.
     TerminalQueueRemove(Vec<u64>),
+    TerminalQueueMove {
+        issue_number: u64,
+        position: usize,
+    },
+    TerminalQueueAutoRefill {
+        enabled: bool,
+        limit: usize,
+    },
     /// SPEC-3431 FR-006: request one immediate scan without changing any
     /// state. The PM's `launch_now` writes the new priority order to prefs
     /// (the SOT the driver re-reads each scan) and then sends this so the
@@ -2545,6 +2533,14 @@ fn apply_routine_issue_monitor_control(
             );
             true
         }
+        IssueMonitorControl::TerminalQueueMove {
+            issue_number,
+            position,
+        } => monitor.terminal_queue_move(issue_number, position, &chrono::Utc::now().to_rfc3339()),
+        IssueMonitorControl::TerminalQueueAutoRefill { enabled, limit } => {
+            monitor.set_terminal_queue_auto_refill(enabled, limit);
+            true
+        }
         IssueMonitorControl::TerminalQueueRemove(issue_numbers) => {
             monitor.terminal_queue_remove(&issue_numbers, &chrono::Utc::now().to_rfc3339());
             true
@@ -2922,7 +2918,26 @@ fn try_apply_accepted_issue_monitor_control_with_disk_migration_observed(
     }
 }
 
+/// SPEC #4778 AC-1: `repo_path` is what lets an ON frame be believed.
+///
+/// The handler that published the frame checked the caller's PM registration,
+/// but a frame is just bytes on a channel, so the daemon re-checks the session
+/// id it carries against this repository's PM registry. Passing `None` means no
+/// registry is reachable, and then ON stays refused exactly as before.
+// Only the tests decode without a repository: the worker always has
+// `scope.project_root`, so a production build has no caller for this shape.
+// Some of those tests are platform-gated, so on Windows the test build can
+// compile every caller out — the helper is still the right shape to keep.
+#[cfg(test)]
+#[allow(dead_code)]
 fn decode_issue_monitor_control(payload: serde_json::Value) -> Option<IssueMonitorControl> {
+    decode_issue_monitor_control_in_repo(payload, None)
+}
+
+fn decode_issue_monitor_control_in_repo(
+    payload: serde_json::Value,
+    repo_path: Option<&std::path::Path>,
+) -> Option<IssueMonitorControl> {
     match crate::runtime_daemon_events::decode_runtime_daemon_event(
         crate::runtime_daemon_events::ISSUE_MONITOR_CHANNEL,
         payload,
@@ -2979,8 +2994,24 @@ fn decode_issue_monitor_control(payload: serde_json::Value) -> Option<IssueMonit
                         .ok()?,
                     ),
                 };
-                if enabled == Some(true)
-                    || autonomous_mode == Some(true)
+                let resident_pm = config
+                    .get("resident_pm_session")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|session| !session.is_empty())
+                    .is_some_and(|session| {
+                        repo_path.is_some_and(|repo| {
+                            crate::pm_registry::session_is_registered_pm(
+                                &crate::pm_registry::pm_prefs_path_for_repo_path(repo),
+                                session,
+                            ) || crate::pm_registry::pm_repository_key(repo).is_some_and(|key| {
+                                crate::pm_registry::pm_registrations_for_repository(&key)
+                                    .iter()
+                                    .any(|record| record.registration.session_id == session)
+                            })
+                        })
+                    });
+                if (!resident_pm && (enabled == Some(true) || autonomous_mode == Some(true)))
                     || max_active_agents == Some(0)
                     || (enabled.is_none()
                         && autonomous_mode.is_none()
@@ -3337,6 +3368,18 @@ fn decode_issue_monitor_control(payload: serde_json::Value) -> Option<IssueMonit
                     .collect::<Option<Vec<_>>>()?;
                 return Some(IssueMonitorControl::TerminalQueuePush(issue_numbers));
             }
+            if let Some(move_entry) = payload.get("terminal_queue_move") {
+                return Some(IssueMonitorControl::TerminalQueueMove {
+                    issue_number: move_entry.get("issue_number")?.as_u64()?,
+                    position: usize::try_from(move_entry.get("position")?.as_u64()?).ok()?,
+                });
+            }
+            if let Some(refill) = payload.get("terminal_queue_auto_refill") {
+                return Some(IssueMonitorControl::TerminalQueueAutoRefill {
+                    enabled: refill.get("enabled")?.as_bool()?,
+                    limit: usize::try_from(refill.get("limit")?.as_u64()?).ok()?,
+                });
+            }
             if let Some(remove) = payload.get("terminal_queue_remove") {
                 let issue_numbers = remove
                     .get("issue_numbers")?
@@ -3506,7 +3549,7 @@ fn persist_daemon_issue_monitor_state(
     persist_daemon_issue_monitor_state_observed(
         prefs_path,
         monitor,
-        ISSUE_MONITOR_PREFS_TIMEOUT,
+        issue_monitor_prefs_timeout(),
         || {},
     )
 }
@@ -4082,7 +4125,15 @@ fn issue_monitor_http_client_with_repository(
     let (owner, repo) =
         crate::issue_monitor_worker::github_remote_owner_and_repo(&scope.project_root)
             .map_err(|error| error.to_string())?;
-    let client = HttpIssueClient::from_gh_auth(&owner, &repo).map_err(|error| error.to_string())?;
+    let client = HttpIssueClient::from_owner_environment_with_deadline(
+        &owner,
+        &repo,
+        &gwt_github::client::ResolutionDeadline::new(
+            Duration::from_secs(5),
+            Duration::from_secs(30),
+        ),
+    )
+    .map_err(|error| error.to_string())?;
     Ok((
         client,
         gwt_github::client::RepositoryIdentity::new(owner, repo),
@@ -5513,12 +5564,29 @@ mod tests {
 
     use super::{
         apply_issue_monitor_control, build_handshake_response, decode_issue_monitor_control,
-        handle_connection, issue_monitor_control_is_authorizing, run_server,
+        decode_issue_monitor_control_in_repo, handle_connection,
+        issue_monitor_control_is_authorizing, run_server,
         run_server_with_shutdown_and_worker_config, spawn_issue_monitor_worker_with_config,
         spawn_issue_monitor_worker_with_config_and_scan_probe,
         spawn_issue_monitor_worker_with_config_and_timeout, BroadcastHub, ConnectionGuard,
         DaemonShutdown, IssueMonitorControl, IssueMonitorScanConcurrencyProbe,
     };
+
+    /// SPEC #4740: pin the prefs budget for a test whose verdict must not
+    /// depend on how fast the runner's filesystem is. Load mode
+    /// (`GWT_TEST_SHRINK_BUDGETS=1`) fails every test that leans on the
+    /// production default instead.
+    fn pin_prefs_hang_guard() -> super::ScopedIssueMonitorPrefsTimeout {
+        super::ScopedIssueMonitorPrefsTimeout::set(gwt_core::deadline_budget::HANG_GUARD)
+    }
+
+    /// SPEC #4778 AC-1: these cases exercise frame shape, not PM authority, so
+    /// they decode with no registry reachable — the strictest of the two paths.
+    fn decode_issue_monitor_control_for_test(
+        payload: serde_json::Value,
+    ) -> Option<IssueMonitorControl> {
+        decode_issue_monitor_control(payload)
+    }
 
     /// Issue #3766 AC-1 regression: a duplicate `gwtd` start against a socket
     /// that a live daemon is still serving must refuse to start instead of
@@ -5702,6 +5770,30 @@ mod tests {
                 .expect("parse reclaimed descriptor");
         assert_eq!(reclaimed.pid, ours.pid);
         assert_eq!(reclaimed.auth_token, ours.auth_token);
+    }
+
+    #[test]
+    fn monitor_http_client_rejects_non_loopback_test_override() {
+        let _env_lock = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = TempDir::new().expect("tempdir");
+        let _home = ScopedGwtHome::set(temp.path().join("home"));
+        let _token = ScopedEnvVar::set("GH_TOKEN", "fixture-only");
+        let _mode = ScopedEnvVar::set("GWT_OWNER_GITHUB_TEST_MODE", "loopback-v1");
+        let _rest = ScopedEnvVar::set("GWT_OWNER_GITHUB_REST_BASE", "https://example.invalid");
+        let _graphql =
+            ScopedEnvVar::set("GWT_OWNER_GITHUB_GRAPHQL_URL", "http://127.0.0.1:1/graphql");
+        let _owner_token = ScopedEnvVar::set("GWT_OWNER_GITHUB_TOKEN", "fixture-only");
+        let fake_gh = write_fake_gh_issue_list(temp.path());
+        let _path = prepend_fake_gh_to_path(&fake_gh);
+        let _gh = ScopedEnvVar::set("GWT_TEST_GH", &fake_gh);
+        init_git_repo(temp.path());
+        git_remote_add_origin(temp.path(), "https://github.com/fixture/queue.git");
+        let error = super::issue_monitor_http_client(&sample_scope(&temp))
+            .err()
+            .expect("non-loopback test override must fail closed");
+        assert!(error.contains("loopback"), "{error}");
     }
 
     fn sample_endpoint(scope: RuntimeScope, socket_path: &Path, token: &str) -> DaemonEndpoint {
@@ -6828,6 +6920,7 @@ exit 0
             enabled: true,
             ..crate::IssueMonitorConfig::default()
         });
+        monitor.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
         monitor.record_candidate(sample_issue_monitor_issue(42));
         assert!(monitor.apply_confirmed_claim(
             42,
@@ -6915,6 +7008,7 @@ exit 0
             enabled: true,
             ..crate::IssueMonitorConfig::default()
         });
+        claim_monitor.terminal_queue_push(&[44], "test", "2026-07-27T00:00:00Z");
         claim_monitor.record_candidate(sample_issue_monitor_issue(44));
         super::publish_issue_monitor_payloads(&hub, &mut claim_monitor, &project_store);
         assert_eq!(
@@ -7300,6 +7394,7 @@ exit 0
 
     #[tokio::test]
     async fn issue_monitor_control_ack_follows_agent_projection_update() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let initial = crate::IssueMonitorPrefs {
@@ -7367,6 +7462,28 @@ exit 0
 
         assert_eq!(projected, monitor.agent_status());
         assert_eq!(projected.max_active, 3);
+    }
+
+    fn scheduled_issue_monitor_prefs(
+        mut prefs: crate::IssueMonitorPrefs,
+        numbers: &[u64],
+    ) -> crate::IssueMonitorPrefs {
+        let queue = prefs
+            .terminal_queues
+            .entry(crate::process::current_hostname())
+            .or_default();
+        for number in numbers {
+            if !queue.entries.iter().any(|entry| entry.number == *number) {
+                queue
+                    .entries
+                    .push(crate::issue_monitor::IssueMonitorTerminalQueueEntry {
+                        number: *number,
+                        queued_at: "2026-07-27T00:00:00Z".to_string(),
+                        queued_by: "test".to_string(),
+                    });
+            }
+        }
+        prefs
     }
 
     fn sample_issue_monitor_profile() -> crate::IssueMonitorLaunchProfile {
@@ -7630,6 +7747,7 @@ exit 0
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn ambiguous_launch_failed_receipt_replays_autonomous_retry_once() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let _env_lock = crate::env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -7645,6 +7763,7 @@ exit 0
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn ambiguous_agent_failed_receipt_replays_autonomous_retry_once() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let _env_lock = crate::env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -7660,6 +7779,7 @@ exit 0
 
     #[test]
     fn distinct_pre_materialization_failure_admission_is_not_deduped_by_last_receipt() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let mut monitor = crate::IssueMonitorState::with_prefs(
@@ -7742,6 +7862,7 @@ exit 0
 
     #[test]
     fn receipt_retry_reuses_the_first_processing_timestamp() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let mut monitor = crate::IssueMonitorState::with_prefs(
@@ -8036,13 +8157,14 @@ exit 0
         });
         assert!(!monitor.autonomous_mode());
 
-        let arm =
-            decode_issue_monitor_control(crate::runtime_daemon_events::issue_monitor_payload(
+        let arm = decode_issue_monitor_control_for_test(
+            crate::runtime_daemon_events::issue_monitor_payload(
                 "control",
                 serde_json::json!({ "autonomous_mode": true }),
                 std::process::id() + 1,
-            ))
-            .expect("arm control decodes");
+            ),
+        )
+        .expect("arm control decodes");
         assert!(
             apply_issue_monitor_control(&mut monitor, arm),
             "rescan requested"
@@ -8050,13 +8172,14 @@ exit 0
         assert!(monitor.autonomous_mode(), "kill switch armed");
         assert!(monitor.status_view().autonomous_mode);
 
-        let disarm =
-            decode_issue_monitor_control(crate::runtime_daemon_events::issue_monitor_payload(
+        let disarm = decode_issue_monitor_control_for_test(
+            crate::runtime_daemon_events::issue_monitor_payload(
                 "control",
                 serde_json::json!({ "autonomous_mode": false }),
                 std::process::id() + 1,
-            ))
-            .expect("disarm control decodes");
+            ),
+        )
+        .expect("disarm control decodes");
         apply_issue_monitor_control(&mut monitor, disarm);
         assert!(!monitor.autonomous_mode(), "kill switch disarmed");
     }
@@ -8159,15 +8282,16 @@ exit 0
             },
         );
 
-        let live =
-            decode_issue_monitor_control(crate::runtime_daemon_events::issue_monitor_payload(
+        let live = decode_issue_monitor_control_for_test(
+            crate::runtime_daemon_events::issue_monitor_payload(
                 "control",
                 serde_json::json!({
                     "requeue": { "issue_number": 43, "reason": "operator recovery" }
                 }),
                 std::process::id() + 1,
-            ))
-            .expect("requeue decodes");
+            ),
+        )
+        .expect("requeue decodes");
         assert!(
             !apply_issue_monitor_control(&mut monitor, live),
             "a row a launch still owns must not be recovered by this control"
@@ -8178,15 +8302,16 @@ exit 0
             "the live launch must be untouched"
         );
 
-        let dead =
-            decode_issue_monitor_control(crate::runtime_daemon_events::issue_monitor_payload(
+        let dead = decode_issue_monitor_control_for_test(
+            crate::runtime_daemon_events::issue_monitor_payload(
                 "control",
                 serde_json::json!({
                     "requeue": { "issue_number": 42, "reason": "operator recovery" }
                 }),
                 std::process::id() + 1,
-            ))
-            .expect("requeue decodes");
+            ),
+        )
+        .expect("requeue decodes");
         assert!(
             apply_issue_monitor_control(&mut monitor, dead),
             "releasing a dead hold must request a scan so the row runs now"
@@ -8451,6 +8576,7 @@ exit 0
 
     #[test]
     fn window_closed_transaction_adopts_disk_successor_claim_before_exact_cas() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let predecessor = crate::IssueMonitorPrefs {
@@ -8527,8 +8653,8 @@ exit 0
                 ..crate::IssueMonitorPrefs::default()
             },
         );
-        let legacy =
-            decode_issue_monitor_control(crate::runtime_daemon_events::issue_monitor_payload(
+        let legacy = decode_issue_monitor_control_for_test(
+            crate::runtime_daemon_events::issue_monitor_payload(
                 "control",
                 serde_json::json!({
                     "window_closed": {
@@ -8536,8 +8662,9 @@ exit 0
                     }
                 }),
                 std::process::id() + 1,
-            ))
-            .expect("legacy targetless close still decodes");
+            ),
+        )
+        .expect("legacy targetless close still decodes");
 
         assert!(!apply_issue_monitor_control(&mut monitor, legacy));
         assert_eq!(monitor.active_count(), 1);
@@ -8657,6 +8784,7 @@ exit 0
 
     #[tokio::test]
     async fn review_verdict_ack_preserves_exact_effect_authority_epoch_and_journal() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let attempting = crate::PendingIssueMonitorEffect {
@@ -8700,6 +8828,7 @@ exit 0
             }],
             ..crate::IssueMonitorPrefs::default()
         };
+        let initial = scheduled_issue_monitor_prefs(initial, &[77]);
         crate::save_issue_monitor_prefs(&prefs_path, &initial).expect("seed durable journal");
         let mut monitor = crate::IssueMonitorState::with_prefs(
             crate::IssueMonitorConfig::default(),
@@ -8738,6 +8867,7 @@ exit 0
 
     #[tokio::test]
     async fn launched_ack_preserves_exact_effect_authority_epoch_and_journal() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let attempting = crate::PendingIssueMonitorEffect {
@@ -8764,6 +8894,7 @@ exit 0
             }],
             ..crate::IssueMonitorPrefs::default()
         };
+        let initial = scheduled_issue_monitor_prefs(initial, &[77]);
         crate::save_issue_monitor_prefs(&prefs_path, &initial).expect("seed durable journal");
         let mut monitor = crate::IssueMonitorState::with_prefs(
             crate::IssueMonitorConfig::default(),
@@ -8803,6 +8934,7 @@ exit 0
             enabled: true,
             ..crate::IssueMonitorConfig::default()
         });
+        monitor.terminal_queue_push(&[42], "test", "2026-07-02T00:00:00Z");
         monitor.set_gui_connected(true);
         monitor.record_claimed(
             crate::IssueMonitorIssue {
@@ -8848,6 +8980,7 @@ exit 0
             enabled: true,
             ..crate::IssueMonitorConfig::default()
         });
+        monitor.terminal_queue_push(&[42], "test", "2026-07-02T00:00:00Z");
         monitor.set_gui_connected(true);
         monitor.record_claimed(
             crate::IssueMonitorIssue {
@@ -8893,6 +9026,7 @@ exit 0
             enabled: true,
             ..crate::IssueMonitorConfig::default()
         });
+        monitor.terminal_queue_push(&[42], "test", "2026-07-02T00:00:00Z");
         monitor.set_gui_connected(true);
         monitor.record_claimed(
             crate::IssueMonitorIssue {
@@ -9004,6 +9138,7 @@ exit 0
             ..crate::IssueMonitorConfig::default()
         });
         monitor.set_gui_connected(true);
+        monitor.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
         monitor.record_claimed(sample_issue_monitor_issue(42), "claim-directory-trust");
         monitor
             .next_launch_request("2026-08-29T00:00:00Z")
@@ -9055,6 +9190,7 @@ exit 0
             ..crate::IssueMonitorConfig::default()
         });
         monitor.set_gui_connected(true);
+        monitor.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
         monitor.record_claimed(sample_issue_monitor_issue(42), "claim-successor");
         monitor
             .next_launch_request("2026-08-29T00:00:00Z")
@@ -9083,6 +9219,7 @@ exit 0
     #[tokio::test]
     async fn typed_failure_control_completion_rejects_stale_source_but_acks_match_and_receipt_replay(
     ) {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let failure = Some(crate::IssueMonitorFailure::ResumeWriterConflict {
             holder_window_id: Some("tab-1::holder".to_string()),
@@ -9095,6 +9232,7 @@ exit 0
                     ..crate::IssueMonitorConfig::default()
                 });
                 monitor.set_gui_connected(true);
+                monitor.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
                 monitor.record_claimed(sample_issue_monitor_issue(42), "claim-agent-match");
                 monitor
                     .next_launch_request("2026-08-13T00:00:00Z")
@@ -9116,6 +9254,7 @@ exit 0
                     enabled: true,
                     ..crate::IssueMonitorConfig::default()
                 });
+                monitor.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
                 monitor.record_candidate(sample_issue_monitor_issue(42));
                 assert!(monitor.apply_confirmed_claim(
                     42,
@@ -9162,6 +9301,7 @@ exit 0
                     ..crate::IssueMonitorConfig::default()
                 });
                 monitor.set_gui_connected(true);
+                monitor.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
                 monitor.record_claimed(sample_issue_monitor_issue(42), "claim-agent-live");
                 monitor
                     .next_launch_request("2026-08-13T00:00:00Z")
@@ -9183,6 +9323,7 @@ exit 0
                     enabled: true,
                     ..crate::IssueMonitorConfig::default()
                 });
+                monitor.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
                 monitor.record_candidate(sample_issue_monitor_issue(42));
                 assert!(monitor.apply_confirmed_claim(
                     42,
@@ -9239,6 +9380,7 @@ exit 0
             ..crate::IssueMonitorConfig::default()
         });
         monitor.set_gui_connected(true);
+        monitor.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
         monitor.record_claimed(sample_issue_monitor_issue(42), "claim-replay");
         monitor
             .next_launch_request("2026-08-13T00:00:00Z")
@@ -9320,6 +9462,7 @@ exit 0
             },
         );
         monitor.set_gui_connected(true);
+        monitor.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
         monitor.record_claimed(sample_issue_monitor_issue(42), "claim-a");
         monitor
             .next_launch_request("2026-08-16T00:00:00Z")
@@ -9403,8 +9546,11 @@ exit 0
             },
         );
         monitor.set_gui_connected(true);
+        monitor.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
         monitor.record_candidate(sample_issue_monitor_issue(42));
+        monitor.terminal_queue_push(&[43], "test", "2026-07-27T00:00:00Z");
         monitor.record_candidate(sample_issue_monitor_issue(43));
+        monitor.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
         monitor.record_claimed(sample_issue_monitor_issue(42), "claim-a");
         monitor
             .next_launch_request("2026-08-16T00:00:00Z")
@@ -9448,7 +9594,9 @@ exit 0
             prefs,
         );
         restored.set_gui_connected(true);
+        restored.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
         restored.record_candidate(sample_issue_monitor_issue(42));
+        restored.terminal_queue_push(&[43], "test", "2026-07-27T00:00:00Z");
         restored.record_candidate(sample_issue_monitor_issue(43));
 
         // Issue #4366 AC-4: the hold admits one re-verification launch every
@@ -9515,6 +9663,7 @@ exit 0
             },
         );
         monitor.set_gui_connected(true);
+        monitor.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
         monitor.record_candidate(sample_issue_monitor_issue(42));
         monitor
             .next_launch_request("2026-08-16T00:00:00Z")
@@ -9550,6 +9699,7 @@ exit 0
             Some(&resets_at)
         );
         assert_eq!(monitor.status_view_at(&before_reset).quota_hold, None);
+        monitor.terminal_queue_push(&[43], "test", "2026-07-27T00:00:00Z");
         monitor.record_candidate(sample_issue_monitor_issue(43));
         assert_eq!(
             monitor
@@ -9581,6 +9731,7 @@ exit 0
             },
         );
         monitor.set_gui_connected(true);
+        monitor.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
         monitor.record_candidate(sample_issue_monitor_issue(42));
         monitor
             .next_launch_request("2026-08-16T00:00:00Z")
@@ -9610,6 +9761,7 @@ exit 0
             monitor.status_view_at("2026-08-22T03:00:00Z").quota_hold,
             None
         );
+        monitor.terminal_queue_push(&[43], "test", "2026-07-27T00:00:00Z");
         monitor.record_candidate(sample_issue_monitor_issue(43));
         assert_eq!(
             monitor
@@ -9676,6 +9828,7 @@ exit 0
             );
             monitor.set_gui_connected(true);
             if control_name == "launch_failed" {
+                monitor.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
                 monitor.record_candidate(sample_issue_monitor_issue(42));
                 assert!(monitor.apply_confirmed_claim(
                     42,
@@ -9693,6 +9846,7 @@ exit 0
                     |_| false,
                 ));
             } else {
+                monitor.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
                 monitor.record_claimed(sample_issue_monitor_issue(42), "claim-a");
                 monitor
                     .next_launch_request("2026-08-13T00:00:00Z")
@@ -9834,6 +9988,7 @@ exit 0
             enabled: true,
             ..crate::IssueMonitorConfig::default()
         });
+        monitor.terminal_queue_push(&[42], "test", "2026-07-02T00:00:00Z");
         monitor.set_autonomous_mode(true);
         monitor.set_gui_connected(true);
         monitor.record_claimed(
@@ -9895,6 +10050,7 @@ exit 0
             enabled: true,
             ..crate::IssueMonitorConfig::default()
         });
+        monitor.terminal_queue_push(&[42], "test", "2026-07-02T00:00:00Z");
         monitor.set_gui_connected(true);
         monitor.record_claimed(
             crate::IssueMonitorIssue {
@@ -9961,13 +10117,14 @@ exit 0
     // decodable control and drops the Issue from this terminal's queue.
     #[test]
     fn issue_monitor_terminal_queue_remove_control_decodes_and_applies() {
-        let control =
-            decode_issue_monitor_control(crate::runtime_daemon_events::issue_monitor_payload(
+        let control = decode_issue_monitor_control_for_test(
+            crate::runtime_daemon_events::issue_monitor_payload(
                 "control",
                 serde_json::json!({ "terminal_queue_remove": { "issue_numbers": [42] } }),
                 std::process::id() + 1,
-            ))
-            .expect("queue remove control decodes");
+            ),
+        )
+        .expect("queue remove control decodes");
         assert_eq!(control, IssueMonitorControl::TerminalQueueRemove(vec![42]));
 
         let mut monitor = crate::IssueMonitorState::new(crate::IssueMonitorConfig::default());
@@ -9992,6 +10149,24 @@ exit 0
     // scan and nothing else. It carries no authority (it changes no config),
     // and it must leave every piece of monitor state untouched — the launch
     // itself still goes through the ordinary claim/slot path on that scan.
+    #[test]
+    fn kanban_queue_controls_decode() {
+        for payload in [
+            serde_json::json!({"terminal_queue_move":{"issue_number":42,"position":0}}),
+            serde_json::json!({"terminal_queue_auto_refill":{"enabled":true,"limit":5}}),
+        ] {
+            assert!(
+                decode_issue_monitor_control(crate::runtime_daemon_events::issue_monitor_payload(
+                    "control",
+                    payload,
+                    std::process::id() + 1,
+                ))
+                .is_some(),
+                "Kanban control reaches daemon"
+            );
+        }
+    }
+
     #[test]
     fn issue_monitor_scan_now_decodes_and_only_requests_a_scan() {
         let payload = crate::runtime_daemon_events::issue_monitor_payload(
@@ -10029,6 +10204,7 @@ exit 0
 
     #[test]
     fn issue_monitor_config_set_decodes_and_commits_atomically() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let payload = crate::runtime_daemon_events::issue_monitor_payload(
             "control",
             serde_json::json!({
@@ -10109,11 +10285,13 @@ exit 0
         assert_eq!(drain.reason, crate::IssueMonitorUpdateDrainReason::Auto);
         assert_eq!(drain.version, "9.99.0");
         assert!(
-            decode_issue_monitor_control(crate::runtime_daemon_events::issue_monitor_payload(
-                "control",
-                serde_json::json!({ "config_set": { "update_drain": "soon" } }),
-                std::process::id() + 1,
-            ))
+            decode_issue_monitor_control_for_test(
+                crate::runtime_daemon_events::issue_monitor_payload(
+                    "control",
+                    serde_json::json!({ "config_set": { "update_drain": "soon" } }),
+                    std::process::id() + 1,
+                )
+            )
             .is_none(),
             "a malformed drain control is refused whole"
         );
@@ -10147,6 +10325,7 @@ exit 0
     /// launches it is draining.
     #[test]
     fn issue_monitor_config_set_update_drain_decodes_and_commits_non_destructively() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let payload = crate::runtime_daemon_events::issue_monitor_payload(
             "control",
             serde_json::json!({
@@ -10218,13 +10397,14 @@ exit 0
             "the drain must not touch the launch ledgers"
         );
 
-        let clear =
-            decode_issue_monitor_control(crate::runtime_daemon_events::issue_monitor_payload(
+        let clear = decode_issue_monitor_control_for_test(
+            crate::runtime_daemon_events::issue_monitor_payload(
                 "control",
                 serde_json::json!({ "config_set": { "update_drain": false } }),
                 std::process::id() + 1,
-            ))
-            .expect("clear control");
+            ),
+        )
+        .expect("clear control");
         assert!(super::apply_issue_monitor_control_with_disk_migration(
             &prefs_path,
             &mut monitor,
@@ -10240,6 +10420,7 @@ exit 0
     /// control frame, exactly like `config_set`.
     #[test]
     fn issue_monitor_profiles_set_decodes_and_commits_atomically() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let payload = crate::runtime_daemon_events::issue_monitor_payload(
             "control",
             serde_json::json!({
@@ -10301,10 +10482,92 @@ exit 0
         }
     }
 
+    /// SPEC #4778 AC-1: the resident PM's ON frame survives the decoder.
+    ///
+    /// Paired with the rejection above: the only difference between the two is
+    /// a session id that this repository's PM registry vouches for, so the
+    /// decoder is proved to check the registry rather than the marker.
+    #[test]
+    fn issue_monitor_config_set_decoder_admits_an_on_frame_from_the_resident_pm() {
+        let temp = TempDir::new().expect("tempdir");
+        let _home = gwt_core::test_support::ScopedGwtHome::set(temp.path().join("home"));
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        crate::pm_registry::try_register_pm(
+            &crate::pm_registry::pm_prefs_path_for_repo_path(&repo),
+            crate::pm_registry::PmRegistration {
+                session_id: "pm-session".to_string(),
+                agent_id: "claude".to_string(),
+                worktree_path: repo.to_string_lossy().into_owned(),
+                created_at: None,
+                consecutive_crashes: 0,
+                next_not_before: None,
+            },
+            |_| false,
+        )
+        .expect("register PM");
+
+        for (field, expected_enabled, expected_autonomous) in [
+            ("enabled", Some(true), None),
+            ("autonomous_mode", None, Some(true)),
+        ] {
+            let payload = crate::runtime_daemon_events::issue_monitor_payload(
+                "control",
+                serde_json::json!({"config_set": {
+                    field: true,
+                    "resident_pm_session": "pm-session",
+                }}),
+                std::process::id() + 1,
+            );
+            let control = decode_issue_monitor_control_in_repo(payload, Some(&repo))
+                .expect("the resident PM's ON frame decodes");
+            match control {
+                IssueMonitorControl::ConfigSet {
+                    enabled,
+                    autonomous_mode,
+                    ..
+                } => {
+                    assert_eq!(enabled, expected_enabled, "{field}");
+                    assert_eq!(autonomous_mode, expected_autonomous, "{field}");
+                }
+                other => panic!("{field} must decode as ConfigSet, got {other:?}"),
+            }
+
+            // The same frame without a reachable registry stays refused.
+            let unverifiable = crate::runtime_daemon_events::issue_monitor_payload(
+                "control",
+                serde_json::json!({"config_set": {
+                    field: true,
+                    "resident_pm_session": "pm-session",
+                }}),
+                std::process::id() + 1,
+            );
+            assert!(
+                decode_issue_monitor_control_in_repo(unverifiable, None).is_none(),
+                "{field} must stay refused when no PM registry is reachable"
+            );
+
+            // So does a session id the registry does not know.
+            let impostor = crate::runtime_daemon_events::issue_monitor_payload(
+                "control",
+                serde_json::json!({"config_set": {
+                    field: true,
+                    "resident_pm_session": "not-the-pm",
+                }}),
+                std::process::id() + 1,
+            );
+            assert!(
+                decode_issue_monitor_control_in_repo(impostor, Some(&repo)).is_none(),
+                "{field} must stay refused for an unregistered session"
+            );
+        }
+    }
+
     /// Issue #3923 AC-5: the daemon applies a launch-agent switch to the
     /// saved profile and refuses one when no profile was ever saved.
     #[test]
     fn issue_monitor_config_set_switches_the_launch_agent_only_with_a_saved_profile() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let payload = crate::runtime_daemon_events::issue_monitor_payload(
             "control",
             serde_json::json!({"config_set": {"launch_agent": "claude"}}),
@@ -10401,6 +10664,7 @@ exit 0
     /// held queue moves without waiting for the interval tick.
     #[test]
     fn quota_hold_clear_control_releases_the_hold_in_the_authoritative_state_and_prefs() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let _clock = ScopedOperationClock::set(Instant::now());
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
@@ -10434,8 +10698,8 @@ exit 0
         );
 
         let released_at = "2026-09-05T01:26:30.123Z";
-        let control =
-            decode_issue_monitor_control(crate::runtime_daemon_events::issue_monitor_payload(
+        let control = decode_issue_monitor_control_for_test(
+            crate::runtime_daemon_events::issue_monitor_payload(
                 "control",
                 serde_json::json!({
                     "quota_hold_clear": {
@@ -10445,8 +10709,9 @@ exit 0
                     }
                 }),
                 std::process::id() + 1,
-            ))
-            .expect("quota_hold_clear decodes");
+            ),
+        )
+        .expect("quota_hold_clear decodes");
         assert_eq!(
             control,
             IssueMonitorControl::QuotaHoldClear {
@@ -10484,8 +10749,8 @@ exit 0
         assert_eq!(record.retry_hold_provider, None);
 
         // A blank provider is a malformed control, not a release of nothing.
-        assert!(
-            decode_issue_monitor_control(crate::runtime_daemon_events::issue_monitor_payload(
+        assert!(decode_issue_monitor_control_for_test(
+            crate::runtime_daemon_events::issue_monitor_payload(
                 "control",
                 serde_json::json!({
                     "quota_hold_clear": {
@@ -10495,9 +10760,9 @@ exit 0
                     }
                 }),
                 std::process::id() + 1,
-            ))
-            .is_none()
-        );
+            )
+        )
+        .is_none());
     }
 
     #[test]
@@ -10537,6 +10802,7 @@ exit 0
 
     #[test]
     fn issue_monitor_control_adopts_newer_disk_migration_before_same_failure_mutation() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         crate::save_issue_monitor_prefs(&prefs_path, &crate::IssueMonitorPrefs::default())
@@ -10732,6 +10998,7 @@ exit 0
             }],
             ..crate::IssueMonitorPrefs::default()
         };
+        let prefs = scheduled_issue_monitor_prefs(prefs, &[44]);
         crate::save_issue_monitor_prefs(
             &crate::issue_monitor_prefs_path_for_repo_path(&scope.project_root),
             &prefs,
@@ -10863,6 +11130,7 @@ exit 0
                 .collect(),
             ..crate::IssueMonitorPrefs::default()
         };
+        let prefs = scheduled_issue_monitor_prefs(prefs, &[QUEUED_ISSUE]);
         crate::save_issue_monitor_prefs(
             &crate::issue_monitor_prefs_path_for_repo_path(&scope.project_root),
             &prefs,
@@ -10973,6 +11241,7 @@ exit 0
             launch_profile: Some(sample_issue_monitor_profile()),
             ..crate::IssueMonitorPrefs::default()
         };
+        let prefs = scheduled_issue_monitor_prefs(prefs, &[43]);
         crate::save_issue_monitor_prefs(
             &crate::issue_monitor_prefs_path_for_repo_path(&scope.project_root),
             &prefs,
@@ -11055,6 +11324,7 @@ exit 0
             launch_profile: Some(sample_issue_monitor_profile()),
             ..crate::IssueMonitorPrefs::default()
         };
+        let prefs = scheduled_issue_monitor_prefs(prefs, &[44]);
         crate::save_issue_monitor_prefs(
             &crate::issue_monitor_prefs_path_for_repo_path(&scope.project_root),
             &prefs,
@@ -11218,6 +11488,7 @@ exit 0
             launch_profile: Some(sample_issue_monitor_profile()),
             ..crate::IssueMonitorPrefs::default()
         };
+        let prefs = scheduled_issue_monitor_prefs(prefs, &[44]);
         crate::save_issue_monitor_prefs(
             &crate::issue_monitor_prefs_path_for_repo_path(&scope.project_root),
             &prefs,
@@ -11325,6 +11596,7 @@ exit 0
             }],
             ..crate::IssueMonitorPrefs::default()
         };
+        let prefs = scheduled_issue_monitor_prefs(prefs, &[44]);
         crate::save_issue_monitor_prefs(
             &crate::issue_monitor_prefs_path_for_repo_path(&scope.project_root),
             &prefs,
@@ -11453,6 +11725,7 @@ exit 0
             launch_profile: Some(sample_issue_monitor_profile()),
             ..crate::IssueMonitorPrefs::default()
         };
+        let prefs = scheduled_issue_monitor_prefs(prefs, &queued);
         crate::save_issue_monitor_prefs(
             &crate::issue_monitor_prefs_path_for_repo_path(&scope.project_root),
             &prefs,
@@ -11663,6 +11936,7 @@ exit 0
             launch_profile: Some(sample_issue_monitor_profile()),
             ..crate::IssueMonitorPrefs::default()
         };
+        let prefs = scheduled_issue_monitor_prefs(prefs, &[44]);
         crate::save_issue_monitor_prefs(
             &crate::issue_monitor_prefs_path_for_repo_path(&scope.project_root),
             &prefs,
@@ -11797,6 +12071,7 @@ exit 0
                 ..crate::IssueMonitorPrefs::default()
             },
         );
+        preserved.terminal_queue_push(&[43], "test", "2026-07-27T00:00:00Z");
         preserved.set_gui_connected(true);
         crate::save_issue_monitor_prefs(
             &crate::issue_monitor_prefs_path_for_repo_path(&scope.project_root),
@@ -11887,6 +12162,7 @@ exit 0
                 ..crate::IssueMonitorPrefs::default()
             },
         );
+        preserved.terminal_queue_push(&[43], "test", "2026-07-27T00:00:00Z");
         preserved.set_gui_connected(true);
         crate::save_issue_monitor_prefs(
             &crate::issue_monitor_prefs_path_for_repo_path(&scope.project_root),
@@ -12179,6 +12455,10 @@ exit 0
                 // AC-4: a human reopens #43 (the live row comes back Open at a
                 // newer revision). The same merge must not fire again.
                 let _reopened = ScopedEnvVar::set("GWT_FAKE_GH_REVISION", "2026-09-02T00:00:00Z");
+                // Reopening on GitHub does not implicitly schedule another launch.
+                monitor.terminal_queue_push(&[43], "test", "2026-09-02T00:00:00Z");
+                crate::save_issue_monitor_prefs(prefs_path, &monitor.prefs())
+                    .expect("queue reopened issue");
                 let monitor =
                     super::scan_issue_monitor_once_blocking(scope.clone(), monitor, false)
                         .expect("second scan");
@@ -12351,6 +12631,7 @@ exit 0
 
     #[test]
     fn daemon_live_scan_migrates_and_atomically_persists_legacy_failure() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let _env_lock = crate::env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -12377,6 +12658,7 @@ exit 0
         .expect("scope");
         let prefs_path = crate::issue_monitor_prefs_path_for_repo_path(&scope.project_root);
         let legacy = legacy_failed_prefs(&scope.project_root);
+        let legacy = scheduled_issue_monitor_prefs(legacy, &[43]);
         crate::save_issue_monitor_prefs(&prefs_path, &legacy).expect("seed legacy prefs");
         let monitor =
             crate::IssueMonitorState::with_prefs(crate::IssueMonitorConfig::default(), legacy);
@@ -12448,9 +12730,11 @@ exit 0
             r#"{"enabled":true,"max_active_agents":1,"priority_order":[43],"merged_issues":[43]}"#,
         )
         .expect("legacy completion prefs");
-        crate::save_issue_monitor_prefs(&prefs_path, &legacy).expect("seed legacy completion");
-        let monitor =
+        let mut monitor =
             crate::IssueMonitorState::with_prefs(crate::IssueMonitorConfig::default(), legacy);
+        monitor.terminal_queue_push(&[43], "test", "2026-07-02T00:00:00Z");
+        crate::save_issue_monitor_prefs(&prefs_path, &monitor.prefs())
+            .expect("seed legacy completion");
 
         let mut monitor = super::scan_issue_monitor_once_blocking(scope, monitor, false)
             .expect("ScanNow live revalidation succeeds");
@@ -12553,6 +12837,7 @@ exit 0
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // global fake-gh env must stay isolated for the full worker run
     async fn hung_scan_is_cut_at_its_deadline_and_the_driver_scans_again_on_the_next_tick() {
+        let _prefs_budget = pin_prefs_hang_guard();
         // Issue #3349: the driver froze forever because a single `gh` call
         // inside the scan never returned. The scan now carries an absolute
         // deadline that kills the hung child, the driver records the expiry as
@@ -12673,6 +12958,7 @@ exit 0
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // global fake-gh env must stay isolated for the full worker run
     async fn issue_monitor_worker_applies_control_during_scan_without_rewinding_mutation() {
+        let _prefs_budget = pin_prefs_hang_guard();
         // SPEC #3200 T-127/T-128 (FR-040/FR-041): a blocking external scan must
         // not stall the driver's control plane, and its stale result must not
         // overwrite a control mutation that committed while the scan ran.
@@ -14104,6 +14390,7 @@ exit 1
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn project_daemon_failed_start_releases_startup_lease() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let _home = ScopedGwtHome::set(temp.path().join("home"));
         let project = temp.path().join("project");
@@ -14218,6 +14505,7 @@ exit 1
             enabled: true,
             ..crate::IssueMonitorConfig::default()
         });
+        seeded.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
         seeded.record_candidate(sample_issue_monitor_issue(42));
         assert!(seeded.apply_confirmed_claim(
             42,
@@ -14760,6 +15048,7 @@ exit 1
 
     #[tokio::test]
     async fn outer_scan_watchdog_keeps_started_blocking_task_as_single_flight_owner() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let initial = crate::IssueMonitorPrefs {
@@ -14876,6 +15165,7 @@ exit 1
             effect_authority_epoch: 7,
             ..crate::IssueMonitorPrefs::default()
         };
+        let initial = scheduled_issue_monitor_prefs(initial, &[42]);
         crate::save_issue_monitor_prefs(&prefs_path, &initial).expect("seed prefs");
         let mut canonical = crate::IssueMonitorState::with_prefs(
             crate::IssueMonitorConfig::default(),
@@ -14922,6 +15212,7 @@ exit 1
             effect_authority_epoch: 7,
             ..crate::IssueMonitorPrefs::default()
         };
+        let initial = scheduled_issue_monitor_prefs(initial, &[42]);
         crate::save_issue_monitor_prefs(&prefs_path, &initial).expect("seed prefs");
         let lock = issue_monitor_prefs_lock_for_test(&prefs_path);
         let mut canonical = crate::IssueMonitorState::with_prefs(
@@ -15194,12 +15485,15 @@ exit 1
         );
         crate::save_issue_monitor_prefs(
             &prefs_path,
-            &crate::IssueMonitorPrefs {
-                enabled: true,
-                effect_authority_epoch: 7,
-                pending_effects: vec![grant],
-                ..crate::IssueMonitorPrefs::default()
-            },
+            &scheduled_issue_monitor_prefs(
+                crate::IssueMonitorPrefs {
+                    enabled: true,
+                    effect_authority_epoch: 7,
+                    pending_effects: vec![grant],
+                    ..crate::IssueMonitorPrefs::default()
+                },
+                &[42],
+            ),
         )
         .expect("seed prepared grant");
         let client_marker = temp.path().join("claim-http-client-started");
@@ -15351,6 +15645,7 @@ exit 1
 
     #[test]
     fn volatile_deny_runs_safety_effects_but_not_grants() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let grant = crate::PendingIssueMonitorEffect::prepared(
@@ -15380,6 +15675,7 @@ exit 1
             pending_effects: vec![grant.clone(), safety.clone()],
             ..crate::IssueMonitorPrefs::default()
         };
+        let prefs = scheduled_issue_monitor_prefs(prefs, &[42]);
         crate::save_issue_monitor_prefs(&prefs_path, &prefs).expect("seed prefs");
         let mut monitor =
             crate::IssueMonitorState::with_prefs(crate::IssueMonitorConfig::default(), prefs);
@@ -15404,6 +15700,7 @@ exit 1
 
     #[test]
     fn stale_scan_cannot_commit_a_prepared_arm_after_authority_is_revoked() {
+        let _prefs_budget = pin_prefs_hang_guard();
         // SPEC #3200 Phase 7 T-134/FR-041/FR-044: a scan may only propose an
         // external mutation. If OFF commits while that scan is in flight, the
         // old-epoch proposal must never enter the durable execution journal.
@@ -15452,6 +15749,7 @@ exit 1
 
     #[test]
     fn scan_commit_preserves_fresh_required_marker_from_autonomous_retry() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let initial = crate::IssueMonitorPrefs {
@@ -15462,6 +15760,7 @@ exit 1
         };
         let mut canonical =
             crate::IssueMonitorState::with_prefs(crate::IssueMonitorConfig::default(), initial);
+        canonical.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
         canonical.record_candidate(sample_issue_monitor_issue(42));
         canonical.set_autonomous_phase(42, crate::AutonomousPhase::Implementing);
         crate::save_issue_monitor_prefs(&prefs_path, &canonical.prefs()).expect("seed prefs");
@@ -15499,6 +15798,7 @@ exit 1
         let mut reloaded =
             crate::IssueMonitorState::with_prefs(crate::IssueMonitorConfig::default(), persisted);
         reloaded.set_gui_connected(true);
+        reloaded.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
         reloaded.record_candidate(sample_issue_monitor_issue(42));
         let request = reloaded
             .next_launch_request("2026-08-13T01:00:00Z")
@@ -15511,6 +15811,7 @@ exit 1
 
     #[test]
     fn stale_scan_fresh_marker_cannot_revive_newer_autonomous_disable() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let _clock = ScopedOperationClock::set(Instant::now());
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
@@ -15568,6 +15869,7 @@ exit 1
 
     #[test]
     fn scan_commit_fresh_marker_cannot_revive_newer_disk_terminal_failure() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let initial = crate::IssueMonitorPrefs {
@@ -15638,6 +15940,7 @@ exit 1
 
     #[test]
     fn scan_commit_adopts_newer_disk_authority_before_retrying() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let _clock = ScopedOperationClock::set(Instant::now());
         // A launch-profile save is intentionally a direct prefs transaction.
         // The daemon must absorb its newer authority generation after rejecting
@@ -15867,6 +16170,7 @@ exit 1
 
     #[test]
     fn effect_executor_fence_is_durable_before_the_attempt_is_returned() {
+        let _prefs_budget = pin_prefs_hang_guard();
         // SPEC #3200 Phase 7 T-135/FR-044: Prepared -> Attempting is a separate
         // commit receipt. Returning work before this write would let a crash
         // submit a remote mutation with no durable tuple to reconcile.
@@ -15904,6 +16208,7 @@ exit 1
 
     #[test]
     fn stale_arm_result_cannot_publish_delivery_and_keeps_new_epoch_disarm() {
+        let _prefs_budget = pin_prefs_hang_guard();
         // Phase 7 T-136: OFF may race an already-started arm. Its old tuple is
         // reconciled and removed, but cannot authorize Delivering; the newer
         // durable disarm remains next in the serialized executor.
@@ -15983,6 +16288,7 @@ exit 1
 
     #[test]
     fn routine_effect_settlement_does_not_rewind_a_live_review() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let release = crate::PendingIssueMonitorEffect {
@@ -16116,6 +16422,7 @@ exit 1
 
     #[test]
     fn deferred_restart_resume_consumes_only_the_startup_review_set_once() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let prefs = crate::IssueMonitorPrefs {
@@ -16204,6 +16511,7 @@ exit 1
 
     #[test]
     fn deferred_restart_resume_retries_after_persistence_failure() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let _env_lock = crate::env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -16284,6 +16592,7 @@ exit 1
 
     #[test]
     fn auto_merge_success_mismatch_is_fail_closed_without_panicking() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let effect = crate::PendingIssueMonitorEffect {
@@ -16306,6 +16615,7 @@ exit 1
             pending_effects: vec![effect.clone()],
             ..crate::IssueMonitorPrefs::default()
         };
+        let prefs = scheduled_issue_monitor_prefs(prefs, &[42]);
         crate::save_issue_monitor_prefs(&prefs_path, &prefs).expect("seed prefs");
         let mut monitor =
             crate::IssueMonitorState::with_prefs(crate::IssueMonitorConfig::default(), prefs);
@@ -16333,12 +16643,14 @@ exit 1
 
     #[test]
     fn acquired_claim_commit_persists_launching_and_outbox_in_one_transaction() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let mut monitor = crate::IssueMonitorState::new(crate::IssueMonitorConfig {
             enabled: true,
             ..crate::IssueMonitorConfig::default()
         });
+        monitor.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
         monitor.record_candidate(sample_issue_monitor_issue(42));
         let effect = crate::PendingIssueMonitorEffect::prepared(
             "claim-effect-42",
@@ -16400,6 +16712,7 @@ exit 1
     /// fills the last slot on disk. Commit must use the current capacity.
     #[test]
     fn acquired_claim_commit_compensates_when_latest_prefs_have_no_capacity() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let now = "2026-09-22T00:00:00Z";
@@ -16409,6 +16722,7 @@ exit 1
             ..crate::IssueMonitorConfig::default()
         });
         monitor.set_gui_connected(true);
+        monitor.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
         monitor.record_candidate(sample_issue_monitor_issue(42));
         assert_eq!(
             monitor.prepare_claim_effects_with_probe("host/session", now, 1, |_| false),
@@ -16429,6 +16743,7 @@ exit 1
         };
 
         let mut latest = monitor.clone();
+        latest.terminal_queue_push(&[43], "test", "2026-07-27T00:00:00Z");
         latest.record_candidate(sample_issue_monitor_issue(43));
         latest.complete_active_launch(43, "tab-1::agent-43");
         crate::save_issue_monitor_prefs(&prefs_path, &latest.prefs())
@@ -16474,6 +16789,7 @@ exit 1
         );
         assert_eq!(restored.active_issue_numbers(), vec![43]);
         // Candidate rows are refreshed by the next scan, not stored in prefs.
+        restored.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
         restored.record_candidate(sample_issue_monitor_issue(42));
         assert_eq!(restored.queued_issue_numbers(), vec![42]);
         assert!(persisted.launching_issues.is_empty());
@@ -16494,12 +16810,14 @@ exit 1
     /// compensated, but cannot consume the recovery fence or publish a launch.
     #[test]
     fn acquired_claim_started_before_requeue_cannot_publish_a_launch() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let mut monitor = crate::IssueMonitorState::new(crate::IssueMonitorConfig {
             enabled: true,
             ..crate::IssueMonitorConfig::default()
         });
+        monitor.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
         monitor.record_candidate(sample_issue_monitor_issue(42));
         let key = monitor
             .prepare_pending_effect(
@@ -16562,6 +16880,7 @@ exit 1
 
     #[test]
     fn acquired_claim_result_cannot_revive_candidate_excluded_after_attempt_fence() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let mut monitor = crate::IssueMonitorState::new(crate::IssueMonitorConfig {
@@ -16569,6 +16888,7 @@ exit 1
             ..crate::IssueMonitorConfig::default()
         });
         let mut issue = sample_issue_monitor_issue(42);
+        monitor.terminal_queue_push(&[issue.number], "test", "2026-07-27T00:00:00Z");
         monitor.record_candidate(issue.clone());
         let key = monitor
             .prepare_pending_effect(
@@ -16587,6 +16907,7 @@ exit 1
         let attempting = monitor.pending_effects()[0].clone();
 
         issue.labels.push("hold".to_string());
+        monitor.terminal_queue_push(&[issue.number], "test", "2026-07-27T00:00:00Z");
         monitor.record_candidate(issue);
         crate::save_issue_monitor_prefs(&prefs_path, &monitor.prefs())
             .expect("persist excluded state");
@@ -16629,6 +16950,7 @@ exit 1
 
     #[test]
     fn concurrent_scan_exclusion_survives_late_blocked_and_lost_claim_results() {
+        let _prefs_budget = pin_prefs_hang_guard();
         for (exclusion, outcome_kind) in [
             ("not-ready", "blocked"),
             ("not-ready", "lost"),
@@ -16644,6 +16966,7 @@ exit 1
             let mut issue = sample_issue_monitor_issue(42);
             issue.labels.push("gwt-spec".to_string());
             issue.readiness = crate::IssueMonitorReadiness::Ready;
+            monitor.terminal_queue_push(&[issue.number], "test", "2026-07-27T00:00:00Z");
             monitor.record_candidate(issue.clone());
             let key = monitor
                 .prepare_pending_effect(
@@ -16669,6 +16992,7 @@ exit 1
                 issue.readiness = crate::IssueMonitorReadiness::NotReady;
             }
             let mut scanned = monitor.clone();
+            scanned.terminal_queue_push(&[issue.number], "test", "2026-07-27T00:00:00Z");
             scanned.record_candidate(issue);
             assert!(super::commit_issue_monitor_scan_if_current(
                 &prefs_path,
@@ -16739,12 +17063,14 @@ exit 1
 
     #[test]
     fn launch_delivery_claim_control_keeps_one_live_materializer() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let mut monitor = crate::IssueMonitorState::new(crate::IssueMonitorConfig {
             enabled: true,
             ..crate::IssueMonitorConfig::default()
         });
+        monitor.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
         monitor.record_candidate(sample_issue_monitor_issue(42));
         assert!(monitor.apply_confirmed_claim(
             42,
@@ -17001,6 +17327,7 @@ exit 1
 
     #[test]
     fn stale_safety_effect_pre_submit_failure_remains_retryable() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let disarm = crate::PendingIssueMonitorEffect {
@@ -17126,6 +17453,7 @@ exit 1
 
     #[test]
     fn claim_remote_outcome_unknown_stays_attempting_until_revocation_adds_release() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let claim = crate::PendingIssueMonitorEffect {
@@ -17148,6 +17476,7 @@ exit 1
             pending_effects: vec![claim.clone()],
             ..crate::IssueMonitorPrefs::default()
         };
+        let prefs = scheduled_issue_monitor_prefs(prefs, &[42]);
         crate::save_issue_monitor_prefs(&prefs_path, &prefs).expect("seed prefs");
         let mut monitor =
             crate::IssueMonitorState::with_prefs(crate::IssueMonitorConfig::default(), prefs);
@@ -17183,6 +17512,7 @@ exit 1
 
     #[test]
     fn current_arm_result_enters_delivering_only_after_exact_result_commit() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let arm = crate::PendingIssueMonitorEffect {
@@ -17248,6 +17578,7 @@ exit 1
 
     #[test]
     fn daemon_scan_adopts_newer_disk_migration_before_remote_error() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let home = temp.path().join("home");
         fs::create_dir_all(&home).expect("create gwt home");
@@ -17289,6 +17620,7 @@ exit 1
 
     #[tokio::test]
     async fn scan_and_persist_issue_monitor_writes_scan_transitions_to_prefs() {
+        let _prefs_budget = pin_prefs_hang_guard();
         // SPEC #3200 (review follow-up): a periodic (interval-tick) scan can
         // complete a merge / escalate without any control frame. The worker must
         // persist prefs after every scan so a daemon restart never loses that
@@ -17316,6 +17648,7 @@ exit 1
 
     #[test]
     fn daemon_persist_does_not_restore_a_launch_merged_by_the_scan() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor-prefs.json");
         let disk = crate::IssueMonitorPrefs {
@@ -17461,6 +17794,7 @@ exit 1
 
     #[test]
     fn persist_daemon_state_preserves_the_gui_owned_candidate_pool() {
+        let _prefs_budget = pin_prefs_hang_guard();
         // SPEC #3914 FR-012 / AC-7: the pool is saved by the GUI / gwtd straight
         // to disk; the daemon's stale in-memory copy must not shrink it back to
         // one candidate or drop the usage threshold.
@@ -17494,6 +17828,7 @@ exit 1
 
     #[test]
     fn persist_daemon_state_preserves_gui_owned_launch_profile_and_tuning() {
+        let _prefs_budget = pin_prefs_hang_guard();
         // adversarial review (launch_profile clobber): launch_profile and
         // autonomous_tuning have no daemon control channel, so the daemon's
         // stale-since-startup in-memory copy must NOT overwrite the GUI's newer
@@ -17555,6 +17890,7 @@ exit 1
 
     #[test]
     fn daemon_persist_keeps_local_record_and_unions_latest_disk_owned_state() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let record = |issue_number, phase, attempts| crate::AutonomousIssueRecord {
@@ -17633,7 +17969,7 @@ exit 1
         let _env_lock = crate::env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _prefs_timeout = ScopedEnvVar::set("GWT_TEST_ISSUE_MONITOR_PREFS_TIMEOUT_MS", "2000");
+        let _prefs_timeout = ScopedEnvVar::set("GWT_TEST_BUDGET_ISSUE_MONITOR_PREFS_MS", "2000");
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let unrelated_failure = crate::IssueMonitorFailedIssue {
@@ -17766,6 +18102,7 @@ exit 1
 
     #[test]
     fn daemon_scan_merges_disk_launch_before_newer_migration_adoption() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let home = temp.path().join("home");
         fs::create_dir_all(&home).expect("create gwt home");
@@ -18040,6 +18377,7 @@ exit 1
 
     #[test]
     fn control_commit_reports_authority_change_from_canonical_rebase() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         crate::save_issue_monitor_prefs(
@@ -18079,6 +18417,7 @@ exit 1
 
     #[test]
     fn changed_off_commit_reconciles_deferred_grant_before_queued_on_overflow() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let old_grant = crate::PendingIssueMonitorEffect {
@@ -18158,6 +18497,7 @@ exit 1
 
     #[test]
     fn intermediate_noop_retains_deferred_grant_until_controls_drain() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let arm = crate::PendingIssueMonitorEffect {
@@ -18940,6 +19280,7 @@ exit 1
 
     #[test]
     fn daemon_persist_adopts_newer_marker_without_dropping_local_needs_human_failure() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         crate::save_issue_monitor_prefs(&prefs_path, &crate::IssueMonitorPrefs::default())
@@ -18991,6 +19332,7 @@ exit 1
 
     #[test]
     fn daemon_persist_adopts_newer_marker_without_dropping_local_failed_window() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         crate::save_issue_monitor_prefs(&prefs_path, &crate::IssueMonitorPrefs::default())
@@ -19023,6 +19365,7 @@ exit 1
 
     #[test]
     fn daemon_persist_recovers_malformed_prefs_from_in_memory_state() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         fs::write(&prefs_path, b"{").expect("seed malformed prefs");
@@ -19062,6 +19405,7 @@ exit 1
 
     #[test]
     fn daemon_control_recovers_malformed_prefs_before_persisting_mutation() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         fs::write(&prefs_path, b"{").expect("seed malformed prefs");
@@ -19097,6 +19441,7 @@ exit 1
 
     #[test]
     fn daemon_newer_failure_adoption_keeps_needs_human_and_clears_restored_launch() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let failure = crate::IssueMonitorFailedIssue {
@@ -19184,6 +19529,7 @@ exit 1
 
     #[test]
     fn persist_daemon_state_keeps_equal_marker_new_failure_and_never_decreases_marker() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let _clock = ScopedOperationClock::set(Instant::now());
         let temp = TempDir::new().expect("tempdir");
         let equal_path = temp.path().join("equal.json");
@@ -19232,6 +19578,7 @@ exit 1
 
     #[test]
     fn daemon_persist_keeps_equal_marker_disk_only_fresh_failures() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let fresh_failure = legacy_git_failure(temp.path());
@@ -19272,6 +19619,7 @@ exit 1
 
     #[test]
     fn daemon_control_rebase_applies_explicit_lifecycle_mutation_last() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
 
         let unrelated_path = temp.path().join("unrelated.json");
@@ -19373,6 +19721,7 @@ exit 1
 
     #[tokio::test]
     async fn run_server_accepts_handshake_and_acknowledges_frames() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let scope = sample_scope(&temp);
         let socket_path = temp.path().join("daemon.sock");
@@ -19466,6 +19815,7 @@ exit 1
 
     #[tokio::test]
     async fn typed_exact_source_at_authority_epoch_max_is_terminal_and_atomically_unreceipted() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let typed_failure = Some(crate::IssueMonitorFailure::ResumeWriterConflict {
             holder_window_id: Some("tab-1::holder".to_string()),
@@ -19478,6 +19828,7 @@ exit 1
                     ..crate::IssueMonitorConfig::default()
                 });
                 seeded.set_gui_connected(true);
+                seeded.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
                 seeded.record_claimed(sample_issue_monitor_issue(42), "claim-agent-max");
                 seeded
                     .next_launch_request("2026-08-13T00:00:00Z")
@@ -19504,6 +19855,7 @@ exit 1
                     enabled: true,
                     ..crate::IssueMonitorConfig::default()
                 });
+                seeded.terminal_queue_push(&[42], "test", "2026-07-27T00:00:00Z");
                 seeded.record_candidate(sample_issue_monitor_issue(42));
                 assert!(seeded.apply_confirmed_claim(
                     42,

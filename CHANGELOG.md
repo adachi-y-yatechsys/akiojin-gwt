@@ -1,6 +1,62 @@
 # Changelog
 
 All notable changes to this project will be documented in this file.
+## [9.105.0] - 2026-09-30
+
+### Bug Fixes
+
+- **verify:** ソース不変のbase mergeで検証証跡を保持
+- **hook:** Grok の camelCase と snake_case を併記した hook payload を受理する
+- **hook:** HookEvent の doc から private 型への intra-doc link を外す
+- **issue-monitor:** Closed 観測後に reopen した Issue を requeue でキューへ戻す
+- **pm:** Gate the test-only decoder shape behind cfg(test)
+- **pm:** Allow the platform-gated test helper to be unused
+- **pm:** An unacknowledged pm message is a success, not an error
+- **test:** テストの期限を注入可能にし、既定値への暗黙依存を負荷モードで暴く
+- キュー画面更新中のOther操作とテスト環境を保護する
+- 明示再投入の全成功経路を端末キューへ反映する
+- エージェント開始時刻だけの更新でも経過時間表示を再描画する
+- **work:** 配送記帳のパス分類と生成証明を共通化
+
+### Documentation
+
+- **test:** Deadline_budget の cfg 付き型への intra-doc link を外す
+
+### Features
+
+- **index:** Index 資源診断に runner tree の実測値と broker カウンタを追加
+- **pm:** オーナー操作を依頼する前に PM 自身の権限を確認する規定を追加する
+- **perf:** Restore_drain の内訳と event loop ブロックを perf.startup に記録する
+- **pm:** Let the resident PM turn the Issue Monitor back on
+- Issueを明示投入キューと4列Kanbanに統一する (#4499)
+- Issue本文と読み取り専用出力の切り替えを維持する
+
+### Miscellaneous Tasks
+
+- **work:** Issue #4527 の Work 記録を更新
+- **work:** Issue #4249 の Work event を記録
+- **work:** Issue #4249 の Work event を記録
+- **work:** Issue #4249 の Work event を記録
+- **work:** #4520 の Work event を記録する
+- **work:** Issue #4770 の Work 記録を更新
+- Work イベントログを追加する
+- Work イベントログを追加する
+- Work イベントログを追加する
+- 配送検証再開のWork記帳を追加
+- PR作成時のWork記帳を追加
+
+### Styling
+
+- **pm:** Allow the argument count the config-set gate already had
+
+### Testing
+
+- **pm:** Worktree 内を指す plugin symlink を跨ぐ PM refresh の受け入れテストを追加
+- **pm:** Move the envelope-level ON refusal off the PM
+- 残るアプリ実行fixtureを明示キューへ移行する
+- 統合テストの起動fixtureを明示キューへ移行する
+- 旧 Issue リスト前提の kanban.spec を 4 列 Kanban の契約へ移行する
+
 ## [9.104.0] - 2026-09-28
 
 ### Bug Fixes

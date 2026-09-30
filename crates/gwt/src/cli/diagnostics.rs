@@ -86,6 +86,9 @@ pub struct CpuDiagnostics {
     pub runtime: RuntimeDiagnostics,
     pub recent_logs: LogBudgetDiagnostics,
     pub stale: StaleDiagnostics,
+    /// Issue #4527 AC-1: heavy owner, broker queue, and the owner's measured
+    /// runner tree, collected without `ps` so Windows reports them too.
+    pub index_resources: crate::index_resources::IndexResourceDiagnostics,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -201,6 +204,7 @@ pub fn collect_cpu_diagnostics(repo_path: &Path) -> CpuDiagnostics {
         runtime,
         recent_logs,
         stale,
+        index_resources: crate::index_resources::collect_index_resources(),
     }
 }
 
@@ -518,6 +522,13 @@ mod tests {
         assert!(
             payload.get("host_cpu").is_some_and(Value::is_object),
             "CPU diagnostics must include the host_cpu object"
+        );
+        assert!(
+            payload
+                .get("index_resources")
+                .and_then(|resources| resources.get("broker_queue_depth"))
+                .is_some_and(Value::is_u64),
+            "CPU diagnostics must include the index resource counters"
         );
     }
 
