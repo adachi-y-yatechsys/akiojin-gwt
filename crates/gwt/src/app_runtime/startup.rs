@@ -129,6 +129,10 @@ pub(super) enum RestoreRefusal {
     DiagnosticWindow,
     WorktreeAlreadyRestoring,
     ClosedWorkDiagnostic,
+    /// Issue #4802 (AC-4): the linked execution reached Completed. The Work
+    /// is finished even while a settlement obligation is open, so its agent
+    /// is not restarted; the placeholder is kept as the diagnostic.
+    CompletedWork,
     AlreadyRunning,
     NoProjectTab,
     TabNotRestorable,
@@ -161,6 +165,7 @@ impl RestoreRefusal {
             Self::DiagnosticWindow => "diagnostic_window_retained".to_string(),
             Self::WorktreeAlreadyRestoring => "worktree_already_restoring".to_string(),
             Self::ClosedWorkDiagnostic => "closed_work_diagnostic_retained".to_string(),
+            Self::CompletedWork => "completed_work_retained".to_string(),
             Self::AlreadyRunning => "already_running".to_string(),
             Self::NoProjectTab => "no_project_tab".to_string(),
             Self::TabNotRestorable => "tab_not_restorable".to_string(),
@@ -1083,6 +1088,7 @@ impl AppRuntime {
             return Err(RestoreRefusal::DiagnosticWindow);
         }
         // Preserve terminal cleanup before applying spawn-only refusals.
+        let mut completed_work = false;
         match self.restore_work_terminality(session, project_root, window_id) {
             RestoreAdmission::RefuseTerminal(reason) => {
                 return Err(RestoreRefusal::TerminalWork(reason))
@@ -1094,6 +1100,9 @@ impl AppRuntime {
                 return Err(RestoreRefusal::ClosedWorkDiagnostic)
             }
             RestoreAdmission::RefuseHeld(cause) => return Err(RestoreRefusal::MonitorHold(cause)),
+            // Issue #4802 (AC-4): a spawn-only refusal, reported after the
+            // more specific worktree answers below.
+            RestoreAdmission::RefuseCompletedWork => completed_work = true,
             RestoreAdmission::Admit => {}
         }
         // Reopened #4143 AC-6: queued and in-flight restores reserve their
@@ -1144,6 +1153,9 @@ impl AppRuntime {
                 return Err(RestoreRefusal::EmptyLandedWorktree);
             }
             return Err(RestoreRefusal::LandedWorktree);
+        }
+        if completed_work {
+            return Err(RestoreRefusal::CompletedWork);
         }
         if launch_config_from_persisted_session(session).session_mode
             != gwt_agent::SessionMode::Resume
