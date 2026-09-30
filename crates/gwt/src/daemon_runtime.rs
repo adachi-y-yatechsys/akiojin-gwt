@@ -2146,9 +2146,9 @@ mod tests {
         }
 
         fn receive(&self) -> (HeaderMap, serde_json::Value) {
-            self.rx
-                .recv_timeout(Duration::from_secs(2))
-                .expect("binding probe request")
+            // The handler captures the request before returning the HTTP response.
+            // Every caller has already received that response, so no wait is needed.
+            self.rx.try_recv().expect("binding probe request")
         }
 
         fn assert_no_redirect(&self) {
@@ -2227,6 +2227,9 @@ mod tests {
 
     #[test]
     fn execution_continuation_never_follows_redirects_or_forwards_its_bearer() {
+        let _env_lock = env_test_lock();
+        let _url = ScopedEnvVar::unset(GWT_HOOK_FORWARD_URL_ENV);
+        let _token = ScopedEnvVar::unset(GWT_HOOK_FORWARD_TOKEN_ENV);
         let server = BindingProbeServer::start_redirect();
         let target = HookForwardTarget {
             url: server.forward_url.clone(),
@@ -2348,6 +2351,9 @@ mod tests {
 
     #[test]
     fn execution_continuation_preserves_bounded_safe_rejection_diagnostics() {
+        let _env_lock = env_test_lock();
+        let _url = ScopedEnvVar::unset(GWT_HOOK_FORWARD_URL_ENV);
+        let _token = ScopedEnvVar::unset(GWT_HOOK_FORWARD_TOKEN_ENV);
         let server = BindingProbeServer::start(
             StatusCode::CONFLICT,
             serde_json::json!({
@@ -2464,6 +2470,9 @@ mod tests {
 
     #[test]
     fn operation_local_bridge_failures_have_stable_reason_codes() {
+        let _env_lock = env_test_lock();
+        let _url = ScopedEnvVar::unset(GWT_HOOK_FORWARD_URL_ENV);
+        let _token = ScopedEnvVar::unset(GWT_HOOK_FORWARD_TOKEN_ENV);
         let request = crate::AgentWorkspaceUpdateRequest {
             schema_version: crate::AGENT_WORKSPACE_UPDATE_SCHEMA_VERSION,
             claimed_session_id: "session-reason-codes".to_string(),
