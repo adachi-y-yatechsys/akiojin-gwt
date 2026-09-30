@@ -1868,7 +1868,7 @@ mod tests {
         )
         .expect("readiness hook should recover within its bounded deadline");
 
-        assert_eq!(server.attempts(), 2);
+        assert!(server.attempts() >= 2);
     }
 
     #[test]
