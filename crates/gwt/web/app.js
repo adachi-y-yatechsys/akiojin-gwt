@@ -167,6 +167,12 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
       import { createViewportSyncState } from "/viewport-sync.js";
       // SPEC-2008 camera-focus / FR-094: the always-on Fleet Minimap carrier.
       import { createFleetMinimap } from "/fleet-minimap.js";
+      // Issue #4777 T-1: the rail picks Issues / Agents / Board / Settings.
+      import {
+        applySurfaceSelection,
+        installSurfaceRail,
+        surfaceForWindow,
+      } from "/surface-rail.js";
       import { shouldSkipTerminalFocusActivation } from "/clone-modal-focus-guard.js";
       import { createUiTraceProfiler } from "/ui-trace-profiler.js";
       import { UI_TRACE_EVENT, createUiTraceWiring } from "/ui-trace-wiring.js";
@@ -231,7 +237,6 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
       const stackButton = document.getElementById("stack-button");
       const alignButton = document.getElementById("align-button");
       const worldGrid = document.getElementById("canvas-world-grid");
-      const workspaceOverviewEntry = document.getElementById("op-workspace-overview-entry");
       // SPEC-3431 FR-018: both PM launchers share one handler so the rail and
       // the canvas CTA can never drift apart.
       for (const id of ["op-pm-entry", "canvas-pm-launcher"]) {
@@ -2034,6 +2039,37 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
         focusOrSpawnPreset("issue");
       }
 
+      // Issue #4777 T-1: until the Agents surface lands (T-4), the canvas is
+      // where every agent is visible, so Agents frames all agent windows.
+      // The PM is not one of them. With no agent yet, it opens the Add Window
+      // deck to launch one.
+      function openSurface(surface) {
+        switch (surface) {
+          case "issues":
+            openWorkspaceOverview();
+            return;
+          case "board":
+            focusOrSpawnPreset("board");
+            return;
+          case "settings":
+            focusOrSpawnPreset("settings");
+            return;
+          case "agents":
+            if (
+              fitAll({
+                include: (windowData) => surfaceForWindow(windowData) === "agents",
+              })
+            ) {
+              applySurfaceSelection(document, "agents");
+            } else {
+              openModal();
+            }
+            return;
+          default:
+            return;
+        }
+      }
+
       function clamp(value, min) {
         return Math.max(min, value);
       }
@@ -2474,13 +2510,13 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
       // Frame the bounding box of every canvas window so all windows are in
       // view (overview / fit-all). Falls back to a gentle zoom-to-fit-nothing
       // when there are no framable windows.
-      function fitAll({ animate = true } = {}) {
+      function fitAll({ animate = true, include = () => true } = {}) {
         const windows = (activeWorkspace().windows || []).filter(
           (windowData) =>
-            visibleWindowData(windowData) && windowData.geometry,
+            visibleWindowData(windowData) && windowData.geometry && include(windowData),
         );
         if (windows.length === 0) {
-          return;
+          return false;
         }
         let minX = Infinity;
         let minY = Infinity;
@@ -2510,6 +2546,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
           { minZoom: OVERVIEW_ZOOM_MIN, maxZoom: FRAME_ZOOM_MAX },
         );
         animateViewportTo(target, { animate });
+        return true;
       }
 
       // Esc when framed zooms the camera out to frame all windows.
@@ -3413,12 +3450,14 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
               ? "stopped"
               : "running";
           railEntry.dataset.pmState = state;
+          // Issue #4777: the hover text says what the PM is, not only its name.
+          const role = "your point of contact, not one of the agents";
           railEntry.title =
             state === "running"
-              ? "Project Manager"
+              ? `Project Manager: ${role}`
               : state === "stopped"
-                ? "Project Manager (stopped) — click to resume"
-                : "Project Manager — click to start";
+                ? `Project Manager (stopped): ${role}. Click to resume`
+                : `Project Manager: ${role}. Click to start`;
         }
 
         const floating = document.getElementById("canvas-pm-launcher");
@@ -3829,6 +3868,16 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
           targetElement.classList.add("focused");
           raiseWindowElementLocally(targetElement);
         }
+        syncSurfaceRail();
+      }
+
+      // Issue #4777 T-1: the pressed rail surface is the one the focused
+      // window belongs to; no second selection state is kept.
+      function syncSurfaceRail() {
+        const focused = focusedId
+          ? (activeWorkspace().windows || []).find((windowData) => windowData.id === focusedId)
+          : null;
+        applySurfaceSelection(document, surfaceForWindow(focused));
       }
 
       function numericZIndex(value) {
@@ -6033,6 +6082,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
                   });
                 } else {
                   focusedId = null;
+                  syncSurfaceRail();
                 }
               },
             });
@@ -7435,9 +7485,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
       if (kanbanDrawerBackdrop) {
         kanbanDrawerBackdrop.addEventListener("click", closeKanbanDrawer);
       }
-      if (workspaceOverviewEntry) {
-        workspaceOverviewEntry.addEventListener("click", openWorkspaceOverview);
-      }
+      installSurfaceRail(document, { openSurface });
       // SPEC-2356 — keyboard equivalent for clicking the modal backdrop.
       // Without this, Esc only worked for the Hotkey overlay and Command
       // Palette; users were trapped in branch-cleanup / migration / wizard
