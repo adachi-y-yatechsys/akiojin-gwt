@@ -44841,6 +44841,9 @@ fn app_runtime_background_knowledge_refresh_silent_paths_do_not_dispatch() {
         WindowProcessStatus::Ready,
     );
     let (mut runtime, events) = sample_runtime_with_events(temp.path(), vec![tab], Some("tab-1"));
+    // Run each refresh to completion before asserting: the fake gh writes the
+    // marker before it exits, so waiting on the marker races its still-open
+    // handle (Windows os error 32) and the refresh result (Issue #4793).
     let (blocking_tasks, queued_tasks) = BlockingTaskSpawner::queued();
     runtime.blocking_tasks = blocking_tasks;
     let window_id = combined_window_id("tab-1", "issue-1");
@@ -44857,10 +44860,8 @@ fn app_runtime_background_knowledge_refresh_silent_paths_do_not_dispatch() {
         sessions_dir: runtime.sessions_dir.clone(),
         issue_link_cache_dir: runtime.issue_link_cache_dir.clone(),
     });
-    // The marker records invocation, not completion: on Windows gh.cmd can
-    // still hold its write handle when the file first becomes visible.
     drain_queued_blocking_tasks(&queued_tasks);
-    assert!(marker.exists(), "stale knowledge refresh should invoke gh");
+    assert!(marker.exists(), "stale knowledge refresh must invoke gh");
     assert!(
         events.lock().expect("event log").is_empty(),
         "background refresh errors should not overwrite the current cache view"
