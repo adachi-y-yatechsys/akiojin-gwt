@@ -104,10 +104,55 @@
              app.js / operator-shell.js wiring stays intact. Icons are Unicode
              symbols; hover flyouts carry the label + real shortcut. -->
         <aside class="op-rail" id="op-rail" aria-label="Command rail">
+          <div class="op-rail__group" role="group" aria-label="Navigate">
+            <!-- SPEC-3431 FR-018/FR-019/FR-021: the PM is the user's single
+                 conversational window, so its launcher leads the Navigate
+                 group. One click always lands on the PM — an existing pane is
+                 framed in the viewport, a missing one is started first. The
+                 state dot reports running / stopped / not started. -->
+            <!-- SPEC-3431 FR-026: the settings gear is a SIBLING of the PM
+                 button, never a child. Nested, its click would bubble into the
+                 launcher and start/frame the PM every time the user only
+                 wanted to configure it. It stays hidden until the shell is
+                 hovered or focused so the rail keeps one icon per row. -->
+            <div class="pm-launcher-shell">
+              <button
+                class="op-rail__item op-rail__item--pm"
+                type="button"
+                id="op-pm-entry"
+                data-pm-state="absent"
+                data-surface="pm"
+                aria-pressed="false"
+                aria-label="Project Manager"
+                title="Project Manager"
+              >
+                <svg class="op-rail__icon op-rail__surface-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4 5h16v10H10l-6 4z"/><path d="M8 9h8"/><path d="M8 12h5"/></svg>
+                <span class="op-rail__surface-label" aria-hidden="true">PM</span>
+                <span class="op-rail__pm-dot" aria-hidden="true"></span>
+              </button>
+              <button
+                class="pm-launcher-gear"
+                type="button"
+                id="op-pm-settings-button"
+                aria-label="Project Manager settings"
+                title="Project Manager settings"
+              >
+                <span aria-hidden="true">⚙</span>
+              </button>
+            </div>
+            <!-- 2026-06-20 Update: Board (⌘B) and Logs (⌘L) were demoted out of
+                 the Navigate rail group per user feedback. They stay reachable
+                 via the Add Window presets, the command palette, and the ⌘B /
+                 ⌘L hotkeys; the op:command handlers (open-board / open-logs)
+                 and operator-shell.js wiring are unchanged. -->
+          </div>
+          <div class="op-rail__divider" aria-hidden="true"></div>
           <!-- Issue #4777 T-1: the rail picks one of four surfaces. Every
                window preset folds into Issues / Agents / Board / Settings
                (surface-rail.js), and the entry for the focused window's
-               surface is pressed. SPEC-3885: Issues keeps the ⌘G entry id. -->
+               surface is pressed. The PM sits above them, cut off by the
+               rule, because it is the user's own window and not one of the
+               agents. SPEC-3885: Issues keeps the ⌘G entry id. -->
           <div class="op-rail__group op-rail__group--surfaces" role="group" aria-label="Surfaces">
             <button
               class="op-rail__item op-rail__surface"
@@ -151,49 +196,6 @@
               <svg class="op-rail__surface-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M4 8h16"/><path d="M4 16h16"/><path d="M14 6v4"/><path d="M9 14v4"/></svg>
               <span class="op-rail__surface-label">Settings</span>
             </button>
-          </div>
-          <div class="op-rail__divider" aria-hidden="true"></div>
-          <div class="op-rail__group" role="group" aria-label="Navigate">
-            <!-- SPEC-3431 FR-018/FR-019/FR-021: the PM is the user's single
-                 conversational window, so its launcher leads the Navigate
-                 group. One click always lands on the PM — an existing pane is
-                 framed in the viewport, a missing one is started first. The
-                 state dot reports running / stopped / not started. -->
-            <!-- SPEC-3431 FR-026: the settings gear is a SIBLING of the PM
-                 button, never a child. Nested, its click would bubble into the
-                 launcher and start/frame the PM every time the user only
-                 wanted to configure it. It stays hidden until the shell is
-                 hovered or focused so the rail keeps one icon per row. -->
-            <div class="pm-launcher-shell">
-              <button
-                class="op-rail__item op-rail__item--pm"
-                type="button"
-                id="op-pm-entry"
-                data-pm-state="absent"
-                aria-label="Project Manager"
-                title="Project Manager"
-              >
-                <span class="op-rail__icon" aria-hidden="true">◎</span>
-                <span class="op-rail__pm-dot" aria-hidden="true"></span>
-                <span class="op-rail__flyout" aria-hidden="true">
-                  <span class="op-rail__flyout-label">PM</span>
-                </span>
-              </button>
-              <button
-                class="pm-launcher-gear"
-                type="button"
-                id="op-pm-settings-button"
-                aria-label="Project Manager settings"
-                title="Project Manager settings"
-              >
-                <span aria-hidden="true">⚙</span>
-              </button>
-            </div>
-            <!-- 2026-06-20 Update: Board (⌘B) and Logs (⌘L) were demoted out of
-                 the Navigate rail group per user feedback. They stay reachable
-                 via the Add Window presets, the command palette, and the ⌘B /
-                 ⌘L hotkeys; the op:command handlers (open-board / open-logs)
-                 and operator-shell.js wiring are unchanged. -->
           </div>
           <div class="op-rail__divider" aria-hidden="true"></div>
           <div class="op-rail__group" role="group" aria-label="Windows">

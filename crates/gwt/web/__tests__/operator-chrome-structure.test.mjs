@@ -399,7 +399,7 @@ test("Command Rail groups items into Navigate / Windows / Agents / System (SPEC-
   // Align / Windows / Add), and system actions (Palette / Update) — in that
   // order. Groups carry aria-labels instead of visual headings. SPEC-2356
   // Anshin (FR-042) inserts an Agents group (STOP ALL) before System.
-  // Issue #4777 T-1 leads the rail with the Surfaces group.
+  // Issue #4777 T-1 puts the Surfaces group right under the PM.
   const groups = Array.from(document.querySelectorAll(".op-rail > .op-rail__group")).map(
     (group) => group.getAttribute("aria-label"),
   );
@@ -407,8 +407,8 @@ test("Command Rail groups items into Navigate / Windows / Agents / System (SPEC-
   // bottom-right home, so the sidebar no longer carries an Update section.
   assert.deepEqual(
     groups,
-    ["Surfaces", "Navigate", "Windows", "Agents", "System"],
-    "Rail order must be Surfaces → Navigate → Windows → Agents → System",
+    ["Navigate", "Surfaces", "Windows", "Agents", "System"],
+    "Rail order must be Navigate (PM) → Surfaces → Windows → Agents → System",
   );
 });
 
@@ -1495,10 +1495,10 @@ test("Command Rail retires the pseudo kbd badges (SPEC-3038 FR-012)", () => {
 });
 
 test("Command Rail items are icon buttons with accessible names and flyout labels (SPEC-3038 AS-1.2/AS-1.3)", () => {
-  // Issue #4777 T-1: surface entries are labelled buttons, not icon-only
-  // ones; surface-rail.test.mjs owns their contract.
+  // Issue #4777 T-1: the PM and the surface entries are labelled buttons,
+  // not icon-only ones; surface-rail.test.mjs owns their contract.
   const items = Array.from(
-    document.querySelectorAll(".op-rail .op-rail__item:not(.op-rail__surface)"),
+    document.querySelectorAll(".op-rail .op-rail__item:not([data-surface])"),
   );
   // Navigate 2 (Start Work + Workspace) + Windows 5 + System 1 = 8 after the
   // 2026-06-20 Update removed Board / Logs from the rail.
@@ -5755,7 +5755,7 @@ test("SPEC #3206 v2: the System rail group carries the notification bell with an
   const groups = Array.from(document.querySelectorAll(".op-rail > .op-rail__group")).map(
     (group) => group.getAttribute("aria-label"),
   );
-  assert.deepEqual(groups, ["Surfaces", "Navigate", "Windows", "Agents", "System"]);
+  assert.deepEqual(groups, ["Navigate", "Surfaces", "Windows", "Agents", "System"]);
 });
 
 test("SPEC #3206 v2: bell → op:command toggle-notifications → drawer toggle, Esc closes, badge is wired (FR-009 / FR-014)", () => {

@@ -171,7 +171,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
       import {
         applySurfaceSelection,
         installSurfaceRail,
-        surfaceForPreset,
+        surfaceForWindow,
       } from "/surface-rail.js";
       import { shouldSkipTerminalFocusActivation } from "/clone-modal-focus-guard.js";
       import { createUiTraceProfiler } from "/ui-trace-profiler.js";
@@ -2041,7 +2041,8 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
 
       // Issue #4777 T-1: until the Agents surface lands (T-4), the canvas is
       // where every agent is visible, so Agents frames all agent windows.
-      // With no agent yet, it opens the Add Window deck to launch one.
+      // The PM is not one of them. With no agent yet, it opens the Add Window
+      // deck to launch one.
       function openSurface(surface) {
         switch (surface) {
           case "issues":
@@ -2056,7 +2057,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
           case "agents":
             if (
               fitAll({
-                include: (windowData) => surfaceForPreset(windowData.preset) === "agents",
+                include: (windowData) => surfaceForWindow(windowData) === "agents",
               })
             ) {
               applySurfaceSelection(document, "agents");
@@ -3449,12 +3450,14 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
               ? "stopped"
               : "running";
           railEntry.dataset.pmState = state;
+          // Issue #4777: the hover text says what the PM is, not only its name.
+          const role = "your point of contact, not one of the agents";
           railEntry.title =
             state === "running"
-              ? "Project Manager"
+              ? `Project Manager: ${role}`
               : state === "stopped"
-                ? "Project Manager (stopped) — click to resume"
-                : "Project Manager — click to start";
+                ? `Project Manager (stopped): ${role}. Click to resume`
+                : `Project Manager: ${role}. Click to start`;
         }
 
         const floating = document.getElementById("canvas-pm-launcher");
@@ -3874,7 +3877,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
         const focused = focusedId
           ? (activeWorkspace().windows || []).find((windowData) => windowData.id === focusedId)
           : null;
-        applySurfaceSelection(document, surfaceForPreset(focused?.preset));
+        applySurfaceSelection(document, surfaceForWindow(focused));
       }
 
       function numericZIndex(value) {

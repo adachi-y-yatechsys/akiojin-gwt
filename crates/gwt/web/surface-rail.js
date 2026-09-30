@@ -29,18 +29,26 @@ export function surfaceForPreset(preset) {
   return SURFACE_BY_PRESET[preset] || null;
 }
 
-function surfaceItems(document) {
-  return Array.from(document.querySelectorAll(".op-rail__surface[data-surface]"));
+// The PM is the user's own window, not one of the agents the app runs. The
+// backend marks it from the pane role (`is_pm`), so the rail never guesses
+// from a title or a worktree path.
+export function surfaceForWindow(windowData) {
+  if (windowData?.is_pm) {
+    return "pm";
+  }
+  return surfaceForPreset(windowData?.preset);
 }
 
 export function applySurfaceSelection(document, surface) {
-  for (const item of surfaceItems(document)) {
+  for (const item of document.querySelectorAll(".op-rail [data-surface]")) {
     item.setAttribute("aria-pressed", item.dataset.surface === surface ? "true" : "false");
   }
 }
 
+// The PM entry keeps its own launcher wiring (it starts a missing PM), so
+// only the four surfaces are routed through `openSurface`.
 export function installSurfaceRail(document, { openSurface }) {
-  for (const item of surfaceItems(document)) {
+  for (const item of document.querySelectorAll(".op-rail__surface[data-surface]")) {
     item.addEventListener("click", () => openSurface(item.dataset.surface));
   }
 }

@@ -47,11 +47,33 @@ test("surfaceForPreset folds every window preset into one of the four surfaces",
   }
 });
 
-test("the rail leads with a Surfaces group of Issues / Agents / Board / Settings", () => {
+test("surfaceForWindow puts the PM apart from the agents by its role marker", async () => {
+  const { surfaceForWindow } = await importSurfaceRail();
+  assert.equal(surfaceForWindow({ preset: "claude", is_pm: true }), "pm");
+  assert.equal(surfaceForWindow({ preset: "claude", is_pm: false }), "agents");
+  assert.equal(surfaceForWindow({ preset: "board" }), "board");
+  assert.equal(surfaceForWindow(null), null);
+});
+
+test("the PM sits alone above the rule, then the Surfaces group of Issues / Agents / Board / Settings", () => {
   const { document } = parseHTML(html);
-  const firstGroup = document.querySelector(".op-rail > .op-rail__group");
-  assert.equal(firstGroup?.getAttribute("aria-label"), "Surfaces");
-  const items = Array.from(firstGroup.querySelectorAll("[data-surface]"));
+  const children = Array.from(document.querySelector(".op-rail").children).filter(
+    (child) => child.tagName !== "#comment",
+  );
+  const [pmGroup, rule, surfacesGroup] = children;
+  assert.deepEqual(
+    Array.from(pmGroup.querySelectorAll("[data-surface]")).map((item) => item.id),
+    ["op-pm-entry"],
+  );
+  assert.ok(rule.classList.contains("op-rail__divider"));
+  assert.equal(surfacesGroup?.getAttribute("aria-label"), "Surfaces");
+  const pm = document.getElementById("op-pm-entry");
+  assert.equal(pm.dataset.surface, "pm");
+  assert.equal(pm.getAttribute("aria-pressed"), "false");
+  assert.ok(pm.querySelector("svg"), "the PM carries an SVG icon");
+  assert.equal(pm.querySelector(".op-rail__surface-label")?.textContent.trim(), "PM");
+  assert.equal(pm.classList.contains("op-rail__surface"), false, "the PM is not one of the surfaces");
+  const items = Array.from(surfacesGroup.querySelectorAll("[data-surface]"));
   assert.deepEqual(
     items.map((item) => item.dataset.surface),
     ["issues", "agents", "board", "settings"],
@@ -83,6 +105,8 @@ test("applySurfaceSelection presses exactly the selected surface", async () => {
   assert.deepEqual(pressed(), ["board"]);
   applySurfaceSelection(document, "agents");
   assert.deepEqual(pressed(), ["agents"]);
+  applySurfaceSelection(document, "pm");
+  assert.deepEqual(pressed(), ["pm"]);
   applySurfaceSelection(document, null);
   assert.deepEqual(pressed(), []);
 });
@@ -97,6 +121,9 @@ test("installSurfaceRail asks the host to open the clicked surface", async () =>
       .querySelector(`[data-surface="${surface}"]`)
       .dispatchEvent(new window.Event("click", { bubbles: true }));
   }
+  assert.deepEqual(opened, ["settings", "agents", "board", "issues"]);
+  // The PM keeps its own launcher wiring; the surface router never sees it.
+  document.getElementById("op-pm-entry").dispatchEvent(new window.Event("click", { bubbles: true }));
   assert.deepEqual(opened, ["settings", "agents", "board", "issues"]);
 });
 

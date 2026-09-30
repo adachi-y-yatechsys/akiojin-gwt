@@ -1,7 +1,7 @@
 /* Issue #4777 T-1 — the rail picks one of four surfaces.
  *
- * Issues / Agents / Board / Settings lead the Command Rail with an icon and a
- * visible label. The pressed entry is the surface of the focused window, a
+ * The PM sits alone above a rule; Issues / Agents / Board / Settings follow
+ * with an icon and a visible label. The pressed entry is the surface of the focused window, a
  * click opens (or focuses) that surface, and at 860px and below the rail is a
  * strip across the top of the canvas. Runs against the embedded frontend with
  * a stub backend, in both themes, with zero console / page errors.
@@ -41,6 +41,16 @@ test.describe("Surface rail", () => {
 
     await expect(windowById(page, "board-window")).toBeVisible({ timeout: 10_000 });
     await expect(surfaces).toHaveText(["Issues", "Agents", "Board", "Settings"]);
+    // The PM leads the rail, cut off from the four surfaces by a rule.
+    const railOrder = await rail.evaluate((element) =>
+      Array.from(element.querySelectorAll("[data-surface], .op-rail__divider")).map((node) =>
+        node.classList.contains("op-rail__divider")
+          ? "|"
+          : (node as HTMLElement).dataset.surface ?? "",
+      ),
+    );
+    expect(railOrder.slice(0, 6)).toEqual(["pm", "|", "issues", "agents", "board", "settings"]);
+    await expect(entry("pm")).toHaveText("PM");
     for (const surface of ["issues", "agents", "board", "settings"]) {
       await expect(entry(surface).locator("svg")).toBeVisible();
     }
@@ -60,8 +70,8 @@ test.describe("Surface rail", () => {
     );
     expect(accent).not.toBe(idleEdge);
 
-    // Agents frames every agent window and presses the Agents entry without
-    // creating or focusing any window.
+    // Agents frames every agent window, but not the PM, and presses the
+    // Agents entry without creating or focusing any window.
     await clearMessages(page);
     const stage = page.locator("#canvas-stage");
     const before = await stage.evaluate((element) => (element as HTMLElement).style.transform);
@@ -75,6 +85,17 @@ test.describe("Surface rail", () => {
         (message) => message.kind === "create_window" || message.kind === "focus_window",
       ),
     ).toEqual([]);
+    await expect.poll(() => inCanvasView(page, "agent-one")).toBe(true);
+    await expect.poll(() => inCanvasView(page, "agent-two")).toBe(true);
+    expect(await inCanvasView(page, "pm-window")).toBe(false);
+
+    // The PM entry lands on the PM and presses itself, not Agents: the role
+    // marker (is_pm), not the claude preset, decides where it belongs.
+    await clearMessages(page);
+    await entry("pm").click();
+    await expect.poll(() => inCanvasView(page, "pm-window")).toBe(true);
+    await windowById(page, "pm-window").locator(".titlebar").click();
+    await expect.poll(() => pressedSurfaces(page)).toEqual(["pm"]);
 
     // Issues focuses the existing Issue window instead of spawning another.
     await clearMessages(page);
@@ -120,9 +141,25 @@ function windowById(page: Page, id: string) {
   return page.locator(`.workspace-window[data-id='${id}']`);
 }
 
+async function inCanvasView(page: Page, id: string): Promise<boolean> {
+  return page.evaluate((windowId) => {
+    const canvas = document.getElementById("canvas")!.getBoundingClientRect();
+    const target = document
+      .querySelector(`.workspace-window[data-id='${windowId}']`)
+      ?.getBoundingClientRect();
+    if (!target) return false;
+    return (
+      target.left >= canvas.left - 1 &&
+      target.right <= canvas.right + 1 &&
+      target.top >= canvas.top - 1 &&
+      target.bottom <= canvas.bottom + 1
+    );
+  }, id);
+}
+
 async function pressedSurfaces(page: Page): Promise<string[]> {
   return page.evaluate(() =>
-    Array.from(document.querySelectorAll(".op-rail__surface[aria-pressed='true']")).map(
+    Array.from(document.querySelectorAll(".op-rail [data-surface][aria-pressed='true']")).map(
       (element) => (element as HTMLElement).dataset.surface ?? "",
     ),
   );
@@ -178,8 +215,20 @@ async function installSurfaceRailBackend(page: Page): Promise<void> {
       ...overrides,
     });
 
-    // Agents sit far to the right so framing them moves the camera.
+    // Agents sit far to the right so framing them moves the camera; the PM
+    // (a claude pane marked is_pm) sits far to the left so framing the
+    // agents leaves it out of view.
     const windows = [
+      canvasWindow("pm-window", {
+        title: "Project Manager",
+        preset: "claude",
+        is_pm: true,
+        status: "running",
+        agent_id: "pm-window",
+        agent_color: "yellow",
+        geometry: { x: -3200, y: 80, width: 560, height: 340 },
+        z_index: 2,
+      }),
       canvasWindow("issue-window", {
         title: "Issues",
         preset: "issue",
