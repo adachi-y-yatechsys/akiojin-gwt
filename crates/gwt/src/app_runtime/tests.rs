@@ -18248,6 +18248,7 @@ fn targeted_windows_metadata_failure_never_reports_running_ready_or_delivery_suc
         readiness: gwt::IssueMonitorReadiness::NotApplicable,
         updated_at: None,
     });
+    monitor.terminal_queue_push(&[3456], "operator", "2026-08-05T00:00:00Z");
     assert!(monitor.apply_confirmed_claim(
         3456,
         "claim-phase75-metadata-failure",
@@ -44839,7 +44840,9 @@ fn app_runtime_background_knowledge_refresh_silent_paths_do_not_dispatch() {
         WindowPreset::Issue,
         WindowProcessStatus::Ready,
     );
-    let (runtime, events) = sample_runtime_with_events(temp.path(), vec![tab], Some("tab-1"));
+    let (mut runtime, events) = sample_runtime_with_events(temp.path(), vec![tab], Some("tab-1"));
+    let (blocking_tasks, queued_tasks) = BlockingTaskSpawner::queued();
+    runtime.blocking_tasks = blocking_tasks;
     let window_id = combined_window_id("tab-1", "issue-1");
 
     let mode_guard = ScopedEnvVar::set("GWT_FAKE_GH_MODE", "fail");
@@ -44854,7 +44857,10 @@ fn app_runtime_background_knowledge_refresh_silent_paths_do_not_dispatch() {
         sessions_dir: runtime.sessions_dir.clone(),
         issue_link_cache_dir: runtime.issue_link_cache_dir.clone(),
     });
-    wait_for_path("stale knowledge refresh gh invocation", &marker);
+    // The marker records invocation, not completion: on Windows gh.cmd can
+    // still hold its write handle when the file first becomes visible.
+    drain_queued_blocking_tasks(&queued_tasks);
+    assert!(marker.exists(), "stale knowledge refresh should invoke gh");
     assert!(
         events.lock().expect("event log").is_empty(),
         "background refresh errors should not overwrite the current cache view"
@@ -44875,7 +44881,7 @@ fn app_runtime_background_knowledge_refresh_silent_paths_do_not_dispatch() {
         sessions_dir: runtime.sessions_dir.clone(),
         issue_link_cache_dir: runtime.issue_link_cache_dir.clone(),
     });
-    thread::sleep(Duration::from_millis(250));
+    drain_queued_blocking_tasks(&queued_tasks);
     assert!(
         events.lock().expect("event log").is_empty(),
         "noop background refresh should return silently without dispatch"
