@@ -12,9 +12,11 @@ use axum::{
     Json, Router,
 };
 use chrono::TimeZone;
-use gwt::daemon_runtime::{handle_coordination_event, handle_forward, handle_runtime_state};
+use gwt::daemon_runtime::{
+    handle_coordination_event, handle_forward, handle_runtime_state, HOOK_LIVE_ATTEMPT_BUDGET,
+};
 use gwt_agent::{runtime_state_path, AgentId, Session};
-use gwt_core::paths::gwt_cache_dir;
+use gwt_core::{deadline_budget::ScopedDeadlineBudget, paths::gwt_cache_dir};
 use gwt_github::{CommentSnapshot, IssueNumber, IssueSnapshot, IssueState, UpdatedAt};
 use serde_json::Value;
 use tokio::{net::TcpListener, runtime::Runtime, sync::oneshot};
@@ -69,6 +71,11 @@ struct CaptureState {
 }
 
 struct CaptureServer {
+    // SPEC #4740: every test that starts a capture server asserts delivery.
+    // Hook-live is fail-open, so an attempt that outlives its production
+    // 100 ms budget on a loaded host drops the event silently. Pinning the
+    // hang guard makes the verdict independent of how slow the host is.
+    _attempt_budget: ScopedDeadlineBudget,
     runtime: Runtime,
     shutdown_tx: Option<oneshot::Sender<()>>,
     rx: mpsc::Receiver<(String, Value)>,
@@ -96,6 +103,7 @@ impl CaptureServer {
         });
 
         Self {
+            _attempt_budget: ScopedDeadlineBudget::hang_guard(&HOOK_LIVE_ATTEMPT_BUDGET),
             runtime,
             shutdown_tx: Some(shutdown_tx),
             rx,
@@ -103,10 +111,14 @@ impl CaptureServer {
         }
     }
 
+    /// The delivered event. Emission is synchronous and the capture handler
+    /// queues the event before it answers 2xx, so by the time the hook
+    /// handler returns a delivered event is already queued: no wall-clock
+    /// wait is involved. An empty queue means the fail-open emission failed.
     fn recv(&self) -> (String, Value) {
         self.rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("expected hook live event")
+            .try_recv()
+            .expect("expected hook live event to be delivered before the handler returned")
     }
 }
 

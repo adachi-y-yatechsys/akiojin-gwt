@@ -206,6 +206,11 @@ pub enum IssueCommand {
         number: u64,
         position: usize,
     },
+    MonitorQueueAutoRefill {
+        project_root: Option<std::path::PathBuf>,
+        enabled: bool,
+        limit: usize,
+    },
     MonitorConfigSet {
         project_root: Option<std::path::PathBuf>,
         enabled: Option<bool>,

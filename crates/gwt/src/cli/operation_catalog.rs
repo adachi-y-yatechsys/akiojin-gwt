@@ -308,6 +308,10 @@ pub const OPERATIONS: &[Operation] = &[
     // The operator's hand on the implementation queue: list what is queued,
     // put an Issue in, take one out, and reorder what is left.
     Operation {
+        name: "issue.monitor.queue.auto_refill",
+        aliases: &[],
+    },
+    Operation {
         name: "issue.monitor.queue.list",
         aliases: &[],
     },

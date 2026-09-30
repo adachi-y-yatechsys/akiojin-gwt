@@ -573,6 +573,9 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
           appendRenderKeyPart(parts, windowWorktreeForm(windowData));
           appendRenderKeyPart(parts, "status");
           appendRenderKeyPart(parts, windowData?.status || "");
+          // SPEC #3885 T-020: a start-time-only broadcast must reach the elapsed label.
+          appendRenderKeyPart(parts, "runtime_started_at_ms");
+          appendRenderKeyPart(parts, windowData?.runtime_started_at_ms ?? "");
           appendRenderKeyPart(parts, "geometry");
           appendRenderKeyPart(parts, "x");
           appendRenderKeyPart(parts, geometry.x ?? 0);
@@ -734,6 +737,9 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
           // Issue #3884: the status row shows the activity line and elapsed time.
           appendRenderKeyPart(parts, "activity");
           appendRenderKeyPart(parts, windowActivityDetail(windowData));
+          // SPEC #3885 T-020: the backend start time drives the elapsed label.
+          appendRenderKeyPart(parts, "started_at");
+          appendRenderKeyPart(parts, windowData.runtime_started_at_ms ?? "");
           appendRenderKeyPart(parts, "since_minute");
           const since = windowRuntimeStateSinceMap.get(windowData.id);
           appendRenderKeyPart(

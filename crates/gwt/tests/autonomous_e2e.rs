@@ -68,7 +68,8 @@ fn drive_to_reviewed(
     issue: &IssueMonitorIssue,
     review_passes: bool,
 ) {
-    // Scan the issue into the inbox first so inbox-state transitions are visible.
+    monitor.terminal_queue_push(&[issue.number], "operator", "2026-06-29T00:00:00Z");
+    // Scan the queued issue so inbox-state transitions are visible.
     gwt::scan_issue_monitor_candidates(
         monitor,
         std::slice::from_ref(issue),
@@ -259,6 +260,7 @@ fn unverified_branch_protection_blocks_eligibility() {
     // on the next scan — never parked as needs_human.
     let mut monitor = autonomous_monitor();
     let issue = auto_issue(42);
+    monitor.terminal_queue_push(&[issue.number], "operator", "2026-06-29T00:00:00Z");
     gwt::scan_issue_monitor_candidates(
         &mut monitor,
         std::slice::from_ref(&issue),
@@ -345,6 +347,7 @@ fn fr_family_decision_boundaries_are_observable() {
 
     // FR-006/FR-014 (eligibility + acceptance snapshot): eligibility is a
     // returned value; the captured snapshot + Implementing phase are state.
+    monitor.terminal_queue_push(&[issue.number], "operator", "2026-06-29T00:00:00Z");
     gwt::scan_issue_monitor_candidates(
         &mut monitor,
         std::slice::from_ref(&issue),
@@ -451,6 +454,7 @@ fn fr_family_decision_boundaries_are_observable() {
         },
     );
     let issue2 = auto_issue(44);
+    escalated.terminal_queue_push(&[44], "operator", "2026-07-02T00:00:00Z");
     gwt::scan_issue_monitor_candidates(
         &mut escalated,
         std::slice::from_ref(&issue2),
@@ -554,6 +558,7 @@ mod idle_windows {
     fn launched_with_queue(launched: u64, queued: u64, window_id: &str) -> IssueMonitorState {
         let mut monitor = idle_monitor();
         monitor.set_gui_connected(true);
+        monitor.terminal_queue_push(&[launched, queued], "operator", LAUNCHED_AT);
         gwt::scan_issue_monitor_candidates(
             &mut monitor,
             &[auto_issue(launched), auto_issue(queued)],

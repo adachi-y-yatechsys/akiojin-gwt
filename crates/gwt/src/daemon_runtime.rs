@@ -11,6 +11,7 @@ use gwt_agent::{
     Session, GWT_HOOK_FORWARD_TOKEN_ENV, GWT_HOOK_FORWARD_URL_ENV, GWT_SESSION_ID_ENV,
     GWT_SESSION_RUNTIME_PATH_ENV,
 };
+use gwt_core::deadline_budget::DeadlineBudget;
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 
@@ -19,10 +20,18 @@ use crate::cli::hook::{
     HookError, RawHookEvent,
 };
 
-const HOOK_LIVE_TIMEOUT_MS: u64 = 100;
-const HOOK_LIVE_OVERALL_DEADLINE_MS: u64 = 1_000;
+/// Per-attempt budget of a hook-live POST. Tests that assert delivery pin it
+/// (SPEC #4740): hook-live is fail-open, so an attempt that outlives the
+/// budget on a loaded host drops the event silently.
+pub const HOOK_LIVE_ATTEMPT_BUDGET: DeadlineBudget =
+    DeadlineBudget::new("HOOK_LIVE_ATTEMPT", Duration::from_millis(100));
+/// Overall budget of a SessionStart readiness delivery, retries included.
+pub const HOOK_LIVE_READINESS_BUDGET: DeadlineBudget =
+    DeadlineBudget::new("HOOK_LIVE_READINESS", Duration::from_millis(1_000));
 const HOOK_LIVE_RETRY_DELAY_MS: u64 = 25;
-const USER_PROMPT_SUBMIT_HOOK_LIVE_DEADLINE_MS: u64 = 25;
+/// Share of the aggregate UserPromptSubmit budget hook-live may consume.
+pub const USER_PROMPT_SUBMIT_HOOK_LIVE_BUDGET: DeadlineBudget =
+    DeadlineBudget::new("USER_PROMPT_SUBMIT_HOOK_LIVE", Duration::from_millis(25));
 const AGENT_BRIDGE_ERROR_BODY_MAX_BYTES: u64 = 64 * 1024;
 
 static HOOK_LIVE_HTTP_CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();
@@ -37,8 +46,8 @@ struct HookLiveRetryPolicy {
 impl HookLiveRetryPolicy {
     fn production() -> Self {
         Self {
-            per_attempt_timeout: Duration::from_millis(HOOK_LIVE_TIMEOUT_MS),
-            overall_deadline: Duration::from_millis(HOOK_LIVE_OVERALL_DEADLINE_MS),
+            per_attempt_timeout: HOOK_LIVE_ATTEMPT_BUDGET.resolve(),
+            overall_deadline: HOOK_LIVE_READINESS_BUDGET.resolve(),
             retry_delay: Duration::from_millis(HOOK_LIVE_RETRY_DELAY_MS),
         }
     }
@@ -1255,7 +1264,7 @@ pub(crate) fn handle_runtime_state_prepared(
     // UserPromptSubmit budget before the Board and obligation handlers run.
     let _live_deadline = (event == "UserPromptSubmit").then(|| {
         gwt_core::operation_deadline::ScopedOperationDeadline::enter(
-            Instant::now() + Duration::from_millis(USER_PROMPT_SUBMIT_HOOK_LIVE_DEADLINE_MS),
+            Instant::now() + USER_PROMPT_SUBMIT_HOOK_LIVE_BUDGET.resolve(),
         )
     });
     let live_started = Instant::now();
