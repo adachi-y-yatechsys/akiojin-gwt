@@ -6773,6 +6773,7 @@ impl AppRuntime {
         &mut self,
         now: &str,
     ) -> Vec<OutboundEvent> {
+        let mut events = self.reconcile_activated_issue_monitor_launches();
         let mut seen_prefs_paths = HashSet::new();
         let projects: Vec<(PathBuf, PathBuf, String)> = self
             .tabs
@@ -6785,7 +6786,6 @@ impl AppRuntime {
                     .then(|| (tab.project_root.clone(), prefs_path, tab.id.clone()))
             })
             .collect();
-        let mut events = Vec::new();
         for (project_root, prefs_path, expected_project_tab_id) in projects {
             // Issue #3627: reclaim slots held by windows that no longer exist
             // before deciding what to launch. This runs on the periodic tick
