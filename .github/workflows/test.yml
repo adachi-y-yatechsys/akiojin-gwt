@@ -428,7 +428,9 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: windows-startup-tray-performance
-          path: target/startup-tray-performance.json
+          path: |
+            target/startup-tray-performance.json
+            target/startup-update-performance.json
           if-no-files-found: warn
 
   # The default-parallel determinism proof lives in nightly.yml (Issue #4134

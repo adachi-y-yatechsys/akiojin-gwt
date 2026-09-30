@@ -102,7 +102,7 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn new() -> Self {
+    fn new(worktree_count: usize) -> Self {
         let temp = tempfile::tempdir().expect("isolated startup fixture");
         let repo = temp.path().join("repo");
         let template = temp.path().join("session-template");
@@ -116,9 +116,9 @@ impl Fixture {
             &repo,
             &["commit", "--quiet", "--allow-empty", "-m", "fixture"],
         );
-        // Exactly 300 real worktrees including the main worktree; no production repo is touched.
+        // Real worktrees including the main worktree; no production repo is touched.
         let mut worktrees = vec![repo.clone()];
-        for index in 1..300 {
+        for index in 1..worktree_count {
             let path = temp.path().join(format!("wt-{index}"));
             let target = path.to_str().unwrap();
             git(
@@ -276,7 +276,7 @@ fn startup_metric_and_native_command_contract() {
 #[test]
 #[ignore = "real Windows tray, 300 worktrees and 1500 stopped Sessions; run explicitly"]
 fn startup_tray_under_large_stopped_session_load() {
-    let fixture = Fixture::new();
+    let fixture = Fixture::new(300);
     let control_binary = std::env::var_os("GWT_STARTUP_CONTROL_BINARY");
     let is_control = control_binary.is_some();
     let binary = control_binary.unwrap_or_else(|| env!("CARGO_BIN_EXE_gwt").into());
@@ -444,4 +444,177 @@ fn startup_tray_under_large_stopped_session_load() {
     fs::write(&out, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
     eprintln!("{report}");
     assert!(passed, "startup tray budget failed or unmeasured");
+}
+
+/// Issue #4803: the update marker forces the historical Session path that
+/// ordinary cold-start coverage does not exercise.
+#[test]
+#[ignore = "real Windows startup with an update marker and 1500 Sessions"]
+fn startup_update_resume_under_large_session_load() {
+    // More worktrees than the Git budget proves a per-worktree Git cache
+    // alone is insufficient, without repeating the separate 300-worktree suite.
+    let fixture = Fixture::new(6);
+    git(
+        &fixture.repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://example.invalid/startup-fixture.git",
+        ],
+    );
+    let home = fixture.home(0);
+    {
+        let _scope = gwt_core::test_support::ScopedGwtHome::set(&home);
+        gwt_core::update::persist_update_resume_marker(&gwt_core::update::UpdateResumeMarker {
+            from_version: "fixture".into(),
+            to_version: env!("CARGO_PKG_VERSION").into(),
+            started_at: chrono::Utc::now().to_rfc3339(),
+            restart_args: Vec::new(),
+            projects: vec![gwt_core::update::UpdateResumeProject {
+                hash: gwt_core::paths::project_scope_hash(&fixture.repo).to_string(),
+                update_drain: false,
+            }],
+            attempt: 1,
+        })
+        .unwrap();
+    }
+    let mut command = hidden_command(env!("CARGO_BIN_EXE_gwt"));
+    fixture.configure(&mut command, &home);
+    let url_file = home.join("browser-url.txt");
+    command
+        .arg("--no-open")
+        .env("GWT_BROWSER_URL_FILE", &url_file)
+        .stdout(Stdio::null())
+        .stderr(fs::File::create(home.join("stderr.log")).unwrap());
+    let mut child = Running(command.spawn().expect("spawn checkout gwt"));
+    let started = Instant::now();
+    let browser_binary = std::env::var_os("GWT_TEST_CHROMIUM")
+        .map(PathBuf::from)
+        .or_else(|| {
+            ["ProgramFiles(x86)", "ProgramFiles"]
+                .into_iter()
+                .find_map(|key| {
+                    let path = PathBuf::from(std::env::var_os(key)?)
+                        .join("Microsoft/Edge/Application/msedge.exe");
+                    path.is_file().then_some(path)
+                })
+        })
+        .expect("set GWT_TEST_CHROMIUM or install Chromium-based Microsoft Edge");
+    let mut browser = None;
+    let mut browser_url = None;
+    let mut browser_started_ms = None;
+    let mut canvas = None;
+    let mut drain = None;
+    let mut parsed_sessions = None;
+    let mut common_dir_spawns = std::collections::HashSet::new();
+    let mut process_logging_seen = false;
+    let mut phases = Vec::new();
+    while started.elapsed() < TIMEOUT && child.0.try_wait().unwrap().is_none() {
+        if browser.is_none() {
+            if let Ok(url) = fs::read_to_string(&url_file) {
+                if !url.trim().is_empty() {
+                    let project_url = format!(
+                        "{}p/{}",
+                        url.trim().trim_end_matches('/').to_owned() + "/",
+                        gwt_core::paths::project_scope_hash(&fixture.repo)
+                    );
+                    browser_url = Some(project_url.clone());
+                    browser_started_ms = Some(started.elapsed().as_secs_f64() * 1000.0);
+                    browser = Some(Running(
+                        hidden_command(&browser_binary)
+                            .arg(format!(
+                                "--user-data-dir={}",
+                                home.join("chromium-profile").display()
+                            ))
+                            .args([
+                                "--no-first-run",
+                                "--no-default-browser-check",
+                                "--disable-background-networking",
+                                // Keep the headed measurement rendering when another
+                                // window occludes it, as browser test runners do.
+                                "--disable-background-timer-throttling",
+                                "--disable-backgrounding-occluded-windows",
+                                "--disable-renderer-backgrounding",
+                                "--no-sandbox",
+                                "--remote-debugging-port=0",
+                            ])
+                            .arg(format!("--app={project_url}"))
+                            .stdout(Stdio::null())
+                            .stderr(fs::File::create(home.join("chromium-stderr.log")).unwrap())
+                            .spawn()
+                            .expect("start isolated headed Chromium"),
+                    ));
+                }
+            }
+        }
+        let mut text = logs(&home.join(".gwt/logs"));
+        let project_logs = {
+            let _scope = gwt_core::test_support::ScopedGwtHome::set(&home);
+            gwt_core::paths::gwt_project_dir_for_repo_path(&fixture.repo).join("logs")
+        };
+        text.push_str(&logs(&project_logs));
+        phases.clear();
+        common_dir_spawns.clear();
+        for row in text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        {
+            if row["target"] == "gwt.process.summary" && row["fields"]["phase"] == "start" {
+                process_logging_seen = true;
+                if row["fields"]["label"].as_str().is_some_and(|label| {
+                    label.contains("rev-parse") && label.contains("--git-common-dir")
+                }) {
+                    common_dir_spawns.insert(format!(
+                        "{}:{}:{}",
+                        row["timestamp"], row["fields"]["spawn_id"], row["fields"]["label"]
+                    ));
+                }
+            }
+            match row["startup"]["phase"].as_str() {
+                Some("canvas_ready") => canvas = row["value"].as_f64(),
+                Some("restore_drain") => drain = row["value"].as_f64(),
+                Some("session_load") => parsed_sessions = row["startup"]["count"].as_u64(),
+                _ => {}
+            }
+            if row["startup"].is_object() || row["target"] == "gwt.process.summary" {
+                phases.push(row);
+            }
+        }
+        if canvas.is_some() && drain.is_some() {
+            break;
+        }
+        std::thread::sleep(POLL);
+    }
+    let passed = parsed_sessions == Some(1500)
+        && process_logging_seen
+        && common_dir_spawns.len() <= 5
+        && canvas.is_some_and(|ms| ms <= 5000.0)
+        && drain.is_some_and(|ms| ms <= 500.0);
+    let browser_exit = browser
+        .as_mut()
+        .and_then(|browser| browser.0.try_wait().ok().flatten());
+    let report = json!({"passed":passed, "sessions":1500, "worktrees":6,
+        "update_resume_marker":true, "parsed_sessions":parsed_sessions, "canvas_ready_ms":canvas,
+        "common_dir_git_spawns":common_dir_spawns.len(), "process_logging_seen":process_logging_seen,
+        "restore_drain_ms":drain, "perf_log_excerpt":phases,
+        "browser_started":browser.is_some(), "browser_binary":browser_binary,
+        "browser_url":browser_url, "browser_started_ms":browser_started_ms,
+        "browser_exit":browser_exit.map(|status|status.to_string()),
+        "browser_stderr":fs::read_to_string(home.join("chromium-stderr.log")).unwrap_or_default(),
+        "fixture_home":home,
+        "failure_stderr":(!passed).then(||fs::read_to_string(home.join("stderr.log")).unwrap_or_default())});
+    let out =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/startup-update-performance.json");
+    fs::write(out, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+    eprintln!("{report}");
+    if let Some(hwnd) = tray_window(child.0.id()) {
+        menu_command(hwnd, QUIT);
+    }
+    drop(child);
+    drop(browser);
+    if !passed {
+        let _ = fixture._temp.keep();
+    }
+    assert!(passed, "update startup budget failed or unmeasured");
 }

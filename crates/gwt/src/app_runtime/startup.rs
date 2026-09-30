@@ -19,7 +19,7 @@
 //! `PendingStartupAutoResumeSession` stay in `mod.rs`.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     thread::JoinHandle,
     time::Instant,
@@ -759,6 +759,13 @@ impl AppRuntime {
             .flat_map(|tab| {
                 match gwt::worktree_inventory::enumerate_worktrees(&tab.project_root, None) {
                     Ok(entries) => {
+                        // The inventory already resolved this root. Reuse it
+                        // when restored Sessions are associated with the tab.
+                        if let Some(main) = entries.iter().find(|entry| {
+                            entry.kind == gwt::worktree_inventory::WorktreeEntryKind::BareMain
+                        }) {
+                            let _ = tab.main_worktree_root_cache.set(main.path.clone());
+                        }
                         let paths: Vec<PathBuf> =
                             entries.iter().map(|entry| entry.path.clone()).collect();
                         startup_worktree_inventories
@@ -940,6 +947,7 @@ impl AppRuntime {
         let now = chrono::Utc::now();
         let mut resumed_native_sessions = std::collections::HashSet::new();
         let mut restored_owner_issues = std::collections::HashSet::new();
+        let mut resume_tabs = HashMap::new();
         let mut admission = RestoreAdmissionLog::default();
         for session in sessions {
             // The startup prune plan is the authoritative fixed snapshot of
@@ -958,9 +966,11 @@ impl AppRuntime {
             // update apply began resume regardless of age — the gap was the
             // update, not the operator walking away.
             let resumes_after_update = !self.update_resume_tab_ids.is_empty()
-                && self
-                    .auto_resume_tab_id_for_session(&session)
-                    .is_some_and(|tab_id| self.update_resume_tab_ids.contains(&tab_id));
+                && resume_tabs
+                    .entry((session.worktree_path.clone(), session.repo_hash.clone()))
+                    .or_insert_with(|| self.auto_resume_tab_id_for_session(&session))
+                    .as_ref()
+                    .is_some_and(|tab_id| self.update_resume_tab_ids.contains(tab_id));
             let native_session_id = session.exact_resume_session_id().map(str::to_string);
             let already_running = self
                 .active_agent_sessions
@@ -2214,10 +2224,33 @@ impl AppRuntime {
             }
         }
 
-        let sessions = candidates
-            .iter()
-            .filter_map(|session_id| Self::load_recovery_session(&self.sessions_dir, session_id))
-            .collect();
+        // Update restart may read the entire ledger. Files have independent
+        // locks, so bound parallel parsing while retaining the recovery barrier
+        // before restore selection and the generation reaper.
+        let workers = std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(4)
+            .min(candidates.len().div_ceil(64).max(1));
+        let sessions_dir = &self.sessions_dir;
+        let load = |ids: &[String]| {
+            ids.iter()
+                .filter_map(|id| Self::load_recovery_session(sessions_dir, id))
+                .collect::<Vec<_>>()
+        };
+        let sessions = if workers == 1 {
+            load(&candidates)
+        } else {
+            std::thread::scope(|scope| {
+                let handles = candidates
+                    .chunks(candidates.len().div_ceil(workers))
+                    .map(|ids| scope.spawn(move || load(ids)))
+                    .collect::<Vec<_>>();
+                handles
+                    .into_iter()
+                    .flat_map(|handle| handle.join().expect("Session recovery worker panicked"))
+                    .collect()
+            })
+        };
         gwt::perf::startup::session_load(started, candidates.len());
         if !deferred.is_empty() {
             let sessions_dir = self.sessions_dir.clone();
@@ -2233,6 +2266,19 @@ impl AppRuntime {
     }
 
     fn load_recovery_session(sessions_dir: &Path, session_id: &str) -> Option<gwt_agent::Session> {
+        gwt_agent::validate_session_id_path_component(session_id).ok()?;
+        let session =
+            gwt_agent::Session::load(&sessions_dir.join(format!("{session_id}.toml"))).ok()?;
+        // Historical stopped Sessions need no writer lease or serialization.
+        // A real mutation still re-reads and checks lifecycle under the lock below.
+        let needs_interruption = session.status != gwt_agent::AgentStatus::Interrupted
+            && session.should_mark_interrupted_from_lifecycle()
+            && session.worktree_path.exists();
+        if session.schema_version >= gwt_agent::Session::CURRENT_SCHEMA_VERSION
+            && !needs_interruption
+        {
+            return Some(session);
+        }
         gwt_agent::update_session_if_changed(sessions_dir, session_id, |session| {
             if session.status != gwt_agent::AgentStatus::Interrupted
                 && session.worktree_path.exists()
