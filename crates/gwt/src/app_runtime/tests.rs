@@ -4371,6 +4371,8 @@ fn sample_runtime_with_events(
         knowledge_monitor_snapshot: Default::default(),
         issue_client_factory: super::default_issue_client_factory(),
         pending_update: None,
+        update_download_in_flight: None,
+        deferred_update_discovery: None,
         pty_writers,
         attachment_uploads: AttachmentUploadStore::new(temp_root.join("attachment-uploads")),
         persist_dispatcher,
@@ -49419,11 +49421,32 @@ fn app_runtime_staged_update_never_requests_a_restart_by_itself() {
         },
     )
     .expect("seed prefs");
-    let tab = sample_project_tab("tab-1", "Repo", repo.clone(), ProjectKind::Git, &[]);
+    let tab = sample_project_tab_with_window_at(
+        "tab-1",
+        "agent-1",
+        repo.clone(),
+        WindowPreset::Agent,
+        WindowProcessStatus::Running,
+    );
     let (mut runtime, user_events) =
         sample_runtime_with_events(temp.path(), vec![tab], Some("tab-1"));
+    runtime.rebuild_window_lookup();
 
     let events = runtime.update_staged_events_with("9.99.0", None);
+    let log = fs::read_to_string(gwt_core::update::update_log_path()).unwrap_or_default();
+    assert!(
+        log.lines().any(|line| {
+            let entry: serde_json::Value = serde_json::from_str(line).expect("update log JSON");
+            entry["stage"] == "drain_started"
+                && entry["version"] == "9.99.0"
+                && serde_json::from_str::<serde_json::Value>(
+                    entry["blockers"].as_str().unwrap_or("null"),
+                )
+                .expect("blocker JSON")[0]["window_id"]
+                    == "tab-1::agent-1"
+        }),
+        "the update log records the staged version entering drain: {log}"
+    );
     assert!(
         events.iter().any(|event| matches!(
             &event.event,
@@ -49921,6 +49944,31 @@ fn app_runtime_update_drain_tick_applies_after_quiescence_and_grace() {
     let toasts = update_resume_toasts(&notice);
     assert_eq!(toasts.len(), 1, "long-drain notice: {toasts:?}");
     assert_eq!(toasts[0].0, "warn");
+    assert!(
+        toasts[0].1.contains("tab-1::agent-1")
+            && toasts[0].1.contains("new launches are held")
+            && toasts[0].1.contains("finish"),
+        "the bounded notice identifies the blocker, launch hold, and safe next action: {}",
+        toasts[0].1
+    );
+    let log_path = gwt_core::update::update_log_path();
+    let log = fs::read_to_string(&log_path).unwrap_or_default();
+    let entry = log
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("update log JSON"))
+        .find(|entry| entry["stage"] == "drain_blocked")
+        .expect("the bounded warning records drain blockers in the update log");
+    assert_eq!(entry["version"], "9.99.0");
+    let blockers: serde_json::Value =
+        serde_json::from_str(entry["blockers"].as_str().expect("serialized blockers"))
+            .expect("blocker JSON");
+    assert_eq!(blockers[0]["window_id"], "tab-1::agent-1");
+    assert!(runtime.update_drain_tick_events_at(at(1801)).is_empty());
+    assert_eq!(
+        fs::read_to_string(&log_path).expect("update log"),
+        log,
+        "unchanged blockers must not emit a log on every tick"
+    );
     assert!(
         toasts[0].1.contains("9.99.0") && toasts[0].1.contains("Sample"),
         "the notice names the blocking pane: {}",
