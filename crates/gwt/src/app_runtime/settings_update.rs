@@ -289,13 +289,9 @@ impl AppRuntime {
     /// through the existing `ApplyUpdateStart` pipeline so the standard
     /// update modal renders downloading → ready → restart.
     ///
-    /// Codex review on PR #2917: the resolved state is also published as
-    /// `UserEvent::UpdateAvailable` so `AppRuntime.pending_update` reflects
-    /// the chosen release. Without this step, `ApplyUpdateLater` /
-    /// `ApplyUpdateRestartNow` (which both gate on `self.pending_update`)
-    /// would either no-op or fire against an unrelated latest-update state
-    /// when the user selected a downgrade while `pending_update` was
-    /// `UpToDate`.
+    /// The shared event-loop admission publishes the accepted state before
+    /// downloading, so Later / Restart now use the selected release. Manual
+    /// selection never enters the automatic discovery path.
     pub(super) fn apply_update_to_version_events(
         &self,
         client_id: &str,
@@ -308,12 +304,6 @@ impl AppRuntime {
             let current_exe = std::env::current_exe().ok();
             match manager.resolve_state_for_version(&version, current_exe.as_deref()) {
                 Ok(state) => {
-                    // Update `pending_update` first so Later / Restart now
-                    // read the selected release. The frontend update-cta
-                    // ignores the broadcast `UpdateState` here because its
-                    // local status is already `applying` (the modal was
-                    // opened by `beginUpdateDownloading` on click).
-                    proxy.send(UserEvent::UpdateAvailable(state.clone()));
                     proxy.send(UserEvent::ApplyUpdateStart {
                         state,
                         client_id: client_id_owned,
@@ -705,12 +695,39 @@ impl AppRuntime {
         }
     }
 
-    /// SPEC-2041 Phase 19 (FR-052): user clicked the update CTA and the modal
-    /// is opening in the `downloading` state. Backend kicks off
-    /// `prepare_update` on a worker thread and emits
-    /// [`BackendEvent::UpdateReady`] (or [`BackendEvent::UpdateApplyError`])
-    /// without exiting the parent process.
-    pub(super) fn apply_update_start_events(&self, client_id: &str) -> Vec<OutboundEvent> {
+    /// Issue #4801: discovery enters the same staging path as the Update
+    /// button when an open project opted into unattended updates.
+    pub(crate) fn start_automatic_update_download(&mut self) {
+        let Some(gwt_core::update::UpdateState::Available {
+            latest,
+            asset_url: Some(_),
+            ..
+        }) = self.pending_update.as_ref()
+        else {
+            return;
+        };
+        if gwt_core::update::load_pending_update_manifest()
+            .is_some_and(|manifest| manifest.version == *latest)
+        {
+            return;
+        }
+        let enabled = self.project_contexts().iter().any(|context| {
+            gwt::load_issue_monitor_prefs(&gwt::issue_monitor_prefs_path_for_repo_path(
+                &context.project_root,
+            ))
+            .is_ok_and(|prefs| prefs.autonomous_mode && prefs.auto_apply_updates.unwrap_or(true))
+        });
+        if enabled {
+            self.apply_update_start_events(super::UPDATE_AUTO_APPLY_CLIENT_ID);
+        }
+    }
+
+    /// Shared staging request for the update CTA and automatic discovery.
+    /// The worker emits `UpdateReady` or `UpdateApplyError` without exiting.
+    pub(super) fn apply_update_start_events(&mut self, client_id: &str) -> Vec<OutboundEvent> {
+        if self.update_download_in_flight.is_some() {
+            return Vec::new();
+        }
         match self.pending_update.clone() {
             Some(
                 state @ gwt_core::update::UpdateState::Available {
