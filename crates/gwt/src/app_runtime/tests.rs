@@ -64401,6 +64401,65 @@ fn mark_remote_only_flags_fetched_branches_without_local_worktree() {
     assert_eq!(unknown[0].works[0].close_blocked_reason, None);
 }
 
+/// Issue #4774: rows sharing a branch pick the newest row as representative by
+/// instant, not by RFC3339 text. A second-precision `...56Z` Work record must
+/// not outrank a session row stamped `...56.831192+00:00` later in the same
+/// second just because `'Z'` sorts after `'.'`.
+#[test]
+fn workspace_group_representative_is_the_newest_row_by_instant_not_by_text() {
+    fn row(id: &str, updated_at: &str) -> gwt::ActiveWorkItemView {
+        gwt::ActiveWorkItemView {
+            linked_issue_numbers: Vec::new(),
+            id: id.to_string(),
+            title: id.to_string(),
+            status_category: "idle".to_string(),
+            status_text: "Paused".to_string(),
+            summary: None,
+            progress_summary: None,
+            work_summary: None,
+            owner: None,
+            next_action: None,
+            active_agents: 0,
+            blocked_agents: 0,
+            branch: Some("work/off-loop".to_string()),
+            worktree_path: None,
+            managed_hook_health: None,
+            pr_number: None,
+            pr_url: None,
+            pr_state: None,
+            board_refs: Vec::new(),
+            agents: Vec::new(),
+            works: Vec::new(),
+            lifecycle_state: "paused".to_string(),
+            closed_at: None,
+            session_agent_total: 0,
+            merged_into_base: false,
+            workspace_key: None,
+            remote_only: false,
+            done_equivalent: false,
+            cleanup_candidate: None,
+            cleanup_blocked_reason: None,
+            updated_at: updated_at.to_string(),
+        }
+    }
+
+    let mut same_second = vec![
+        row("work-session-session-1", "2026-09-30T01:36:56.831192+00:00"),
+        row("work-offloop-a1b2c3", "2026-09-30T01:36:56Z"),
+    ];
+    super::assign_and_merge_workspace_groups(&mut same_second, Path::new("/repo"));
+    assert_eq!(same_second.len(), 1);
+    assert_eq!(same_second[0].id, "work-session-session-1");
+
+    let mut later_record = vec![
+        row("work-session-session-1", "2026-09-30T01:36:56.831192+00:00"),
+        row("work-offloop-a1b2c3", "2026-09-30T01:36:57Z"),
+    ];
+    super::assign_and_merge_workspace_groups(&mut later_record, Path::new("/repo"));
+    assert_eq!(later_record.len(), 1);
+    assert_eq!(later_record[0].id, "work-offloop-a1b2c3");
+}
+
 /// SPEC-2359 W16-4 (FR-391): merged ∧ stale rows classify as derived Done;
 /// activity after the merge reference clears it; explicit terminal closes
 /// and pr_state-only merges never enter the derived classification; and the

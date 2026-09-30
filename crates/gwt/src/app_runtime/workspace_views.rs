@@ -2437,6 +2437,16 @@ fn assign_and_merge_workspace_groups_cache_only(
     assign_and_merge_workspace_groups_impl(active_works, project_root, false);
 }
 
+/// Rows mix second-precision `...Z` and fractional `...+00:00` stamps, so
+/// compare instants; text order would rank `...56Z` above `...56.8+00:00`.
+fn updated_at_is_newer(candidate: &str, current: &str) -> bool {
+    let parse = |stamp: &str| chrono::DateTime::parse_from_rfc3339(stamp).ok();
+    match (parse(candidate), parse(current)) {
+        (Some(candidate), Some(current)) => candidate > current,
+        _ => candidate > current,
+    }
+}
+
 fn assign_and_merge_workspace_groups_impl(
     active_works: &mut Vec<gwt::ActiveWorkItemView>,
     project_root: &Path,
@@ -2475,7 +2485,7 @@ fn assign_and_merge_workspace_groups_impl(
                 linked_issue_numbers.extend(&work.linked_issue_numbers);
                 linked_issue_numbers.sort_unstable();
                 linked_issue_numbers.dedup();
-                let newer = work.updated_at > target.updated_at;
+                let newer = updated_at_is_newer(&work.updated_at, &target.updated_at);
                 let mut agents = std::mem::take(&mut target.agents);
                 agents.extend(work.agents.iter().cloned());
                 let mut child_works = std::mem::take(&mut target.works);
