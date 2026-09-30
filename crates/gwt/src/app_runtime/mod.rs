@@ -1535,8 +1535,10 @@ pub struct AppRuntime {
     pub(crate) issue_client_factory: RuntimeIssueClientFactory,
     /// Cached update state so late-connecting WebView clients get the toast.
     pub(crate) pending_update: Option<gwt_core::update::UpdateState>,
-    /// Shared by automatic detection and manual download requests.
-    pub(crate) update_download_in_flight: bool,
+    /// Initiator of the shared download, or None when its worker is idle.
+    pub(crate) update_download_in_flight: Option<ClientId>,
+    /// Newest discovery to retry if the active download fails.
+    pub(crate) deferred_update_discovery: Option<gwt_core::update::UpdateState>,
     /// Shared PTY writer registry published to the WebSocket fast-path.
     pub(crate) pty_writers: PtyWriterRegistry,
     /// Browser-uploaded attachment temp files waiting to be staged under the
@@ -3303,7 +3305,8 @@ impl AppRuntime {
             knowledge_monitor_snapshot: Default::default(),
             issue_client_factory: default_issue_client_factory(),
             pending_update: None,
-            update_download_in_flight: false,
+            update_download_in_flight: None,
+            deferred_update_discovery: None,
             pty_writers,
             attachment_uploads,
             persist_dispatcher,

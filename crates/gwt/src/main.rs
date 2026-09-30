@@ -318,7 +318,22 @@ fn record_update_available(
     app: &mut AppRuntime,
     state: gwt_core::update::UpdateState,
 ) -> Vec<OutboundEvent> {
-    if app.update_download_in_flight {
+    if app.update_download_in_flight.is_some() {
+        let known = app
+            .deferred_update_discovery
+            .as_ref()
+            .or(app.pending_update.as_ref());
+        if app.update_download_in_flight.as_deref()
+            == Some(app_runtime::UPDATE_AUTO_APPLY_CLIENT_ID)
+            && matches!(
+                (known, &state),
+                (Some(gwt_core::update::UpdateState::Available { latest: active, .. }),
+                 gwt_core::update::UpdateState::Available { latest, .. })
+                    if gwt_core::update::pending_version_is_newer(latest, active)
+            )
+        {
+            app.deferred_update_discovery = Some(state);
+        }
         return Vec::new();
     }
     app.pending_update = Some(state.clone());
@@ -332,7 +347,7 @@ fn admit_update_download(
     state: &gwt_core::update::UpdateState,
     client_id: &str,
 ) -> (bool, Vec<OutboundEvent>) {
-    if app.update_download_in_flight {
+    if app.update_download_in_flight.is_some() {
         let same_version = matches!(
             (app.pending_update.as_ref(), state),
             (Some(gwt_core::update::UpdateState::Available { latest: active, .. }),
@@ -351,7 +366,7 @@ fn admit_update_download(
         };
         return (false, events);
     }
-    app.update_download_in_flight = true;
+    app.update_download_in_flight = Some(client_id.to_string());
     app.pending_update = Some(state.clone());
     (
         true,
@@ -365,8 +380,18 @@ fn finish_update_download(
     app: &mut AppRuntime,
     failure: Option<OutboundEvent>,
 ) -> Vec<OutboundEvent> {
-    app.update_download_in_flight = false;
-    failure.into_iter().collect()
+    app.update_download_in_flight = None;
+    let deferred = app.deferred_update_discovery.take();
+    let mut events: Vec<_> = failure.into_iter().collect();
+    // On success, keep the staged selection and its drain: starting another
+    // worker could race its graceful restart. The next launch polls afresh.
+    // On failure, replay the discovery that the poller's last_seen suppresses.
+    if !events.is_empty() {
+        if let Some(state) = deferred {
+            events.extend(record_update_available(app, state));
+        }
+    }
+    events
 }
 
 fn update_download_failure(stage: &str, reason: String, log_path: String) -> OutboundEvent {
@@ -4120,7 +4145,8 @@ mod tests {
             knowledge_monitor_snapshot: Default::default(),
             issue_client_factory: crate::app_runtime::default_issue_client_factory(),
             pending_update: None,
-            update_download_in_flight: false,
+            update_download_in_flight: None,
+            deferred_update_discovery: None,
             pty_writers: Arc::new(RwLock::new(HashMap::new())),
             attachment_uploads: AttachmentUploadStore::new(temp_root.join("attachment-uploads")),
             persist_dispatcher,
@@ -4465,7 +4491,7 @@ mod tests {
             .unwrap();
             super::record_update_available(&mut runtime, state.clone());
             assert!(
-                !runtime.update_download_in_flight,
+                runtime.update_download_in_flight.is_none(),
                 "queuing discovery must leave admission to the shared event-loop worker gate"
             );
             super::record_update_available(&mut runtime, state.clone());
@@ -4495,13 +4521,49 @@ mod tests {
         super::record_update_available(&mut runtime, selected.clone());
         assert_eq!(runtime.pending_update.as_ref(), Some(&state));
         assert!(super::finish_update_download(&mut runtime, None).is_empty());
-        assert!(!runtime.update_download_in_flight);
+        assert!(runtime.update_download_in_flight.is_none());
         assert!(super::admit_update_download(&mut runtime, &selected, "manual").0);
         assert_eq!(runtime.pending_update.as_ref(), Some(&selected));
         assert!(
             user_events.lock().unwrap().is_empty(),
             "manual selection must not enqueue an automatic download"
         );
+
+        // A failed manual selection keeps its version for Retry.
+        assert!(super::record_update_available(&mut runtime, state.clone()).is_empty());
+        assert_eq!(runtime.pending_update.as_ref(), Some(&selected));
+        let failure =
+            super::update_download_failure("Download asset", "failed".into(), "log".into());
+        super::finish_update_download(&mut runtime, Some(failure));
+        assert_eq!(runtime.pending_update.as_ref(), Some(&selected));
+        assert!(user_events.lock().unwrap().is_empty());
+
+        // Automatic discovery must survive an automatic worker's failure:
+        // PollState suppresses later repeats of this new version.
+        let mut newer = state.clone();
+        if let gwt_core::update::UpdateState::Available { latest, .. } = &mut newer {
+            *latest = "9.107.0".into();
+        }
+        assert!(
+            super::admit_update_download(
+                &mut runtime,
+                &state,
+                crate::app_runtime::UPDATE_AUTO_APPLY_CLIENT_ID,
+            )
+            .0
+        );
+        assert!(super::record_update_available(&mut runtime, newer.clone()).is_empty());
+        let failure =
+            super::update_download_failure("Download asset", "failed".into(), "log".into());
+        let events = super::finish_update_download(&mut runtime, Some(failure));
+        assert_eq!(runtime.pending_update.as_ref(), Some(&newer));
+        assert!(events.iter().any(|event| matches!(
+            &event.event, BackendEvent::UpdateState(discovered) if discovered == &newer
+        )));
+        let requests = std::mem::take(&mut *user_events.lock().unwrap());
+        assert!(requests.iter().any(|event| matches!(
+            event, UserEvent::ApplyUpdateStart { state: discovered, .. } if discovered == &newer
+        )));
     }
 
     #[test]
@@ -4509,14 +4571,14 @@ mod tests {
         let temp = tempdir().expect("tempdir");
         let mut runtime = sample_runtime(temp.path(), Vec::new(), None);
         for stage in ["Download asset", "Persist pending"] {
-            runtime.update_download_in_flight = true;
+            runtime.update_download_in_flight = Some("manual".to_string());
             let event = super::update_download_failure(
                 stage,
                 "fixture failure".to_string(),
                 "update.log".to_string(),
             );
             let events = super::finish_update_download(&mut runtime, Some(event));
-            assert!(!runtime.update_download_in_flight);
+            assert!(runtime.update_download_in_flight.is_none());
             assert!(
                 matches!(events[0].target, DispatchTarget::All),
                 "both the automatic request and manual clients need the shared worker's failure"

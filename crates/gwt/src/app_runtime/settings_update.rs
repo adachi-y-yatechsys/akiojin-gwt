@@ -725,7 +725,7 @@ impl AppRuntime {
     /// Shared staging request for the update CTA and automatic discovery.
     /// The worker emits `UpdateReady` or `UpdateApplyError` without exiting.
     pub(super) fn apply_update_start_events(&mut self, client_id: &str) -> Vec<OutboundEvent> {
-        if self.update_download_in_flight {
+        if self.update_download_in_flight.is_some() {
             return Vec::new();
         }
         match self.pending_update.clone() {
