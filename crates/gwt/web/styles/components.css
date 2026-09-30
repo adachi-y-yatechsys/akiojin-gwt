@@ -156,9 +156,10 @@ body::after {
   z-index: 1;
   height: 100%;
   display: grid;
-  /* SPEC-3038 US-1: the Command Rail is grid-docked at 56px so it is always
-     visible and never overlays canvas windows. */
-  grid-template-columns: 56px 1fr;
+  /* SPEC-3038 US-1: the Command Rail is grid-docked so it is always visible
+     and never overlays canvas windows. Issue 4777 T-1 widens it to 64px so
+     each surface entry carries a visible label under its icon. */
+  grid-template-columns: 64px 1fr;
   grid-template-rows: 44px 1fr 28px;
   grid-template-areas:
     "projectbar projectbar"
@@ -755,6 +756,108 @@ body::after {
 
 .op-rail__badge[hidden] {
   display: none;
+}
+
+/* Issue 4777 T-1 — surface entries. Unlike the 40px icon buttons below
+   them, a surface entry spans the rail and names itself under the icon; the
+   pressed entry is the surface the focused window belongs to, marked by a
+   2px accent edge so the state never rests on color alone. */
+.op-rail__group--surfaces,
+.op-rail__group[aria-label="Navigate"] {
+  align-self: stretch;
+  gap: 2px;
+}
+
+.op-rail__surface {
+  flex-direction: column;
+  gap: 3px;
+  width: 100%;
+  height: auto;
+  padding: var(--space-2) 2px;
+  border-radius: 0;
+  border-left: 2px solid transparent;
+}
+
+.op-rail__surface-icon {
+  width: 19px;
+  height: 19px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linejoin: round;
+}
+
+.op-rail__surface-label {
+  font-family: var(--font-body);
+  font-size: 9.5px;
+  letter-spacing: 0.04em;
+  line-height: 1.2;
+}
+
+.op-rail__surface[aria-pressed="true"] {
+  color: var(--color-text-strong);
+  background: var(--color-surface-elevated);
+  border-left-color: var(--color-state-active);
+}
+
+/* Issue 4777 T-1 — at 860px and below the rail becomes a strip across the
+   top of the canvas. Groups wrap instead of scrolling so the popovers
+   anchored to rail items (window list, PM gear) are never clipped. */
+@media (max-width: 860px) {
+  #app {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: 44px auto minmax(0, 1fr) 28px;
+    grid-template-areas:
+      "projectbar"
+      "rail"
+      "canvas"
+      "strip";
+  }
+
+  .op-rail {
+    flex-direction: row;
+    flex-wrap: wrap;
+    padding: 0 var(--space-1);
+    border-right: 0;
+    border-bottom: 1px solid var(--color-border);
+  }
+
+  .op-rail__group {
+    flex-direction: row;
+  }
+
+  .op-rail__group--surfaces {
+    align-self: auto;
+  }
+
+  .op-rail__divider {
+    width: 1px;
+    height: 24px;
+    margin: 0 var(--space-1);
+  }
+
+  .op-rail__surface {
+    width: 64px;
+    border-left: 0;
+    border-bottom: 2px solid transparent;
+  }
+
+  .op-rail__surface[aria-pressed="true"] {
+    border-bottom-color: var(--color-state-active);
+  }
+
+  .op-rail__flyout {
+    display: none;
+  }
+
+  /* The window list popover hangs below its trigger instead of beside it,
+     right-aligned so it stays inside the viewport. */
+  .op-rail .window-list-panel {
+    top: calc(100% + 10px);
+    bottom: auto;
+    left: auto;
+    right: 0;
+  }
 }
 
 
@@ -6473,15 +6576,29 @@ button.workspace-board-ref:focus-visible {
    rather than a command, and review (2026-08-05) showed a plain icon does not
    read as "this is the PM". It therefore carries a persistent accent chip so
    it stands apart from the command icons at a glance, in every state. */
+/* Issue 4777: the PM sits alone above the rule, laid out like a surface
+   entry (icon over a visible label) but keeping its role color whether or not
+   it is pressed, so it never reads as one of the agents. */
 .op-rail__item--pm {
+  flex-direction: column;
+  gap: 3px;
+  width: 100%;
+  height: auto;
+  padding: var(--space-2) 2px;
+  border-radius: 0;
+  border-left: 2px solid transparent;
   color: var(--color-role-pm);
-  background: color-mix(in oklab, var(--color-role-pm) 14%, transparent);
-  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--color-role-pm) 45%, transparent);
 }
 
 .op-rail__item--pm:hover,
 .op-rail__item--pm:focus-visible {
-  background: color-mix(in oklab, var(--color-role-pm) 26%, transparent);
+  color: var(--color-role-pm);
+  background: color-mix(in oklab, var(--color-role-pm) 14%, transparent);
+}
+
+.op-rail__item--pm[aria-pressed="true"] {
+  background: var(--color-surface-elevated);
+  border-left-color: var(--color-role-pm);
 }
 
 .op-rail__item--pm .op-rail__icon {
@@ -6493,8 +6610,8 @@ button.workspace-board-ref:focus-visible {
    "absent" carries a filled dot in an accent colour. */
 .op-rail__pm-dot {
   position: absolute;
-  right: 6px;
-  bottom: 6px;
+  right: 14px;
+  top: 7px;
   width: 6px;
   height: 6px;
   border-radius: var(--radius-pill);
@@ -6593,6 +6710,7 @@ button.workspace-board-ref:focus-visible {
    focused, so the rail keeps reading as one icon per action. */
 .pm-launcher-shell {
   position: relative;
+  align-self: stretch;
 }
 
 .pm-launcher-gear {
@@ -6631,6 +6749,24 @@ button.workspace-board-ref:focus-visible {
 @media (prefers-reduced-motion: reduce) {
   .pm-launcher-gear {
     transition: none;
+  }
+}
+
+/* Issue 4777 T-1 — in the narrow top strip the PM marks its pressed state on
+   the bottom edge, like the surface entries next to it. */
+@media (max-width: 860px) {
+  .pm-launcher-shell {
+    align-self: auto;
+  }
+
+  .op-rail__item--pm {
+    width: 64px;
+    border-left: 0;
+    border-bottom: 2px solid transparent;
+  }
+
+  .op-rail__item--pm[aria-pressed="true"] {
+    border-bottom-color: var(--color-role-pm);
   }
 }
 
