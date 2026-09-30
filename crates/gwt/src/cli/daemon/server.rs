@@ -248,6 +248,29 @@ pub(super) fn serve_blocking<W: std::io::Write + ?Sized>(
 }
 
 #[cfg(test)]
+pub fn spawn_server(
+    endpoint: DaemonEndpoint,
+    socket_path: PathBuf,
+    endpoint_path: PathBuf,
+    hub: BroadcastHub,
+) -> Result<tokio::task::JoinHandle<Result<i32, SpecOpsError>>, SpecOpsError> {
+    // Bind synchronously so test clients never race a scheduled server task.
+    let authority_lease = acquire_daemon_startup_lease(&endpoint.scope)?;
+    let bound = bind_daemon(&endpoint, &socket_path, &endpoint_path, authority_lease)?;
+    let shutdown = Arc::new(DaemonShutdown::new());
+    spawn_signal_watcher(Arc::clone(&shutdown));
+    Ok(tokio::spawn(run_bound_server(
+        endpoint,
+        endpoint_path,
+        hub,
+        shutdown,
+        crate::IssueMonitorConfig::default(),
+        ISSUE_MONITOR_SCAN_TIMEOUT,
+        bound,
+    )))
+}
+
+#[cfg(all(test, unix))]
 pub async fn run_server(
     endpoint: DaemonEndpoint,
     socket_path: PathBuf,
@@ -268,7 +291,7 @@ pub async fn run_server(
     .await
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 async fn run_server_with_shutdown_and_worker_config(
     endpoint: DaemonEndpoint,
     socket_path: PathBuf,
