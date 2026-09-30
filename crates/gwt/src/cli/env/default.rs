@@ -186,7 +186,7 @@ impl DefaultCliEnv {
             owner,
             repo,
             repo_path,
-            Arc::new(HttpIssueClient::from_gh_auth),
+            Arc::new(HttpIssueClient::from_runtime_environment),
         )
     }
 
@@ -476,4 +476,74 @@ impl CliEnv for DefaultCliEnv {
 
 fn api_to_io(err: gwt_github::client::ApiError) -> io::Error {
     io::Error::other(err.to_string())
+}
+
+#[cfg(test)]
+mod runtime_factory_tests {
+    use super::*;
+    use std::time::Duration;
+    #[test]
+    fn runtime_factory_override_cli_rejects_partial_and_reaches_loopback() {
+        use gwt_core::test_support::ScopedEnvVar;
+        use std::io::{Read, Write};
+
+        let _lock = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _token = ScopedEnvVar::set("GH_TOKEN", "fixture-only-token");
+        let _no_proxy = ScopedEnvVar::set("NO_PROXY", "127.0.0.1,localhost");
+        let _no_proxy_lower = ScopedEnvVar::set("no_proxy", "127.0.0.1,localhost");
+        let _mode = ScopedEnvVar::set("GWT_OWNER_GITHUB_TEST_MODE", "loopback-v1");
+        let _rest = ScopedEnvVar::unset("GWT_OWNER_GITHUB_REST_BASE");
+        let _graphql = ScopedEnvVar::unset("GWT_OWNER_GITHUB_GRAPHQL_URL");
+        let _owner_token = ScopedEnvVar::unset("GWT_OWNER_GITHUB_TOKEN");
+        let repo = tempfile::tempdir().expect("repo");
+        let env = DefaultCliEnv::new("fixture", "repo", repo.path().to_path_buf());
+        // Check construction first: the old factory must fail this assertion
+        // before this test is allowed to issue any HTTP request.
+        assert!(matches!(
+            (env.client_factory)("fixture", "repo"),
+            Err(gwt_github::client::ApiError::TestOverrideRejected { .. })
+        ));
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback");
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let _rest = ScopedEnvVar::set("GWT_OWNER_GITHUB_REST_BASE", &base);
+        let _graphql = ScopedEnvVar::set("GWT_OWNER_GITHUB_GRAPHQL_URL", format!("{base}/graphql"));
+        let _owner_token = ScopedEnvVar::set("GWT_OWNER_GITHUB_TOKEN", "loopback-token");
+        if !cfg!(debug_assertions) {
+            assert!(matches!(
+                (env.client_factory)("fixture", "repo"),
+                Err(gwt_github::client::ApiError::TestOverrideRejected { .. })
+            ));
+            return;
+        }
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept loopback");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut bytes = [0; 1024];
+                let count = stream.read(&mut bytes).expect("request");
+                assert_ne!(count, 0, "complete request headers");
+                request.extend_from_slice(&bytes[..count]);
+            }
+            let request = String::from_utf8(request).expect("ASCII headers");
+            stream
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            request
+        });
+        let env = DefaultCliEnv::new("fixture", "repo", repo.path().to_path_buf());
+        env.client()
+            .delete_comment(gwt_github::client::CommentId(42))
+            .expect("local mutation");
+        let request = server.join().expect("server");
+        assert!(request.starts_with("DELETE /repos/fixture/repo/issues/comments/42 "));
+        assert!(request
+            .to_ascii_lowercase()
+            .contains("authorization: bearer loopback-token"));
+    }
 }

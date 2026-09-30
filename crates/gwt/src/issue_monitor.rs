@@ -23,6 +23,9 @@ use crate::{
     LinkedIssueKind, WindowState,
 };
 
+mod tiers;
+pub(crate) use tiers::record_work_done_tier_landing;
+pub use tiers::{IssueMonitorTierLandingStats, IssueMonitorTierRecord, IssueMonitorTierSelection};
 mod quota;
 #[cfg(test)]
 pub(crate) use quota::hold_provider_quota_on_first_failure_in_this_test;
@@ -61,6 +64,15 @@ const LEGACY_SHUTDOWN_REVOKE_FENCE: &[u8] = b"gwt issue-monitor shutdown revoke 
 
 const LEGACY_GIT_LAUNCH_FAILURE_PREFIX: &str =
     "Current branch is unavailable: Git error: Not a git repository: ";
+
+/// SPEC #4774: zero-based launch tier, independent of retry admission.
+pub fn tier_for(attempts: u32, is_spec: bool, floor: u8, tier_count: u8) -> u8 {
+    attempts
+        .min(u32::from(u8::MAX))
+        .max(u32::from(floor))
+        .max(u32::from(is_spec))
+        .min(u32::from(tier_count.saturating_sub(1))) as u8
+}
 
 pub(crate) fn normalize_issue_monitor_provider(raw: &str) -> Option<String> {
     gwt_agent::resolve_agent_id(raw).map(|id| id.command().to_ascii_lowercase())
@@ -900,6 +912,15 @@ pub struct IssueMonitorPrefs {
     /// [`Self::launch_profile_pool`] / [`Self::set_launch_profile_pool`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub launch_profiles: Vec<IssueMonitorLaunchProfile>,
+    #[serde(default)]
+    pub launch_auto: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub launch_tiers: Vec<Vec<IssueMonitorLaunchProfile>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub issue_tiers: BTreeMap<u64, IssueMonitorTierRecord>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tier_overrides: BTreeMap<u64, u8>,
+
     /// SPEC #3914 FR-002: a candidate whose known usage is at or above this
     /// percentage yields to the next candidate. Unknown usage never blocks.
     #[serde(default = "default_launch_usage_threshold_percent")]
@@ -1123,6 +1144,10 @@ impl Default for IssueMonitorPrefs {
                 LEGACY_GIT_LAUNCH_FAILURE_MIGRATION_VERSION,
             launch_profile: None,
             launch_profiles: Vec::new(),
+            launch_auto: false,
+            launch_tiers: Vec::new(),
+            issue_tiers: BTreeMap::new(),
+            tier_overrides: BTreeMap::new(),
             launch_usage_threshold_percent: DEFAULT_LAUNCH_USAGE_THRESHOLD_PERCENT,
             provider_quota_holds: BTreeMap::new(),
             provider_quota_hold_evidence: BTreeMap::new(),
@@ -1467,6 +1492,9 @@ pub enum IssueMonitorLaunchSessionStrategy {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum IssueMonitorFailure {
+    Termination {
+        classification: IssueMonitorFailureClass,
+    },
     ResumeWriterConflict {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         holder_window_id: Option<String>,
@@ -1496,6 +1524,15 @@ pub enum IssueMonitorFailure {
         // would otherwise dwarf the other variants.
         evidence: Option<Box<IssueMonitorProviderQuotaHoldEvidence>>,
     },
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IssueMonitorFailureClass {
+    Agent,
+    Infrastructure,
+    #[default]
+    Unknown,
 }
 
 /// Result of applying a typed late-resume writer-conflict recovery. The
@@ -1684,8 +1721,8 @@ pub struct IssueMonitorReleasedFailure {
     /// Persisted autonomous attempt count observed before the release.
     #[serde(default)]
     pub attempts_before: u32,
-    /// Persisted autonomous attempt count after the release. New releases set
-    /// this to zero; the default keeps pre-Issue-3734 preferences readable.
+    /// Persisted autonomous attempt count after the release. Operator releases
+    /// reset it; automatic retries retain the incremented count.
     #[serde(default)]
     pub attempts_after: u32,
     /// Issue #4630: an operator (`issue.monitor.requeue`, the Issue Monitor
@@ -1694,6 +1731,10 @@ pub struct IssueMonitorReleasedFailure {
     /// false: their reason is bookkeeping, not an instruction.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub operator_requested: bool,
+    /// An automatic retry revokes the abandoned launch without resetting its
+    /// attempt ladder. Legacy/operator releases retain their reset semantics.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_record: Option<AutonomousIssueRecord>,
 }
 
 /// Issue #3734 FR-113: operator reset evidence is durable but cannot grow
@@ -3189,7 +3230,13 @@ impl IssueMonitorPrefs {
             Some(now) => provider_quota_admission_holds(
                 &self.provider_quota_holds,
                 &self.provider_quota_hold_evidence,
-                &launch_pool_providers(&self.launch_profile_pool()),
+                &launch_pool_providers(
+                    &self
+                        .effective_launch_tiers()
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>(),
+                ),
                 now,
                 reported_healthy,
             ),
@@ -4000,6 +4047,10 @@ pub fn provider_unauthenticated_message(agent_id: &str) -> String {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssueMonitorInboxSummary {
     pub issue_number: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_tier: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub landing_tier: Option<u8>,
     pub state: MonitorInboxState,
     #[serde(default)]
     pub github_state: IssueMonitorIssueState,
@@ -4098,6 +4149,10 @@ pub struct IssueMonitorInboxSummary {
     /// healthy row is what made the interesting ones hard to find.
     #[serde(default, skip_serializing_if = "attempt_count_is_zero")]
     pub attempts: u32,
+    #[serde(default)]
+    pub non_agent_attempts: u32,
+    #[serde(default)]
+    pub tier_input: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_failure_message: Option<String>,
     /// Issue #4207 AC-4: which mechanism failed this row.
@@ -4170,6 +4225,10 @@ pub struct AutonomousIssueSummary {
     pub issue_number: u64,
     pub phase: AutonomousPhase,
     pub attempts: u32,
+    #[serde(default)]
+    pub non_agent_attempts: u32,
+    #[serde(default)]
+    pub tier_input: u32,
     pub needs_human: bool,
     /// Issue #3478 (AC-9): why the issue is parked, in operator-facing English.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4224,6 +4283,15 @@ pub struct IssueMonitorState {
     /// [`IssueMonitorPrefs::launch_profile_pool`]).
     #[serde(default)]
     launch_profiles: Vec<IssueMonitorLaunchProfile>,
+    #[serde(default)]
+    launch_auto: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    launch_tiers: Vec<Vec<IssueMonitorLaunchProfile>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    issue_tiers: BTreeMap<u64, IssueMonitorTierRecord>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    tier_overrides: BTreeMap<u64, u8>,
+
     #[serde(default = "default_launch_usage_threshold_percent")]
     launch_usage_threshold_percent: u8,
     /// Durable provider-wide launch admission source of truth. Keys and values
@@ -4726,6 +4794,10 @@ pub struct AutonomousIssueRecord {
     /// Failed/started attempts so far (the persisted attempt counter).
     #[serde(default)]
     pub attempts: u32,
+    /// Infrastructure and unclassified failures spend the retry budget but do
+    /// not authorize a stronger model.
+    #[serde(default)]
+    pub non_agent_attempts: u32,
     /// Acceptance-criteria snapshot captured at launch; compared at gate time.
     #[serde(default)]
     pub acceptance_snapshot: Option<crate::issue_monitor_gate::AcceptanceSnapshot>,
@@ -5157,6 +5229,10 @@ pub enum AutonomousFailureOutcome {
 }
 
 impl AutonomousIssueRecord {
+    pub fn tier_input(&self) -> u32 {
+        self.attempts.saturating_sub(self.non_agent_attempts)
+    }
+
     /// A fresh record for `issue_number` with no attempts, holds, or snapshot.
     pub fn new(issue_number: u64) -> Self {
         Self {
@@ -5164,6 +5240,7 @@ impl AutonomousIssueRecord {
             phase: AutonomousPhase::Idle,
             active_launch_id: None,
             attempts: 0,
+            non_agent_attempts: 0,
             acceptance_snapshot: None,
             retry_not_before: None,
             retry_hold_reason: None,
@@ -6422,6 +6499,10 @@ impl IssueMonitorState {
             terminal_queue_exclusions: BTreeMap::new(),
             terminal_queue_auto_refill_limit: 0,
             launch_profiles: Vec::new(),
+            launch_auto: false,
+            launch_tiers: Vec::new(),
+            issue_tiers: BTreeMap::new(),
+            tier_overrides: BTreeMap::new(),
             launch_usage_threshold_percent: DEFAULT_LAUNCH_USAGE_THRESHOLD_PERCENT,
             provider_quota_holds: BTreeMap::new(),
             provider_quota_hold_evidence: BTreeMap::new(),
@@ -6484,6 +6565,10 @@ impl IssueMonitorState {
         state.legacy_git_launch_failure_migration_version =
             prefs.legacy_git_launch_failure_migration_version;
         state.launch_profiles = prefs.launch_profile_pool();
+        state.launch_auto = prefs.launch_auto;
+        state.launch_tiers = prefs.launch_tiers.clone();
+        state.issue_tiers = prefs.issue_tiers.clone();
+        state.tier_overrides = prefs.tier_overrides.clone();
         state.launch_usage_threshold_percent = prefs.launch_usage_threshold_percent;
         state.priority_order = prefs.priority_order;
         state.terminal_queues = prefs.terminal_queues;
@@ -6651,6 +6736,10 @@ impl IssueMonitorState {
                 .legacy_git_launch_failure_migration_version,
             launch_profile: self.launch_profiles.first().cloned(),
             launch_profiles: self.launch_profiles.clone(),
+            launch_auto: self.launch_auto,
+            launch_tiers: self.launch_tiers.clone(),
+            issue_tiers: self.issue_tiers.clone(),
+            tier_overrides: self.tier_overrides.clone(),
             launch_usage_threshold_percent: self.launch_usage_threshold_percent,
             provider_quota_holds: self.provider_quota_holds.clone(),
             provider_quota_hold_evidence: self.provider_quota_hold_evidence.clone(),
@@ -7496,6 +7585,27 @@ impl IssueMonitorState {
         record.attempts
     }
 
+    fn record_classified_attempt(
+        &mut self,
+        issue_number: u64,
+        classification: IssueMonitorFailureClass,
+    ) -> u32 {
+        let previous = self.attempt_count(issue_number);
+        let attempt = self.record_attempt(issue_number);
+        if classification != IssueMonitorFailureClass::Agent {
+            let record = self.autonomous_record_mut(issue_number);
+            record.non_agent_attempts = record
+                .non_agent_attempts
+                .saturating_add(attempt.saturating_sub(previous))
+                .min(attempt);
+        }
+        if classification == IssueMonitorFailureClass::Unknown {
+            let record = self.issue_tiers.entry(issue_number).or_default();
+            record.unknown_failures = record.unknown_failures.saturating_add(1);
+        }
+        attempt
+    }
+
     /// Issue #4161 AC-6: whether an autonomous launch failure has spent its
     /// attempts and says exactly what the previous one said.
     ///
@@ -7561,8 +7671,23 @@ impl IssueMonitorState {
         message: impl Into<String>,
         now: &str,
     ) -> AutonomousFailureOutcome {
+        self.record_classified_autonomous_failure(
+            issue_number,
+            message,
+            IssueMonitorFailureClass::Agent,
+            now,
+        )
+    }
+
+    pub fn record_classified_autonomous_failure(
+        &mut self,
+        issue_number: u64,
+        message: impl Into<String>,
+        classification: IssueMonitorFailureClass,
+        now: &str,
+    ) -> AutonomousFailureOutcome {
         let message = message.into();
-        let attempt = self.record_attempt(issue_number);
+        let attempt = self.record_classified_attempt(issue_number, classification);
         let max = self.autonomous_tuning.max_attempts;
         let backoff = autonomous_retry_backoff_secs(
             attempt,
@@ -7578,6 +7703,7 @@ impl IssueMonitorState {
                 "Issue #{issue_number} attempt {attempt}/{max} failed (retry scheduled): {message}"
             ),
         );
+        self.revoke_launch_binding(issue_number);
         self.clear_active_tracking(issue_number);
         self.require_fresh_launch_session(issue_number);
         self.set_autonomous_phase(issue_number, AutonomousPhase::Idle);
@@ -7613,12 +7739,26 @@ impl IssueMonitorState {
             .iter_mut()
             .find(|item| item.issue.number == issue_number)
         {
-            item.error_message = Some(message);
+            item.error_message = Some(message.clone());
         }
         if !self.queue.contains(&issue_number) {
             self.queue.push_back(issue_number);
             self.apply_priority_order_to_queue();
         }
+        self.failure_release_version += 1;
+        let release = IssueMonitorReleasedFailure {
+            issue_number,
+            release_version: self.failure_release_version,
+            released_at: now.to_string(),
+            reason: message,
+            attempts_before: attempt.saturating_sub(1),
+            attempts_after: attempt,
+            operator_requested: false,
+            retry_record: self.autonomous_record(issue_number).cloned(),
+        };
+        self.released_failures.insert(issue_number, release.clone());
+        self.merge_requeue_audit(std::iter::once(release));
+        self.apply_failure_release(issue_number, true);
         AutonomousFailureOutcome::Retry { attempt }
     }
 
@@ -7683,6 +7823,32 @@ impl IssueMonitorState {
     }
 
     fn retry_ready_for_saved_profile(&self, issue_number: u64, now: &str) -> bool {
+        if self.launch_auto {
+            let holds = parse_rfc3339_utc(now).map_or_else(
+                || self.provider_quota_holds.clone(),
+                |now| self.admission_provider_quota_holds(now),
+            );
+            let is_spec = self
+                .inbox_item(issue_number)
+                .is_some_and(|item| has_gwt_spec_label(&item.issue.labels));
+            if self
+                .prefs()
+                .select_auto_launch_profile(issue_number, is_spec, None, |pool| {
+                    select_launch_profile(
+                        pool,
+                        &holds,
+                        &[],
+                        self.launch_usage_threshold_percent,
+                        &[],
+                        None,
+                        now,
+                    )
+                })
+                .is_none()
+            {
+                return false;
+            }
+        }
         let held_provider = self
             .autonomous_records
             .get(&issue_number)
@@ -7865,9 +8031,10 @@ impl IssueMonitorState {
                         }
                     }
                 } else {
-                    self.record_autonomous_failure(
+                    self.record_classified_autonomous_failure(
                         issue_number,
                         "stuck/idle timeout: no agent window is bound and no progress within stuck_timeout_secs",
+                        IssueMonitorFailureClass::Unknown,
                         now,
                     )
                 };
@@ -7960,7 +8127,12 @@ impl IssueMonitorState {
         reason: String,
         now: &str,
     ) -> AutonomousFailureOutcome {
-        let outcome = self.record_autonomous_failure(issue_number, reason.clone(), now);
+        let outcome = self.record_classified_autonomous_failure(
+            issue_number,
+            reason.clone(),
+            IssueMonitorFailureClass::Unknown,
+            now,
+        );
         if let Some(item) = self
             .inbox
             .iter_mut()
@@ -8986,7 +9158,7 @@ impl IssueMonitorState {
     }
 
     pub fn has_launch_profile(&self) -> bool {
-        !self.launch_profiles.is_empty()
+        self.launch_auto || !self.launch_profiles.is_empty()
     }
 
     /// SPEC #3914 FR-001: the ordered launch candidate pool.
@@ -9043,6 +9215,12 @@ impl IssueMonitorState {
         // SPEC #3914 FR-012: the pool has no daemon control of its own for
         // GUI saves, so disk owns it; a stale in-memory copy must not shrink it.
         self.launch_profiles = disk.launch_profile_pool();
+        self.launch_auto = disk.launch_auto;
+        self.launch_tiers = disk.launch_tiers.clone();
+        self.tier_overrides = disk.tier_overrides.clone();
+        for (number, record) in &disk.issue_tiers {
+            self.issue_tiers.entry(*number).or_default().merge(record);
+        }
         self.launch_usage_threshold_percent = disk.launch_usage_threshold_percent;
         self.autonomous_mode = disk.autonomous_mode;
         // Issue #4037: the drain is raised and cleared through controls that
@@ -9657,16 +9835,32 @@ impl IssueMonitorState {
     ) -> Option<crate::cli::permission_readiness::PermissionReadinessRecord> {
         let now_instant = parse_rfc3339_utc(now)?;
         let holds = self.admission_provider_quota_holds(now_instant);
-        let selection = select_launch_profile(
-            &self.launch_profiles,
-            &holds,
-            &[],
-            self.launch_usage_threshold_percent,
-            &[],
-            None,
-            now,
-        );
-        let profile = self.launch_profiles.get(selection.selected?)?;
+        let select = |pool: &[IssueMonitorLaunchProfile]| {
+            select_launch_profile(
+                pool,
+                &holds,
+                &[],
+                self.launch_usage_threshold_percent,
+                &[],
+                None,
+                now,
+            )
+        };
+        let automatic = if self.launch_auto {
+            let is_spec = self
+                .inbox_item(issue_number)
+                .is_some_and(|item| has_gwt_spec_label(&item.issue.labels));
+            self.prefs()
+                .select_auto_launch_profile(issue_number, is_spec, None, select)
+        } else {
+            None
+        };
+        let profile = if self.launch_auto {
+            &automatic.as_ref()?.profile
+        } else {
+            self.launch_profiles
+                .get(select(&self.launch_profiles).selected?)?
+        };
         let agent_id = gwt_agent::resolve_agent_id(&profile.agent_id)?;
         let custom_agent = match &agent_id {
             // An unreadable definition returns `None` from the whole function,
@@ -10709,7 +10903,18 @@ impl IssueMonitorState {
     /// SPEC #3914 FR-008: every distinct provider in the candidate pool, in
     /// pool order.
     fn saved_launch_providers(&self) -> Vec<String> {
-        launch_pool_providers(&self.launch_profiles)
+        if self.launch_auto {
+            launch_pool_providers(
+                &self
+                    .prefs()
+                    .effective_launch_tiers()
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            launch_pool_providers(&self.launch_profiles)
+        }
     }
 
     /// SPEC #3914 FR-008: the queue-wide hold. Only when every provider in
@@ -10955,7 +11160,7 @@ impl IssueMonitorState {
                 } else {
                     "launching".to_string()
                 }
-            } else if self.launch_profiles.is_empty()
+            } else if !self.has_launch_profile()
                 && !self.queue.is_empty()
                 && self.active_launches.is_empty()
             {
@@ -10980,14 +11185,19 @@ impl IssueMonitorState {
             active_issue_number: self.active_issue_number(),
             last_scan_at: self.last_scan_at.clone(),
             last_error,
-            launch_profile_source: if self.launch_profiles.is_empty() {
+            launch_profile_source: if !self.has_launch_profile() {
                 IssueMonitorLaunchProfileSource::Default
             } else {
                 IssueMonitorLaunchProfileSource::Saved
             },
-            launch_profile_summary: issue_monitor_launch_profile_pool_summary(
-                &self.launch_profiles,
-            ),
+            launch_profile_summary: if self.launch_auto {
+                format!(
+                    "Auto ({} tiers)",
+                    self.prefs().effective_launch_tiers().len()
+                )
+            } else {
+                issue_monitor_launch_profile_pool_summary(&self.launch_profiles)
+            },
             autonomous_mode: self.autonomous_mode,
             auto_apply_updates: self.auto_apply_updates_enabled(),
             quota_hold,
@@ -11006,6 +11216,8 @@ impl IssueMonitorState {
                         issue_number: record.issue_number,
                         phase: record.phase,
                         attempts: record.attempts,
+                        non_agent_attempts: record.non_agent_attempts,
+                        tier_input: record.tier_input(),
                         needs_human,
                         needs_human_reason: needs_human
                             .then(|| self.failed_issues.get(&record.issue_number).cloned())
@@ -11264,10 +11476,26 @@ impl IssueMonitorState {
                         // escalation gate reads, so "this row has burned N
                         // passes on one refusal" is answerable from the
                         // snapshot instead of from the daemon's lossy ring.
+                        launch_tier: self
+                            .issue_tiers
+                            .get(&item.issue.number)
+                            .and_then(|record| record.launch_tier),
+                        landing_tier: self
+                            .issue_tiers
+                            .get(&item.issue.number)
+                            .and_then(|record| record.landing_tier),
                         attempts: self
                             .autonomous_records
                             .get(&item.issue.number)
                             .map_or(0, |record| record.attempts),
+                        non_agent_attempts: self
+                            .autonomous_records
+                            .get(&item.issue.number)
+                            .map_or(0, |record| record.non_agent_attempts),
+                        tier_input: self
+                            .autonomous_records
+                            .get(&item.issue.number)
+                            .map_or(0, AutonomousIssueRecord::tier_input),
                         last_failure_message: self
                             .autonomous_records
                             .get(&item.issue.number)
@@ -12323,7 +12551,16 @@ impl IssueMonitorState {
             issue_number,
             pr_number,
         );
-        self.record_autonomous_failure(issue_number, reason.clone(), now);
+        self.record_classified_autonomous_failure(
+            issue_number,
+            reason.clone(),
+            if exit == DeliveringExit::MergeWatchTimeout {
+                IssueMonitorFailureClass::Unknown
+            } else {
+                IssueMonitorFailureClass::Agent
+            },
+            now,
+        );
         if exit == DeliveringExit::MergeWatchTimeout {
             self.request_autonomous_steering(issue_number, reason, now);
         }
@@ -14217,6 +14454,32 @@ impl IssueMonitorState {
         self.record_agent_issue_failed_at(issue_number, message, &now);
     }
 
+    pub fn record_agent_issue_failed_classified(
+        &mut self,
+        issue_number: u64,
+        message: impl Into<String>,
+        classification: IssueMonitorFailureClass,
+    ) {
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        self.record_agent_issue_failed_classified_at(issue_number, message, classification, &now);
+    }
+
+    pub(crate) fn record_agent_issue_failed_classified_at(
+        &mut self,
+        issue_number: u64,
+        message: impl Into<String>,
+        classification: IssueMonitorFailureClass,
+        now: &str,
+    ) {
+        self.record_failed_issue_classified_at(
+            issue_number,
+            message,
+            MonitorInboxState::AgentFailed,
+            classification,
+            now,
+        );
+    }
+
     pub(crate) fn record_agent_issue_failed_at(
         &mut self,
         issue_number: u64,
@@ -14488,6 +14751,7 @@ impl IssueMonitorState {
             attempts_before: attempts,
             attempts_after: attempts,
             operator_requested: false,
+            retry_record: None,
         }));
     }
 
@@ -15770,6 +16034,7 @@ impl IssueMonitorState {
             attempts_before,
             attempts_after: 0,
             operator_requested,
+            retry_record: None,
         };
         self.released_failures.insert(issue_number, release.clone());
         self.merge_requeue_audit(std::iter::once(release));
@@ -16165,6 +16430,7 @@ impl IssueMonitorState {
             attempts_before,
             attempts_after: 0,
             operator_requested: true,
+            retry_record: None,
         };
         self.released_failures.insert(issue_number, release.clone());
         self.merge_requeue_audit(std::iter::once(release));
@@ -16211,12 +16477,20 @@ impl IssueMonitorState {
     /// converged process cannot land in a different state than the one that
     /// issued the recovery.
     fn apply_failure_release(&mut self, issue_number: u64, revoke_claims: bool) {
+        let retry_record = self
+            .released_failures
+            .get(&issue_number)
+            .and_then(|release| release.retry_record.clone());
         let removed_banner = self
             .failed_issues
             .get(&issue_number)
             .map(|message| format!("issue #{issue_number}: {message}"));
         self.failed_issues.remove(&issue_number);
         self.failed_windows.remove(&issue_number);
+        if retry_record.is_some() {
+            self.launch_bindings
+                .retain(|_, owner| *owner != issue_number);
+        }
         self.clear_active_tracking(issue_number);
         if revoke_claims {
             revoke_uncommitted_claims_for_issue(
@@ -16229,8 +16503,20 @@ impl IssueMonitorState {
         // The abandoned conversation is what stranded this issue; resuming it
         // would reproduce the failure the recovery is undoing.
         self.require_fresh_launch_session(issue_number);
-        if let Some(record) = self.autonomous_records.get_mut(&issue_number) {
+        if let Some(record) = retry_record.as_ref() {
+            // A failure increments attempts before publishing this fence.
+            // Restore only a predecessor: preparation of this same retry may
+            // already have refreshed its acceptance snapshot and phase.
+            if self
+                .autonomous_records
+                .get(&issue_number)
+                .is_none_or(|current| current.attempts < record.attempts)
+            {
+                self.autonomous_records.insert(issue_number, record.clone());
+            }
+        } else if let Some(record) = self.autonomous_records.get_mut(&issue_number) {
             record.attempts = 0;
+            record.non_agent_attempts = 0;
             record.retry_not_before = None;
             record.retry_hold_reason = None;
             record.retry_hold_provider = None;
@@ -16250,7 +16536,7 @@ impl IssueMonitorState {
             item.state = MonitorInboxState::Queued;
             item.claim_id = None;
             item.launched_window_id = None;
-            item.error_message = None;
+            item.error_message = retry_record.and_then(|record| record.last_failure_message);
         }
         if !self.queue.contains(&issue_number) {
             self.queue.push_back(issue_number);
@@ -16553,11 +16839,20 @@ impl IssueMonitorState {
     /// the stale close becomes an inert CAS miss instead of revoking that
     /// successor.
     pub fn requeue_exact_window(&mut self, target: &IssueMonitorStopTarget) -> Option<u64> {
+        self.requeue_exact_window_classified(target, IssueMonitorFailureClass::Agent)
+    }
+
+    pub fn requeue_exact_window_classified(
+        &mut self,
+        target: &IssueMonitorStopTarget,
+        classification: IssueMonitorFailureClass,
+    ) -> Option<u64> {
         let window_id = self
             .resolve_exact_launch(target, StopIdentityMatch::Exact)
             .ok()
             .flatten()?;
-        self.requeue_window(&window_id)
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        self.requeue_window_classified_at(&window_id, classification, &now)
             .filter(|issue_number| *issue_number == target.issue_number)
     }
 
@@ -17326,6 +17621,15 @@ impl IssueMonitorState {
     /// definition ("closed without the work completing"), so it shares that
     /// budget rather than introducing a second one that could disagree.
     pub fn requeue_window_at(&mut self, window_id: &str, now: &str) -> Option<u64> {
+        self.requeue_window_classified_at(window_id, IssueMonitorFailureClass::Agent, now)
+    }
+
+    fn requeue_window_classified_at(
+        &mut self,
+        window_id: &str,
+        classification: IssueMonitorFailureClass,
+        now: &str,
+    ) -> Option<u64> {
         let issue_number = self.launched_window_issue(window_id)?;
         if self.merged_issues.contains(&issue_number) {
             return None;
@@ -17336,7 +17640,7 @@ impl IssueMonitorState {
         {
             return None;
         }
-        let attempt = self.record_attempt(issue_number);
+        let attempt = self.record_classified_attempt(issue_number, classification);
         let max = self.autonomous_tuning.max_attempts;
         // Issue #3944 AC-6: the human-gated flow keeps its cap-park unchanged.
         // AC-2: under autonomous mode a closed window is a dead launch — it is
@@ -17384,6 +17688,23 @@ impl IssueMonitorState {
         state: MonitorInboxState,
         now: &str,
     ) {
+        self.record_failed_issue_classified_at(
+            issue_number,
+            message,
+            state,
+            IssueMonitorFailureClass::Agent,
+            now,
+        );
+    }
+
+    fn record_failed_issue_classified_at(
+        &mut self,
+        issue_number: u64,
+        message: impl Into<String>,
+        state: MonitorInboxState,
+        classification: IssueMonitorFailureClass,
+        now: &str,
+    ) {
         let message = message.into();
         // Issue #3941 AC-3: a launch aborted by transient infrastructure (exact
         // package probe timeout with no cached version, a remote-tracking ref
@@ -17422,7 +17743,7 @@ impl IssueMonitorState {
                 );
                 return;
             }
-            self.record_autonomous_failure(issue_number, message, now);
+            self.record_classified_autonomous_failure(issue_number, message, classification, now);
             return;
         }
         self.active_launches
@@ -18006,6 +18327,8 @@ mod tests {
                 provider_quota_holds: Vec::new(),
                 needs_human: Vec::new(),
                 inbox: vec![IssueMonitorInboxSummary {
+                    launch_tier: None,
+                    landing_tier: None,
                     issue_number: 42,
                     state: MonitorInboxState::BlockedByClaim,
                     github_state: IssueMonitorIssueState::Open,
@@ -18035,6 +18358,8 @@ mod tests {
                     idle_since: None,
                     duplicate_launch_refusal: None,
                     attempts: 0,
+                    non_agent_attempts: 0,
+                    tier_input: 0,
                     last_failure_message: None,
                     failure_kind: None,
                     pane_hold_reason: None,
@@ -19168,6 +19493,7 @@ mod tests {
             phase,
             active_launch_id: None,
             attempts: 2,
+            non_agent_attempts: 0,
             acceptance_snapshot: None,
             retry_not_before: None,
             retry_hold_reason: None,
@@ -19291,6 +19617,7 @@ mod tests {
             phase: AutonomousPhase::NeedsHuman,
             active_launch_id: None,
             attempts: 6,
+            non_agent_attempts: 0,
             acceptance_snapshot: None,
             retry_not_before: None,
             retry_hold_reason: None,
@@ -19360,6 +19687,7 @@ mod tests {
                 phase: AutonomousPhase::NeedsHuman,
                 active_launch_id: None,
                 attempts: 6,
+                non_agent_attempts: 0,
                 acceptance_snapshot: None,
                 retry_not_before: None,
                 retry_hold_reason: None,
@@ -19429,6 +19757,7 @@ mod tests {
             phase: AutonomousPhase::NeedsHuman,
             active_launch_id: None,
             attempts: 4,
+            non_agent_attempts: 0,
             acceptance_snapshot: None,
             retry_not_before: None,
             retry_hold_reason: None,
@@ -19487,6 +19816,7 @@ mod tests {
             phase: AutonomousPhase::Implementing,
             active_launch_id: Some(format!("launch-{issue_number}")),
             attempts: 1,
+            non_agent_attempts: 0,
             acceptance_snapshot: None,
             retry_not_before: None,
             retry_hold_reason: None,
@@ -20416,6 +20746,239 @@ mod tests {
         selection: &LaunchProfileSelection,
     ) -> Option<String> {
         selection.selected.map(|index| pool[index].agent_id.clone())
+    }
+
+    #[test]
+    fn auto_tiers_hold_when_only_a_lower_tier_is_available() {
+        let mut monitor = launched_monitor(42, "tab-1::agent-42");
+        let mut prefs = monitor.prefs();
+        prefs.launch_auto = true;
+        prefs.launch_tiers = vec![
+            vec![test_launch_profile("codex")],
+            vec![test_launch_profile("claude")],
+        ];
+        prefs.record_tier_launch(42, 1);
+        prefs
+            .provider_quota_holds
+            .insert("claude".to_string(), "2026-09-30T00:00:00Z".to_string());
+        monitor.rebase_daemon_driver_prefs(&prefs);
+        assert!(!monitor.retry_ready_for_saved_profile(42, "2026-09-29T00:00:00Z"));
+    }
+
+    #[test]
+    fn auto_tiers_classify_failures_without_changing_the_retry_ladder() {
+        let mut monitor = launched_monitor(42, "tab-1::agent-42");
+        let mut prefs = monitor.prefs();
+        prefs.launch_auto = true;
+        prefs.autonomous_mode = true;
+        monitor.rebase_daemon_driver_prefs(&prefs);
+        for (classification, expected_tier) in [
+            (IssueMonitorFailureClass::Infrastructure, 0),
+            (IssueMonitorFailureClass::Unknown, 0),
+            (IssueMonitorFailureClass::Agent, 1),
+        ] {
+            monitor.record_classified_autonomous_failure(
+                42,
+                "classified failure",
+                classification,
+                "2026-09-29T00:00:00Z",
+            );
+            let selected = monitor
+                .prefs()
+                .select_auto_launch_profile(42, false, None, |pool| {
+                    select_launch_profile(
+                        pool,
+                        &BTreeMap::new(),
+                        &[],
+                        80,
+                        &[],
+                        None,
+                        "2026-09-29T00:00:00Z",
+                    )
+                })
+                .unwrap();
+            assert_eq!(selected.tier, expected_tier);
+        }
+        let record = monitor.autonomous_record(42).unwrap();
+        assert_eq!(record.attempts, 3);
+        assert_eq!(record.non_agent_attempts, 2);
+        assert_eq!(record.tier_input(), 1);
+        assert_eq!(
+            record.retry_not_before.as_deref(),
+            Some("2026-09-29T00:04:00Z")
+        );
+        assert!(
+            record.steering.is_some(),
+            "the total attempt cap is unchanged"
+        );
+        let status = monitor.status_view();
+        let summary = &status.autonomous_issues[0];
+        assert_eq!(
+            (
+                summary.attempts,
+                summary.non_agent_attempts,
+                summary.tier_input
+            ),
+            (3, 2, 1)
+        );
+        let inbox = &monitor.agent_status().inbox[0];
+        assert_eq!(
+            (inbox.attempts, inbox.non_agent_attempts, inbox.tier_input),
+            (3, 2, 1)
+        );
+        let decoded: IssueMonitorPrefs =
+            serde_json::from_str(&serde_json::to_string(&monitor.prefs()).unwrap()).unwrap();
+        let mut restored = IssueMonitorState::with_prefs(IssueMonitorConfig::default(), decoded);
+        assert_eq!(restored.autonomous_record(42).unwrap().tier_input(), 1);
+        restored.record_merged(42);
+        assert_eq!(restored.prefs().tier_landing_stats().unknown_failures, 1);
+        restored.rebase_daemon_driver_prefs(&monitor.prefs());
+        assert_eq!(restored.prefs().tier_landing_stats().unknown_failures, 1);
+    }
+
+    #[test]
+    fn auto_tiers_admit_unconfigured_project_and_escalate_real_retry() {
+        let mut monitor = launched_monitor(42, "tab-1::agent-42");
+        let mut prefs = monitor.prefs();
+        prefs.launch_auto = true;
+        prefs.autonomous_mode = true;
+        monitor.rebase_daemon_driver_prefs(&prefs);
+        assert!(
+            monitor.has_launch_profile(),
+            "auto supplies a launch profile without manual configuration"
+        );
+        let choose = |prefs: IssueMonitorPrefs| {
+            prefs
+                .select_auto_launch_profile(42, false, None, |pool| {
+                    select_launch_profile(
+                        pool,
+                        &BTreeMap::new(),
+                        &[],
+                        80,
+                        &[],
+                        None,
+                        "2026-09-29T00:00:00Z",
+                    )
+                })
+                .unwrap()
+                .tier
+        };
+        assert_eq!(choose(monitor.prefs()), 0);
+        monitor.record_autonomous_failure(42, "agent exited", "2026-09-29T00:00:00Z");
+        assert_eq!(choose(monitor.prefs()), 1);
+        assert_ne!(monitor.status_view().state, "settings_required");
+        assert_ne!(
+            monitor.status_view().launch_profile_summary,
+            "configure before auto start"
+        );
+        assert_eq!(
+            monitor.inbox_item(42).unwrap().state,
+            MonitorInboxState::Queued
+        );
+    }
+
+    #[test]
+    fn auto_tier_landing_is_observable_and_survives_rebase() {
+        let mut monitor = launched_monitor(42, "tab-1::agent-42");
+        let mut prefs = monitor.prefs();
+        prefs.launch_auto = true;
+        prefs.record_tier_launch(42, 0);
+        monitor.rebase_daemon_driver_prefs(&prefs);
+        monitor.apply_merged_terminal_state(42);
+        assert_eq!(monitor.prefs().issue_tiers[&42].landing_tier, None);
+        assert_eq!(monitor.prefs().tier_landing_stats().landed_issues, 0);
+        // Only a successful exact Work done mutation supplies this durable observation.
+        let mut landed = monitor.prefs();
+        landed.issue_tiers.get_mut(&42).unwrap().landing_tier = Some(0);
+        monitor.rebase_daemon_driver_prefs(&landed);
+        let row = serde_json::to_value(monitor.agent_status()).unwrap();
+        let row = row["inbox"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["issue_number"] == 42)
+            .unwrap();
+        assert_eq!(row["launch_tier"], 0);
+        assert_eq!(row["landing_tier"], 0);
+        let stats = monitor.prefs().tier_landing_stats();
+        assert_eq!(stats.landed_issues, 1);
+        assert_eq!(stats.lowest_tier_landing_rate, Some(1.0));
+        monitor.rebase_daemon_driver_prefs(&prefs);
+        assert_eq!(monitor.prefs().issue_tiers[&42].landing_tier, Some(0));
+    }
+
+    #[test]
+    fn auto_tiers_preserve_manual_pool_and_supply_defaults() {
+        let mut prefs = IssueMonitorPrefs::default();
+        prefs.set_launch_profile_pool(vec![test_launch_profile("codex")]);
+        assert_eq!(
+            prefs.effective_launch_tiers(),
+            vec![prefs.launch_profile_pool()]
+        );
+        prefs.launch_auto = true;
+        let tiers = prefs.effective_launch_tiers();
+        assert_eq!(tiers.len(), 3);
+        assert!(tiers.iter().all(|tier| tier.len() >= 2));
+        assert_eq!(prefs.launch_profile_pool()[0].agent_id, "codex");
+    }
+
+    #[test]
+    fn auto_tiers_skip_held_tier_and_retain_floor_after_attempt_reset() {
+        let mut prefs = IssueMonitorPrefs {
+            launch_auto: true,
+            launch_tiers: vec![
+                vec![test_launch_profile("codex")],
+                vec![test_launch_profile("claude")],
+            ],
+            ..Default::default()
+        };
+        let holds = BTreeMap::from([("codex".to_string(), "2026-09-30T00:00:00Z".to_string())]);
+        let select = |pool: &[IssueMonitorLaunchProfile]| {
+            select_launch_profile(pool, &holds, &[], 80, &[], None, "2026-09-29T00:00:00Z")
+        };
+        let choice = prefs
+            .select_auto_launch_profile(42, false, None, select)
+            .unwrap();
+        assert_eq!(choice.tier, 1);
+        assert_eq!(choice.profile.agent_id, "claude");
+        prefs.record_tier_launch(42, choice.tier);
+        let mut monitor = IssueMonitorState::with_prefs(IssueMonitorConfig::default(), prefs);
+        monitor.record_attempt(42);
+        monitor.clear_autonomous_record(42);
+        let roundtrip: IssueMonitorPrefs =
+            serde_json::from_str(&serde_json::to_string(&monitor.prefs()).unwrap()).unwrap();
+        assert_eq!(roundtrip.issue_tiers[&42].floor, 1);
+        let choice = roundtrip
+            .select_auto_launch_profile(42, false, None, |pool| {
+                select_launch_profile(
+                    pool,
+                    &BTreeMap::new(),
+                    &[],
+                    80,
+                    &[],
+                    None,
+                    "2026-09-29T00:00:00Z",
+                )
+            })
+            .unwrap();
+        assert_eq!(choice.tier, 1);
+    }
+
+    #[test]
+    fn auto_tier_uses_attempts_spec_floor_and_caps_at_top() {
+        for (attempts, is_spec, floor, expected) in [
+            (0, false, 0, 0),
+            (1, false, 0, 1),
+            (2, false, 0, 2),
+            (3, false, 0, 2),
+            (0, true, 0, 1),
+            (1, true, 0, 1),
+            (2, true, 0, 2),
+            (0, false, 2, 2),
+            (1, false, 2, 2),
+        ] {
+            assert_eq!(tier_for(attempts, is_spec, floor, 3), expected);
+        }
     }
 
     #[test]
@@ -24325,6 +24888,7 @@ mod tests {
         }
         {
             let record = monitor.autonomous_record_mut(42);
+            record.non_agent_attempts = 2;
             record.phase = AutonomousPhase::Reviewing;
             record.pr_number = Some(3734);
             record.reviewed_sha = Some("reviewed-sha".to_string());
@@ -24369,6 +24933,7 @@ mod tests {
         assert_eq!(attempts_before, 3);
         let autonomous = monitor.autonomous_record(42).expect("record retained");
         assert_eq!(autonomous.phase, AutonomousPhase::Idle);
+        assert_eq!(autonomous.non_agent_attempts, 0);
         assert_eq!(autonomous.pr_number, Some(3734));
         assert_eq!(autonomous.reviewed_sha.as_deref(), Some("reviewed-sha"));
         assert_eq!(autonomous.review_passed, Some(true));
@@ -24385,6 +24950,7 @@ mod tests {
                 attempts_before: 3,
                 attempts_after: 0,
                 operator_requested: true,
+                retry_record: None,
             }],
             "the reset delta and operator reason must survive in durable audit history"
         );
@@ -24951,6 +25517,7 @@ mod tests {
                 attempts_before: 1,
                 attempts_after: 0,
                 operator_requested: false,
+                retry_record: None,
             };
         let stranded = "stranded execution generation released (holder Session Idle); returned to the queue by the Issue Monitor";
         let monitor = IssueMonitorState::with_prefs(
@@ -25672,6 +26239,7 @@ mod tests {
             attempts_before: 1,
             attempts_after: 0,
             operator_requested: false,
+            retry_record: None,
         };
         let mut observer = IssueMonitorState::with_prefs(
             IssueMonitorConfig::default(),
@@ -29882,6 +30450,7 @@ mod tests {
             Some(MonitorInboxState::Queued)
         );
         assert_eq!(monitor.active_count(), 0, "stuck slot reclaimed");
+        assert_eq!(monitor.autonomous_record(42).unwrap().non_agent_attempts, 1);
         assert!(
             monitor
                 .recover_stuck_autonomous("2026-06-29T01:05:00Z")
@@ -30006,6 +30575,7 @@ mod tests {
             "{recovered:?}"
         );
         assert_eq!(monitor.active_count(), 0, "the slot is released");
+        assert_eq!(monitor.autonomous_record(42).unwrap().non_agent_attempts, 1);
         assert_eq!(
             monitor.inbox_item(42).map(|item| item.state),
             Some(MonitorInboxState::Queued),
@@ -31699,6 +32269,7 @@ mod tests {
         );
         let record = monitor.autonomous_record(7).expect("record");
         assert_eq!(record.phase, AutonomousPhase::Idle);
+        assert_eq!(record.non_agent_attempts, 1);
         assert!(
             record
                 .steering
@@ -34713,6 +35284,48 @@ mod tests {
             monitor.next_launch_request(next_scan_at).is_none(),
             "a repaired launch still holds its slot against max_active"
         );
+    }
+
+    #[test]
+    fn autonomous_failure_does_not_readopt_its_exited_claim_binding() {
+        let mut monitor = IssueMonitorState::with_prefs(
+            IssueMonitorConfig::default(),
+            IssueMonitorPrefs {
+                enabled: true,
+                autonomous_mode: true,
+                ..IssueMonitorPrefs::default()
+            },
+        );
+        monitor.set_gui_connected(true);
+        scan_queued_candidates(&mut monitor, &[issue(42)], "2026-09-29T00:00:00Z");
+        assert!(monitor.apply_confirmed_claim(
+            42,
+            "failed-claim",
+            "fixture-owner",
+            "failed-claim-effect",
+            "2026-09-29T00:00:00Z",
+        ));
+        monitor.complete_active_launch_at(42, "tab-1::agent-1", "2026-09-29T00:00:01Z");
+        monitor.record_autonomous_failure(
+            42,
+            "process exited with status 1",
+            "2026-09-29T00:00:02Z",
+        );
+
+        monitor.record_blocked_by_claim(
+            issue(42),
+            "fixture-owner",
+            "2026-09-29T00:30:00Z",
+            Some("failed-claim"),
+        );
+
+        assert_eq!(
+            monitor.active_count(),
+            0,
+            "an exited launch cannot reclaim its slot"
+        );
+        assert!(monitor.prefs().launch_bindings.is_empty());
+        assert_eq!(monitor.attempt_count(42), 1);
     }
 
     /// Issue #4328 AC-2: a genuinely foreign claim is still a block. The
