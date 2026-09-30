@@ -162,7 +162,7 @@ test("AC-23: ⚙ holds the settings copy and the held fallback in its tooltip", 
   const { body, surface } = await makeFixture();
   t.after(() => surface.clearKnowledgeBridgeState("win-1"));
   const gear = body.querySelector('.knowledge-monitor-bar [data-action="monitor-settings"]');
-  assert.equal(gear.textContent, "⚙");
+  assert.equal(gear.textContent, "⚙ Settings");
 
   surface.applyIssueMonitorStatus({
     ...STATUS,
@@ -453,8 +453,9 @@ test("AC-25: the detail pane renders in FR-023 order with the row's badge vocabu
 
   order[3].querySelector('[data-action="move-to-top"]').click();
   assert.deepEqual(sent.at(-1), {
-    kind: "reorder_issue_monitor_issues",
-    issue_numbers: [11, 10],
+    kind: "issue_monitor_queue_move",
+    issue_number: 11,
+    position: 0,
   });
 });
 
@@ -483,4 +484,15 @@ test("AC-28: the Phase 5 CSS uses Operator tokens only", () => {
   assert.doesNotMatch(block, /#[0-9a-fA-F]{3,8}\b/, "no raw hex");
   assert.doesNotMatch(block, /\brgba?\(/, "no raw rgb");
   assert.doesNotMatch(block, /\bposition:\s*fixed/, "no private overlay shell");
+});
+
+test("queue detail provenance follows authoritative terminal queue", async (t) => {
+  const { body, surface, state } = await makeFixture();
+  t.after(() => surface.clearKnowledgeBridgeState("win-1"));
+  state.entries = [entry(11, "queued", { queued_by: "operator" })];
+  state.selectedNumber = 11;
+  state.detail = { number: 11, title: "Issue 11", labels: [], sections: [] };
+  surface.applyIssueMonitorStatus({ ...STATUS, terminal_queue: [{ number: 11, queued_by: "auto-refill" }] });
+  surface.renderKnowledgeBridge("win-1");
+  assert.equal(body.querySelector(".issue-detail-provenance")?.textContent, "Queued by: Auto-refill");
 });

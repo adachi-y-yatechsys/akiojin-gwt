@@ -199,12 +199,30 @@ test("issuePreviewWindowsForIssue binds previews to their host Issue window", as
   assert.deepEqual(issuePreviewWindowsForIssue(windows, "win-1", 9999), []);
 });
 
+test("queue preview defaults to Issue, switches output and preserves visibility across refresh", async (t) => {
+  const fixture = await makeFixture({ workspaceWindows: [previewWindow("agent-1", 3671)] });
+  t.after(() => fixture.surface.clearKnowledgeBridgeState("win-1"));
+  applyEntries(fixture.surface, fixture.load, [knowledgeEntry(3671)], 3671);
+  assert.ok(!fixture.body.querySelector(".issue-preview"));
+  fixture.body.querySelector('[data-issue-detail-view="output"]').click();
+  assert.equal(fixture.body.querySelectorAll(".issue-preview").length, 1);
+  fixture.body.querySelector('[data-action="toggle-issue-preview"]').click();
+  assert.ok(!fixture.body.querySelector(".issue-preview"));
+  fixture.surface.renderKnowledgeBridge("win-1");
+  assert.equal(fixture.body.querySelector(".issue-bridge-root").dataset.previewHidden, "true");
+  fixture.body.querySelector('[data-action="toggle-issue-preview"]').click();
+  assert.equal(fixture.body.querySelectorAll(".issue-preview").length, 1);
+  fixture.body.querySelector('[data-issue-detail-view="issue"]').click();
+  assert.ok(!fixture.body.querySelector(".issue-preview"));
+});
+
 // FR-007 / FR-008.
 test("selecting an Issue mirrors its agent read-only in the right pane", async (t) => {
   const fixture = await makeFixture({ workspaceWindows: [previewWindow("agent-1", 3671)] });
   t.after(() => fixture.surface.clearKnowledgeBridgeState("win-1"));
   applyEntries(fixture.surface, fixture.load, [knowledgeEntry(3671)], 3671);
 
+  fixture.body.querySelector('[data-issue-detail-view="output"]').click();
   const preview = fixture.body.querySelector(".issue-preview");
   assert.ok(preview, "the selected Issue's agent is mirrored in the detail pane");
   assert.equal(preview.dataset.windowId, "agent-1");
@@ -241,6 +259,7 @@ test("only one agent terminal is mirrored at a time", async (t) => {
     3671,
   );
 
+  fixture.body.querySelector('[data-issue-detail-view="output"]').click();
   assert.equal(fixture.body.querySelectorAll(".issue-preview").length, 1);
   assert.equal(fixture.body.querySelector(".issue-preview").dataset.windowId, "agent-1");
 
@@ -264,11 +283,21 @@ test("Windowize hands the mirrored agent back to the canvas", async (t) => {
   t.after(() => fixture.surface.clearKnowledgeBridgeState("win-1"));
   applyEntries(fixture.surface, fixture.load, [knowledgeEntry(3671)], 3671);
 
-  const windowize = fixture.body.querySelector('[data-action="windowize-issue-preview"]');
+  fixture.body.querySelector('[data-issue-detail-view="output"]').click();
+  const windowize = fixture.body.querySelector('.issue-preview [data-action="windowize-issue-preview"]');
   assert.ok(windowize, "the mirror offers a Windowize control");
   windowize.click();
 
   assert.deepEqual(fixture.windowized, ["agent-1"]);
+  // The Canvas response can arrive before Work projection reports its agent.
+  fixture.setWindows([previewWindow("agent-1", 3671, {
+    placement: { kind: "canvas" }, linked_issue_number: 3671,
+  })]);
+  fixture.surface.renderKnowledgeBridge("win-1");
+  const detail = fixture.body.querySelector(".knowledge-detail-pane");
+  assert.match(detail.querySelector(".issue-preview-empty")?.textContent || "", /Shown on canvas/);
+  assert.ok(detail.querySelector('[data-action="focus-canvas-window"]'));
+  assert.equal(detail.querySelectorAll(".terminal-root").length, 0);
 });
 
 // FR-011.
@@ -283,6 +312,7 @@ test("an errored or waiting agent is badged, never auto-opened on the canvas", a
     t.after(() => fixture.surface.clearKnowledgeBridgeState("win-1"));
     applyEntries(fixture.surface, fixture.load, [knowledgeEntry(3671)], 3671);
 
+    fixture.body.querySelector('[data-issue-detail-view="output"]').click();
     const badge = fixture.body.querySelector(".issue-preview .knowledge-monitor-chip");
     assert.equal(badge.textContent, label);
     assert.equal(badge.dataset.tone, tone);
@@ -304,7 +334,7 @@ test("no preview pane is rendered when the Issue has no auto-launched agent", as
   t.after(() => fixture.surface.clearKnowledgeBridgeState("win-1"));
   applyEntries(fixture.surface, fixture.load, [knowledgeEntry(3671)], 3671);
 
-  assert.equal(fixture.body.querySelector(".issue-preview"), null);
+  assert.ok(!fixture.body.querySelector(".issue-preview"));
   assert.equal(fixture.terminalMounts.length, 0);
 });
 
@@ -470,6 +500,7 @@ test("Issue #3884: clicking the status row is not a selection gesture, selecting
     1,
   );
   assert.equal(fixture.body.querySelectorAll(".issue-agent-status").length, 1);
+  fixture.body.querySelector('[data-issue-detail-view="output"]').click();
   // FR-007 still holds: the selected Issue's agent is mirrored read-only.
   assert.equal(fixture.body.querySelectorAll(".issue-preview").length, 1);
   assert.deepEqual(fixture.terminalMounts[0].options, { readOnly: true });
@@ -483,4 +514,26 @@ test("Issue #3884: formatAgentElapsed renders compact durations", async () => {
   assert.equal(formatAgentElapsed(7 * 60 * 1000), "7m");
   assert.equal(formatAgentElapsed(65 * 60 * 1000), "1h 05m");
   assert.equal(formatAgentElapsed(26 * 60 * 60 * 1000), "1d 2h");
+});
+
+test("queue output explains queued and completed issues without agents", async (t) => {
+  const fixture = await makeFixture();
+  t.after(() => fixture.surface.clearKnowledgeBridgeState("win-1"));
+  const state = fixture.surface.ensureKnowledgeBridgeState("win-1", "issue");
+  for (const [extra, reason] of [
+    [{ queue_position: 1, monitor_state: null }, "Waiting in queue. No agent has started."],
+    [{ state: "closed" }, "This issue is completed. No agent is running."],
+  ]) {
+    state.entries = [{ ...knowledgeEntry(3671), ...extra }];
+    state.selectedNumber = 3671;
+    state.issueDetailView = "output";
+    fixture.surface.renderKnowledgeBridge("win-1");
+    assert.equal(fixture.body.querySelector(".issue-preview-empty")?.textContent, reason);
+  }
+});
+
+test("queue columns keep 262px minimum and hidden preview gives board full width", () => {
+  const css = readFileSync(resolve(here, "../styles/app.css"), "utf8");
+  assert.match(css, /\.issue-queue-board\s*\{[^}]*minmax\(262px,/);
+  assert.match(css, /\[data-preview-hidden="true"\] \.issue-list-shell\s*\{[^}]*grid-template-columns:\s*minmax\(0, 1fr\)/);
 });

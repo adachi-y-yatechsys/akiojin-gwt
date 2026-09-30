@@ -3061,6 +3061,7 @@ mod tests {
             max_active: 1,
             ..crate::IssueMonitorConfig::default()
         });
+        monitor.terminal_queue_push(&[42], "test", "2026-07-02T00:00:00Z");
         monitor.set_gui_connected(true);
         // OpenClaw exposes neither a skip flag nor a permission overlay.
         monitor.set_launch_profile_pool(vec![unsupported_launch_profile("openclaw")]);
@@ -3124,6 +3125,7 @@ mod tests {
             max_active: 1,
             ..crate::IssueMonitorConfig::default()
         });
+        monitor.terminal_queue_push(&[42], "test", "2026-07-02T00:00:00Z");
         monitor.set_gui_connected(true);
         monitor.set_launch_profile_pool(vec![unsupported_launch_profile("codex")]);
         crate::scan_issue_monitor_candidates(&mut monitor, &[issue(42)], "2026-07-02T00:00:00Z");
@@ -3173,6 +3175,7 @@ mod tests {
             max_active: 1,
             ..crate::IssueMonitorConfig::default()
         });
+        monitor.terminal_queue_push(&[42, 43], "test", "2026-07-02T00:00:00Z");
         monitor.set_gui_connected(true);
         let closed = IssueMonitorIssue {
             state: IssueMonitorIssueState::Closed,
@@ -3233,6 +3236,7 @@ mod tests {
             enabled: true,
             ..IssueMonitorConfig::default()
         });
+        monitor.terminal_queue_push(&[42], "test", "2026-07-02T00:00:00Z");
         monitor.record_candidate(issue(42));
         assert!(monitor.apply_confirmed_claim(
             42,
@@ -3268,6 +3272,7 @@ mod tests {
             enabled: true,
             ..IssueMonitorConfig::default()
         });
+        monitor.terminal_queue_push(&[42], "test", "2026-07-02T00:00:00Z");
         monitor.set_gui_connected(true);
         monitor.record_candidate(issue(42));
         monitor.claim_next_launch_requests(&client, "host-a/session-a", "2026-06-23T10:00:00Z");
@@ -3358,6 +3363,7 @@ mod tests {
             enabled: true,
             ..IssueMonitorConfig::default()
         });
+        monitor.terminal_queue_push(&[42], "test", "2026-07-02T00:00:00Z");
         scan_loaded_issue_monitor_candidates(
             &mut monitor,
             &loaded,
@@ -3575,6 +3581,7 @@ mod tests {
             enabled: true,
             ..IssueMonitorConfig::default()
         });
+        monitor.terminal_queue_push(&[42], "test", "2026-07-02T00:00:00Z");
         monitor.set_gui_connected(true);
         monitor.set_autonomous_mode(true);
         monitor.record_candidate(issue(42));
@@ -3609,6 +3616,7 @@ mod tests {
             enabled: true,
             ..IssueMonitorConfig::default()
         });
+        monitor.terminal_queue_push(&[42], "test", "2026-07-02T00:00:00Z");
         monitor.record_candidate(issue(42));
         assert!(monitor.apply_confirmed_claim(
             42,
@@ -3644,6 +3652,7 @@ mod tests {
             enabled: true,
             ..IssueMonitorConfig::default()
         });
+        monitor.terminal_queue_push(&[42], "test", "2026-07-02T00:00:00Z");
         monitor.set_gui_connected(true);
         monitor.record_candidate(issue(42));
         monitor.claim_next_launch_requests(&client, "host-a/session-a", "2026-06-23T10:00:00Z");
@@ -3675,6 +3684,7 @@ mod tests {
             max_active: 3,
             ..IssueMonitorConfig::default()
         });
+        monitor.terminal_queue_push(&[42, 43, 44], "test", "2026-07-02T00:00:00Z");
         monitor.set_gui_connected(true);
         monitor.record_candidate(issue(42));
         monitor.record_candidate(issue(43));
@@ -4029,6 +4039,7 @@ mod tests {
             "full refresh follows the short page's Link"
         );
         let mut monitor = crate::IssueMonitorState::new(IssueMonitorConfig::default());
+        monitor.terminal_queue_push(&[4080, 7, 8], "test", "2026-07-02T00:00:00Z");
         crate::issue_monitor::scan_issue_monitor_candidates(
             &mut monitor,
             &candidates,
@@ -4505,6 +4516,7 @@ exit 1
                 ..crate::IssueMonitorPrefs::default()
             },
         );
+        monitor.terminal_queue_push(&[50, 51], "test", "2026-07-02T00:00:00Z");
         let mut not_ready = issue(50);
         not_ready.labels = vec!["gwt-spec".to_string(), "auto-merge".to_string()];
         not_ready.readiness = IssueMonitorReadiness::NotReady;
@@ -4828,6 +4840,7 @@ exit 0
                 ..crate::IssueMonitorPrefs::default()
             },
         );
+        monitor.terminal_queue_push(&[42], "test", "2026-07-02T00:00:00Z");
         crate::scan_issue_monitor_candidates(&mut monitor, &issues, "2026-07-28T00:00:00Z");
         // Delivering is the narrowest phase that proves the loop reaches gh: it
         // watches the merge (`--json mergeCommit`) and then re-reads the merged
