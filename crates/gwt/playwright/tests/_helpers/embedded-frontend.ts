@@ -59,6 +59,8 @@ const ROOT_MODULES = new Set([
   "file-tree-surface.js",
   // SPEC-2008 camera-focus / FR-094 — always-on Fleet Minimap carrier.
   "fleet-minimap.js",
+  // Issue #4777 T-1 — rail surface selection (Issues / Agents / Board / Settings).
+  "surface-rail.js",
   "focus-trap.js",
   "startup-metrics.js",
   "hotkey.js",
