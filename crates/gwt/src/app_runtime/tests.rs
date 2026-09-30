@@ -30702,6 +30702,28 @@ fn managed_hook_health_for_worktree_uses_the_latest_matching_session_state() {
     assert_eq!(health.last_event.as_deref(), Some("UserPromptSubmit"));
 }
 
+fn managed_hook_inspection_text(rendered: &str) -> String {
+    let mut inspected = rendered.to_string();
+    if let Ok(root) = serde_json::from_str::<serde_json::Value>(rendered) {
+        for command in root["hooks"]
+            .as_object()
+            .into_iter()
+            .flat_map(|hooks| hooks.values())
+            .filter_map(|groups| groups.as_array())
+            .flatten()
+            .filter_map(|group| group["hooks"].as_array())
+            .flatten()
+            .filter_map(|hook| hook["command"].as_str())
+        {
+            if let Some(decoded) = gwt_skills::decode_powershell_encoded_command(command) {
+                inspected.push('\n');
+                inspected.push_str(&decoded);
+            }
+        }
+    }
+    inspected
+}
+
 #[test]
 fn startup_self_heals_managed_hooks_in_every_known_worktree() {
     let _env_lock = crate::env_test_lock()
@@ -30749,7 +30771,8 @@ fn startup_self_heals_managed_hooks_in_every_known_worktree() {
             ".gwt/openclaw/plugins/gwt-hook-bridge/plugin.ts",
             ".gwt/hermes/agent-hooks/gwt-hook.sh",
         ] {
-            let rendered = fs::read_to_string(worktree.join(relative)).unwrap();
+            let rendered =
+                managed_hook_inspection_text(&fs::read_to_string(worktree.join(relative)).unwrap());
             assert!(rendered.contains("GWT_BIN_PATH"), "{relative}: {rendered}");
             assert!(
                 !rendered.contains(&local.display().to_string()),
@@ -30815,7 +30838,7 @@ fn bootstrap_runs_managed_hook_self_heal_off_the_startup_path() {
     }
     let healed = fs::read_to_string(&config).unwrap();
     assert!(
-        healed.contains("GWT_BIN_PATH"),
+        managed_hook_inspection_text(&healed).contains("GWT_BIN_PATH"),
         "the deferred sweep must still heal the worktree: {healed}"
     );
     assert!(repo.join(".gwt/managed-hook-self-healed").exists());
@@ -30843,16 +30866,24 @@ fn startup_self_heal_converges_legacy_config_to_explicit_hook_binary_pin() {
     super::startup::self_heal_managed_hooks_in_worktrees([worktree.as_path()]);
 
     let rendered = fs::read_to_string(&config).unwrap();
-    assert!(rendered.contains("GWT_BIN_PATH"), "{rendered}");
+    assert!(
+        managed_hook_inspection_text(&rendered).contains("GWT_BIN_PATH"),
+        "{rendered}"
+    );
     let parsed: serde_json::Value = serde_json::from_str(&rendered).expect("parse healed hooks");
     let session_start_command = parsed
         .pointer("/hooks/SessionStart/0/hooks/0/command")
         .and_then(serde_json::Value::as_str)
         .expect("SessionStart command");
-    let normalized_command = session_start_command.replace('\\', "/");
+    let inspected_command = gwt_skills::decode_powershell_encoded_command(session_start_command)
+        .unwrap_or_else(|| session_start_command.to_string());
+    let normalized_command = inspected_command.replace('\\', "/");
     let normalized_pin = missing_pin.display().to_string().replace('\\', "/");
     assert!(normalized_command.contains(&normalized_pin), "{rendered}");
-    assert!(!rendered.contains("/repo/target/debug/gwtd"), "{rendered}");
+    assert!(
+        !managed_hook_inspection_text(&rendered).contains("/repo/target/debug/gwtd"),
+        "{rendered}"
+    );
     assert!(worktree.join(".gwt/managed-hook-self-healed").exists());
 }
 
