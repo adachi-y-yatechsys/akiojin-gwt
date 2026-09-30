@@ -849,6 +849,15 @@ body::after {
   .op-rail__flyout {
     display: none;
   }
+
+  /* The window list popover hangs below its trigger instead of beside it,
+     right-aligned so it stays inside the viewport. */
+  .op-rail .window-list-panel {
+    top: calc(100% + 10px);
+    bottom: auto;
+    left: auto;
+    right: 0;
+  }
 }
 
 
