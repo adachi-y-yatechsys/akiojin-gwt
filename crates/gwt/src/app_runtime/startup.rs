@@ -2024,21 +2024,7 @@ impl AppRuntime {
         // workspace-home project_root and its linked worktrees, so scope-hash
         // equality alone fails to associate worktree-backed agent sessions with
         // the parent tab and they never auto-resume on startup.
-        // Issue #4803: update restart visits historical Sessions too. Resolve
-        // the same shared Git directory from disk instead of spawning Git for
-        // every Session; the queue memoizes repeated worktree paths per sweep.
-        let session_root = gwt_core::repo_hash::repository_common_dir(&session.worktree_path)
-            .map(|common| {
-                if common.file_name().is_some_and(|name| name == ".git") {
-                    common.parent().unwrap_or(&common).to_path_buf()
-                } else {
-                    common
-                }
-            })
-            // Preserve Git discovery for legacy cwd values below a worktree
-            // root and layouts the filesystem resolver cannot disambiguate.
-            .or_else(|| gwt_git::worktree::main_worktree_root(&session.worktree_path).ok());
-        if let Some(session_root) = session_root {
+        if let Ok(session_root) = gwt_git::worktree::main_worktree_root(&session.worktree_path) {
             if let Some(tab) = self.tabs.iter().find(|tab| {
                 tab.kind == gwt::ProjectKind::Git
                     && !tab.migration_pending

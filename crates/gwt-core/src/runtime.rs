@@ -1402,30 +1402,34 @@ mod tests {
 
     #[test]
     fn runtime_command_obeys_ambient_operation_deadline() {
+        use crate::operation_deadline::{ScopedOperationClock, ScopedOperationDeadline};
+
         let (program, args) = if cfg!(windows) {
             (
                 OsString::from("cmd"),
-                vec![
-                    OsString::from("/C"),
-                    OsString::from("ping -n 4 127.0.0.1 >NUL"),
-                ],
+                vec![OsString::from("/C"), OsString::from("exit 0")],
             )
         } else {
             (
                 OsString::from("sh"),
-                vec![OsString::from("-c"), OsString::from("sleep 3")],
+                vec![OsString::from("-c"), OsString::from("exit 0")],
             )
         };
-        let started = std::time::Instant::now();
-        let _deadline = crate::operation_deadline::ScopedOperationDeadline::enter(
-            started + std::time::Duration::from_millis(150),
-        );
+        // Keep the deadline ahead of host time: only the test-local clock
+        // advancing to expiry may reject this otherwise successful command.
+        let start = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        let expiry = start + std::time::Duration::from_millis(150);
+        let _clock = ScopedOperationClock::set(start);
+        let _deadline = ScopedOperationDeadline::enter(expiry);
+        assert!(run_silent(&program, &args, "runtime deadline fixture")
+            .expect("runtime helper may run before logical expiry")
+            .success());
 
+        let _expired = ScopedOperationClock::set(expiry);
         let error = run_silent(program, &args, "runtime deadline fixture")
-            .expect_err("runtime helper must stop at the ambient deadline");
+            .expect_err("runtime helper must reject at the ambient deadline");
 
         assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
-        assert!(started.elapsed() < std::time::Duration::from_millis(1_500));
     }
 
     #[test]

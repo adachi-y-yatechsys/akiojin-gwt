@@ -1578,6 +1578,17 @@ fn to_tracking_ref(remote_ref: &str) -> Option<String> {
 
 /// Resolve the main worktree root for a repository or linked worktree path.
 pub fn main_worktree_root(repo_path: &Path) -> Result<PathBuf> {
+    // Startup and launch callers already know a repository/worktree root.
+    // Its gitdir/commondir files carry the same identity without a subprocess.
+    // Keep Git discovery below for nested cwd values and unresolved layouts.
+    if let Some(common_dir) = gwt_core::repo_hash::repository_common_dir(repo_path) {
+        let root = if common_dir.file_name().is_some_and(|name| name == ".git") {
+            common_dir.parent().unwrap_or(&common_dir)
+        } else {
+            &common_dir
+        };
+        return Ok(normalize_windows_child_process_path(root));
+    }
     // Issue #3629 AC-1/AC-2: the workspace-home layout root has no `.git`
     // anywhere up its ancestry, so asking git first is a guaranteed exit-128
     // subprocess — and this resolver runs behind most periodic scans.
@@ -2465,9 +2476,15 @@ prunable gitdir file points to non-existent location
             String::from_utf8_lossy(&output.stderr)
         );
 
+        let before = gwt_core::process::thread_git_spawn_count();
         assert_eq!(
             comparable_path(&main_worktree_root(&linked_worktree).unwrap()),
             comparable_path(&std::fs::canonicalize(&repo_path).unwrap())
+        );
+        assert_eq!(
+            gwt_core::process::thread_git_spawn_count(),
+            before,
+            "linked-worktree root resolution must not spawn Git (Issue #4803)"
         );
     }
 

@@ -502,6 +502,8 @@ fn startup_update_resume_under_large_session_load() {
         })
         .expect("set GWT_TEST_CHROMIUM or install Chromium-based Microsoft Edge");
     let mut browser = None;
+    let mut browser_url = None;
+    let mut browser_started_ms = None;
     let mut canvas = None;
     let mut drain = None;
     let mut parsed_sessions = None;
@@ -512,6 +514,13 @@ fn startup_update_resume_under_large_session_load() {
         if browser.is_none() {
             if let Ok(url) = fs::read_to_string(&url_file) {
                 if !url.trim().is_empty() {
+                    let project_url = format!(
+                        "{}p/{}",
+                        url.trim().trim_end_matches('/').to_owned() + "/",
+                        gwt_core::paths::project_scope_hash(&fixture.repo)
+                    );
+                    browser_url = Some(project_url.clone());
+                    browser_started_ms = Some(started.elapsed().as_secs_f64() * 1000.0);
                     browser = Some(Running(
                         hidden_command(&browser_binary)
                             .arg(format!(
@@ -525,13 +534,9 @@ fn startup_update_resume_under_large_session_load() {
                                 "--no-sandbox",
                                 "--remote-debugging-port=0",
                             ])
-                            .arg(format!(
-                                "--app={}p/{}",
-                                url.trim().trim_end_matches('/').to_owned() + "/",
-                                gwt_core::paths::project_scope_hash(&fixture.repo)
-                            ))
+                            .arg(format!("--app={project_url}"))
                             .stdout(Stdio::null())
-                            .stderr(Stdio::null())
+                            .stderr(fs::File::create(home.join("chromium-stderr.log")).unwrap())
                             .spawn()
                             .expect("start isolated headed Chromium"),
                     ));
@@ -567,10 +572,7 @@ fn startup_update_resume_under_large_session_load() {
                 Some("session_load") => parsed_sessions = row["startup"]["count"].as_u64(),
                 _ => {}
             }
-            if matches!(
-                row["startup"]["phase"].as_str(),
-                Some("project_state_load" | "canvas_ready" | "restore_drain" | "session_load")
-            ) {
+            if row["startup"].is_object() || row["target"] == "gwt.process.summary" {
                 phases.push(row);
             }
         }
@@ -584,11 +586,18 @@ fn startup_update_resume_under_large_session_load() {
         && common_dir_spawns.len() <= 5
         && canvas.is_some_and(|ms| ms <= 5000.0)
         && drain.is_some_and(|ms| ms <= 500.0);
+    let browser_exit = browser
+        .as_mut()
+        .and_then(|browser| browser.0.try_wait().ok().flatten());
     let report = json!({"passed":passed, "sessions":1500, "worktrees":6,
         "update_resume_marker":true, "parsed_sessions":parsed_sessions, "canvas_ready_ms":canvas,
         "common_dir_git_spawns":common_dir_spawns.len(), "process_logging_seen":process_logging_seen,
         "restore_drain_ms":drain, "perf_log_excerpt":phases,
         "browser_started":browser.is_some(), "browser_binary":browser_binary,
+        "browser_url":browser_url, "browser_started_ms":browser_started_ms,
+        "browser_exit":browser_exit.map(|status|status.to_string()),
+        "browser_stderr":fs::read_to_string(home.join("chromium-stderr.log")).unwrap_or_default(),
+        "fixture_home":home,
         "failure_stderr":(!passed).then(||fs::read_to_string(home.join("stderr.log")).unwrap_or_default())});
     let out =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/startup-update-performance.json");
@@ -599,5 +608,8 @@ fn startup_update_resume_under_large_session_load() {
     }
     drop(child);
     drop(browser);
+    if !passed {
+        let _ = fixture._temp.keep();
+    }
     assert!(passed, "update startup budget failed or unmeasured");
 }

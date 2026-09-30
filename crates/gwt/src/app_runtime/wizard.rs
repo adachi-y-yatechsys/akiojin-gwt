@@ -133,6 +133,7 @@ struct IssueMonitorLaunchProfileChoice {
     profiles: gwt::LaunchWizardPreviousProfiles,
     selected_agent_id: Option<String>,
     skipped: Vec<gwt::LaunchProfileSkip>,
+    tier: Option<u8>,
 }
 
 /// SPEC #3914 FR-007: make a non-head selection visible, with the reason each
@@ -199,12 +200,21 @@ struct IssueMonitorLaunchFacts {
 }
 
 #[derive(Debug, Clone)]
+enum IssueMonitorLaunchPreparation {
+    Launch(Box<IssueMonitorLaunchFacts>),
+    Answer(Box<PreparedIssueMonitorResume>),
+}
+
+type IssueMonitorSelectionSnapshot =
+    Result<Option<(gwt::LaunchWizardPreviousProfiles, Option<u8>)>, String>;
+
+#[derive(Debug, Clone)]
 pub(crate) struct IssueMonitorLaunchPrepared {
     context: super::ProjectContext,
     request: super::DeferredIssueMonitorLaunch,
     handoff: IssueMonitorResumeHandoff,
-    profiles: gwt::LaunchWizardPreviousProfiles,
-    result: Result<IssueMonitorLaunchFacts, String>,
+    selection: IssueMonitorSelectionSnapshot,
+    result: Result<IssueMonitorLaunchPreparation, String>,
 }
 
 pub(crate) type IssueMonitorLaunchPreparationKey = (String, u64, u64, Option<String>, bool);
@@ -233,6 +243,75 @@ fn issue_monitor_resume_handoff(
     .map_err(|error| format!("failed to read the autonomous handoff answer: {error}"))
 }
 
+// None means an automatic answer must return to its asking Session, before
+// considering the current tier pool or its provider eligibility.
+fn issue_monitor_preparation_choice(
+    cache: &LaunchWizardMemoryCache,
+    provider_usage_accounts: &[gwt_core::usage::ProviderUsage],
+    request: &super::DeferredIssueMonitorLaunch,
+) -> Result<Option<IssueMonitorLaunchProfileChoice>, String> {
+    let prefs_path = gwt::issue_monitor_prefs_path_for_repo_path(&request.project_root);
+    let prefs = gwt::load_issue_monitor_prefs(&prefs_path).map_err(|error| error.to_string())?;
+    if prefs.launch_auto
+        && gwt::preserve_answered_handoff_resume_strategy_from_prefs(
+            &prefs_path,
+            request.issue_number,
+        )
+        .map_err(|error| error.to_string())?
+    {
+        return Ok(None);
+    }
+    issue_monitor_owner_launch_profile_choice(
+        cache,
+        provider_usage_accounts,
+        &request.project_root,
+        request.issue_number,
+        request.linked_issue_kind,
+    )
+    .map(Some)
+}
+
+fn prepare_issue_monitor_answer(
+    request: &super::DeferredIssueMonitorLaunch,
+    cache: &LaunchWizardMemoryCache,
+    sessions_dir: &Path,
+    profile_config_path: &Result<PathBuf, String>,
+    auth_probe: fn(&str) -> gwt::issue_monitor::ProviderAuthState,
+    handoff: IssueMonitorResumeHandoff,
+) -> Result<PreparedIssueMonitorResume, String> {
+    let handoff = handoff?
+        .ok_or_else(|| "answered autonomous handoff is not ready for exact delivery".to_string())?;
+    let source =
+        gwt_agent::Session::load(&sessions_dir.join(format!("{}.toml", handoff.session_id)))
+            .ok()
+            .or_else(|| cache.session_by_id(&handoff.session_id).cloned())
+            .ok_or_else(|| {
+                format!(
+                    "answered autonomous handoff Session {} is unavailable",
+                    handoff.session_id
+                )
+            })?;
+    let agent_id = source.agent_id.command();
+    if auth_probe(agent_id) == gwt::issue_monitor::ProviderAuthState::Unauthenticated {
+        return Err(gwt::issue_monitor::provider_unauthenticated_message(
+            agent_id,
+        ));
+    }
+    let branch =
+        knowledge_launch_target_branch_name(request.linked_issue_kind, request.issue_number);
+    prepare_issue_monitor_resume(
+        &request.project_root,
+        &branch,
+        request.issue_number,
+        agent_id,
+        sessions_dir,
+        cache,
+        profile_config_path,
+        Ok(Some(handoff)),
+    )?
+    .ok_or_else(|| "answered autonomous handoff requires its exact Session".to_string())
+}
+
 fn prepare_issue_monitor_launch(
     request: &super::DeferredIssueMonitorLaunch,
     cache: &LaunchWizardMemoryCache,
@@ -259,9 +338,9 @@ fn prepare_issue_monitor_launch(
     }
     let branch =
         knowledge_launch_target_branch_name(request.linked_issue_kind, request.issue_number);
-    let resume = if request.launch_session_strategy
-        == gwt::IssueMonitorLaunchSessionStrategy::ResumeIfSafe
-        || handoff.as_ref().is_ok_and(|handoff| handoff.is_some())
+    let resume = if choice.tier.is_none()
+        && (request.launch_session_strategy == gwt::IssueMonitorLaunchSessionStrategy::ResumeIfSafe
+            || handoff.as_ref().is_ok_and(|handoff| handoff.is_some()))
     {
         prepare_issue_monitor_resume(
             project_root,
@@ -2271,6 +2350,23 @@ impl AppRuntime {
         )
     }
 
+    /// Select automatic tiers only when an owner is known. Settings previews
+    /// and manually configured pools retain their existing selection behavior.
+    fn issue_monitor_owner_launch_profile_choice(
+        &self,
+        project_root: &Path,
+        issue_number: u64,
+        linked_issue_kind: gwt::LinkedIssueKind,
+    ) -> Result<IssueMonitorLaunchProfileChoice, String> {
+        issue_monitor_owner_launch_profile_choice(
+            &self.launch_wizard_cache,
+            &self.provider_usage_accounts,
+            project_root,
+            issue_number,
+            linked_issue_kind,
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn auto_launch_issue_monitor_request_events_for_project(
         &mut self,
@@ -2346,28 +2442,42 @@ impl AppRuntime {
         let failure_delivery_id = request.delivery_id.clone();
         if let Err(error) = self.blocking_tasks.try_spawn(move || {
             let handoff = issue_monitor_resume_handoff(&request.project_root, issue_number);
-            let choice = issue_monitor_launch_profile_choice(
-                &cache,
-                &provider_usage,
-                &request.project_root,
-                None,
-            );
-            let profiles = choice.profiles.clone();
-            let result = prepare_issue_monitor_launch(
-                &request,
-                &cache,
-                &sessions_dir,
-                &profile_config_path,
-                choice,
-                auth_probe,
-                handoff.clone(),
-            );
+            let choice = issue_monitor_preparation_choice(&cache, &provider_usage, &request);
+            let selection = choice
+                .as_ref()
+                .map(|choice| {
+                    choice
+                        .as_ref()
+                        .map(|choice| (choice.profiles.clone(), choice.tier))
+                })
+                .map_err(Clone::clone);
+            let result = choice.and_then(|choice| match choice {
+                Some(choice) => prepare_issue_monitor_launch(
+                    &request,
+                    &cache,
+                    &sessions_dir,
+                    &profile_config_path,
+                    choice,
+                    auth_probe,
+                    handoff.clone(),
+                )
+                .map(|facts| IssueMonitorLaunchPreparation::Launch(Box::new(facts))),
+                None => prepare_issue_monitor_answer(
+                    &request,
+                    &cache,
+                    &sessions_dir,
+                    &profile_config_path,
+                    auth_probe,
+                    handoff.clone(),
+                )
+                .map(|resume| IssueMonitorLaunchPreparation::Answer(Box::new(resume))),
+            });
             proxy.send(UserEvent::IssueMonitorLaunchPrepared(Box::new(
                 IssueMonitorLaunchPrepared {
                     context,
                     request,
                     handoff,
-                    profiles,
+                    selection,
                     result,
                 },
             )));
@@ -2393,7 +2503,7 @@ impl AppRuntime {
             context,
             request,
             handoff,
-            profiles,
+            selection,
             result,
         } = prepared;
         let key = issue_monitor_launch_preparation_key(&context, &request);
@@ -2403,8 +2513,14 @@ impl AppRuntime {
             return Vec::new();
         }
         let mut session_changed = false;
-        if let Ok(facts) = &result {
-            if let Ok(Some(resume)) = &facts.resume {
+        if let Ok(preparation) = &result {
+            let resume = match preparation {
+                IssueMonitorLaunchPreparation::Launch(facts) => {
+                    facts.resume.as_ref().ok().and_then(Option::as_ref)
+                }
+                IssueMonitorLaunchPreparation::Answer(resume) => Some(resume.as_ref()),
+            };
+            if let Some(resume) = resume {
                 let path = self
                     .sessions_dir
                     .join(format!("{}.toml", resume.session.id));
@@ -2420,10 +2536,13 @@ impl AppRuntime {
         }
         // Profile edits, Session changes and newly answered questions supersede worker facts.
         if session_changed
-            || profiles
-                != self
-                    .issue_monitor_launch_profile_choice(&request.project_root, None)
-                    .profiles
+            || selection
+                != issue_monitor_preparation_choice(
+                    &self.launch_wizard_cache,
+                    &self.provider_usage_accounts,
+                    &request,
+                )
+                .map(|choice| choice.map(|choice| (choice.profiles, choice.tier)))
             || handoff != issue_monitor_resume_handoff(&request.project_root, request.issue_number)
         {
             return self.auto_launch_issue_monitor_delivery_events_for_project(
@@ -2451,7 +2570,7 @@ impl AppRuntime {
         linked_issue_kind: gwt::LinkedIssueKind,
         delivery_id: Option<String>,
         launch_session_strategy: gwt::IssueMonitorLaunchSessionStrategy,
-        prepared: Option<Result<IssueMonitorLaunchFacts, String>>,
+        prepared: Option<Result<IssueMonitorLaunchPreparation, String>>,
     ) -> Vec<OutboundEvent> {
         let Some(context) = self
             .issue_monitor_tab_id_for_project_root(project_root)
@@ -2825,7 +2944,7 @@ impl AppRuntime {
         &mut self,
         requested_project_root: &Path,
         request: SilentIssueMonitorLaunchRequest,
-        prepared: Option<Result<IssueMonitorLaunchFacts, String>>,
+        prepared: Option<Result<IssueMonitorLaunchPreparation, String>>,
     ) -> Result<Option<Vec<OutboundEvent>>, String> {
         let context = self
             .project_context_for_root(requested_project_root)
@@ -2886,7 +3005,77 @@ impl AppRuntime {
         }
 
         // Preparation failures still belong to the exact claimed delivery.
-        let mut prepared = prepared.transpose()?;
+        let mut prepared = match prepared.transpose()? {
+            Some(IssueMonitorLaunchPreparation::Answer(resume)) => {
+                let agent_id = resume.session.agent_id.command().to_string();
+                let target_branch =
+                    knowledge_launch_target_branch_name(linked_issue_kind, issue_number);
+                let (events, _) = self.silent_issue_monitor_resume_events(
+                    &tab_id,
+                    &project_root,
+                    &target_branch,
+                    issue_number,
+                    delivery_id,
+                    &agent_id,
+                    Some(Ok(Some(*resume))),
+                )?;
+                return events.map(Some).ok_or_else(|| {
+                    "answered autonomous handoff requires its exact Session".to_string()
+                });
+            }
+            Some(IssueMonitorLaunchPreparation::Launch(facts)) => Some(*facts),
+            None => None,
+        };
+
+        // An answer belongs to its asking Session. Auto settings may have
+        // changed provider, model, or tier while the question was pending;
+        // defer that selection until the next producing launch.
+        let prefs_path = gwt::issue_monitor_prefs_path_for_repo_path(&project_root);
+        let auto_answer_pending = prepared.is_none()
+            && review_prompt.is_none()
+            && gwt::load_issue_monitor_prefs(&prefs_path)
+                .map_err(|error| error.to_string())?
+                .launch_auto
+            && gwt::preserve_answered_handoff_resume_strategy_from_prefs(&prefs_path, issue_number)
+                .map_err(|error| error.to_string())?;
+        if auto_answer_pending {
+            let handoff =
+                gwt::pending_autonomous_handoff_resumption_from_prefs(&prefs_path, issue_number)
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| {
+                        "answered autonomous handoff is not ready for exact delivery".to_string()
+                    })?;
+            let source = self
+                .issue_monitor_session_by_id(&handoff.session_id)
+                .ok_or_else(|| {
+                    format!(
+                        "answered autonomous handoff Session {} is unavailable",
+                        handoff.session_id
+                    )
+                })?;
+            let agent_id = source.agent_id.command();
+            if (self.issue_monitor_provider_auth_probe)(agent_id)
+                == gwt::issue_monitor::ProviderAuthState::Unauthenticated
+            {
+                return Err(gwt::issue_monitor::provider_unauthenticated_message(
+                    agent_id,
+                ));
+            }
+            let target_branch =
+                knowledge_launch_target_branch_name(linked_issue_kind, issue_number);
+            let (events, _) = self.silent_issue_monitor_resume_events(
+                &tab_id,
+                &project_root,
+                &target_branch,
+                issue_number,
+                delivery_id,
+                agent_id,
+                None,
+            )?;
+            return events.map(Some).ok_or_else(|| {
+                "answered autonomous handoff requires its exact Session".to_string()
+            });
+        }
 
         let base_branch_name = match prepared.as_ref() {
             Some(facts) => facts.base_branch.clone(),
@@ -2896,10 +3085,18 @@ impl AppRuntime {
             profiles: previous_profiles,
             selected_agent_id,
             skipped: skipped_candidates,
+            tier,
         } = prepared
             .as_ref()
             .map(|facts| facts.choice.clone())
-            .unwrap_or_else(|| self.issue_monitor_launch_profile_choice(&project_root, None));
+            .map(Ok)
+            .unwrap_or_else(|| {
+                self.issue_monitor_owner_launch_profile_choice(
+                    &project_root,
+                    issue_number,
+                    linked_issue_kind,
+                )
+            })?;
         let non_head_selection_toast = issue_monitor_non_head_selection_toast(
             &context,
             issue_number,
@@ -2943,6 +3140,21 @@ impl AppRuntime {
             .ok()
             .unwrap_or(false);
 
+        let record_launch_tier = || -> Result<(), String> {
+            if review_prompt.is_none() {
+                if let Some(tier) = tier {
+                    gwt::mutate_issue_monitor_prefs(
+                        &gwt::issue_monitor_prefs_path_for_repo_path(&project_root),
+                        |prefs| prefs.record_tier_launch(issue_number, tier),
+                    )
+                    .map_err(|error| {
+                        format!("Could not record Issue Monitor launch tier: {error}")
+                    })?;
+                }
+            }
+            Ok(())
+        };
+
         // FR-022: an Issue whose agent window was previously closed without a
         // merge keeps a resumable session. Re-engage by resuming that session
         // (continuing the conversation) instead of launching a fresh agent.
@@ -2950,7 +3162,10 @@ impl AppRuntime {
         // (no shared context with the implementation agent), so the review path
         // skips resume and always launches a new agent.
         let target_branch = knowledge_launch_target_branch_name(linked_issue_kind, issue_number);
+        // Auto uses a fresh launch even at the same tier index: an override
+        // may have changed that tier's model or effort since the last launch.
         let resume_holder_window_id = if review_prompt.is_none()
+            && tier.is_none()
             && (launch_session_strategy == gwt::IssueMonitorLaunchSessionStrategy::ResumeIfSafe
                 || answered_handoff_pending)
         {
@@ -2970,6 +3185,7 @@ impl AppRuntime {
                 // candidates like a fresh one. An empty vector means the
                 // delivery stays pending, so nothing launched to report on.
                 if !events.is_empty() {
+                    record_launch_tier()?;
                     events.extend(non_head_selection_toast);
                 }
                 return Ok(Some(events));
@@ -3112,6 +3328,7 @@ impl AppRuntime {
             // owns the launch binding the implementation window holds.
             issue_monitor_review_dispatch: review_prompt.is_some(),
         };
+        record_launch_tier()?;
         let mut events = match launch_request {
             LaunchWizardLaunchRequest::Agent(config) => self
                 .spawn_agent_window_with_feedback_at_geometry(
@@ -3355,6 +3572,26 @@ impl AppRuntime {
                 ));
             }
             return Ok((Some(Vec::new()), None));
+        }
+        // A Blocked owner cannot regain producing authority through Resume:
+        // execution.continue requires execution.reopen first. Preserve native
+        // writer/answer handling above, then use the normal fresh-launch path.
+        if session.linked_issue_number == Some(issue_number)
+            && gwt::cli::execution_state::load(&session.worktree_path)
+                .map_err(|error| format!("failed to inspect Monitor resume authority: {error}"))?
+                .is_some_and(|record| {
+                    record.owner_number == issue_number
+                        && record.status
+                            == gwt::cli::execution_state::ExecutionControlStatus::Blocked
+                })
+        {
+            if autonomous_handoff.is_some() {
+                return Err(
+                    "answered autonomous handoff requires execution.reopen before Resume"
+                        .to_string(),
+                );
+            }
+            return Ok((None, None));
         }
         if !session.worktree_path.as_path().exists() {
             config.working_dir = None;
@@ -5599,6 +5836,66 @@ mod launch_agent_branch_resolution_tests {
     }
 }
 
+fn issue_monitor_owner_launch_profile_choice(
+    cache: &LaunchWizardMemoryCache,
+    provider_usage_accounts: &[gwt_core::usage::ProviderUsage],
+    project_root: &Path,
+    issue_number: u64,
+    linked_issue_kind: gwt::LinkedIssueKind,
+) -> Result<IssueMonitorLaunchProfileChoice, String> {
+    let prefs_path = gwt::issue_monitor_prefs_path_for_repo_path(project_root);
+    let prefs = gwt::load_issue_monitor_prefs(&prefs_path).map_err(|error| error.to_string())?;
+    if !prefs.launch_auto {
+        return Ok(issue_monitor_launch_profile_choice(
+            cache,
+            provider_usage_accounts,
+            project_root,
+            None,
+        ));
+    }
+    let available = cache
+        .agent_options()
+        .into_iter()
+        .filter(|option| option.available)
+        .map(|option| option.id)
+        .collect::<Vec<_>>();
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let holds = prefs.launch_admission_provider_quota_holds(&now, |provider| {
+        gwt::issue_monitor::provider_reports_healthy_for_agent(provider, provider_usage_accounts)
+    });
+    let work_tags = vec![if linked_issue_kind == gwt::LinkedIssueKind::Spec {
+        "kind:spec".to_string()
+    } else {
+        "kind:issue".to_string()
+    }];
+    let selection = prefs
+        .select_auto_launch_profile(
+            issue_number,
+            linked_issue_kind == gwt::LinkedIssueKind::Spec,
+            Some(&available),
+            |pool| {
+                gwt::select_launch_profile(
+                    pool,
+                    &holds,
+                    provider_usage_accounts,
+                    prefs.launch_usage_threshold_percent,
+                    &work_tags,
+                    None,
+                    &now,
+                )
+            },
+        )
+        .ok_or_else(|| "No eligible Issue Monitor automatic tier candidate".to_string())?;
+    Ok(IssueMonitorLaunchProfileChoice {
+        profiles: gwt::LaunchWizardPreviousProfiles::from_profile(Some(
+            selection.profile.clone().into(),
+        )),
+        selected_agent_id: Some(selection.profile.agent_id),
+        skipped: selection.skipped,
+        tier: Some(selection.tier),
+    })
+}
+
 fn issue_monitor_launch_profile_choice(
     cache: &LaunchWizardMemoryCache,
     provider_usage_accounts: &[gwt_core::usage::ProviderUsage],
@@ -5646,6 +5943,7 @@ fn issue_monitor_launch_profile_choice(
                 )),
                 selected_agent_id: Some(profile.agent_id),
                 skipped,
+                tier: None,
             };
         }
     }
@@ -5660,6 +5958,7 @@ fn issue_monitor_launch_profile_choice(
         profiles,
         selected_agent_id: None,
         skipped: Vec::new(),
+        tier: None,
     }
 }
 
