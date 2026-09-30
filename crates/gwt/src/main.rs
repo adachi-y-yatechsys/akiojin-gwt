@@ -1796,6 +1796,11 @@ enum UserEvent {
             Result<Option<gwt::AgentExecutionContinuationReceipt>, gwt::AgentWorkspaceUpdateError>,
         >,
     },
+    IssueMonitorFreshLaunchRepaired {
+        window_id: String,
+        operation_id: String,
+        binding: gwt_agent::SessionExecutionBinding,
+    },
     RuntimeHook(gwt::RuntimeHookEvent),
     DaemonRuntimeHook(gwt::RuntimeHookEvent),
     DaemonRuntimeApprovalOverlay {
@@ -10515,6 +10520,15 @@ fn main() -> std::io::Result<()> {
                 let (result, events) = app.resend_fresh_execution_ready(&grant, &request);
                 clients.dispatch(events);
                 let _ = reply.send(result);
+            }
+            Event::UserEvent(UserEvent::IssueMonitorFreshLaunchRepaired {
+                window_id,
+                operation_id,
+                binding,
+            }) => {
+                clients.dispatch(app.handle_issue_monitor_fresh_launch_repaired(
+                    &window_id, &operation_id, &binding,
+                ));
             }
             Event::UserEvent(UserEvent::RuntimeHook(event)) => {
                 let events = app.handle_runtime_hook_event(event);

@@ -14,7 +14,8 @@ use sha2::{Digest, Sha256};
 use crate::settings_local::{
     codex_event_hook_commands, codex_event_hook_commands_with_bin,
     codex_hooks_paths_for_codex_discovery, codex_self_improvement_stop_hook_commands,
-    write_text_atomically, CodexHookDiscoveryMode,
+    decode_powershell_encoded_command, write_text_atomically, CodexHookDiscoveryMode,
+    POWERSHELL_ENCODED_COMMAND_PREFIX,
 };
 
 const CODEX_DEFAULT_COMMAND_TIMEOUT_SECONDS: u64 = 600;
@@ -1016,6 +1017,17 @@ fn is_trusted_gwt_hook_command(
 /// they are gwt hooks that gwt refuses to vouch for, which is exactly what the
 /// caller must surface.
 fn is_gwt_hook_transport_command(command: &str) -> bool {
+    // A suffix invalidates trust, but must not hide the gwt dispatch from
+    // diagnostics. Exact trust still compares the entire command.
+    let decoded = command
+        .strip_prefix(POWERSHELL_ENCODED_COMMAND_PREFIX)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|payload| {
+            decode_powershell_encoded_command(&format!(
+                "{POWERSHELL_ENCODED_COMMAND_PREFIX}{payload}"
+            ))
+        });
+    let command = decoded.as_deref().unwrap_or(command);
     GWT_HOOK_TRANSPORT_MARKERS.iter().any(|marker| {
         command.match_indices(marker).any(|(index, _)| {
             command[..index]
@@ -2804,7 +2816,7 @@ mod tests {
             .expect("PowerShell Stop trust entry");
         assert_eq!(
             stop.trusted_hash,
-            "sha256:9d5d048e34bba9a9bc1fc4086052911570757a132a439f7d43f578359136c38a",
+            "sha256:7f74089a89cc57e46974101c8525e4f310f1d9e3a132969d8288344cb3a63211",
             "trusted hash must match the Codex identity for the PowerShell command"
         );
     }
@@ -2930,6 +2942,30 @@ mod tests {
             REPO_OWNED_SELF_IMPROVEMENT_STOP_COMMAND
         ));
         assert!(!is_gwt_hook_transport_command("echo ' hook event '"));
+    }
+
+    #[test]
+    fn encoded_hook_trust_requires_the_exact_expected_binary_and_wrapper() {
+        let expected_bin = r"C:\Program Files\GWT\gwtd.exe";
+        let command = codex_event_hook_commands_with_bin(expected_bin, "SessionStart")[1].clone();
+        assert!(is_trusted_gwt_hook_command(
+            &command,
+            "SessionStart",
+            "session_start",
+            Some(expected_bin)
+        ));
+        let swapped =
+            codex_event_hook_commands_with_bin(r"C:\attacker\gwtd.exe", "SessionStart")[1].clone();
+        assert!(is_gwt_hook_transport_command(&swapped));
+        for invalid in [swapped, format!("{command} ; echo injected")] {
+            assert!(is_gwt_hook_transport_command(&invalid));
+            assert!(!is_trusted_gwt_hook_command(
+                &invalid,
+                "SessionStart",
+                "session_start",
+                Some(expected_bin)
+            ));
+        }
     }
 
     #[test]
