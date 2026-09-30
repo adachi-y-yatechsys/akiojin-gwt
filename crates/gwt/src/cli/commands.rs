@@ -242,6 +242,22 @@ pub enum IssueCommand {
         profiles: Vec<crate::IssueMonitorLaunchProfilePatch>,
         usage_threshold_percent: Option<u8>,
     },
+    /// Read automatic launch tiers and observed landing statistics.
+    MonitorTiers {
+        project_root: Option<std::path::PathBuf>,
+    },
+    /// Configure automatic launch selection; omitted tiers restore defaults.
+    MonitorTiersSet {
+        project_root: Option<std::path::PathBuf>,
+        auto: bool,
+        tiers: Option<Vec<Vec<crate::IssueMonitorLaunchProfile>>>,
+    },
+    /// Persist a non-decreasing tier override for one Issue.
+    MonitorTierSet {
+        project_root: Option<std::path::PathBuf>,
+        number: u64,
+        tier: u8,
+    },
     /// SPEC-3431 FR-006: the PM's launch instruction — move the issue to the
     /// priority head and ask for one immediate scan. Never launches directly.
     MonitorLaunchNow {

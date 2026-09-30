@@ -2297,7 +2297,8 @@ pub(crate) type RuntimeIssueClientFactory =
 
 pub(crate) fn default_issue_client_factory() -> RuntimeIssueClientFactory {
     Arc::new(|owner, repo| {
-        let client = gwt_github::client::http::HttpIssueClient::from_gh_auth(owner, repo)?;
+        let client =
+            gwt_github::client::http::HttpIssueClient::from_runtime_environment(owner, repo)?;
         Ok(Arc::new(client) as RuntimeIssueClient)
     })
 }
@@ -4570,7 +4571,8 @@ impl AppRuntime {
                     // agent must be running to be refused), and the daemon
                     // rejects it, so nothing committed.
                     Some(gwt::IssueMonitorFailure::ProviderUsageLimit { .. }) => false,
-                    Some(gwt::IssueMonitorFailure::CodexDirectoryTrustPrompt) => false,
+                    Some(gwt::IssueMonitorFailure::CodexDirectoryTrustPrompt)
+                    | Some(gwt::IssueMonitorFailure::Termination { .. }) => false,
                     None => delivery_id.is_none_or(|delivery_id| {
                         project_root.is_some_and(|project_root| {
                             self.issue_monitor_launch_failure_committed(
@@ -4610,7 +4612,8 @@ impl AppRuntime {
                         Some(gwt::IssueMonitorFailure::ProviderUsageLimit { .. }) => {
                             IssueMonitorFailureCommit::Rejected
                         }
-                        Some(gwt::IssueMonitorFailure::CodexDirectoryTrustPrompt) => {
+                        Some(gwt::IssueMonitorFailure::CodexDirectoryTrustPrompt)
+                        | Some(gwt::IssueMonitorFailure::Termination { .. }) => {
                             IssueMonitorFailureCommit::Rejected
                         }
                         None => {
@@ -4907,6 +4910,61 @@ impl AppRuntime {
             .filter(|stale| stale != fresh_window_id)
     }
 
+    fn classify_issue_monitor_termination(
+        sessions_dir: &Path,
+        session_id: &str,
+        incarnation: u64,
+        has_exit_receipt: bool,
+    ) -> gwt::IssueMonitorFailureClass {
+        use gwt::IssueMonitorFailureClass::{Agent, Infrastructure, Unknown};
+        if !has_exit_receipt {
+            return Unknown;
+        }
+        // The Wizard cache intentionally excludes unsettled genesis launches;
+        // its availability cannot determine the producing Session's diagnosis.
+        let Ok(session) =
+            gwt_agent::Session::load(&sessions_dir.join(format!("{session_id}.toml")))
+        else {
+            return Unknown;
+        };
+        let Ok(Some(identity)) = gwt_agent::SessionExecutionIdentity::from_session(&session) else {
+            return Unknown;
+        };
+        let path = gwt_agent::runtime_state_path(sessions_dir, session_id);
+        let Ok(runtime) = gwt_agent::SessionRuntimeState::load(&path) else {
+            return Unknown;
+        };
+        if identity.session_id != session_id
+            || runtime.execution_identity.as_ref() != Some(&identity)
+            || runtime.runtime_incarnation != Some(incarnation)
+        {
+            return Unknown;
+        }
+        match gwt_agent::has_unresolved_host_bridge_fault(&path, &runtime) {
+            Ok(true) => Infrastructure,
+            Ok(false) => Agent,
+            Err(_) => Unknown,
+        }
+    }
+
+    fn issue_monitor_termination_for_window(
+        &self,
+        window_id: &str,
+    ) -> gwt::IssueMonitorFailureClass {
+        let classification = (|| {
+            let active = self.active_agent_sessions.get(window_id)?;
+            let runtime = self.runtimes.get(window_id)?;
+            let has_exit = runtime.pane.try_lock().ok()?.last_exit().is_some();
+            Some(Self::classify_issue_monitor_termination(
+                &self.sessions_dir,
+                &active.session_id,
+                runtime.incarnation,
+                has_exit,
+            ))
+        })();
+        classification.unwrap_or(gwt::IssueMonitorFailureClass::Unknown)
+    }
+
     pub(crate) fn issue_monitor_agent_failed_events_with_mode(
         &mut self,
         project_root: &Path,
@@ -5130,7 +5188,7 @@ impl AppRuntime {
                 match self.commit_local_issue_monitor_control_for_project(
                     project_root,
                     |monitor| {
-                        if failure.is_none() {
+                        if matches!(failure, None | Some(gwt::IssueMonitorFailure::Termination { .. })) {
                             match loaded {
                                 Ok(loaded) => {
                                     gwt::issue_monitor_worker::scan_loaded_issue_monitor_candidates_for_project_tab(
@@ -5209,24 +5267,20 @@ impl AppRuntime {
                                     IssueMonitorFailureCommit::Rejected
                                 }
                             }
-                            None => {
-                                let issue_number = if let Some(issue_number) = issue_number_hint {
-                                    monitor.record_agent_issue_failed(
-                                        issue_number,
-                                        message.to_string(),
-                                    );
-                                    Some(issue_number)
-                                } else {
-                                    monitor.record_agent_window_failed(
-                                        window_id,
-                                        message.to_string(),
-                                    )
+                            Some(gwt::IssueMonitorFailure::Termination { .. }) | None => {
+                                let classification = match &failure {
+                                    Some(gwt::IssueMonitorFailure::Termination { classification }) => *classification,
+                                    _ => gwt::IssueMonitorFailureClass::Unknown,
                                 };
+                                let issue_number = issue_number_hint.or_else(|| monitor.launched_window_issue(window_id));
+                                if let Some(issue_number) = issue_number {
+                                    monitor.record_agent_issue_failed_classified(issue_number, message.to_string(), classification);
+                                }
                                 IssueMonitorFailureCommit::Committed(issue_number)
                             }
                         };
                         if commit == IssueMonitorFailureCommit::Committed(None)
-                            && failure.is_none()
+                            && matches!(failure, None | Some(gwt::IssueMonitorFailure::Termination { .. }))
                         {
                             monitor.record_scan_error(
                                 &now,
@@ -5490,6 +5544,20 @@ impl AppRuntime {
         target: &gwt::IssueMonitorStopTarget,
         commit_timeout: std::time::Duration,
     ) -> WindowCloseMonitorResult {
+        Self::finalize_issue_monitor_window_close_classified_in_background(
+            project_root,
+            target,
+            commit_timeout,
+            gwt::IssueMonitorFailureClass::Unknown,
+        )
+    }
+
+    pub(crate) fn finalize_issue_monitor_window_close_classified_in_background(
+        project_root: &Path,
+        target: &gwt::IssueMonitorStopTarget,
+        commit_timeout: std::time::Duration,
+        classification: gwt::IssueMonitorFailureClass,
+    ) -> WindowCloseMonitorResult {
         let window_id = target.window_id.as_deref().unwrap_or_default();
 
         let publication = {
@@ -5501,6 +5569,7 @@ impl AppRuntime {
                         "issue_number": target.issue_number,
                         "claim_id": target.claim_id.as_deref(),
                         "delivery_id": target.delivery_id.as_deref(),
+                        "classification": classification,
                     }
                 }),
                 std::process::id(),
@@ -5515,6 +5584,7 @@ impl AppRuntime {
                     project_root,
                     target,
                     commit_timeout,
+                    classification,
                 ) {
                     Ok(Some(monitor)) => WindowCloseMonitorResult::LocalFallback(Box::new(monitor)),
                     Ok(None) => WindowCloseMonitorResult::Noop,
@@ -5592,6 +5662,7 @@ impl AppRuntime {
         project_root: &Path,
         target: &gwt::IssueMonitorStopTarget,
         commit_timeout: std::time::Duration,
+        classification: gwt::IssueMonitorFailureClass,
     ) -> Result<
         Option<gwt::IssueMonitorState>,
         gwt::runtime_daemon_events::IssueMonitorControlPublishError,
@@ -5607,7 +5678,10 @@ impl AppRuntime {
                 gwt::IssueMonitorConfig::default(),
                 prefs.clone(),
             );
-            if monitor.requeue_exact_window(target).is_none() {
+            if monitor
+                .requeue_exact_window_classified(target, classification)
+                .is_none()
+            {
                 return Ok(None);
             }
             Self::apply_local_issue_monitor_fallback_projection(
@@ -6702,6 +6776,7 @@ impl AppRuntime {
         &mut self,
         now: &str,
     ) -> Vec<OutboundEvent> {
+        let mut events = self.reconcile_activated_issue_monitor_launches();
         let mut seen_prefs_paths = HashSet::new();
         let projects: Vec<(PathBuf, PathBuf, String)> = self
             .tabs
@@ -6714,7 +6789,6 @@ impl AppRuntime {
                     .then(|| (tab.project_root.clone(), prefs_path, tab.id.clone()))
             })
             .collect();
-        let mut events = Vec::new();
         for (project_root, prefs_path, expected_project_tab_id) in projects {
             // Issue #3627: reclaim slots held by windows that no longer exist
             // before deciding what to launch. This runs on the periodic tick
@@ -9000,17 +9074,18 @@ impl AppRuntime {
                 .handle_launch_wizard_action_for_client(context, Some(&client_id), action, bounds),
             FrontendEvent::SetIssueMonitorEnabled { enabled } => {
                 if enabled {
-                    let has_saved_profile = Some(context.project_root.as_path())
+                    let has_launch_profile = Some(context.project_root.as_path())
                         .map(|project_root| {
                             let prefs_path =
                                 gwt::issue_monitor_prefs_path_for_repo_path(project_root);
                             gwt::load_issue_monitor_prefs(&prefs_path)
                                 .ok()
-                                .and_then(|prefs| prefs.launch_profile)
-                                .is_some()
+                                .is_some_and(|prefs| {
+                                    prefs.launch_auto || !prefs.launch_profile_pool().is_empty()
+                                })
                         })
                         .unwrap_or(false);
-                    if !has_saved_profile {
+                    if !has_launch_profile {
                         let project_root = Some(context.project_root.clone());
                         let mut events = self.open_issue_monitor_configure_profile_wizard_events(
                             context, &client_id,

@@ -731,6 +731,76 @@ fn persist_local_workspace_update(
     )
 }
 
+/// Enrich the intent before either local persistence or Host forwarding so
+/// receipt validation compares exactly the summary that was persisted.
+fn terminal_auto_tier_summary(
+    worktree: &Path,
+    session_id: &str,
+    status: Option<WorkspaceStatusCategory>,
+    summary: Option<String>,
+) -> Option<String> {
+    if status != Some(WorkspaceStatusCategory::Done) {
+        return summary;
+    }
+    let enriched = (|| {
+        let execution = crate::cli::execution_state::load(worktree).ok()??;
+        if execution.primary_session_id != session_id {
+            return None;
+        }
+        let target =
+            crate::agent_project_state::resolve_session_work_mutation_target(worktree, session_id)
+                .ok()?;
+        let owner = match execution.owner_kind {
+            crate::cli::execution_state::ExecutionOwnerKind::Issue => {
+                format!("Issue #{}", execution.owner_number)
+            }
+            crate::cli::execution_state::ExecutionOwnerKind::Spec => {
+                format!("SPEC-{}", execution.owner_number)
+            }
+        };
+        if target.owner.as_deref() != Some(owner.as_str()) {
+            return None;
+        }
+        let prefs = crate::load_issue_monitor_prefs(
+            &crate::issue_monitor_prefs_path_for_repo_path(worktree),
+        )
+        .ok()?;
+        if !prefs.launch_auto {
+            return None;
+        }
+        let tier = prefs
+            .issue_tiers
+            .get(&execution.owner_number)?
+            .launch_tier?;
+        let existing = match summary.as_ref() {
+            Some(summary) => summary.clone(),
+            None => {
+                let works = load_workspace_work_items_from_path(
+                    &gwt_workspace_work_items_path_for_repo_path(&target.project_state_root),
+                )
+                .ok()??;
+                works
+                    .work_items
+                    .iter()
+                    .find(|work| work.id == target.work_id)?
+                    .summary
+                    .clone()
+                    .unwrap_or_default()
+            }
+        };
+        let annotation = format!("Auto launch tier: {tier}; landing tier: {tier}");
+        if existing.lines().any(|line| line == annotation) {
+            return Some(existing);
+        }
+        Some(if existing.is_empty() {
+            annotation
+        } else {
+            format!("{existing}\n{annotation}")
+        })
+    })();
+    enriched.or(summary)
+}
+
 pub(super) fn run<E: CliEnv>(
     env: &mut E,
     cmd: WorkspaceCommand,
@@ -772,6 +842,12 @@ pub(super) fn run<E: CliEnv>(
                 ));
             }
             let legacy_repo_path = gwt_core::paths::resolve_current_worktree_root(env.repo_path());
+            let summary = terminal_auto_tier_summary(
+                &legacy_repo_path,
+                &session_id,
+                status_category,
+                summary,
+            );
             let intent = crate::AgentWorkspaceUpdateIntent {
                 title,
                 status_category,
@@ -953,6 +1029,14 @@ pub(super) fn run<E: CliEnv>(
                     tracing::warn!(
                         ?error,
                         "terminal Work event persisted; retaining the write-ahead settlement receipt after refresh failure"
+                    );
+                }
+            }
+            if status_category == Some(WorkspaceStatusCategory::Done) {
+                if let Err(error) = crate::issue_monitor::record_work_done_tier_landing(&target) {
+                    tracing::warn!(
+                        ?error,
+                        "Work done persisted; auto tier landing observation could not be saved"
                     );
                 }
             }
@@ -5312,6 +5396,100 @@ pub(crate) mod tests {
         assert_eq!(
             latest.progress_summary.as_deref(),
             Some("PR #3672 opened for review")
+        );
+    }
+
+    #[test]
+    fn terminal_workspace_update_records_auto_tier_in_work_summary() {
+        let _guard = env_guard();
+        let home = tempfile::tempdir().unwrap();
+        let _home = ScopedHome::set(home.path());
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        seed_valid_update_target(&repo, "session-auto-tier");
+        save_completed_execution_record(&repo, "session-auto-tier", 3412);
+        let mut execution = crate::cli::execution_state::load(&repo).unwrap().unwrap();
+        execution.status = crate::cli::execution_state::ExecutionControlStatus::Active;
+        execution.settled_at = None;
+        crate::cli::execution_state::save(&repo, &execution).unwrap();
+        let mut prefs = crate::IssueMonitorPrefs {
+            launch_auto: true,
+            ..Default::default()
+        };
+        prefs.record_tier_launch(3412, 1);
+        crate::save_issue_monitor_prefs(
+            &crate::issue_monitor_prefs_path_for_repo_path(&repo),
+            &prefs,
+        )
+        .unwrap();
+        let _session = crate::cli::test_support::ScopedEnvVar::set(
+            gwt_agent::session::GWT_SESSION_ID_ENV,
+            "session-auto-tier",
+        );
+        assert_eq!(
+            terminal_auto_tier_summary(
+                &repo,
+                "session-auto-tier",
+                Some(WorkspaceStatusCategory::Done),
+                None
+            ),
+            Some("Auto launch tier: 1; landing tier: 1".to_string()),
+        );
+        let mut target = crate::agent_project_state::resolve_session_work_mutation_target(
+            &repo,
+            "session-auto-tier",
+        )
+        .unwrap();
+        target.owner = Some("Issue #9999".to_string());
+        crate::issue_monitor::record_work_done_tier_landing(&target).unwrap();
+        target.owner = Some("Issue #3412".to_string());
+        target.session_id = "another-session".to_string();
+        crate::issue_monitor::record_work_done_tier_landing(&target).unwrap();
+        assert_eq!(
+            crate::load_issue_monitor_prefs(&crate::issue_monitor_prefs_path_for_repo_path(&repo),)
+                .unwrap()
+                .issue_tiers[&3412]
+                .landing_tier,
+            None
+        );
+        let mut env = TestEnv::new(repo.clone());
+        let cmd = parse(&[
+            s("update"),
+            s("--status"),
+            s("done"),
+            s("--summary"),
+            s("Verified implementation"),
+        ])
+        .unwrap();
+        run(&mut env, cmd, &mut String::new()).unwrap();
+        let works = load_workspace_work_items(&repo).unwrap().unwrap();
+        let work = works
+            .work_items
+            .iter()
+            .find(|work| work.id == "work-session")
+            .unwrap();
+        assert_eq!(
+            work.summary.as_deref(),
+            Some("Verified implementation\nAuto launch tier: 1; landing tier: 1")
+        );
+        let event = work
+            .events
+            .iter()
+            .rev()
+            .find(|event| event.kind == WorkEventKind::Done)
+            .unwrap();
+        assert_eq!(event.summary, work.summary);
+        let saved =
+            crate::load_issue_monitor_prefs(&crate::issue_monitor_prefs_path_for_repo_path(&repo))
+                .unwrap();
+        assert_eq!(saved.issue_tiers[&3412].landing_tier, Some(1));
+        let mut stale_monitor =
+            crate::IssueMonitorState::with_prefs(crate::IssueMonitorConfig::default(), prefs);
+        stale_monitor.rebase_daemon_driver_prefs(&saved);
+        assert_eq!(
+            stale_monitor.prefs().issue_tiers[&3412].landing_tier,
+            Some(1)
         );
     }
 

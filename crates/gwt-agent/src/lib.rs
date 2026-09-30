@@ -18,6 +18,10 @@ pub mod permission_mode;
 pub mod prepare;
 pub mod presets;
 pub mod session;
+mod session_bridge;
+pub use session_bridge::{
+    has_unresolved_host_bridge_fault, HostBridgeKind, SessionBridgeObservation,
+};
 pub mod store;
 pub mod types;
 pub mod version_cache;

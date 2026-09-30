@@ -747,11 +747,25 @@ fn hook_doctor_repair_does_not_persist_path_local_build_binary() {
 
     assert_eq!(code, 0, "{}", String::from_utf8_lossy(&env.stderr));
     let rendered = fs::read_to_string(temp.path().join(".codex/hooks.json")).unwrap();
-    assert!(rendered.contains("GWT_BIN_PATH"), "{rendered}");
-    assert!(
-        !rendered.contains(&local_bin.display().to_string()),
-        "doctor persisted a worktree-local binary: {rendered}"
-    );
+    let hooks: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+    let local_bin_text = local_bin.display().to_string().replace('\\', "/");
+    let mut command_count = 0;
+    for groups in hooks["hooks"].as_object().unwrap().values() {
+        for group in groups.as_array().unwrap() {
+            for hook in group["hooks"].as_array().unwrap() {
+                command_count += 1;
+                let command = hook["command"].as_str().unwrap();
+                let payload = gwt_skills::decode_powershell_encoded_command(command)
+                    .unwrap_or_else(|| command.to_string());
+                assert!(payload.contains("GWT_BIN_PATH"), "{payload}");
+                assert!(
+                    !payload.replace('\\', "/").contains(&local_bin_text),
+                    "doctor persisted a worktree-local binary: {payload}"
+                );
+            }
+        }
+    }
+    assert!(command_count > 0, "doctor must generate managed hooks");
 }
 
 #[test]

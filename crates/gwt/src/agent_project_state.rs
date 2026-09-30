@@ -1784,6 +1784,8 @@ where
     let opens_work_settlement = tracked_event_policy == TrackedWorkEventPolicy::Persist
         && request.intent.status_category
             == Some(gwt_core::workspace_projection::WorkspaceStatusCategory::Done);
+    let is_done = request.intent.status_category
+        == Some(gwt_core::workspace_projection::WorkspaceStatusCategory::Done);
     let update = WorkspaceProjectionUpdate {
         title: request.intent.title,
         status_category: request.intent.status_category,
@@ -1842,6 +1844,14 @@ where
             tracing::warn!(
                 ?error,
                 "terminal Work event persisted; retaining the write-ahead settlement receipt after refresh failure"
+            );
+        }
+    }
+    if is_done {
+        if let Err(error) = crate::issue_monitor::record_work_done_tier_landing(&target) {
+            tracing::warn!(
+                ?error,
+                "Work done persisted; auto tier landing observation could not be saved"
             );
         }
     }
@@ -8908,11 +8918,20 @@ mod tests {
     #[test]
     fn authenticated_terminal_workspace_update_opens_host_settlement_obligation() {
         with_strict_target_fixture(|repo, session| {
-            seed_unique_mutation_target(repo, repo, session, "work-authenticated-terminal");
+            let (session, binding) = bind_session_to_current_execution(repo, session);
+            seed_unique_mutation_target(repo, repo, &session, "work-authenticated-terminal");
+            let mut prefs = crate::IssueMonitorPrefs {
+                launch_auto: true,
+                ..Default::default()
+            };
+            prefs.record_tier_launch(2359, 1);
+            let prefs_path = crate::issue_monitor_prefs_path_for_repo_path(repo);
+            crate::save_issue_monitor_prefs(&prefs_path, &prefs).unwrap();
 
-            apply_authenticated_workspace_update(
+            apply_bound_authenticated_workspace_update(
                 repo,
                 &session.id,
+                &binding,
                 AgentWorkspaceUpdateRequest {
                     schema_version: AGENT_WORKSPACE_UPDATE_SCHEMA_VERSION,
                     claimed_session_id: session.id.clone(),
@@ -8933,6 +8952,13 @@ mod tests {
                 .expect("Host terminal update must create a settlement obligation");
             assert!(record.obligation_open);
             assert_eq!(record.session_id, session.id);
+            assert_eq!(
+                crate::load_issue_monitor_prefs(&prefs_path)
+                    .unwrap()
+                    .issue_tiers[&2359]
+                    .landing_tier,
+                Some(1)
+            );
         });
     }
 
