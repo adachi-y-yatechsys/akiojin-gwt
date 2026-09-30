@@ -378,6 +378,19 @@ pub(super) fn run<E: CliEnv>(
             update_drain,
             out,
         )?,
+        IssueCommand::MonitorTiers { project_root } => {
+            run_monitor_tiers(env, project_root.as_deref(), out)?
+        }
+        IssueCommand::MonitorTiersSet {
+            project_root,
+            auto,
+            tiers,
+        } => run_monitor_tiers_set(env, project_root.as_deref(), auto, tiers, out)?,
+        IssueCommand::MonitorTierSet {
+            project_root,
+            number,
+            tier,
+        } => run_monitor_tier_set(env, project_root.as_deref(), number, tier, out)?,
         IssueCommand::MonitorProfiles { project_root } => {
             run_monitor_profiles(env, project_root.as_deref(), out)?
         }
@@ -2860,6 +2873,114 @@ fn run_monitor_config_set<E: CliEnv>(
         })
         .to_string(),
     );
+    out.push('\n');
+    Ok(0)
+}
+
+fn monitor_tiers_projection(prefs: &crate::IssueMonitorPrefs) -> serde_json::Value {
+    serde_json::json!({
+        "auto": prefs.launch_auto,
+        "tiers": prefs.effective_launch_tiers(),
+        "configured_tiers": prefs.launch_tiers,
+        "tier_overrides": prefs.tier_overrides,
+        "issue_tiers": prefs.issue_tiers,
+        "landing_stats": prefs.tier_landing_stats(),
+    })
+}
+
+fn run_monitor_tiers<E: CliEnv>(
+    env: &E,
+    project_root: Option<&std::path::Path>,
+    out: &mut String,
+) -> Result<i32, SpecOpsError> {
+    let root = issue_monitor_project_root(env, project_root)?;
+    let prefs =
+        crate::load_issue_monitor_prefs(&crate::issue_monitor_prefs_path_for_repo_path(&root))
+            .map_err(io_as_api_error)?;
+    out.push_str(&monitor_tiers_projection(&prefs).to_string());
+    out.push('\n');
+    Ok(0)
+}
+
+fn apply_monitor_tiers_set(
+    prefs: &mut crate::IssueMonitorPrefs,
+    auto: bool,
+    tiers: Option<Vec<Vec<crate::IssueMonitorLaunchProfile>>>,
+) -> io::Result<()> {
+    if let Some(tiers) = &tiers {
+        if !(1..=255).contains(&tiers.len()) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "tiers must contain between 1 and 255 tiers",
+            ));
+        }
+        for tier in tiers {
+            validate_monitor_profiles_set(tier, None)?;
+        }
+    }
+    prefs
+        .advance_effect_authority_epoch()
+        .ok_or_else(|| io::Error::other("Issue Monitor authority epoch overflow"))?;
+    prefs.launch_auto = auto;
+    prefs.launch_tiers = tiers.unwrap_or_default();
+    Ok(())
+}
+
+fn run_monitor_tiers_set<E: CliEnv>(
+    env: &E,
+    project_root: Option<&std::path::Path>,
+    auto: bool,
+    tiers: Option<Vec<Vec<crate::IssueMonitorLaunchProfile>>>,
+    out: &mut String,
+) -> Result<i32, SpecOpsError> {
+    let root = issue_monitor_project_root(env, project_root)?;
+    let path = crate::issue_monitor_prefs_path_for_repo_path(&root);
+    let (prefs, ()) = crate::try_mutate_issue_monitor_prefs(&path, |prefs| {
+        apply_monitor_tiers_set(prefs, auto, tiers)
+    })
+    .map_err(io_as_api_error)?;
+    out.push_str(&monitor_tiers_projection(&prefs).to_string());
+    out.push('\n');
+    Ok(0)
+}
+
+fn apply_monitor_tier_set(
+    prefs: &mut crate::IssueMonitorPrefs,
+    number: u64,
+    tier: u8,
+) -> io::Result<()> {
+    if usize::from(tier) >= prefs.effective_launch_tiers().len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "tier is outside the configured launch tiers",
+        ));
+    }
+    let current = prefs
+        .tier_overrides
+        .get(&number)
+        .copied()
+        .unwrap_or_default();
+    prefs
+        .advance_effect_authority_epoch()
+        .ok_or_else(|| io::Error::other("Issue Monitor authority epoch overflow"))?;
+    prefs.tier_overrides.insert(number, current.max(tier));
+    Ok(())
+}
+
+fn run_monitor_tier_set<E: CliEnv>(
+    env: &E,
+    project_root: Option<&std::path::Path>,
+    number: u64,
+    tier: u8,
+    out: &mut String,
+) -> Result<i32, SpecOpsError> {
+    let root = issue_monitor_project_root(env, project_root)?;
+    let path = crate::issue_monitor_prefs_path_for_repo_path(&root);
+    let (prefs, ()) = crate::try_mutate_issue_monitor_prefs(&path, |prefs| {
+        apply_monitor_tier_set(prefs, number, tier)
+    })
+    .map_err(io_as_api_error)?;
+    out.push_str(&monitor_tiers_projection(&prefs).to_string());
     out.push('\n');
     Ok(0)
 }
@@ -6980,6 +7101,10 @@ mod tests {
             provider_quota_holds: Vec::new(),
             needs_human: vec![2338],
             inbox: vec![crate::issue_monitor::IssueMonitorInboxSummary {
+                launch_tier: None,
+                landing_tier: None,
+                non_agent_attempts: 0,
+                tier_input: 0,
                 issue_number: 2338,
                 state: crate::MonitorInboxState::Queued,
                 github_state: crate::IssueMonitorIssueState::Open,
@@ -7109,6 +7234,10 @@ mod tests {
                 provider_quota_holds: Vec::new(),
                 needs_human: vec![2338],
                 inbox: vec![crate::issue_monitor::IssueMonitorInboxSummary {
+                    launch_tier: None,
+                    landing_tier: None,
+                    non_agent_attempts: 0,
+                    tier_input: 0,
                     issue_number: 2338,
                     state: crate::MonitorInboxState::Queued,
                     github_state: crate::IssueMonitorIssueState::Open,
@@ -7431,6 +7560,8 @@ mod tests {
                         "issue_updated_at": "2026-08-03T00:00:00Z",
                         "readiness": "not_applicable",
                         "recoverable_merged": false,
+                        "non_agent_attempts": 0,
+                        "tier_input": 0,
                     },
                     {
                         "issue_number": 1,
@@ -7439,6 +7570,8 @@ mod tests {
                         "issue_updated_at": "2026-08-03T00:00:00Z",
                         "readiness": "not_applicable",
                         "recoverable_merged": false,
+                        "non_agent_attempts": 0,
+                        "tier_input": 0,
                     },
                     {
                         "issue_number": 9,
@@ -7446,6 +7579,8 @@ mod tests {
                         "github_state": "open",
                         "readiness": "not_applicable",
                         "recoverable_merged": false,
+                        "non_agent_attempts": 0,
+                        "tier_input": 0,
                     },
                 ],
                 // Issue #3633 AC-5: this branch rebuilds the queue from the
@@ -8252,6 +8387,53 @@ mod tests {
     /// sends when it is not relying on Issue #4079 inheritance.
     fn pool_patch(agent_id: &str, prefer_for: &[&str]) -> crate::IssueMonitorLaunchProfilePatch {
         crate::IssueMonitorLaunchProfilePatch::complete(pool_profile(agent_id, prefer_for))
+    }
+
+    #[test]
+    fn monitor_tiers_settings_preserve_pool_and_override_across_reload() {
+        let tmp = TempDir::new().expect("tempdir");
+        let _home = ScopedGwtHome::set(tmp.path().join("home"));
+        let repo = tmp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let path = crate::issue_monitor_prefs_path_for_repo_path(&repo);
+        let mut prefs = crate::IssueMonitorPrefs::default();
+        prefs.set_launch_profile_pool(vec![pool_profile("claude", &[])]);
+        let saved_pool = prefs.launch_profile_pool();
+        crate::save_issue_monitor_prefs(&path, &prefs).unwrap();
+        let env = crate::cli::TestEnv::new(repo);
+        let mut out = String::new();
+        run_monitor_tiers_set(
+            &env,
+            None,
+            true,
+            Some(vec![
+                vec![pool_profile("codex", &[])],
+                vec![pool_profile("claude", &["kind:spec"])],
+            ]),
+            &mut out,
+        )
+        .unwrap();
+        run_monitor_tier_set(&env, None, 4774, 1, &mut out).unwrap();
+        run_monitor_tier_set(&env, None, 4774, 0, &mut out).unwrap();
+        let prefs = crate::load_issue_monitor_prefs(&path).unwrap();
+        assert_eq!(prefs.launch_profile_pool(), saved_pool);
+        assert!(prefs.launch_auto);
+        assert_eq!(prefs.tier_overrides[&4774], 1);
+        assert_eq!(prefs.effective_launch_tiers().len(), 2);
+        let before = fs::read(&path).unwrap();
+        assert!(run_monitor_tier_set(&env, None, 4774, 2, &mut out).is_err());
+        assert!(run_monitor_tiers_set(&env, None, true, Some(vec![]), &mut out).is_err());
+        assert!(run_monitor_tiers_set(&env, None, true, Some(vec![vec![]]), &mut out).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        out.clear();
+        run_monitor_tiers(&env, None, &mut out).unwrap();
+        let projection: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(projection["tier_overrides"]["4774"], 1);
+        assert!(projection.get("landing_stats").is_some());
+        run_monitor_tiers_set(&env, None, true, None, &mut out).unwrap();
+        let prefs = crate::load_issue_monitor_prefs(&path).unwrap();
+        assert!(prefs.launch_tiers.is_empty());
+        assert_eq!(prefs.tier_overrides[&4774], 1);
     }
 
     /// SPEC #3914 FR-011 / AC-8 / SC-6: the pool is written whole, mirrored
@@ -9499,6 +9681,10 @@ mod tests {
             provider_quota_holds: Vec::new(),
             needs_human: Vec::new(),
             inbox: vec![crate::issue_monitor::IssueMonitorInboxSummary {
+                launch_tier: None,
+                landing_tier: None,
+                non_agent_attempts: 0,
+                tier_input: 0,
                 issue_number: 4077,
                 state: crate::MonitorInboxState::BlockedByClaim,
                 github_state: crate::IssueMonitorIssueState::Open,

@@ -804,7 +804,27 @@ fn audit_hook_json_config(
     };
 
     for event in MANAGED_EVENTS {
-        let commands = hook_commands_for_event(&root, event);
+        let raw_commands = hook_commands_for_event(&root, event);
+        for command in &raw_commands {
+            if is_managed_event_command(command, event)
+                && command.starts_with("powershell ")
+                && command.contains(" -Command \"")
+            {
+                needs_attention(
+                    health,
+                    format!(
+                        "managed hook PowerShell transport unsafe: {}",
+                        path.display()
+                    ),
+                );
+            }
+        }
+        let commands: Vec<_> = raw_commands
+            .into_iter()
+            .map(|command| {
+                gwt_skills::decode_powershell_encoded_command(&command).unwrap_or(command)
+            })
+            .collect();
         if !commands
             .iter()
             .any(|command| is_managed_event_command(command, event))

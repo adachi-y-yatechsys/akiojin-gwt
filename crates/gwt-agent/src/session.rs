@@ -5234,6 +5234,68 @@ display_name = "Claude Code"
         assert_eq!(runtime.runtime_incarnation, Some(17));
     }
 
+    #[test]
+    fn bridge_diagnostic_is_exact_launch_scoped_and_cleared_only_by_same_bridge() {
+        let dir = tempfile::tempdir().unwrap();
+        let (session, identity) = save_bound_session_for_fence_test(dir.path());
+        let path = runtime_state_path(dir.path(), &session.id);
+        let runtime = SessionRuntimeState::for_execution_process(
+            AgentStatus::Running,
+            &identity,
+            17,
+            100,
+            123,
+            101,
+        );
+        runtime.save(&path).unwrap();
+        let request = crate::SessionBridgeObservation::capture(&path, &session.id)
+            .unwrap()
+            .unwrap();
+        request
+            .record(crate::HostBridgeKind::WorkspaceUpdate, true)
+            .unwrap();
+        assert!(crate::has_unresolved_host_bridge_fault(&path, &runtime).unwrap());
+        // Runtime inventory treats every *.json filename as a Session id.
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+                .count(),
+            1
+        );
+
+        let request = crate::SessionBridgeObservation::capture(&path, &session.id)
+            .unwrap()
+            .unwrap();
+        request
+            .record(crate::HostBridgeKind::WorkTerminalization, false)
+            .unwrap();
+        assert!(crate::has_unresolved_host_bridge_fault(&path, &runtime).unwrap());
+        // Hook updates replace the runtime sidecar, not the adjacent receipt.
+        let mut hooked = runtime.clone();
+        hooked.source_event = Some("PostToolUse".into());
+        hooked.save(&path).unwrap();
+        assert!(crate::has_unresolved_host_bridge_fault(&path, &hooked).unwrap());
+        let success = crate::SessionBridgeObservation::capture(&path, &session.id)
+            .unwrap()
+            .unwrap();
+        success
+            .record(crate::HostBridgeKind::WorkspaceUpdate, false)
+            .unwrap();
+        assert!(!crate::has_unresolved_host_bridge_fault(&path, &runtime).unwrap());
+        let late = crate::SessionBridgeObservation::capture(&path, &session.id)
+            .unwrap()
+            .unwrap();
+        let mut successor = runtime.clone();
+        successor.runtime_incarnation = Some(18);
+        successor.save(&path).unwrap();
+        assert!(!late
+            .record(crate::HostBridgeKind::WorkspaceUpdate, true)
+            .unwrap());
+        assert!(!crate::has_unresolved_host_bridge_fault(&path, &successor).unwrap());
+    }
+
     fn save_bound_session_for_fence_test(
         sessions_dir: &Path,
     ) -> (Session, SessionExecutionIdentity) {
