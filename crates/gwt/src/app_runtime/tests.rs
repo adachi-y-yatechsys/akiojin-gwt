@@ -18248,6 +18248,7 @@ fn targeted_windows_metadata_failure_never_reports_running_ready_or_delivery_suc
         readiness: gwt::IssueMonitorReadiness::NotApplicable,
         updated_at: None,
     });
+    monitor.terminal_queue_push(&[3456], "operator", "2026-08-05T00:00:00Z");
     assert!(monitor.apply_confirmed_claim(
         3456,
         "claim-phase75-metadata-failure",
