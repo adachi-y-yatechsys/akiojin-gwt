@@ -249,6 +249,7 @@ mod title_sync;
 mod ui_trace;
 mod window;
 mod wizard;
+pub(crate) use wizard::IssueMonitorLaunchPrepared;
 mod workspace;
 mod workspace_views;
 use attachments::UploadedImagePasteOperation;
@@ -1284,6 +1285,7 @@ pub struct AppRuntime {
     /// replay never creates a second agent window and can re-ACK after a
     /// transient daemon disconnect.
     pub(crate) issue_monitor_launch_deliveries: HashMap<String, IssueMonitorLaunchDeliveryState>,
+    pub(crate) issue_monitor_launch_preparations: HashSet<wizard::IssueMonitorLaunchPreparationKey>,
     pub(crate) issue_monitor_materializer_id: String,
     /// Issue #3878: budget for one local fallback commit of the Issue Monitor
     /// prefs. Injected at construction so a test runtime owns its budget
@@ -3240,6 +3242,7 @@ impl AppRuntime {
             pending_update_resume_notice: None,
             pending_launch_feedback_contexts: HashMap::new(),
             issue_monitor_launch_deliveries: HashMap::new(),
+            issue_monitor_launch_preparations: HashSet::new(),
             issue_monitor_materializer_id: uuid::Uuid::new_v4().to_string(),
             issue_monitor_fallback_commit_timeout: ISSUE_MONITOR_FALLBACK_COMMIT_TIMEOUT,
             issue_monitor_provider_auth_probe: gwt::issue_monitor::provider_auth_state_from_env,

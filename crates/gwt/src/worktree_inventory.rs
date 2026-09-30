@@ -48,7 +48,18 @@ pub fn enumerate_worktrees(
     // directories): .git". Resolve the main/bare repo first so the listing
     // runs inside the actual git directory; `main_worktree_root` already
     // handles linked worktrees, normal repos, and child-bare layouts.
-    let main_root = main_worktree_root(repo_root).ok();
+    // Issue #4803: known repository roots expose the same common directory
+    // on disk; avoid a process just to rediscover it before listing worktrees.
+    // Keep Git discovery for nested cwd values and ambiguous layouts.
+    let main_root = gwt_core::repo_hash::repository_common_dir(repo_root)
+        .map(|common| {
+            if common.file_name().is_some_and(|name| name == ".git") {
+                common.parent().unwrap_or(&common).to_path_buf()
+            } else {
+                common
+            }
+        })
+        .or_else(|| main_worktree_root(repo_root).ok());
     let list_root = main_root.as_deref().unwrap_or(repo_root);
     let manager = WorktreeManager::new(list_root);
     let infos = manager
