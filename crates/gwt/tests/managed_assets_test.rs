@@ -1182,7 +1182,10 @@ fn json_commands(raw: &str) -> Vec<String> {
         match value {
             Value::Object(map) => {
                 if let Some(command) = map.get("command").and_then(Value::as_str) {
-                    out.push(command.to_string());
+                    out.push(
+                        gwt_skills::decode_powershell_encoded_command(command)
+                            .unwrap_or_else(|| command.to_string()),
+                    );
                 }
                 for value in map.values() {
                     collect(value, out);
