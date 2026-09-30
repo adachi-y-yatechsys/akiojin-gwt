@@ -380,21 +380,6 @@ mod windows_impl {
     }
 }
 
-/// Test-only readiness probe: resolves once a daemon accepts connections at
-/// `bind`. Unix checks the socket file; Windows opens (and immediately
-/// drops) a pipe client because pipe names are not visible on the file
-/// system.
-#[cfg(test)]
-pub(crate) async fn wait_until_bound(bind: &Path) {
-    for _ in 0..100 {
-        if bind_is_present(bind) {
-            return;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    panic!("daemon transport never became ready at {}", bind.display());
-}
-
 #[cfg(test)]
 mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -433,7 +418,6 @@ mod tests {
             write_half.flush().await.expect("flush");
         });
 
-        wait_until_bound(&bind).await;
         let client = IpcStream::connect(&bind.to_string_lossy())
             .await
             .expect("connect");
