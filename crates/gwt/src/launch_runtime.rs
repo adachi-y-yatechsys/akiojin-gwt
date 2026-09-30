@@ -557,7 +557,11 @@ pub fn plan_orphan_intake_worktree_prune_from_inventory(
     repo_path: &Path,
     inventory: &[gwt::worktree_inventory::WorktreeEntry],
 ) -> Option<OrphanIntakePrunePlan> {
-    let main_repo_path = gwt_git::worktree::main_worktree_root(repo_path).ok()?;
+    let main_repo_path = inventory
+        .iter()
+        .find(|entry| entry.kind == gwt::worktree_inventory::WorktreeEntryKind::BareMain)
+        .map(|entry| entry.path.clone())
+        .or_else(|| gwt_git::worktree::main_worktree_root(repo_path).ok())?;
     Some(orphan_intake_prune_plan(
         main_repo_path,
         inventory

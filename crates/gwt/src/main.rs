@@ -1888,6 +1888,7 @@ enum UserEvent {
         id: String,
         waiting: bool,
     },
+    IssueMonitorLaunchPrepared(Box<app_runtime::IssueMonitorLaunchPrepared>),
     IssueMonitorLaunchRequest {
         project_root: PathBuf,
         issue_number: u64,
@@ -4075,6 +4076,7 @@ mod tests {
 
             pending_launch_feedback_contexts: HashMap::new(),
             issue_monitor_launch_deliveries: HashMap::new(),
+            issue_monitor_launch_preparations: std::collections::HashSet::new(),
             issue_monitor_materializer_id: "main-test-materializer".to_string(),
             issue_monitor_fallback_commit_timeout:
                 crate::app_runtime::TEST_ISSUE_MONITOR_FALLBACK_COMMIT_TIMEOUT,
@@ -10755,6 +10757,9 @@ fn main() -> std::io::Result<()> {
             Event::UserEvent(UserEvent::DaemonRuntimeHook(event)) => {
                 let events = app.handle_daemon_runtime_hook_event(event);
                 clients.dispatch(events);
+            }
+            Event::UserEvent(UserEvent::IssueMonitorLaunchPrepared(prepared)) => {
+                clients.dispatch(app.handle_issue_monitor_launch_prepared(*prepared));
             }
             Event::UserEvent(UserEvent::IssueMonitorLaunchRequest {
                 project_root,
