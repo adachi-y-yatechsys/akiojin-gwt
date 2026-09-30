@@ -1195,6 +1195,23 @@ impl AppRuntime {
                 self.window_details.remove(&id);
             }
         }
+        let termination_failure = self
+            .issue_monitor_failure_for_window(
+                &id,
+                detail.as_deref().unwrap_or_default(),
+                issue_monitor_session_mode,
+            )
+            .or(Some(gwt::IssueMonitorFailure::Termination {
+                classification: if exit_confirmed && exact_runtime_incarnation {
+                    self.issue_monitor_termination_for_window(&id)
+                } else {
+                    gwt::IssueMonitorFailureClass::Unknown
+                },
+            }));
+        let termination_issue_hint = self
+            .pending_launch_feedback_contexts
+            .get(&id)
+            .and_then(|context| context.issue_monitor_issue_number);
         if should_auto_close {
             if !close_window_from_workspace(
                 &mut self.tabs,
@@ -1222,11 +1239,12 @@ impl AppRuntime {
                         .as_deref()
                         .unwrap_or("Agent exited without completing the work")
                         .to_string();
-                    events.extend(self.issue_monitor_agent_failed_events_with_mode(
+                    events.extend(self.issue_monitor_agent_failed_events_with_failure(
                         project_root,
                         &id,
                         &message,
-                        issue_monitor_session_mode,
+                        termination_issue_hint,
+                        termination_failure.clone(),
                     ));
                 }
             }
@@ -1316,11 +1334,12 @@ impl AppRuntime {
             };
             let message = detail.as_deref().unwrap_or(default_message).to_string();
             if let Some(project_root) = issue_monitor_project_root.as_deref() {
-                events.extend(self.issue_monitor_agent_failed_events_with_mode(
+                events.extend(self.issue_monitor_agent_failed_events_with_failure(
                     project_root,
                     &id,
                     &message,
-                    issue_monitor_session_mode,
+                    termination_issue_hint,
+                    termination_failure.clone(),
                 ));
             }
         }
