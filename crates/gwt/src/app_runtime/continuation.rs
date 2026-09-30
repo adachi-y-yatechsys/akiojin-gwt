@@ -2807,6 +2807,7 @@ mod repaired_binding_probe_tests {
     #[test]
     fn recovery_repository_mismatch_archives_original_receipt_once() {
         let temp = tempfile::tempdir().unwrap();
+        let _gwt_home = gwt_core::test_support::ScopedGwtHome::set(temp.path());
         let (sessions, path, bytes) = recovery_fixture(temp.path());
         assert!(durable_launch_recovery_records(&sessions).is_empty());
         assert!(!path.exists());
@@ -2824,6 +2825,7 @@ mod repaired_binding_probe_tests {
     #[test]
     fn recovery_repository_unavailable_retains_receipt() {
         let temp = tempfile::tempdir().unwrap();
+        let _gwt_home = gwt_core::test_support::ScopedGwtHome::set(temp.path());
         let (sessions, path, _) = recovery_fixture(temp.path());
         let mut record: DurableLaunchRecoveryRecord =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
@@ -2840,6 +2842,7 @@ mod repaired_binding_probe_tests {
     #[test]
     fn recovery_repository_archive_failure_retains_receipt() {
         let temp = tempfile::tempdir().unwrap();
+        let _gwt_home = gwt_core::test_support::ScopedGwtHome::set(temp.path());
         let (sessions, path, bytes) = recovery_fixture(temp.path());
         std::fs::write(
             durable_launch_recovery_dir(&sessions).join("archive"),

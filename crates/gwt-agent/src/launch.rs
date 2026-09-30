@@ -2219,7 +2219,26 @@ mod tests {
 
     #[test]
     fn repo_hash_from_subdirectory_does_not_require_git_on_path() {
-        let _lock = gwt_core::test_support::env_lock().lock().unwrap();
+        const CHILD_REPO: &str = "GWT_TEST_REPO_HASH_NO_GIT_DIR";
+        let origin = "https://github.com/example/monitor-launch.git";
+        if let Some(nested) = std::env::var_os(CHILD_REPO) {
+            assert!(
+                gwt_core::process::hidden_command("git")
+                    .arg("--version")
+                    .output()
+                    .is_err(),
+                "the isolated child must not be able to execute Git"
+            );
+            assert_eq!(
+                detect_repo_hash_for_dir(std::path::Path::new(&nested)),
+                Some(
+                    gwt_core::repo_hash::compute_repo_hash(origin)
+                        .as_str()
+                        .to_owned()
+                )
+            );
+            return;
+        }
         let repo = tempfile::tempdir().unwrap();
         let output = gwt_core::process::hidden_command("git")
             .arg("init")
@@ -2227,7 +2246,6 @@ mod tests {
             .output()
             .unwrap();
         assert!(output.status.success(), "git init failed: {output:?}");
-        let origin = "https://github.com/example/monitor-launch.git";
         std::fs::write(
             repo.path().join(".git/config"),
             format!("[remote \"origin\"]\n\turl = {origin}\n"),
@@ -2235,16 +2253,22 @@ mod tests {
         .unwrap();
         let nested = repo.path().join("src/nested");
         std::fs::create_dir_all(&nested).unwrap();
-        let _path =
-            gwt_core::test_support::ScopedEnvVar::set("PATH", repo.path().join("missing-bin"));
-
-        assert_eq!(
-            detect_repo_hash_for_dir(&nested),
-            Some(
-                gwt_core::repo_hash::compute_repo_hash(origin)
-                    .as_str()
-                    .to_owned()
-            )
+        // Isolate PATH in a child so parallel agent tests retain their runners.
+        let output = gwt_core::process::hidden_command(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "launch::tests::repo_hash_from_subdirectory_does_not_require_git_on_path",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("PATH", repo.path().join("missing-bin"))
+            .env(CHILD_REPO, &nested)
+            .current_dir(&nested)
+            .output()
+            .expect("run isolated repository hash check");
+        assert!(
+            output.status.success(),
+            "isolated repository hash check failed: {output:?}"
         );
     }
 

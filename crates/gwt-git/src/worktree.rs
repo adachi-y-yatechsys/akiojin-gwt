@@ -1581,7 +1581,9 @@ pub fn main_worktree_root(repo_path: &Path) -> Result<PathBuf> {
     // Startup and launch callers already know a repository/worktree root.
     // Its gitdir/commondir files carry the same identity without a subprocess.
     // Keep Git discovery below for nested cwd values and unresolved layouts.
-    if let Some(common_dir) = gwt_core::repo_hash::repository_common_dir(repo_path) {
+    if let Some(common_dir) =
+        gwt_core::repo_hash::repository_common_dir(repo_path).filter(|dir| dir.is_dir())
+    {
         let root = if common_dir.file_name().is_some_and(|name| name == ".git") {
             common_dir.parent().unwrap_or(&common_dir)
         } else {

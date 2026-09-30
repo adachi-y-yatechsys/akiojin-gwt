@@ -80035,6 +80035,7 @@ fn commit_issue4803_monitor_preparation(
 #[test]
 fn issue4803_launch_cache_clone_preserves_independent_session_updates() {
     let temp = tempdir().expect("tempdir");
+    let _gwt_home = ScopedGwtHome::set(temp.path());
     let sessions_dir = temp.path().join("sessions");
     fs::create_dir_all(&sessions_dir).expect("sessions dir");
     let session = gwt_agent::Session::new(temp.path(), "develop", gwt_agent::AgentId::Codex);
