@@ -785,6 +785,7 @@ pub(crate) fn is_read_only_json_envelope_operation(operation: &str) -> bool {
             | "issue.spec.audit"
             | "issue.monitor.status"
             | "issue.monitor.profiles"
+            | "issue.monitor.tiers"
             | "pr.current"
             | "pr.list"
             | "github.budget"
@@ -1820,6 +1821,13 @@ mod tests {
     #[test]
     fn issue_monitor_json_operations_have_the_expected_policy_classification() {
         assert!(is_read_only_json_envelope_operation("issue.monitor.status"));
+        assert!(is_read_only_json_envelope_operation("issue.monitor.tiers"));
+        assert!(!is_read_only_json_envelope_operation(
+            "issue.monitor.tiers.set"
+        ));
+        assert!(!is_read_only_json_envelope_operation(
+            "issue.monitor.tier.set"
+        ));
         // SPEC #3914 FR-011: reading the candidate pool mutates nothing.
         assert!(is_read_only_json_envelope_operation(
             "issue.monitor.profiles"
