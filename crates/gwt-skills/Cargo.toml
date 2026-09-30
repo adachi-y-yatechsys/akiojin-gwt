@@ -9,6 +9,7 @@ description = "Skill registry and hooks management for gwt"
 publish = false
 
 [dependencies]
+base64.workspace = true
 chrono.workspace = true
 dunce.workspace = true
 fs2.workspace = true

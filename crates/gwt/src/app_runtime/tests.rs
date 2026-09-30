@@ -24152,6 +24152,306 @@ fn fresh_execution_session_replacement_before_work_commit_preserves_predecessor_
 }
 
 #[test]
+fn issue_monitor_scan_reconciles_activated_launch_but_preserves_unready_candidate() {
+    let _env_guard = env_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().unwrap();
+    let _home = ScopedGwtHome::set(temp.path());
+    let _home_env = gwt_core::test_support::ScopedEnvVar::set("HOME", temp.path());
+    let _profile = gwt_core::test_support::ScopedEnvVar::set("USERPROFILE", temp.path());
+    for activated in [false, true] {
+        let mut fixture = pending_fresh_execution_fixture(
+            temp.path(),
+            if activated {
+                "monitor-scan-activated"
+            } else {
+                "monitor-scan-unready"
+            },
+        );
+        let prefs_path = gwt::issue_monitor_prefs_path_for_repo_path(&fixture.repo);
+        gwt::save_issue_monitor_prefs(
+            &prefs_path,
+            &gwt::IssueMonitorPrefs {
+                launching_issues: vec![gwt::IssueMonitorLaunchingIssue {
+                    issue_number: fixture.owner.number,
+                    claimed_at: None,
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        fixture
+            .runtime
+            .pending_fresh_execution_launches
+            .get_mut(&fixture.window_id)
+            .unwrap()
+            .launch_feedback_context = Some(LaunchFeedbackContext {
+            client_id: "__issue_monitor__".to_string(),
+            title: "Issue Monitor".to_string(),
+            issue_monitor_issue_number: Some(fixture.owner.number),
+            issue_monitor_delivery_id: None,
+            issue_monitor_project_root: Some(fixture.repo.clone()),
+            issue_monitor_session_mode: None,
+            issue_monitor_autonomous_handoff: None,
+            issue_monitor_autonomous_submit_started: false,
+            issue_monitor_review_dispatch: false,
+        });
+        if activated {
+            leave_fresh_execution_activated_before_projection_commit(&mut fixture);
+        }
+        let (spawner, queued_tasks) = BlockingTaskSpawner::queued();
+        let (proxy, recorded_events) = AppEventProxy::stub();
+        fixture.runtime.blocking_tasks = spawner;
+        fixture.runtime.proxy = proxy;
+        fixture
+            .runtime
+            .issue_monitor_scheduled_tick_events_at(&Utc::now().to_rfc3339());
+        assert!(
+            fixture
+                .runtime
+                .pending_fresh_execution_launches
+                .contains_key(&fixture.window_id),
+            "scan must defer durable repair and ACK until its blocking task completes"
+        );
+        assert_eq!(
+            gwt::load_issue_monitor_prefs(&prefs_path)
+                .unwrap()
+                .launching_issues
+                .len(),
+            1
+        );
+        drain_queued_blocking_tasks(&queued_tasks);
+        let completions = std::mem::take(&mut *recorded_events.lock().unwrap());
+        let mut repaired = false;
+        for event in completions {
+            if let UserEvent::IssueMonitorFreshLaunchRepaired {
+                window_id,
+                operation_id,
+                binding,
+            } = event
+            {
+                repaired = true;
+                // A completion for a replaced operation cannot acknowledge this window.
+                assert!(fixture
+                    .runtime
+                    .handle_issue_monitor_fresh_launch_repaired(
+                        &window_id,
+                        "stale-operation",
+                        &binding,
+                    )
+                    .is_empty());
+                assert!(fixture
+                    .runtime
+                    .pending_fresh_execution_launches
+                    .contains_key(&window_id));
+                fixture.runtime.handle_issue_monitor_fresh_launch_repaired(
+                    &window_id,
+                    &operation_id,
+                    &binding,
+                );
+            }
+        }
+        assert_eq!(repaired, activated);
+        let prefs = gwt::load_issue_monitor_prefs(&prefs_path).unwrap();
+        assert!(
+            fixture
+                .runtime
+                .active_agent_sessions
+                .contains_key(&fixture.window_id),
+            "scan must preserve the live candidate"
+        );
+        assert_eq!(
+            fixture
+                .runtime
+                .pending_fresh_execution_launches
+                .contains_key(&fixture.window_id),
+            !activated
+        );
+        if activated {
+            assert!(prefs.launching_issues.is_empty());
+            assert_eq!(
+                prefs.launched_issues,
+                vec![gwt::IssueMonitorLaunchedIssue {
+                    issue_number: fixture.owner.number,
+                    window_id: fixture.window_id
+                }]
+            );
+            assert_eq!(
+                gwt::cli::execution_state::current_execution_binding(&fixture.repo, fixture.owner)
+                    .unwrap(),
+                Some(fixture.binding.identity)
+            );
+        } else {
+            assert_eq!(prefs.launching_issues.len(), 1);
+            assert!(prefs.launched_issues.is_empty());
+            assert_eq!(
+                gwt::cli::execution_state::current_execution_binding(&fixture.repo, fixture.owner)
+                    .unwrap(),
+                Some(fixture.predecessor_binding)
+            );
+            assert!(durable_launch_recovery_exists(
+                &fixture.runtime.sessions_dir,
+                &fixture.candidate_session_id
+            ));
+        }
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn fresh_monitor_powershell_session_start_activates_prepared_successor_and_acknowledges() {
+    let _env_guard = env_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().unwrap();
+    let _home = ScopedGwtHome::set(temp.path());
+    let _home_env = gwt_core::test_support::ScopedEnvVar::set("HOME", temp.path());
+    let _profile = gwt_core::test_support::ScopedEnvVar::set("USERPROFILE", temp.path());
+    let mut fixture = pending_fresh_execution_fixture(temp.path(), "monitor-powershell-ready");
+    run_git(
+        &fixture.repo,
+        &["symbolic-ref", "HEAD", "refs/heads/work/issue-2359"],
+    );
+    let prefs_path = gwt::issue_monitor_prefs_path_for_repo_path(&fixture.repo);
+    gwt::save_issue_monitor_prefs(
+        &prefs_path,
+        &gwt::IssueMonitorPrefs {
+            launching_issues: vec![gwt::IssueMonitorLaunchingIssue {
+                issue_number: fixture.owner.number,
+                claimed_at: None,
+            }],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let pending = fixture
+        .runtime
+        .pending_fresh_execution_launches
+        .get_mut(&fixture.window_id)
+        .unwrap();
+    pending.launch_feedback_context = Some(LaunchFeedbackContext {
+        client_id: "__issue_monitor__".to_string(),
+        title: "Issue Monitor".to_string(),
+        issue_monitor_issue_number: Some(fixture.owner.number),
+        issue_monitor_delivery_id: None,
+        issue_monitor_project_root: Some(fixture.repo.clone()),
+        issue_monitor_session_mode: None,
+        issue_monitor_autonomous_handoff: None,
+        issue_monitor_autonomous_submit_started: false,
+        issue_monitor_review_dispatch: false,
+    });
+    let nonce = pending.readiness_nonce.clone();
+    let tokio = TokioRuntime::new().unwrap();
+    let (proxy, events) = AppEventProxy::stub();
+    let mut server = crate::embedded_server::EmbeddedServer::start(
+        &tokio,
+        proxy,
+        crate::embedded_server::ClientHub::default(),
+        Arc::clone(&fixture.runtime.pty_writers),
+        AttachmentUploadStore::in_system_temp(),
+    )
+    .unwrap();
+    let issuer = server.agent_capability_issuer();
+    let target = issuer
+        .issue_prepared(
+            &fixture.repo,
+            &fixture.candidate_session_id,
+            fixture.binding.clone(),
+        )
+        .unwrap();
+    fixture.runtime.agent_capability_issuer = Some(issuer.clone());
+    fixture
+        .runtime
+        .agent_capability_tokens
+        .insert(fixture.window_id.clone(), target.token.clone());
+    let binary = std::env::current_exe()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("gwtd.exe");
+    assert!(
+        binary.is_file(),
+        "build the checkout gwtd binary before this integration test"
+    );
+    let spaced_bin = temp.path().join("hook bin");
+    fs::create_dir_all(&spaced_bin).unwrap();
+    let hook_bin = spaced_bin.join("gwtd.exe");
+    fs::copy(binary, &hook_bin).unwrap();
+    gwt_skills::generate_codex_hooks_for_mode(
+        &fixture.repo,
+        gwt_skills::CodexHookDiscoveryMode::WorktreeLocal,
+    )
+    .unwrap();
+    let hooks: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.repo.join(".codex/hooks.json")).unwrap()).unwrap();
+    let command = hooks["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap();
+    let mut child = gwt_core::process::hidden_command("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", command])
+        .current_dir(&fixture.repo)
+        .env(gwt_agent::GWT_BIN_PATH_ENV, &hook_bin)
+        .env(gwt_agent::GWT_SESSION_ID_ENV, &fixture.candidate_session_id)
+        .env(
+            gwt_agent::GWT_SESSION_RUNTIME_PATH_ENV,
+            gwt_agent::runtime_state_path(
+                &fixture.runtime.sessions_dir,
+                &fixture.candidate_session_id,
+            ),
+        )
+        .env(gwt_agent::GWT_CONTINUE_WORK_READY_NONCE_ENV, nonce)
+        .env(gwt_agent::GWT_HOOK_FORWARD_URL_ENV, &target.url)
+        .env(gwt_agent::GWT_HOOK_FORWARD_TOKEN_ENV, &target.token)
+        .env_remove("CODEX_THREAD_ID")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            serde_json::json!({
+                "session_id": "native-monitor-powershell", "cwd": fixture.repo,
+                "hook_event_name": "SessionStart", "source": "startup"
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let forwarded = std::mem::take(&mut *events.lock().unwrap());
+    for event in forwarded {
+        if let UserEvent::RuntimeHook(event) = event {
+            fixture.runtime.handle_runtime_hook_event(event);
+        }
+    }
+    server.shutdown();
+    assert_eq!(
+        gwt::cli::execution_state::current_execution_binding(&fixture.repo, fixture.owner).unwrap(),
+        Some(fixture.binding.identity.clone()),
+        "generated startup hook must activate the prepared successor; shell status={}, stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(issuer.active_token_is_current(&target.token, &fixture.binding));
+    let prefs = gwt::load_issue_monitor_prefs(&prefs_path).unwrap();
+    assert!(prefs.launching_issues.is_empty());
+    assert_eq!(
+        prefs.launched_issues,
+        vec![gwt::IssueMonitorLaunchedIssue {
+            issue_number: fixture.owner.number,
+            window_id: fixture.window_id,
+        }]
+    );
+}
+
+#[test]
 fn fresh_execution_continue_resends_ready_and_commits_work() {
     let _env_guard = env_test_lock()
         .lock()
@@ -30439,6 +30739,28 @@ fn managed_hook_health_for_worktree_uses_the_latest_matching_session_state() {
     assert_eq!(health.last_event.as_deref(), Some("UserPromptSubmit"));
 }
 
+fn managed_hook_inspection_text(rendered: &str) -> String {
+    let mut inspected = rendered.to_string();
+    if let Ok(root) = serde_json::from_str::<serde_json::Value>(rendered) {
+        for command in root["hooks"]
+            .as_object()
+            .into_iter()
+            .flat_map(|hooks| hooks.values())
+            .filter_map(|groups| groups.as_array())
+            .flatten()
+            .filter_map(|group| group["hooks"].as_array())
+            .flatten()
+            .filter_map(|hook| hook["command"].as_str())
+        {
+            if let Some(decoded) = gwt_skills::decode_powershell_encoded_command(command) {
+                inspected.push('\n');
+                inspected.push_str(&decoded);
+            }
+        }
+    }
+    inspected
+}
+
 #[test]
 fn startup_self_heals_managed_hooks_in_every_known_worktree() {
     let _env_lock = crate::env_test_lock()
@@ -30486,7 +30808,8 @@ fn startup_self_heals_managed_hooks_in_every_known_worktree() {
             ".gwt/openclaw/plugins/gwt-hook-bridge/plugin.ts",
             ".gwt/hermes/agent-hooks/gwt-hook.sh",
         ] {
-            let rendered = fs::read_to_string(worktree.join(relative)).unwrap();
+            let rendered =
+                managed_hook_inspection_text(&fs::read_to_string(worktree.join(relative)).unwrap());
             assert!(rendered.contains("GWT_BIN_PATH"), "{relative}: {rendered}");
             assert!(
                 !rendered.contains(&local.display().to_string()),
@@ -30552,7 +30875,7 @@ fn bootstrap_runs_managed_hook_self_heal_off_the_startup_path() {
     }
     let healed = fs::read_to_string(&config).unwrap();
     assert!(
-        healed.contains("GWT_BIN_PATH"),
+        managed_hook_inspection_text(&healed).contains("GWT_BIN_PATH"),
         "the deferred sweep must still heal the worktree: {healed}"
     );
     assert!(repo.join(".gwt/managed-hook-self-healed").exists());
@@ -30580,16 +30903,24 @@ fn startup_self_heal_converges_legacy_config_to_explicit_hook_binary_pin() {
     super::startup::self_heal_managed_hooks_in_worktrees([worktree.as_path()]);
 
     let rendered = fs::read_to_string(&config).unwrap();
-    assert!(rendered.contains("GWT_BIN_PATH"), "{rendered}");
+    assert!(
+        managed_hook_inspection_text(&rendered).contains("GWT_BIN_PATH"),
+        "{rendered}"
+    );
     let parsed: serde_json::Value = serde_json::from_str(&rendered).expect("parse healed hooks");
     let session_start_command = parsed
         .pointer("/hooks/SessionStart/0/hooks/0/command")
         .and_then(serde_json::Value::as_str)
         .expect("SessionStart command");
-    let normalized_command = session_start_command.replace('\\', "/");
+    let inspected_command = gwt_skills::decode_powershell_encoded_command(session_start_command)
+        .unwrap_or_else(|| session_start_command.to_string());
+    let normalized_command = inspected_command.replace('\\', "/");
     let normalized_pin = missing_pin.display().to_string().replace('\\', "/");
     assert!(normalized_command.contains(&normalized_pin), "{rendered}");
-    assert!(!rendered.contains("/repo/target/debug/gwtd"), "{rendered}");
+    assert!(
+        !managed_hook_inspection_text(&rendered).contains("/repo/target/debug/gwtd"),
+        "{rendered}"
+    );
     assert!(worktree.join(".gwt/managed-hook-self-healed").exists());
 }
 
@@ -51899,6 +52230,24 @@ fn monitor_relaunch_fixture(
     holder: MonitorNativeHolderFixture,
     durable_delivery: bool,
 ) -> MonitorRelaunchFixture {
+    monitor_relaunch_fixture_with_settlement(
+        root,
+        case_name,
+        conversation,
+        holder,
+        durable_delivery,
+        gwt::cli::execution_state::ExecutionSettlement::Completed,
+    )
+}
+
+fn monitor_relaunch_fixture_with_settlement(
+    root: &Path,
+    case_name: &str,
+    conversation: MonitorProviderConversationFixture,
+    holder: MonitorNativeHolderFixture,
+    durable_delivery: bool,
+    settlement: gwt::cli::execution_state::ExecutionSettlement,
+) -> MonitorRelaunchFixture {
     let case_root = root.join(case_name);
     fs::create_dir_all(&case_root).expect("create monitor relaunch case root");
     let repo = case_root.join("repo");
@@ -51923,7 +52272,8 @@ fn monitor_relaunch_fixture(
         .expect("materialize monitored issue worktree");
     assert!(status.success(), "git worktree add failed with {status}");
 
-    let sessions_dir = case_root.join("sessions");
+    // Resume authority and the launch handshake must read the same Session store.
+    let sessions_dir = gwt_core::paths::gwt_sessions_dir();
     fs::create_dir_all(&sessions_dir).expect("create sessions dir");
     let native_conversation_id = format!("native-monitor-{case_name}");
     let source_session_id = format!("session-monitor-{case_name}");
@@ -51959,15 +52309,8 @@ fn monitor_relaunch_fixture(
     )
     .expect("materialize monitored predecessor execution");
     assert!(matches!(
-        gwt::cli::execution_state::settle(
-            &worktree,
-            &source_session_id,
-            gwt::cli::execution_state::ExecutionSettlement::Blocked {
-                reason: "monitor predecessor failed".to_string(),
-                missing_verification: Some("successor verification pending".to_string()),
-            },
-        )
-        .expect("settle monitored predecessor"),
+        gwt::cli::execution_state::settle(&worktree, &source_session_id, settlement,)
+            .expect("settle monitored predecessor"),
         gwt::cli::execution_state::SettleResult::Settled(_)
     ));
     gwt::cli::execution_state::ensure_generation_ledger(
@@ -51998,12 +52341,6 @@ fn monitor_relaunch_fixture(
     source
         .save(&sessions_dir)
         .expect("save resume source Session");
-    let global_sessions_dir = gwt_core::paths::gwt_sessions_dir();
-    fs::create_dir_all(&global_sessions_dir).expect("create isolated global sessions dir");
-    source
-        .save(&global_sessions_dir)
-        .expect("save globally discoverable predecessor Session");
-
     let holder_window_id = (holder != MonitorNativeHolderFixture::None)
         .then(|| combined_window_id("tab-1", "agent-holder"));
     let holder_session_id = holder_window_id.as_ref().map(|_| {
@@ -52152,6 +52489,7 @@ fn monitor_relaunch_fixture(
     };
     let (mut runtime, recorded_events) =
         sample_runtime_with_events(&case_root, vec![tab], Some("tab-1"));
+    runtime.sessions_dir = sessions_dir.clone();
     let mut agent_options = sample_agent_options();
     agent_options.push(gwt::AgentOption {
         id: "claude".to_string(),
@@ -52410,6 +52748,19 @@ fn assert_monitor_exact_resume(result: AgentLaunchResult, fixture: &MonitorRelau
         gwt_agent::Session::load(&fixture.sessions_dir.join(format!("{session_id}.toml")))
             .expect("load prepared exact Resume Session");
     assert_eq!(resumed.session_mode, gwt_agent::SessionMode::Resume);
+    let binding = resumed
+        .execution_binding
+        .as_ref()
+        .expect("exact Monitor Resume must retain producing authority");
+    assert_eq!(binding.session_id, session_id);
+    assert_eq!(
+        gwt::cli::execution_state::current_execution_binding(
+            &fixture.worktree,
+            fixture.execution_owner,
+        )
+        .unwrap(),
+        Some(binding.identity.clone())
+    );
     assert_eq!(
         resumed.agent_session_id.as_deref(),
         Some(fixture.native_conversation_id.as_str()),
@@ -52452,6 +52803,76 @@ fn assert_monitor_exact_resume(result: AgentLaunchResult, fixture: &MonitorRelau
                 );
             }
         }
+    }
+}
+
+#[test]
+fn app_runtime_monitor_resume_from_terminal_owner_retains_execution_authority() {
+    let _env_lock = env_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().unwrap();
+    let _home = ScopedEnvVar::set("HOME", temp.path());
+    let _userprofile = ScopedEnvVar::set("USERPROFILE", temp.path());
+    let _codex_home = ScopedEnvVar::set("CODEX_HOME", temp.path().join(".codex"));
+    let _session_id = ScopedEnvVar::unset(gwt_agent::GWT_SESSION_ID_ENV);
+    let _session_runtime = ScopedEnvVar::unset(gwt_agent::GWT_SESSION_RUNTIME_PATH_ENV);
+    let _ready_nonce = ScopedEnvVar::unset(gwt_agent::GWT_CONTINUE_WORK_READY_NONCE_ENV);
+    let _forward_url = ScopedEnvVar::unset(gwt_agent::GWT_HOOK_FORWARD_URL_ENV);
+    let _forward_token = ScopedEnvVar::unset(gwt_agent::GWT_HOOK_FORWARD_TOKEN_ENV);
+    let _pane_url = ScopedEnvVar::unset(gwt_agent::GWT_PANE_WS_URL_ENV);
+    let mut fixture = monitor_relaunch_fixture_with_settlement(
+        temp.path(),
+        "resume-terminal-authority",
+        MonitorProviderConversationFixture::Present,
+        MonitorNativeHolderFixture::None,
+        false,
+        gwt::cli::execution_state::ExecutionSettlement::Blocked {
+            reason: "monitor predecessor failed".to_string(),
+            missing_verification: Some("successor verification pending".to_string()),
+        },
+    );
+    fixture.runtime.auto_launch_issue_monitor_delivery_events(
+        &fixture.runtime.test_context(),
+        3165,
+        LinkedIssueKind::Spec,
+        None,
+        gwt::IssueMonitorLaunchSessionStrategy::ResumeIfSafe,
+    );
+    let result =
+        take_monitor_launch_complete("resume-terminal-authority", &fixture.recorded_events);
+    let (.., session_mode, _, _) = result.as_ref().expect("monitor launch succeeds");
+    if *session_mode == gwt_agent::SessionMode::Resume {
+        let (_, session_id, ..) = result.as_ref().unwrap();
+        let resumed =
+            gwt_agent::Session::load(&fixture.sessions_dir.join(format!("{session_id}.toml")))
+                .unwrap();
+        let binding = resumed
+            .execution_binding
+            .as_ref()
+            .expect("Resume must retain execution authority (#4788)");
+        assert_eq!(binding.session_id, *session_id);
+        assert_eq!(binding.owner_number, fixture.execution_owner.number);
+        assert_eq!(
+            gwt::cli::execution_state::current_execution_binding(
+                &fixture.worktree,
+                fixture.execution_owner,
+            )
+            .unwrap(),
+            Some(binding.identity.clone())
+        );
+        assert_eq!(
+            gwt::cli::execution_state::load_generation_ledger(
+                &fixture.worktree,
+                fixture.execution_owner,
+            )
+            .unwrap()
+            .unwrap()
+            .current_effective_status(),
+            Some(gwt::cli::execution_state::ExecutionControlStatus::Active)
+        );
+    } else {
+        assert_monitor_fresh_successor(result, &fixture);
     }
 }
 

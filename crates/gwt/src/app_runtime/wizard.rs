@@ -3334,6 +3334,26 @@ impl AppRuntime {
             }
             return Ok((Some(Vec::new()), None));
         }
+        // A Blocked owner cannot regain producing authority through Resume:
+        // execution.continue requires execution.reopen first. Preserve native
+        // writer/answer handling above, then use the normal fresh-launch path.
+        if session.linked_issue_number == Some(issue_number)
+            && gwt::cli::execution_state::load(&session.worktree_path)
+                .map_err(|error| format!("failed to inspect Monitor resume authority: {error}"))?
+                .is_some_and(|record| {
+                    record.owner_number == issue_number
+                        && record.status
+                            == gwt::cli::execution_state::ExecutionControlStatus::Blocked
+                })
+        {
+            if autonomous_handoff.is_some() {
+                return Err(
+                    "answered autonomous handoff requires execution.reopen before Resume"
+                        .to_string(),
+                );
+            }
+            return Ok((None, None));
+        }
         let mut config = super::launch_config_from_persisted_session(&session);
         if !session.worktree_path.as_path().exists() {
             config.working_dir = None;

@@ -6492,6 +6492,74 @@ impl AppRuntime {
         events
     }
 
+    pub(super) fn reconcile_activated_issue_monitor_launches(&mut self) -> Vec<OutboundEvent> {
+        let pending: Vec<_> = self
+            .pending_fresh_execution_launches
+            .iter()
+            .filter(|(_, launch)| {
+                launch
+                    .launch_feedback_context
+                    .as_ref()
+                    .and_then(|context| context.issue_monitor_launch_binding_issue_number())
+                    .is_some()
+            })
+            .map(|(window_id, launch)| (window_id.clone(), launch.clone()))
+            .collect();
+        if pending.is_empty() {
+            return Vec::new();
+        }
+        let sessions_dir = self.sessions_dir.clone();
+        let proxy = self.proxy.clone();
+        if let Err(error) = self.blocking_tasks.try_spawn(move || {
+            for (window_id, launch) in pending {
+                // Read status and acquire repair leases off the UI thread.
+                // Prepared candidates still require authenticated readiness.
+                if pending_fresh_execution_attempt_status(&launch)
+                    != Some(gwt::cli::execution_state::ContinuationAttemptStatus::Activated)
+                    || !resolve_activated_fresh_execution_commit(
+                        &launch.project_root,
+                        &launch.worktree_path,
+                        launch.owner,
+                        &launch.operation_id,
+                        &launch.request,
+                        &sessions_dir,
+                        &launch.session_identity,
+                    )
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                proxy.send(crate::UserEvent::IssueMonitorFreshLaunchRepaired {
+                    window_id,
+                    operation_id: launch.operation_id,
+                    binding: launch.binding,
+                });
+            }
+        }) {
+            tracing::warn!(%error, "could not schedule Issue Monitor launch repair");
+        }
+        Vec::new()
+    }
+
+    pub(crate) fn handle_issue_monitor_fresh_launch_repaired(
+        &mut self,
+        window_id: &str,
+        operation_id: &str,
+        binding: &gwt_agent::SessionExecutionBinding,
+    ) -> Vec<OutboundEvent> {
+        let Some(pending) = self
+            .pending_fresh_execution_launches
+            .get(window_id)
+            .cloned()
+        else {
+            return Vec::new();
+        };
+        if pending.operation_id != operation_id || &pending.binding != binding {
+            return Vec::new();
+        }
+        self.finalize_repaired_fresh_execution_launch_events(window_id, &pending)
+    }
+
     fn reconcile_activated_fresh_execution_launch_events(
         &mut self,
         window_id: &str,
@@ -6511,6 +6579,14 @@ impl AppRuntime {
         {
             return Vec::new();
         }
+        self.finalize_repaired_fresh_execution_launch_events(window_id, pending)
+    }
+
+    fn finalize_repaired_fresh_execution_launch_events(
+        &mut self,
+        window_id: &str,
+        pending: &PendingFreshExecutionLaunch,
+    ) -> Vec<OutboundEvent> {
         let exact_current = gwt::cli::execution_state::current_execution_binding(
             &pending.worktree_path,
             pending.owner,
