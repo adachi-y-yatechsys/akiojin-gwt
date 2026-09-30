@@ -4301,6 +4301,7 @@ fn sample_runtime_with_events(
         startup_worktree_inventories: HashMap::new(),
         pending_launch_feedback_contexts: HashMap::new(),
         issue_monitor_launch_deliveries: HashMap::new(),
+        issue_monitor_launch_preparations: HashSet::new(),
         issue_monitor_materializer_id: "app-runtime-test-materializer".to_string(),
         // Issue #3878: own the fallback commit budget instead of inheriting
         // the GUI-thread one; tests that assert that budget set it explicitly.
@@ -38913,6 +38914,57 @@ fn startup_restore_defers_1500_old_sessions_without_git_spawns() {
 }
 
 #[test]
+fn startup_restore_update_marker_1500_sessions_bounds_git_spawns() {
+    let temp = tempdir().expect("tempdir");
+    let _gwt_home = ScopedGwtHome::set(temp.path());
+    let repo = temp.path().join("repo");
+    init_git_clone_with_origin(&repo);
+    let worktrees: Vec<_> = (0..6)
+        .map(|index| {
+            let path = temp.path().join(format!("linked-{index}"));
+            run_git(
+                &repo,
+                &["worktree", "add", "--detach", path.to_str().unwrap()],
+            );
+            path
+        })
+        .collect();
+    let tab = sample_project_tab("tab-repo", "Repo", repo, ProjectKind::Git, &[]);
+    let mut runtime = sample_runtime(temp.path(), vec![tab], Some("tab-repo"));
+    let (spawner, _tasks) = BlockingTaskSpawner::queued();
+    runtime.blocking_tasks = spawner;
+    runtime.update_resume_tab_ids.insert("tab-repo".to_string());
+    fs::create_dir_all(&runtime.sessions_dir).unwrap();
+    for index in 0..1500 {
+        let mut session = gwt_agent::Session::new(
+            &worktrees[index % worktrees.len()],
+            "history",
+            gwt_agent::AgentId::Codex,
+        );
+        session.id = format!("update-history-{index}");
+        session.last_activity_at = chrono::Utc::now() - chrono::Duration::days(3);
+        fs::write(
+            runtime.sessions_dir.join(format!("{}.toml", session.id)),
+            toml::to_string(&session).unwrap(),
+        )
+        .unwrap();
+    }
+    let before = gwt_core::process::thread_git_spawn_count();
+    let started = Instant::now();
+    runtime.queue_startup_auto_resume_sessions(&HashSet::new());
+    let spawns = gwt_core::process::thread_git_spawn_count() - before;
+    eprintln!(
+        "update restore: sessions=1500 git_spawns={spawns} elapsed={:?}",
+        started.elapsed()
+    );
+    assert!(
+        spawns <= 5,
+        "update restore spawned {spawns} Git processes; budget is 5"
+    );
+    assert!(runtime.pending_startup_auto_resume_sessions.is_empty());
+}
+
+#[test]
 fn app_runtime_startup_auto_resume_includes_legacy_non_stopped_sessions() {
     let _env_lock = env_test_lock()
         .lock()
@@ -51316,14 +51368,19 @@ fn app_runtime_issue_monitor_auto_launch_uses_start_with_last_settings() {
     previous.save(&sessions_dir).expect("save previous session");
 
     let tab = sample_project_tab("tab-1", "Repo", repo.clone(), ProjectKind::Git, &[]);
-    let (mut runtime, _recorded_events) =
+    let (mut runtime, recorded_events) =
         sample_runtime_with_events(temp.path(), vec![tab], Some("tab-1"));
 
-    let events = runtime.auto_launch_issue_monitor_request_events_for_project(
+    let (spawner, queued) = BlockingTaskSpawner::queued();
+    runtime.blocking_tasks = spawner;
+    runtime.auto_launch_issue_monitor_delivery_events_for_project(
         &repo,
         3165,
         LinkedIssueKind::Spec,
+        None,
+        gwt::IssueMonitorLaunchSessionStrategy::ResumeIfSafe,
     );
+    let events = commit_issue4803_monitor_preparation(&mut runtime, &queued, &recorded_events);
 
     assert!(events.iter().any(|event| {
         matches!(
@@ -52208,6 +52265,31 @@ struct MonitorRelaunchFixture {
     delivery_id: Option<String>,
 }
 
+fn prepare_monitor_relaunch(
+    fixture: &mut MonitorRelaunchFixture,
+    strategy: gwt::IssueMonitorLaunchSessionStrategy,
+) -> Vec<OutboundEvent> {
+    let previous_spawner = fixture.runtime.blocking_tasks.clone();
+    let (spawner, queued) = BlockingTaskSpawner::queued();
+    fixture.runtime.blocking_tasks = spawner;
+    fixture
+        .runtime
+        .auto_launch_issue_monitor_delivery_events_for_project(
+            &fixture.project_root,
+            3165,
+            LinkedIssueKind::Spec,
+            None,
+            strategy,
+        );
+    drain_queued_blocking_tasks(&queued);
+    fixture.runtime.blocking_tasks = previous_spawner;
+    fixture
+        .runtime
+        .handle_issue_monitor_launch_prepared(take_issue4803_monitor_preparation(
+            &fixture.recorded_events,
+        ))
+}
+
 fn codex_issue_monitor_launch_profile() -> gwt::IssueMonitorLaunchProfile {
     gwt::IssueMonitorLaunchProfile {
         agent_id: "codex".to_string(),
@@ -52851,11 +52933,8 @@ fn app_runtime_monitor_resume_from_terminal_owner_retains_execution_authority() 
             missing_verification: Some("successor verification pending".to_string()),
         },
     );
-    fixture.runtime.auto_launch_issue_monitor_delivery_events(
-        &fixture.runtime.test_context(),
-        3165,
-        LinkedIssueKind::Spec,
-        None,
+    prepare_monitor_relaunch(
+        &mut fixture,
         gwt::IssueMonitorLaunchSessionStrategy::ResumeIfSafe,
     );
     let result =
@@ -53091,12 +53170,31 @@ fn app_runtime_monitor_resume_if_safe_resumes_only_present_provider_conversation
             MonitorNativeHolderFixture::None,
             false,
         );
-        fixture.runtime.auto_launch_issue_monitor_delivery_events(
-            &fixture.runtime.test_context(),
-            3165,
-            LinkedIssueKind::Spec,
-            None,
-            gwt::IssueMonitorLaunchSessionStrategy::ResumeIfSafe,
+        let previous_spawner = fixture.runtime.blocking_tasks.clone();
+        let (spawner, queued) = BlockingTaskSpawner::queued();
+        fixture.runtime.blocking_tasks = spawner;
+        let project_root = fixture.runtime.test_context().project_root;
+        fixture
+            .runtime
+            .auto_launch_issue_monitor_delivery_events_for_project(
+                &project_root,
+                3165,
+                LinkedIssueKind::Spec,
+                None,
+                gwt::IssueMonitorLaunchSessionStrategy::ResumeIfSafe,
+            );
+        drain_queued_blocking_tasks(&queued);
+        fixture.runtime.blocking_tasks = previous_spawner;
+        let prepared = take_issue4803_monitor_preparation(&fixture.recorded_events);
+        let started = Instant::now();
+        fixture
+            .runtime
+            .handle_issue_monitor_launch_prepared(prepared);
+        eprintln!("monitor completion {case_name}: {:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "{case_name} completion blocked the GUI: {:?}",
+            started.elapsed()
         );
         let result = take_monitor_launch_complete(case_name, &fixture.recorded_events);
         if exact_resume_expected {
@@ -54455,7 +54553,7 @@ fn app_runtime_monitor_launch_preflight_refuses_unauthenticated_provider() {
         "unauthenticated-provider",
         MonitorProviderConversationFixture::Present,
         MonitorNativeHolderFixture::None,
-        false,
+        true,
     );
     // The fixture writes rollouts but no auth.json: this CODEX_HOME is a
     // definitively unauthenticated Codex CLI for the real probe.
@@ -54464,12 +54562,37 @@ fn app_runtime_monitor_launch_preflight_refuses_unauthenticated_provider() {
     fixture.runtime.issue_monitor_provider_auth_probe =
         gwt::issue_monitor::provider_auth_state_from_env;
 
-    let events = fixture.runtime.auto_launch_issue_monitor_delivery_events(
-        &fixture.runtime.test_context(),
-        3165,
-        LinkedIssueKind::Spec,
-        None,
-        gwt::IssueMonitorLaunchSessionStrategy::ResumeIfSafe,
+    let (spawner, queued) = BlockingTaskSpawner::queued();
+    fixture.runtime.blocking_tasks = spawner;
+    fixture
+        .runtime
+        .auto_launch_issue_monitor_delivery_events_for_project(
+            &fixture.project_root,
+            3165,
+            LinkedIssueKind::Spec,
+            fixture.delivery_id.clone(),
+            gwt::IssueMonitorLaunchSessionStrategy::ResumeIfSafe,
+        );
+    // This fixture has no daemon: claim/failure publication exercises the
+    // existing offline fallback, including its Git-backed cache validation.
+    // Keep this an authorization regression; request latency is tested separately.
+    drain_queued_blocking_tasks(&queued);
+    let events =
+        fixture
+            .runtime
+            .handle_issue_monitor_launch_prepared(take_issue4803_monitor_preparation(
+                &fixture.recorded_events,
+            ));
+    let prefs = gwt::load_issue_monitor_prefs(&gwt::issue_monitor_prefs_path_for_repo_path(
+        &fixture.project_root,
+    ))
+    .expect("read rejected delivery");
+    assert!(
+        prefs
+            .failed_issues
+            .iter()
+            .any(|failed| failed.issue_number == 3165),
+        "prepared rejection must claim the exact delivery before recording its failure"
     );
     let message = events
         .iter()
@@ -55463,13 +55586,20 @@ fn app_runtime_issue_monitor_auto_tiers_do_not_force_a_held_head() {
     gwt::save_issue_monitor_prefs(&gwt::issue_monitor_prefs_path_for_repo_path(&repo), &prefs)
         .expect("save prefs");
     let tab = sample_project_tab("tab-1", "Repo", repo.clone(), ProjectKind::Git, &[]);
-    let (mut runtime, _recorded_events) =
+    let (mut runtime, recorded_events) =
         sample_runtime_with_events(temp.path(), vec![tab], Some("tab-1"));
-    runtime.auto_launch_issue_monitor_request_events_for_project(
+    let (spawner, queued) = BlockingTaskSpawner::queued();
+    runtime.blocking_tasks = spawner;
+    runtime.auto_launch_issue_monitor_delivery_events_for_project(
         &repo,
         4774,
         LinkedIssueKind::Issue,
+        None,
+        gwt::IssueMonitorLaunchSessionStrategy::FreshRequired,
     );
+    drain_queued_blocking_tasks(&queued);
+    runtime
+        .handle_issue_monitor_launch_prepared(take_issue4803_monitor_preparation(&recorded_events));
     assert!(
         runtime.tabs[0]
             .workspace
@@ -55604,11 +55734,8 @@ fn app_runtime_issue_monitor_auto_tier_change_starts_fresh() {
     let prefs = serde_json::from_value(value).expect("tier prefs");
     gwt::save_issue_monitor_prefs(&prefs_path, &prefs).expect("save tier prefs");
 
-    let _events = fixture.runtime.auto_launch_issue_monitor_delivery_events(
-        &fixture.runtime.test_context(),
-        3165,
-        LinkedIssueKind::Spec,
-        None,
+    prepare_monitor_relaunch(
+        &mut fixture,
         gwt::IssueMonitorLaunchSessionStrategy::ResumeIfSafe,
     );
     let result = take_monitor_launch_complete("fresh tier launch", &fixture.recorded_events);
@@ -55650,11 +55777,8 @@ fn app_runtime_issue_monitor_auto_same_tier_override_starts_fresh() {
     prefs.launch_tiers = vec![vec![profile.clone()], vec![profile]];
     prefs.record_tier_launch(3165, 1);
     gwt::save_issue_monitor_prefs(&prefs_path, &prefs).expect("save updated tier");
-    fixture.runtime.auto_launch_issue_monitor_delivery_events(
-        &fixture.runtime.test_context(),
-        3165,
-        LinkedIssueKind::Spec,
-        None,
+    prepare_monitor_relaunch(
+        &mut fixture,
         gwt::IssueMonitorLaunchSessionStrategy::ResumeIfSafe,
     );
     let result = take_monitor_launch_complete("same tier override", &fixture.recorded_events);
@@ -55700,11 +55824,8 @@ fn app_runtime_issue_monitor_auto_answered_handoff_defers_tier_selection() {
     prefs.record_tier_launch(3165, 0);
     let history = prefs.issue_tiers.clone();
     gwt::save_issue_monitor_prefs(&prefs_path, &prefs).expect("save changed auto tiers");
-    let events = fixture.runtime.auto_launch_issue_monitor_delivery_events(
-        &fixture.runtime.test_context(),
-        3165,
-        LinkedIssueKind::Spec,
-        None,
+    let events = prepare_monitor_relaunch(
+        &mut fixture,
         gwt::IssueMonitorLaunchSessionStrategy::FreshRequired,
     );
     assert!(
@@ -79848,6 +79969,179 @@ fn active_work_issue_numbers_include_registry_sessions_beyond_the_display_cap() 
     );
     assert_eq!(rows[0].linked_issue_numbers, (1..=12).collect::<Vec<_>>());
 }
+
+#[test]
+fn issue4803_monitor_launch_request_does_not_wait_for_provider_preparation() {
+    let _env_lock = env_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().expect("tempdir");
+    let _home = ScopedEnvVar::set("HOME", temp.path());
+    let _userprofile = ScopedEnvVar::set("USERPROFILE", temp.path());
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    init_repo_with_initial_commit(&repo);
+    gwt::save_issue_monitor_prefs(
+        &gwt::issue_monitor_prefs_path_for_repo_path(&repo),
+        &gwt::IssueMonitorPrefs {
+            launch_profile: Some(sample_issue_monitor_launch_profile()),
+            ..Default::default()
+        },
+    )
+    .expect("save monitor profile");
+    let tab = sample_project_tab("tab-1", "Repo", repo.clone(), ProjectKind::Git, &[]);
+    let (mut runtime, recorded_events) =
+        sample_runtime_with_events(temp.path(), vec![tab], Some("tab-1"));
+    let (spawner, queued) = BlockingTaskSpawner::queued();
+    runtime.blocking_tasks = spawner;
+    runtime.issue_monitor_provider_auth_probe = |_| {
+        // A slow credential store must not hold the GUI request handler.
+        std::thread::sleep(Duration::from_secs(1));
+        gwt::issue_monitor::ProviderAuthState::Unauthenticated
+    };
+    for strategy in [
+        gwt::IssueMonitorLaunchSessionStrategy::FreshRequired,
+        gwt::IssueMonitorLaunchSessionStrategy::ResumeIfSafe,
+    ] {
+        let started = Instant::now();
+        runtime.auto_launch_issue_monitor_delivery_events_for_project(
+            &repo,
+            4803,
+            LinkedIssueKind::Issue,
+            None,
+            strategy,
+        );
+        runtime.auto_launch_issue_monitor_delivery_events_for_project(
+            &repo,
+            4803,
+            LinkedIssueKind::Issue,
+            None,
+            strategy,
+        );
+        eprintln!("monitor request {strategy:?}: {:?}", started.elapsed());
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "Monitor launch request blocked the GUI for {:?}",
+            started.elapsed()
+        );
+    }
+    assert_eq!(
+        queued.lock().expect("queued preparations").len(),
+        2,
+        "replayed delivery must not start another preparation"
+    );
+    drain_queued_blocking_tasks(&queued);
+    runtime
+        .project_tab_incarnations
+        .get_mut("tab-1")
+        .expect("project")
+        .generation += 1;
+    for _ in 0..2 {
+        let prepared = take_issue4803_monitor_preparation(&recorded_events);
+        assert!(
+            runtime
+                .handle_issue_monitor_launch_prepared(prepared)
+                .is_empty(),
+            "a reopened project's old preparation must not be applied"
+        );
+    }
+    assert!(runtime.issue_monitor_launch_preparations.is_empty());
+}
+
+fn take_issue4803_monitor_preparation(
+    events: &Arc<Mutex<Vec<UserEvent>>>,
+) -> super::IssueMonitorLaunchPrepared {
+    let mut events = events.lock().expect("recorded events");
+    let index = events
+        .iter()
+        .position(|event| matches!(event, UserEvent::IssueMonitorLaunchPrepared(_)))
+        .expect("monitor preparation completion");
+    match events.remove(index) {
+        UserEvent::IssueMonitorLaunchPrepared(prepared) => *prepared,
+        _ => unreachable!(),
+    }
+}
+
+fn commit_issue4803_monitor_preparation(
+    runtime: &mut AppRuntime,
+    queued: &BlockingTestTaskQueue,
+    events: &Arc<Mutex<Vec<UserEvent>>>,
+) -> Vec<OutboundEvent> {
+    drain_queued_blocking_tasks(queued);
+    let started = Instant::now();
+    let result =
+        runtime.handle_issue_monitor_launch_prepared(take_issue4803_monitor_preparation(events));
+    eprintln!("monitor fresh completion: {:?}", started.elapsed());
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "fresh completion blocked the GUI: {:?}",
+        started.elapsed()
+    );
+    result
+}
+
+#[test]
+fn issue4803_launch_cache_clone_preserves_independent_session_updates() {
+    let temp = tempdir().expect("tempdir");
+    let _gwt_home = ScopedGwtHome::set(temp.path());
+    let sessions_dir = temp.path().join("sessions");
+    fs::create_dir_all(&sessions_dir).expect("sessions dir");
+    let session = gwt_agent::Session::new(temp.path(), "develop", gwt_agent::AgentId::Codex);
+    session.save(&sessions_dir).expect("save session");
+    let mut original = LaunchWizardMemoryCache::load_with_agent_options(&sessions_dir, Vec::new());
+    let snapshot = original.clone();
+    original.forget_session(&session.id);
+    assert!(original.session_by_id(&session.id).is_none());
+    assert!(snapshot.session_by_id(&session.id).is_some());
+}
+
+#[test]
+fn issue4803_monitor_preparation_rechecks_deleted_resume_session() {
+    let _env_lock = env_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().expect("tempdir");
+    let _home = ScopedEnvVar::set("HOME", temp.path());
+    let _userprofile = ScopedEnvVar::set("USERPROFILE", temp.path());
+    let _codex_home = ScopedEnvVar::set("CODEX_HOME", temp.path().join(".codex"));
+    let mut fixture = monitor_relaunch_fixture(
+        temp.path(),
+        "deleted-during-preparation",
+        MonitorProviderConversationFixture::Present,
+        MonitorNativeHolderFixture::None,
+        false,
+    );
+    let (spawner, queued) = BlockingTaskSpawner::queued();
+    fixture.runtime.blocking_tasks = spawner;
+    fixture
+        .runtime
+        .auto_launch_issue_monitor_delivery_events_for_project(
+            &fixture.project_root,
+            3165,
+            LinkedIssueKind::Spec,
+            None,
+            gwt::IssueMonitorLaunchSessionStrategy::ResumeIfSafe,
+        );
+    drain_queued_blocking_tasks(&queued);
+    fs::remove_file(
+        fixture
+            .sessions_dir
+            .join(format!("{}.toml", fixture.source_session_id)),
+    )
+    .expect("delete selected session after preparation");
+    let prepared = take_issue4803_monitor_preparation(&fixture.recorded_events);
+    assert!(fixture
+        .runtime
+        .handle_issue_monitor_launch_prepared(prepared)
+        .is_empty());
+    assert_eq!(
+        queued.lock().expect("retry queue").len(),
+        1,
+        "stale resume must be prepared again"
+    );
+    assert!(fixture.runtime.pending_launch_feedback_contexts.is_empty());
+}
+
 #[test]
 fn runtime_factory_override_gui_rejects_partial_configuration() {
     let _lock = env_test_lock()

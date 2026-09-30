@@ -2263,8 +2263,8 @@ pub struct LaunchWizardMemoryCache {
     // Issue #4377: the ledger holds every Session ever launched, stopped ones
     // included (1,124 files on one host), so it is parsed on a background
     // thread and joined on first read instead of inside `AppRuntime::new`.
-    sessions: OnceLock<Vec<gwt_agent::Session>>,
-    pending_sessions: Mutex<Option<thread::JoinHandle<Vec<gwt_agent::Session>>>>,
+    sessions: Arc<OnceLock<Vec<gwt_agent::Session>>>,
+    pending_sessions: Arc<Mutex<Option<thread::JoinHandle<Vec<gwt_agent::Session>>>>>,
     agent_options: Arc<Mutex<AgentOptionsSlot>>,
     // SPEC-3170 FR-001: Claude capability detection may read settings and run
     // `claude --version` once per process. The wizard stores the booleans at
@@ -2277,8 +2277,8 @@ impl Clone for LaunchWizardMemoryCache {
     fn clone(&self) -> Self {
         Self {
             sessions_dir: self.sessions_dir.clone(),
-            sessions: OnceLock::from(self.sessions().clone()),
-            pending_sessions: Mutex::new(None),
+            sessions: self.sessions.clone(),
+            pending_sessions: self.pending_sessions.clone(),
             agent_options: self.agent_options.clone(),
             claude_ultracode_supported: self.claude_ultracode_supported,
             claude_workflows_enabled: self.claude_workflows_enabled,
@@ -2291,8 +2291,8 @@ impl LaunchWizardMemoryCache {
         let claude_capabilities = gwt_agent::claude_capability_snapshot();
         Self {
             sessions_dir: sessions_dir.to_path_buf(),
-            sessions: OnceLock::new(),
-            pending_sessions: Self::spawn_session_load(sessions_dir),
+            sessions: Arc::new(OnceLock::new()),
+            pending_sessions: Arc::new(Self::spawn_session_load(sessions_dir)),
             agent_options: Self::spawn_agent_options_detection(),
             claude_ultracode_supported: claude_capabilities.ultracode_supported,
             claude_workflows_enabled: claude_capabilities.workflows_enabled,
@@ -2316,8 +2316,8 @@ impl LaunchWizardMemoryCache {
     ) -> Self {
         Self {
             sessions_dir: sessions_dir.to_path_buf(),
-            sessions: OnceLock::new(),
-            pending_sessions: Self::spawn_session_load(sessions_dir),
+            sessions: Arc::new(OnceLock::new()),
+            pending_sessions: Arc::new(Self::spawn_session_load(sessions_dir)),
             agent_options: Arc::new(Mutex::new(AgentOptionsSlot::Ready(agent_options))),
             claude_ultracode_supported,
             claude_workflows_enabled,
@@ -2370,7 +2370,7 @@ impl LaunchWizardMemoryCache {
 
     fn sessions_mut(&mut self) -> &mut Vec<gwt_agent::Session> {
         self.sessions();
-        self.sessions
+        Arc::make_mut(&mut self.sessions)
             .get_mut()
             .expect("session ledger resolved above")
     }
@@ -2450,7 +2450,7 @@ impl LaunchWizardMemoryCache {
         self.sessions().clone()
     }
 
-    fn latest_resumable_branch_session(
+    pub(super) fn latest_resumable_branch_session(
         &self,
         repo_path: &Path,
         branch_name: &str,
@@ -2475,11 +2475,8 @@ impl LaunchWizardMemoryCache {
             .filter(|session| !durable_launch_recovery_exists(&self.sessions_dir, &session.id))
             .collect();
         // A still-running startup load is superseded; dropping it detaches.
-        *self
-            .pending_sessions
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        self.sessions = OnceLock::from(sessions);
+        self.pending_sessions = Arc::new(Mutex::new(None));
+        self.sessions = Arc::new(OnceLock::from(sessions));
     }
 
     pub(super) fn session_by_id(&self, session_id: &str) -> Option<&gwt_agent::Session> {
@@ -2499,7 +2496,7 @@ impl LaunchWizardMemoryCache {
         )
     }
 
-    fn record_session(&mut self, session: gwt_agent::Session) {
+    pub(super) fn record_session(&mut self, session: gwt_agent::Session) {
         if durable_launch_recovery_exists(&self.sessions_dir, &session.id) {
             self.forget_session(&session.id);
             return;
