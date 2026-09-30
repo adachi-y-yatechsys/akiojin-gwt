@@ -351,14 +351,24 @@ fn handle_at(
          Build a stalled-item inventory covering `needs_human`, decision waits, ownerless PRs, \
          red or escalation-due PRs, and quiet agents; advance at least one item with a concrete \
          action or user handoff. \
-         Sweep orphan agent windows every cycle: compare `active_session_count` against \
-         `gui_status.active_count` and the rows `pane.list` returns. A window the Monitor no \
-         longer tracks keeps burning a provider session and can crowd the launch path, and no \
-         other snapshot reports it — only that gap does. Close each orphan with `pane.close`, \
-         and when a row still claims a window that is gone, release the slot with \
+         Separate an orphan from an idle agent before touching either, because the remedies are \
+         opposite. An orphan is a window the Monitor no longer tracks: find it by comparing \
+         `active_session_count` against `gui_status.active_count` and the rows `pane.list` \
+         returns, since no other snapshot reports one — only that gap does. An orphan keeps \
+         burning a provider session and can crowd the launch path, so close it with `pane.close`; \
+         when a row still claims a window that is gone, release the slot with \
          `issue.monitor.stop` (it needs `reason`; `pane.close` alone leaves the row holding the \
          slot), then `issue.monitor.requeue` that Issue, because the stop counts as a failed \
          attempt against it. \
+         An idle agent the Monitor still tracks is a different case and is never closed on the \
+         count alone: it stopped for a reason it has already stated. Read that reason before \
+         acting — its latest Board posts, then one bounded `pane.read` if they do not say — and \
+         respond to what it says. It may be blocked on a ruling only you can give, waiting on a \
+         serialized resource, holding a provider limit, sitting at an approval prompt, or done \
+         and waiting for the next instruction. Closing it discards that state and the work has to \
+         start over. Give the directive through `board.post` with a mention or `pm.message.send`; \
+         close it only once you have read why it is idle and that reason makes the window \
+         unusable. \
          Treat that required advance or handoff as a reportable milestone or escalation under \
          the shared conditional-reporting clause below. \
          Re-report every unresolved wait in every cycle using the window title and required user \
@@ -827,14 +837,22 @@ mod tests {
             // An orphan window is reported by no snapshot except the gap
             // between the session count and the tracked launches, so the
             // sweep has to be named in the highest-frequency prompt or a
-            // fresh PM session never performs it.
-            "Sweep orphan agent windows every cycle",
-            "compare `active_session_count` against `gui_status.active_count`",
+            // fresh PM session never performs it. The idle clause is the
+            // other half: a tracked agent that went quiet stated a reason,
+            // and closing it on the count discards work that then restarts.
+            "Separate an orphan from an idle agent before touching either",
+            "comparing `active_session_count` against `gui_status.active_count`",
             "keeps burning a provider session",
-            "Close each orphan with `pane.close`",
+            "close it with `pane.close`",
             "release the slot with `issue.monitor.stop`",
             "`pane.close` alone leaves the row holding the slot",
             "the stop counts as a failed attempt against it",
+            "is never closed on the count alone",
+            "it stopped for a reason it has already stated",
+            "Read that reason before acting",
+            "one bounded `pane.read` if they do not say",
+            "Closing it discards that state and the work has to start over",
+            "close it only once you have read why it is idle",
         ] {
             assert!(
                 reason.contains(phrase),
