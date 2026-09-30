@@ -232,6 +232,10 @@ root_js_modules! {
     // cell map + camera frame. app.js imports this at module top level, so the
     // asset MUST be registered or the ES module load 404s and the splash hangs.
     "fleet-minimap.js" => "createFleetMinimap",
+    // Issue #4777 T-1 — the rail picks Issues / Agents / Board / Settings and
+    // presses the surface of the focused window. app.js imports it at module
+    // top level, so a missing entry would hang the splash.
+    "surface-rail.js" => "installSurfaceRail",
     // SPEC-3038 (2026-06-20) — Command Rail Windows popover model: groups the
     // cross-tab open-window set by owning project tab so the list matches the
     // badge and supports cross-tab focus.

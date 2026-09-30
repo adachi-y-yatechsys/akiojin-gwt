@@ -227,7 +227,7 @@ test("index.html declares Operator chrome scaffold", () => {
 test("SPEC-3038 Command Rail retires the legacy sidebar entirely", () => {
   // SPEC-3038 US-1: the 240px auto-hide overlay sidebar (`.op-sidebar`) and
   // its checkbox-style `.op-layer` rows are replaced by the always-visible
-  // 56px Command Rail. No legacy sidebar scaffolding may remain.
+  // Command Rail. No legacy sidebar scaffolding may remain.
   assert.equal(document.querySelector(".op-sidebar"), null, ".op-sidebar must be removed");
   assert.equal(
     document.querySelectorAll(".op-layer").length,
@@ -399,6 +399,7 @@ test("Command Rail groups items into Navigate / Windows / Agents / System (SPEC-
   // Align / Windows / Add), and system actions (Palette / Update) — in that
   // order. Groups carry aria-labels instead of visual headings. SPEC-2356
   // Anshin (FR-042) inserts an Agents group (STOP ALL) before System.
+  // Issue #4777 T-1 puts the Surfaces group right under the PM.
   const groups = Array.from(document.querySelectorAll(".op-rail > .op-rail__group")).map(
     (group) => group.getAttribute("aria-label"),
   );
@@ -406,8 +407,8 @@ test("Command Rail groups items into Navigate / Windows / Agents / System (SPEC-
   // bottom-right home, so the sidebar no longer carries an Update section.
   assert.deepEqual(
     groups,
-    ["Navigate", "Windows", "Agents", "System"],
-    "Rail order must be Navigate → Windows → Agents → System",
+    ["Navigate", "Surfaces", "Windows", "Agents", "System"],
+    "Rail order must be Navigate (PM) → Surfaces → Windows → Agents → System",
   );
 });
 
@@ -931,10 +932,15 @@ test("Workspace Overview is separate from live-only Active Work", () => {
     /function\s+openWorkspaceOverview\(\)\s*\{[\s\S]{0,300}?focusOrSpawnPreset\("issue"\)/,
     "expected Workspace Overview to open the Work window instead of a drawer",
   );
+  // Issue #4777 T-1: the entry is the Issues surface of the rail.
+  assert.equal(
+    document.querySelector("#op-workspace-overview-entry")?.dataset.surface,
+    "issues",
+  );
   assert.match(
     appSource,
-    /op-workspace-overview-entry[\s\S]+openWorkspaceOverview/,
-    "expected Sidebar Workspace Overview entry to open the overview",
+    /case "issues":\s*openWorkspaceOverview\(\);/,
+    "expected the Issues surface to open the overview",
   );
 });
 
@@ -1442,8 +1448,9 @@ test("Command Rail keeps real shortcuts on its keyshortcut items (SPEC-3038 AS-1
   );
   const shortcut = workspace.getAttribute("aria-keyshortcuts") ?? "";
   assert.match(shortcut, /Meta\+G/, "Workspace must declare its Meta+G shortcut");
-  const kbd = workspace.querySelector(".op-rail__flyout kbd.op-rail__kbd");
-  assert.ok(kbd, "Workspace must show a kbd hint inside its flyout");
+  // Issue #4777 T-1: surface entries show their label, so the shortcut
+  // rides in the hover title instead of a flyout kbd chip.
+  assert.match(workspace.getAttribute("title") ?? "", /⌘G/);
 });
 
 test("Command Rail Navigate group drops Board / Logs but keeps their access paths (SPEC-3038 2026-06-20 Update)", () => {
@@ -1488,7 +1495,11 @@ test("Command Rail retires the pseudo kbd badges (SPEC-3038 FR-012)", () => {
 });
 
 test("Command Rail items are icon buttons with accessible names and flyout labels (SPEC-3038 AS-1.2/AS-1.3)", () => {
-  const items = Array.from(document.querySelectorAll(".op-rail .op-rail__item"));
+  // Issue #4777 T-1: the PM and the surface entries are labelled buttons,
+  // not icon-only ones; surface-rail.test.mjs owns their contract.
+  const items = Array.from(
+    document.querySelectorAll(".op-rail .op-rail__item:not([data-surface])"),
+  );
   // Navigate 2 (Start Work + Workspace) + Windows 5 + System 1 = 8 after the
   // 2026-06-20 Update removed Board / Logs from the rail.
   assert.ok(items.length >= 8, `expected >=8 rail items, got ${items.length}`);
@@ -3950,13 +3961,15 @@ test("Rail item buttons reset UA chrome so Windows WebView2 stops drawing defaul
 // entry points say "Workspace" while launch-level rows keep "Work".
 test("SPEC-3885: surface entry points open Issues and Other", () => {
   const railLabel = document.querySelector(
-    "#op-workspace-overview-entry .op-rail__flyout-label",
+    "#op-workspace-overview-entry .op-rail__surface-label",
   );
   assert.ok(railLabel, "expected rail Workspace entry to exist");
+  // The visible label is the accessible name (Issue #4777 T-1).
   assert.equal(railLabel.textContent.trim(), "Issues");
-
-  const sidebarAria = document.querySelector("#op-workspace-overview-entry");
-  assert.equal(sidebarAria.getAttribute("aria-label"), "Issues");
+  assert.equal(
+    document.querySelector("#op-workspace-overview-entry").hasAttribute("aria-label"),
+    false,
+  );
 
   // SPEC-3671 FR-015 supersedes FR-392 for the ADD WINDOW card only: the card
   // opens the surface that lists Works (launches), and its window title already
@@ -5742,7 +5755,7 @@ test("SPEC #3206 v2: the System rail group carries the notification bell with an
   const groups = Array.from(document.querySelectorAll(".op-rail > .op-rail__group")).map(
     (group) => group.getAttribute("aria-label"),
   );
-  assert.deepEqual(groups, ["Navigate", "Windows", "Agents", "System"]);
+  assert.deepEqual(groups, ["Navigate", "Surfaces", "Windows", "Agents", "System"]);
 });
 
 test("SPEC #3206 v2: bell → op:command toggle-notifications → drawer toggle, Esc closes, badge is wired (FR-009 / FR-014)", () => {
