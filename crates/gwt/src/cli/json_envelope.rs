@@ -741,6 +741,39 @@ fn parse(input: &str) -> Result<ParsedEnvelope, CliParseError> {
                 update_drain,
             })
         }
+        "issue.monitor.tiers" => CliCommand::Issue(IssueCommand::MonitorTiers {
+            project_root: optional_path(params, "project_root")?,
+        }),
+        "issue.monitor.tiers.set" => {
+            let auto = optional_bool(params, "auto")?.ok_or(CliParseError::MissingFlag("auto"))?;
+            let tiers = lookup(params, "tiers")
+                .map(|value| {
+                    serde_json::from_value::<Vec<Vec<crate::IssueMonitorLaunchProfile>>>(
+                        value.clone(),
+                    )
+                })
+                .transpose()
+                .map_err(|error| {
+                    CliParseError::InvalidJson(format!(
+                        "tiers must be an array of profile arrays: {error}"
+                    ))
+                })?;
+            CliCommand::Issue(IssueCommand::MonitorTiersSet {
+                project_root: optional_path(params, "project_root")?,
+                auto,
+                tiers,
+            })
+        }
+        "issue.monitor.tier.set" => {
+            let tier = u8::try_from(required_u64(params, "tier")?).map_err(|_| {
+                CliParseError::InvalidJson("tier must fit in an unsigned byte".to_string())
+            })?;
+            CliCommand::Issue(IssueCommand::MonitorTierSet {
+                project_root: optional_path(params, "project_root")?,
+                number: required_u64(params, "number")?,
+                tier,
+            })
+        }
         "issue.monitor.profiles" => CliCommand::Issue(IssueCommand::MonitorProfiles {
             project_root: optional_path(params, "project_root")?,
         }),
@@ -3752,6 +3785,22 @@ mod tests {
     // SPEC #3914 FR-011 / AC-8: the pool operations accept the shorthand
     // `{"agent_id": ...}` profile; semantic validation (empty / duplicate /
     // unknown agent / tag format / threshold range) lives in the handler.
+    #[test]
+    fn issue_monitor_tiers_operations_are_accepted() {
+        ok("issue.monitor.tiers", json!({}));
+        ok("issue.monitor.tiers.set", json!({"auto": true}));
+        ok(
+            "issue.monitor.tiers.set",
+            json!({"auto": true, "tiers": [[{"agent_id":"codex"}]]}),
+        );
+        ok("issue.monitor.tier.set", json!({"number":4774, "tier":1}));
+        assert!(
+            !err("issue.monitor.tier.set", json!({"number":4774, "tier":256}))
+                .to_string()
+                .is_empty()
+        );
+    }
+
     #[test]
     fn issue_monitor_profiles_operations_parse_shorthand_profiles() {
         assert_eq!(
