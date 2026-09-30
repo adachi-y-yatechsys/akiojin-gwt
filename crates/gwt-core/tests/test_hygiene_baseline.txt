@@ -141,7 +141,6 @@ short-wall-clock|crates/gwt/src/cli/daemon/server.rs|wait_until_ready
 short-wall-clock|crates/gwt/src/cli/daemon/server.rs|wait_until_zombie
 short-wall-clock|crates/gwt/src/cli/daemon/server.rs|worker_off_during_blocked_arm_serializes_compensating_disarm
 short-wall-clock|crates/gwt/src/cli/daemon/server.rs|worker_stays_starting_until_the_local_fallback_lease_is_released
-short-wall-clock|crates/gwt/src/cli/daemon/transport.rs|wait_until_bound
 short-wall-clock|crates/gwt/src/cli/daemon/verification_spawn.rs|dropping_the_child_reclaims_grandchildren_too
 short-wall-clock|crates/gwt/src/cli/daemon/verification_spawn.rs|wait_until_gone
 short-wall-clock|crates/gwt/src/cli/execution_state.rs|leased_active_binding_times_out_session_contention_and_retries_without_stranding_owner
