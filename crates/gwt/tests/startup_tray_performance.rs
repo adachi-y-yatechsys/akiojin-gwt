@@ -531,6 +531,11 @@ fn startup_update_resume_under_large_session_load() {
                                 "--no-first-run",
                                 "--no-default-browser-check",
                                 "--disable-background-networking",
+                                // Keep the headed measurement rendering when another
+                                // window occludes it, as browser test runners do.
+                                "--disable-background-timer-throttling",
+                                "--disable-backgrounding-occluded-windows",
+                                "--disable-renderer-backgrounding",
                                 "--no-sandbox",
                                 "--remote-debugging-port=0",
                             ])
