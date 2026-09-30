@@ -8,7 +8,27 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde_json::{json, Map, Value};
+
+pub(crate) const POWERSHELL_ENCODED_COMMAND_PREFIX: &str = "powershell -NoProfile -EncodedCommand ";
+
+/// Decode only the exact wrapper generated for managed Windows hooks.
+/// Decoding is for inspection; it does not establish command trust.
+pub fn decode_powershell_encoded_command(command: &str) -> Option<String> {
+    let encoded = command.strip_prefix(POWERSHELL_ENCODED_COMMAND_PREFIX)?;
+    let bytes = STANDARD.decode(encoded).ok()?;
+    if bytes.is_empty() || bytes.len() % 2 != 0 || STANDARD.encode(&bytes) != encoded {
+        return None;
+    }
+    let units = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect::<Vec<_>>();
+    String::from_utf16(&units).ok()
+}
 
 const GWT_MANAGED_RUNTIME_MARKER: &str = "GWT_MANAGED_HOOK";
 const GWT_HOOK_CLI_PREFIX: &str = "gwtd hook ";
@@ -432,6 +452,8 @@ fn existing_user_hooks(existing: Option<&Value>) -> Map<String, Value> {
 }
 
 fn is_gwt_managed_command(command: &str) -> bool {
+    let decoded = decode_powershell_encoded_command(command);
+    let command = decoded.as_deref().unwrap_or(command);
     command.contains(LEGACY_GWT_HOOK_SCRIPT_SEGMENT)
         || command.contains(GWT_MANAGED_RUNTIME_MARKER)
         || command.contains(GWT_HOOK_CLI_PREFIX)
@@ -873,8 +895,18 @@ fn posix_coordination_hook_command(event: &str) -> String {
 /// `managed_hook_shell` (Issue #3966).
 fn powershell_codex_event_hook_command_with_bin(bin: &str, event: &str) -> String {
     let bin = powershell_quote(bin);
+    // Codex may itself use PowerShell to interpret this command. Encoding the
+    // inner script prevents that outer shell from expanding its variables.
+    let script = format!(
+        "& {{ $gwtBin = if ($env:GWT_BIN_PATH) {{ $env:GWT_BIN_PATH }} else {{ {bin} }}; try {{ & $gwtBin hook event {event}; exit $LASTEXITCODE }} catch {{ exit 0 }} }}"
+    );
+    let bytes = script
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
     format!(
-        "powershell -NoProfile -Command \"& {{ $gwtBin = if ($env:GWT_BIN_PATH) {{ $env:GWT_BIN_PATH }} else {{ {bin} }}; try {{ & $gwtBin hook event {event}; exit $LASTEXITCODE }} catch {{ exit 0 }} }}\""
+        "{POWERSHELL_ENCODED_COMMAND_PREFIX}{}",
+        STANDARD.encode(bytes)
     )
 }
 
@@ -1157,13 +1189,27 @@ mod tests {
         );
     }
 
-    fn commands_for_event<'a>(value: &'a Value, event: &str) -> Vec<&'a str> {
+    fn inspected_command(command: &str) -> String {
+        decode_powershell_encoded_command(command).unwrap_or_else(|| command.to_string())
+    }
+
+    fn inspected_config(content: &str) -> String {
+        let value: Value = serde_json::from_str(content).unwrap();
+        MANAGED_EVENT_ORDER
+            .iter()
+            .flat_map(|event| commands_for_event(&value, event))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn commands_for_event(value: &Value, event: &str) -> Vec<String> {
         value["hooks"][event]
             .as_array()
             .unwrap_or_else(|| panic!("hooks missing for event {event}"))
             .iter()
             .flat_map(|entry| entry["hooks"].as_array().into_iter().flatten())
             .filter_map(|hook| hook["command"].as_str())
+            .map(inspected_command)
             .collect()
     }
 
@@ -1248,6 +1294,7 @@ mod tests {
                 "SessionStart",
                 shell,
             );
+            let command = inspected_command(&command);
             assert!(
                 command.contains("GWT_BIN_PATH"),
                 "managed hooks must resolve the runtime override first: {command}"
@@ -1344,10 +1391,79 @@ mod tests {
             "SessionStart",
             HookShell::PowerShell,
         );
+        let command = inspected_command(&command);
 
         assert!(command.contains("try {"), "{command}");
         assert!(command.contains("catch { exit 0 }"), "{command}");
         assert!(command.contains("exit $LASTEXITCODE"), "{command}");
+    }
+
+    #[test]
+    fn encoded_hook_inspection_rejects_noncanonical_wrappers() {
+        let command = powershell_codex_event_hook_command_with_bin("gwtd", "SessionStart");
+        assert!(decode_powershell_encoded_command(&command)
+            .unwrap()
+            .contains("hook event SessionStart"));
+        for invalid in [
+            format!("{command} ; echo injected"),
+            format!("{command} "),
+            format!("{POWERSHELL_ENCODED_COMMAND_PREFIX}YQ=="),
+            format!("{POWERSHELL_ENCODED_COMMAND_PREFIX}ANg="),
+        ] {
+            assert!(decode_powershell_encoded_command(&invalid).is_none());
+        }
+    }
+
+    #[test]
+    fn encoded_managed_hook_regeneration_replaces_instead_of_duplicating() {
+        let command = powershell_codex_event_hook_command_with_bin("gwtd", "SessionStart");
+        let existing = json!({"SessionStart": [{"hooks": [
+            {"type": "command", "command": command},
+            {"type": "command", "command": "echo user-hook"}
+        ]}]});
+        let merged = merge_managed_and_user_hooks(
+            existing_user_hooks(Some(&existing)),
+            HookShell::PowerShell,
+            "gwtd",
+        );
+        let hooks = merged["SessionStart"].as_array().unwrap();
+        assert_eq!(hooks.len(), 2);
+        assert_eq!(hooks[0]["hooks"][0]["command"], command);
+        assert_eq!(hooks[1]["hooks"][0]["command"], "echo user-hook");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_hook_runs_through_outer_powershell_with_launch_identity() {
+        use std::process::Stdio;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mock = dir.path().join("mock gwtd.cmd");
+        let receipt = dir.path().join("hook receipt.txt");
+        fs::write(
+            &mock,
+            "@echo off\r\n(echo %*& echo %GWT_CONTINUE_WORK_READY_TOKEN%) > \"%GWT_TEST_HOOK_RECEIPT%\"\r\nexit /b 0\r\n",
+        )
+        .unwrap();
+        let command = powershell_codex_event_hook_command_with_bin(
+            r"C:\missing fallback\gwtd.exe",
+            "SessionStart",
+        );
+        let output = gwt_core::process::hidden_command("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &command])
+            .env("GWT_BIN_PATH", &mock)
+            .env("GWT_CONTINUE_WORK_READY_TOKEN", "test-launch-readiness")
+            .env("GWT_TEST_HOOK_RECEIPT", &receipt)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run the generated hook through Codex's outer PowerShell");
+        assert!(output.status.success(), "{output:?}");
+        let actual = fs::read_to_string(&receipt).unwrap_or_default();
+        assert_eq!(
+            actual.lines().map(str::trim).collect::<Vec<_>>(),
+            ["hook event SessionStart", "test-launch-readiness"],
+            "a successful shell exit must actually dispatch the authenticated hook: {output:?}"
+        );
     }
 
     #[test]
@@ -1704,7 +1820,7 @@ mod tests {
                 1,
                 "managed event {event} must collapse to one command, got: {commands:?}"
             );
-            let cmd = commands[0];
+            let cmd = &commands[0];
             assert!(
                 cmd.contains(&format!(" hook event {event}")),
                 "managed hook for {event} must dispatch to `hook event {event}`, got: {cmd}"
@@ -1777,6 +1893,7 @@ mod tests {
                     .into_iter()
                     .flatten()
                     .filter_map(|hook| hook["command"].as_str())
+                    .map(inspected_command)
                     .any(|command| command.contains(" hook event PreToolUse"))
             })
             .collect();
@@ -1839,7 +1956,7 @@ mod tests {
             "tracked legacy node bash blocker must be migrated away, got: {content}"
         );
         assert!(
-            content.contains("hook event PreToolUse"),
+            inspected_config(&content).contains("hook event PreToolUse"),
             "tracked file must be migrated to the consolidated event dispatcher form, got: {content}"
         );
     }
@@ -1893,7 +2010,7 @@ mod tests {
             "tracked block-bash-policy hook must be migrated away, got: {content}"
         );
         assert!(
-            content.contains("hook event PreToolUse"),
+            inspected_config(&content).contains("hook event PreToolUse"),
             "tracked file must dispatch to the event dispatcher after migration, got: {content}"
         );
     }
@@ -1947,7 +2064,7 @@ mod tests {
             "tracked legacy inline shell runtime hook must be migrated away, got: {content}"
         );
         assert!(
-            content.contains("hook event PreToolUse"),
+            inspected_config(&content).contains("hook event PreToolUse"),
             "tracked file must carry the event dispatcher CLI form, got: {content}"
         );
         assert!(
@@ -2005,16 +2122,17 @@ mod tests {
         let content = fs::read_to_string(&path).unwrap();
         let value: Value = serde_json::from_str(&content).unwrap();
         let pre_tool = value["hooks"]["PreToolUse"].as_array().unwrap();
-        let commands: Vec<&str> = pre_tool
+        let commands: Vec<String> = pre_tool
             .iter()
             .flat_map(|entry| entry["hooks"].as_array().unwrap().iter())
             .filter_map(|hook| hook["command"].as_str())
+            .map(inspected_command)
             .collect();
 
         assert!(commands
             .iter()
             .any(|command| command.contains(" hook event PreToolUse")));
-        assert!(commands.contains(&"my-custom-hook"));
+        assert!(commands.contains(&"my-custom-hook".to_string()));
         assert_eq!(
             value["hooks"]["CustomEvent"][0]["hooks"][0]["command"],
             Value::String("my-custom-event-hook".to_string())
@@ -2160,7 +2278,7 @@ mod tests {
         );
         let content = fs::read_to_string(root_hooks).unwrap();
         assert!(
-            content.contains("hook event SessionStart"),
+            inspected_config(&content).contains("hook event SessionStart"),
             "root checkout hooks must contain generated gwt hooks, got: {content}"
         );
     }
@@ -2251,18 +2369,19 @@ mod tests {
 
         let content = fs::read_to_string(&path).unwrap();
         let value: Value = serde_json::from_str(&content).unwrap();
-        let commands: Vec<&str> = value["hooks"]["SessionStart"]
+        let commands: Vec<String> = value["hooks"]["SessionStart"]
             .as_array()
             .unwrap()
             .iter()
             .flat_map(|entry| entry["hooks"].as_array().unwrap().iter())
             .filter_map(|hook| hook["command"].as_str())
+            .map(inspected_command)
             .collect();
 
         assert!(commands
             .iter()
             .any(|command| command.contains(" hook event SessionStart")));
-        assert!(commands.contains(&"my-custom-hook"));
+        assert!(commands.contains(&"my-custom-hook".to_string()));
     }
 
     #[test]
@@ -2311,22 +2430,24 @@ mod tests {
 
         let content = fs::read_to_string(&path).unwrap();
         let value: Value = serde_json::from_str(&content).unwrap();
-        let session_start_commands: Vec<&str> = value["hooks"]["SessionStart"]
+        let session_start_commands: Vec<String> = value["hooks"]["SessionStart"]
             .as_array()
             .unwrap()
             .iter()
             .flat_map(|entry| entry["hooks"].as_array().unwrap().iter())
             .filter_map(|hook| hook["command"].as_str())
+            .map(inspected_command)
             .collect();
-        let pre_tool_commands: Vec<&str> = value["hooks"]["PreToolUse"]
+        let pre_tool_commands: Vec<String> = value["hooks"]["PreToolUse"]
             .as_array()
             .unwrap()
             .iter()
             .flat_map(|entry| entry["hooks"].as_array().unwrap().iter())
             .filter_map(|hook| hook["command"].as_str())
+            .map(inspected_command)
             .collect();
 
-        assert!(session_start_commands.contains(&"tracked-command"));
+        assert!(session_start_commands.contains(&"tracked-command".to_string()));
         assert!(session_start_commands
             .iter()
             .any(|command| command.contains(" hook event SessionStart")));
@@ -2415,7 +2536,7 @@ mod tests {
         assert!(session_start_commands
             .iter()
             .all(|command| !command.contains("node")));
-        assert!(pre_tool_commands.contains(&"my-custom-hook"));
+        assert!(pre_tool_commands.contains(&"my-custom-hook".to_string()));
         assert!(pre_tool_commands
             .iter()
             .any(|command| command.contains(" hook event PreToolUse")));
@@ -2645,19 +2766,21 @@ mod tests {
 
         let content = fs::read_to_string(&path).unwrap();
         let value: Value = serde_json::from_str(&content).unwrap();
-        let session_start_commands: Vec<&str> = value["hooks"]["SessionStart"]
+        let session_start_commands: Vec<String> = value["hooks"]["SessionStart"]
             .as_array()
             .unwrap()
             .iter()
             .flat_map(|entry| entry["hooks"].as_array().unwrap().iter())
             .filter_map(|hook| hook["command"].as_str())
+            .map(inspected_command)
             .collect();
-        let stop_commands: Vec<&str> = value["hooks"]["Stop"]
+        let stop_commands: Vec<String> = value["hooks"]["Stop"]
             .as_array()
             .unwrap()
             .iter()
             .flat_map(|entry| entry["hooks"].as_array().unwrap().iter())
             .filter_map(|hook| hook["command"].as_str())
+            .map(inspected_command)
             .collect();
 
         assert!(session_start_commands
@@ -2666,7 +2789,7 @@ mod tests {
         assert!(stop_commands
             .iter()
             .any(|command| command.contains(" hook event Stop")));
-        assert!(stop_commands.contains(&"my-custom-hook"));
+        assert!(stop_commands.contains(&"my-custom-hook".to_string()));
     }
 
     #[test]
@@ -2790,8 +2913,8 @@ mod tests {
                 "migration must restore exactly one event dispatcher for {event}, got: {commands:?}"
             );
         }
-        assert!(commands_for_event(&value, "PreToolUse").contains(&"my-custom-hook"));
-        assert!(content.contains("gwtd"));
+        assert!(commands_for_event(&value, "PreToolUse").contains(&"my-custom-hook".to_string()));
+        assert!(inspected_config(&content).contains("gwtd"));
         assert!(!content.contains("\"gwt hook"));
     }
 
@@ -3050,7 +3173,7 @@ mod tests {
             "tracked PATH-less literal must be migrated away, got: {content}"
         );
         assert!(
-            content.contains("hook event PreToolUse"),
+            inspected_config(&content).contains("hook event PreToolUse"),
             "migrated file must dispatch through the event dispatcher, got: {content}"
         );
     }

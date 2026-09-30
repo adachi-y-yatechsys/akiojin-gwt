@@ -381,10 +381,6 @@ mod tests {
         )
     }
 
-    async fn wait_for_socket(path: &std::path::Path) {
-        crate::cli::daemon::transport::wait_until_bound(path).await;
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn subscriber_forwards_events_through_callback() {
         let temp = TempDir::new().expect("tempdir");
@@ -398,11 +394,9 @@ mod tests {
         let server_endpoint_path = endpoint_path.clone();
         let hub = BroadcastHub::new();
         let publisher = hub.clone();
-        let server_handle = tokio::spawn(async move {
-            server::run_server(server_endpoint, server_socket, server_endpoint_path, hub).await
-        });
-
-        wait_for_socket(&socket_path).await;
+        let server_handle =
+            server::spawn_server(server_endpoint, server_socket, server_endpoint_path, hub)
+                .expect("bind test server");
 
         let received: Arc<Mutex<Vec<(String, serde_json::Value)>>> =
             Arc::new(Mutex::new(Vec::new()));
@@ -461,11 +455,9 @@ mod tests {
         let server_socket = socket_path.clone();
         let server_endpoint_path = endpoint_path.clone();
         let hub = BroadcastHub::new();
-        let server_handle = tokio::spawn(async move {
-            server::run_server(server_endpoint, server_socket, server_endpoint_path, hub).await
-        });
-
-        wait_for_socket(&socket_path).await;
+        let server_handle =
+            server::spawn_server(server_endpoint, server_socket, server_endpoint_path, hub)
+                .expect("bind test server");
 
         let subscriber =
             DaemonSubscriber::spawn(endpoint, vec!["board".to_string()], |_channel, _payload| {});
@@ -488,10 +480,9 @@ mod tests {
         let server_socket = socket_path.clone();
         let hub = BroadcastHub::new();
         let observed_hub = hub.clone();
-        let server_handle = tokio::spawn(async move {
-            server::run_server(server_endpoint, server_socket, endpoint_path, hub).await
-        });
-        wait_for_socket(&socket_path).await;
+        let server_handle =
+            server::spawn_server(server_endpoint, server_socket, endpoint_path, hub)
+                .expect("bind test server");
 
         let resolver_endpoint = endpoint.clone();
         let subscriber = DaemonSubscriber::spawn_materializer_with_resolver(
@@ -656,12 +647,11 @@ mod tests {
         let server_endpoint_path = endpoint_path.clone();
         let hub = BroadcastHub::new();
         let publisher = hub.clone();
-        let server_handle = tokio::spawn(async move {
-            server::run_server(server_endpoint, server_socket, server_endpoint_path, hub).await
-        });
+        let server_handle =
+            server::spawn_server(server_endpoint, server_socket, server_endpoint_path, hub)
+                .expect("bind test server");
 
-        // Wait for the daemon socket and then publish.
-        wait_for_socket(&socket_path).await;
+        // The daemon socket is bound; publish until the subscriber reconnects.
         let event = DaemonFrame::Event {
             channel: "board".to_string(),
             payload: json!({"entries": 11}),
@@ -728,10 +718,9 @@ mod tests {
         let server_endpoint = live_endpoint.clone();
         let server_socket = socket_path.clone();
         let server_endpoint_path = endpoint_path.clone();
-        let server_handle = tokio::spawn(async move {
-            server::run_server(server_endpoint, server_socket, server_endpoint_path, hub).await
-        });
-        wait_for_socket(&socket_path).await;
+        let server_handle =
+            server::spawn_server(server_endpoint, server_socket, server_endpoint_path, hub)
+                .expect("bind test server");
 
         // Resolver state holds the currently-believed endpoint. We
         // mutate it during the test to simulate
@@ -781,7 +770,7 @@ mod tests {
         //
         // Up to 5 s slack covers slow CI runners; the steady-state
         // first-connect attempt typically lands within a few ms after
-        // `wait_for_socket` returns.
+        // `spawn_server` returns.
         let mut stale_sessions_observed = false;
         for _ in 0..500 {
             if resolver_calls.load(Ordering::SeqCst) >= 2 {
