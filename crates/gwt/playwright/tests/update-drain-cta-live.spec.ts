@@ -15,6 +15,42 @@ const BASE = process.env.GWT_PLAYWRIGHT_BASE_URL ?? "http://127.0.0.1:0/";
 test.describe("Update drain CTA", () => {
   test.skip(!process.env.GWT_PLAYWRIGHT_BASE_URL, "no GWT_PLAYWRIGHT_BASE_URL set");
 
+  test("automatic staging reaches drain and scheduled apply without a click or modal", async ({ page }) => {
+    const errors: string[] = [];
+    page.on("console", (message) => {
+      if (message.type() === "error") errors.push(message.text());
+    });
+    page.on("pageerror", (error) => errors.push(error.message));
+    await gotoLiveGwt(page, BASE, { enableTestBridge: true, suppressUpdateApplyStart: true });
+    const inject = (detail: Record<string, unknown>) =>
+      page.evaluate((payload) => {
+        window.dispatchEvent(new CustomEvent("__gwt_test_inject", { detail: payload }));
+      }, detail);
+
+    await inject({ kind: "update_state", state: "available", current: "9.105.0", latest: "9.106.0" });
+    await inject({ kind: "update_progress", version: "9.106.0", downloaded: 100, total: 100 });
+    await inject({ kind: "update_ready", version: "9.106.0", asset_path: "staged-test-payload" });
+    await expect(page.locator("#update-modal")).toHaveCount(0);
+    await inject({
+      kind: "issue_monitor_status",
+      status: {
+        enabled: true, state: "update_drain",
+        update_drain: {
+          version: "9.106.0", since: new Date().toISOString(), reason: "auto",
+          blocking: [{ kind: "active_pane", window_id: "agent-4801", label: "work/issue-4801", state: "running" }],
+        },
+      },
+    });
+    const cta = page.locator("#update-cta");
+    await expect(cta).toHaveAttribute("data-status", "draining");
+    await expect(cta).toContainText("Update v9.106.0 pending");
+    await expect(page.locator("#update-modal")).toHaveCount(0);
+    await inject({ kind: "update_auto_apply", version: "9.106.0", phase: "scheduled", grace_secs: 60 });
+    await expect(cta).toHaveText("Update v9.106.0 applies in 60 s — click to cancel");
+    await expect(page.locator("#update-modal")).toHaveCount(0);
+    expect(errors).toEqual([]);
+  });
+
   test("issue_monitor_status.update_drain renders the draining CTA and clears back to ready", async ({
     page,
   }) => {
@@ -132,8 +168,9 @@ test.describe("Update drain CTA", () => {
 
     await cta.click();
     await expect(cta).toHaveText("Cancelling automatic update…");
-    const sentKinds = await page.evaluate(() => (window as any).__gwtSentKinds as string[]);
-    expect(sentKinds).toContain("cancel_update_auto_apply");
+    // The Hub socket may still be opening; observe its queued send flushing.
+    await expect.poll(() => page.evaluate(() => (window as any).__gwtSentKinds as string[]))
+      .toContain("cancel_update_auto_apply");
 
     await inject({ kind: "update_auto_apply", version: "9.99.0", phase: "cancelled" });
     await expect(cta).toHaveAttribute("data-status", "ready");

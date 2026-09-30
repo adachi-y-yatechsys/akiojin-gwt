@@ -318,8 +318,89 @@ fn record_update_available(
     app: &mut AppRuntime,
     state: gwt_core::update::UpdateState,
 ) -> Vec<OutboundEvent> {
+    if app.update_download_in_flight.is_some() {
+        let known = app
+            .deferred_update_discovery
+            .as_ref()
+            .or(app.pending_update.as_ref());
+        if app.update_download_in_flight.as_deref()
+            == Some(app_runtime::UPDATE_AUTO_APPLY_CLIENT_ID)
+            && matches!(
+                (known, &state),
+                (Some(gwt_core::update::UpdateState::Available { latest: active, .. }),
+                 gwt_core::update::UpdateState::Available { latest, .. })
+                    if gwt_core::update::pending_version_is_newer(latest, active)
+            )
+        {
+            app.deferred_update_discovery = Some(state);
+        }
+        return Vec::new();
+    }
     app.pending_update = Some(state.clone());
+    app.start_automatic_update_download();
     vec![OutboundEvent::broadcast(BackendEvent::UpdateState(state))]
+}
+
+/// Every download producer enters here, including Release Notes selections.
+fn admit_update_download(
+    app: &mut AppRuntime,
+    state: &gwt_core::update::UpdateState,
+    client_id: &str,
+) -> (bool, Vec<OutboundEvent>) {
+    if app.update_download_in_flight.is_some() {
+        let same_version = matches!(
+            (app.pending_update.as_ref(), state),
+            (Some(gwt_core::update::UpdateState::Available { latest: active, .. }),
+             gwt_core::update::UpdateState::Available { latest: requested, .. })
+                if active == requested
+        );
+        let events = if same_version {
+            Vec::new()
+        } else {
+            vec![OutboundEvent::reply(client_id, BackendEvent::UpdateApplyError {
+                message: Some("Another update is downloading; wait for it to finish before selecting a different release.".into()),
+                stage: Some("Download asset".into()),
+                reason: None,
+                log_path: None,
+            })]
+        };
+        return (false, events);
+    }
+    app.update_download_in_flight = Some(client_id.to_string());
+    app.pending_update = Some(state.clone());
+    (
+        true,
+        vec![OutboundEvent::broadcast(BackendEvent::UpdateState(
+            state.clone(),
+        ))],
+    )
+}
+
+fn finish_update_download(
+    app: &mut AppRuntime,
+    failure: Option<OutboundEvent>,
+) -> Vec<OutboundEvent> {
+    app.update_download_in_flight = None;
+    let deferred = app.deferred_update_discovery.take();
+    let mut events: Vec<_> = failure.into_iter().collect();
+    // On success, keep the staged selection and its drain: starting another
+    // worker could race its graceful restart. The next launch polls afresh.
+    // On failure, replay the discovery that the poller's last_seen suppresses.
+    if !events.is_empty() {
+        if let Some(state) = deferred {
+            events.extend(record_update_available(app, state));
+        }
+    }
+    events
+}
+
+fn update_download_failure(stage: &str, reason: String, log_path: String) -> OutboundEvent {
+    OutboundEvent::broadcast(BackendEvent::UpdateApplyError {
+        message: Some(reason.clone()),
+        stage: Some(stage.to_string()),
+        reason: Some(reason),
+        log_path: Some(log_path),
+    })
 }
 
 fn board_projection_watch_key(project_root: &Path) -> PathBuf {
@@ -1967,6 +2048,8 @@ enum UserEvent {
         state: gwt_core::update::UpdateState,
         client_id: ClientId,
     },
+    /// Releases the shared download guard on success or failure.
+    UpdateDownloadFinished(Option<OutboundEvent>),
     /// SPEC-2041 Phase 19 (FR-058): user pressed Restart now. Resolve the
     /// prepared payload (persisted manifest, or download + persist) on a
     /// worker thread, then route through `ApplyUpdateGraceful`.
@@ -4062,6 +4145,8 @@ mod tests {
             knowledge_monitor_snapshot: Default::default(),
             issue_client_factory: crate::app_runtime::default_issue_client_factory(),
             pending_update: None,
+            update_download_in_flight: None,
+            deferred_update_discovery: None,
             pty_writers: Arc::new(RwLock::new(HashMap::new())),
             attachment_uploads: AttachmentUploadStore::new(temp_root.join("attachment-uploads")),
             persist_dispatcher,
@@ -4367,6 +4452,139 @@ mod tests {
             event.event,
             BackendEvent::UpdateState(gwt_core::update::UpdateState::UpToDate { .. })
         )));
+    }
+
+    #[test]
+    fn update_available_autonomous_download_requires_opt_in_and_starts_once() {
+        let temp = tempdir().expect("tempdir");
+        let _gwt_home = ScopedGwtHome::set(temp.path());
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let tab = sample_project_tab(
+            "tab-1",
+            "Repo",
+            repo.clone(),
+            ProjectKind::Git,
+            &[WindowPreset::Shell],
+        );
+        let (mut runtime, user_events) =
+            sample_runtime_with_events(temp.path(), vec![tab], Some("tab-1"));
+        let prefs_path = gwt::issue_monitor_prefs_path_for_repo_path(&repo);
+        let state = gwt_core::update::UpdateState::Available {
+            current: "9.105.0".into(),
+            latest: "9.106.0".into(),
+            release_url: "https://example.invalid/release".into(),
+            asset_url: Some("https://example.invalid/gwt-windows-x86_64.zip".into()),
+            checked_at: Utc::now(),
+        };
+        for (autonomous_mode, auto_apply_updates) in
+            [(false, Some(true)), (true, Some(false)), (true, None)]
+        {
+            gwt::save_issue_monitor_prefs(
+                &prefs_path,
+                &gwt::IssueMonitorPrefs {
+                    autonomous_mode,
+                    auto_apply_updates,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            super::record_update_available(&mut runtime, state.clone());
+            assert!(
+                runtime.update_download_in_flight.is_none(),
+                "queuing discovery must leave admission to the shared event-loop worker gate"
+            );
+            super::record_update_available(&mut runtime, state.clone());
+            let requests = std::mem::take(&mut *user_events.lock().unwrap());
+            let mut admitted = 0;
+            for event in requests {
+                if let UserEvent::ApplyUpdateStart { state, client_id } = event {
+                    admitted += usize::from(
+                        super::admit_update_download(&mut runtime, &state, &client_id).0,
+                    );
+                }
+            }
+            assert_eq!(
+                admitted,
+                usize::from(autonomous_mode && auto_apply_updates != Some(false)),
+                "automatic staging requires opt-in and must not duplicate a download"
+            );
+        }
+        let mut selected = state.clone();
+        if let gwt_core::update::UpdateState::Available { latest, .. } = &mut selected {
+            *latest = "9.104.0".into();
+        }
+        let (admitted, errors) = super::admit_update_download(&mut runtime, &selected, "manual");
+        assert!(!admitted);
+        assert!(matches!(errors[0].target, DispatchTarget::Client(_)));
+        assert_eq!(runtime.pending_update.as_ref(), Some(&state));
+        super::record_update_available(&mut runtime, selected.clone());
+        assert_eq!(runtime.pending_update.as_ref(), Some(&state));
+        assert!(super::finish_update_download(&mut runtime, None).is_empty());
+        assert!(runtime.update_download_in_flight.is_none());
+        assert!(super::admit_update_download(&mut runtime, &selected, "manual").0);
+        assert_eq!(runtime.pending_update.as_ref(), Some(&selected));
+        assert!(
+            user_events.lock().unwrap().is_empty(),
+            "manual selection must not enqueue an automatic download"
+        );
+
+        // A failed manual selection keeps its version for Retry.
+        assert!(super::record_update_available(&mut runtime, state.clone()).is_empty());
+        assert_eq!(runtime.pending_update.as_ref(), Some(&selected));
+        let failure =
+            super::update_download_failure("Download asset", "failed".into(), "log".into());
+        super::finish_update_download(&mut runtime, Some(failure));
+        assert_eq!(runtime.pending_update.as_ref(), Some(&selected));
+        assert!(user_events.lock().unwrap().is_empty());
+
+        // Automatic discovery must survive an automatic worker's failure:
+        // PollState suppresses later repeats of this new version.
+        let mut newer = state.clone();
+        if let gwt_core::update::UpdateState::Available { latest, .. } = &mut newer {
+            *latest = "9.107.0".into();
+        }
+        assert!(
+            super::admit_update_download(
+                &mut runtime,
+                &state,
+                crate::app_runtime::UPDATE_AUTO_APPLY_CLIENT_ID,
+            )
+            .0
+        );
+        assert!(super::record_update_available(&mut runtime, newer.clone()).is_empty());
+        let failure =
+            super::update_download_failure("Download asset", "failed".into(), "log".into());
+        let events = super::finish_update_download(&mut runtime, Some(failure));
+        assert_eq!(runtime.pending_update.as_ref(), Some(&newer));
+        assert!(events.iter().any(|event| matches!(
+            &event.event, BackendEvent::UpdateState(discovered) if discovered == &newer
+        )));
+        let requests = std::mem::take(&mut *user_events.lock().unwrap());
+        assert!(requests.iter().any(|event| matches!(
+            event, UserEvent::ApplyUpdateStart { state: discovered, .. } if discovered == &newer
+        )));
+    }
+
+    #[test]
+    fn update_download_failure_reaches_clients_joining_the_shared_worker() {
+        let temp = tempdir().expect("tempdir");
+        let _gwt_home = ScopedGwtHome::set(temp.path());
+        let mut runtime = sample_runtime(temp.path(), Vec::new(), None);
+        for stage in ["Download asset", "Persist pending"] {
+            runtime.update_download_in_flight = Some("manual".to_string());
+            let event = super::update_download_failure(
+                stage,
+                "fixture failure".to_string(),
+                "update.log".to_string(),
+            );
+            let events = super::finish_update_download(&mut runtime, Some(event));
+            assert!(runtime.update_download_in_flight.is_none());
+            assert!(
+                matches!(events[0].target, DispatchTarget::All),
+                "both the automatic request and manual clients need the shared worker's failure"
+            );
+        }
     }
 
     #[test]
@@ -10809,6 +11027,11 @@ fn main() -> std::io::Result<()> {
                 );
             }
             Event::UserEvent(UserEvent::ApplyUpdateStart { state, client_id }) => {
+                let (admitted, events) = admit_update_download(app, &state, &client_id);
+                clients.dispatch(events);
+                if !admitted {
+                    return;
+                }
                 let apply_proxy = proxy.clone();
                 let version_for_progress = match &state {
                     gwt_core::update::UpdateState::Available { latest, .. } => Some(latest.clone()),
@@ -10891,17 +11114,13 @@ fn main() -> std::io::Result<()> {
                                     "fail",
                                     &[("stage", "persist_pending"), ("reason", &message)],
                                 );
-                                let _ = apply_proxy.send_event(UserEvent::Dispatch(vec![
-                                    OutboundEvent::reply(
-                                        client_id,
-                                        BackendEvent::UpdateApplyError {
-                                            message: Some(message.clone()),
-                                            stage: Some("Persist pending".to_string()),
-                                            reason: Some(message),
-                                            log_path: Some(log_path_string.clone()),
-                                        },
+                                let _ = apply_proxy.send_event(UserEvent::UpdateDownloadFinished(Some(
+                                    update_download_failure(
+                                        "Persist pending",
+                                        message,
+                                        log_path_string.clone(),
                                     ),
-                                ]));
+                                )));
                                 return;
                             }
                             gwt_core::update::log_update_event(
@@ -10921,20 +11140,21 @@ fn main() -> std::io::Result<()> {
                                 "fail",
                                 &[("stage", "download_asset"), ("reason", &message)],
                             );
-                            let _ = apply_proxy.send_event(UserEvent::Dispatch(vec![
-                                OutboundEvent::reply(
-                                    client_id,
-                                    BackendEvent::UpdateApplyError {
-                                        message: Some(message.clone()),
-                                        stage: Some("Download asset".to_string()),
-                                        reason: Some(message),
-                                        log_path: Some(log_path_string),
-                                    },
+                            let _ = apply_proxy.send_event(UserEvent::UpdateDownloadFinished(Some(
+                                update_download_failure(
+                                    "Download asset",
+                                    message,
+                                    log_path_string,
                                 ),
-                            ]));
+                            )));
+                            return;
                         }
                     }
+                    let _ = apply_proxy.send_event(UserEvent::UpdateDownloadFinished(None));
                 });
+            }
+            Event::UserEvent(UserEvent::UpdateDownloadFinished(failure)) => {
+                clients.dispatch(finish_update_download(app, failure));
             }
             Event::UserEvent(UserEvent::UpdatePrepared {
                 version,

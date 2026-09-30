@@ -1535,6 +1535,10 @@ pub struct AppRuntime {
     pub(crate) issue_client_factory: RuntimeIssueClientFactory,
     /// Cached update state so late-connecting WebView clients get the toast.
     pub(crate) pending_update: Option<gwt_core::update::UpdateState>,
+    /// Initiator of the shared download, or None when its worker is idle.
+    pub(crate) update_download_in_flight: Option<ClientId>,
+    /// Newest discovery to retry if the active download fails.
+    pub(crate) deferred_update_discovery: Option<gwt_core::update::UpdateState>,
     /// Shared PTY writer registry published to the WebSocket fast-path.
     pub(crate) pty_writers: PtyWriterRegistry,
     /// Browser-uploaded attachment temp files waiting to be staged under the
@@ -3301,6 +3305,8 @@ impl AppRuntime {
             knowledge_monitor_snapshot: Default::default(),
             issue_client_factory: default_issue_client_factory(),
             pending_update: None,
+            update_download_in_flight: None,
+            deferred_update_discovery: None,
             pty_writers,
             attachment_uploads,
             persist_dispatcher,
@@ -7651,6 +7657,17 @@ impl AppRuntime {
                 )
             }
         };
+        let monitor = gwt::IssueMonitorState::with_prefs(gwt::IssueMonitorConfig::default(), prefs);
+        if let Ok(blockers) = serde_json::to_string(&self.update_drain_blockers(&monitor)) {
+            gwt_core::update::log_update_event(
+                "drain_started",
+                &[
+                    ("version", &version),
+                    ("project_root", &project_root.to_string_lossy()),
+                    ("blockers", &blockers),
+                ],
+            );
+        }
         // AC-12: drain start is a notification-center record.
         events.push(update_notice(
             "info",
@@ -7732,10 +7749,39 @@ impl AppRuntime {
                 grace_secs: gwt::update_drain::DEFAULT_AUTO_APPLY_GRACE_SECS,
             });
         let version = drain.version.clone();
+        // Record identities when the bounded warning fires or a scheduled
+        // apply is postponed, rather than writing the same blockers each tick.
+        if let gwt::update_drain::UpdateAutoApplyStep::StillDraining(blockers)
+        | gwt::update_drain::UpdateAutoApplyStep::Postponed(blockers) = &step
+        {
+            if let Ok(blockers) = serde_json::to_string(blockers) {
+                gwt_core::update::log_update_event(
+                    "drain_blocked",
+                    &[
+                        ("version", &version),
+                        ("project_root", &context.project_root.to_string_lossy()),
+                        ("blockers", &blockers),
+                    ],
+                );
+            }
+        }
         let blocker_list = |blockers: &[gwt::update_drain::UpdateBlocker]| {
             blockers
                 .iter()
-                .map(ToString::to_string)
+                .map(|blocker| match blocker {
+                    gwt::update_drain::UpdateBlocker::ActivePane { window_id, .. } => format!(
+                        "{blocker} [{window_id}] — let the agent finish; inspect its pane if stalled"
+                    ),
+                    gwt::update_drain::UpdateBlocker::PendingAcquireClaim { .. } => format!(
+                        "{blocker} — wait for the claim to settle; inspect Issue Monitor status if stalled"
+                    ),
+                    gwt::update_drain::UpdateBlocker::ActiveExecution { .. } => format!(
+                        "{blocker} — have the owning agent verify and settle its execution"
+                    ),
+                    gwt::update_drain::UpdateBlocker::HeldVerificationLease { .. } => format!(
+                        "{blocker} — wait for the owning verification to finish"
+                    ),
+                })
                 .collect::<Vec<_>>()
                 .join(", ")
         };
@@ -7745,7 +7791,7 @@ impl AppRuntime {
                 vec![update_notice(
                     "warn",
                     format!(
-                        "Update v{version} still pending after {} min — waiting for: {}. Agents are never stopped automatically.",
+                        "Update v{version} still pending after {} min; new launches are held — waiting for: {}. Agents are never stopped automatically.",
                         drained_for_secs / 60,
                         blocker_list(&blockers)
                     ),
@@ -7771,7 +7817,7 @@ impl AppRuntime {
                 update_notice(
                     "info",
                     format!(
-                        "Update v{version} automatic apply postponed — waiting for: {}.",
+                        "Update v{version} automatic apply postponed; new launches are held — waiting for: {}.",
                         blocker_list(&blockers)
                     ),
                 ),
