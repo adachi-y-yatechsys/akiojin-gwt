@@ -4569,6 +4569,7 @@ mod tests {
     #[test]
     fn update_download_failure_reaches_clients_joining_the_shared_worker() {
         let temp = tempdir().expect("tempdir");
+        let _gwt_home = ScopedGwtHome::set(temp.path());
         let mut runtime = sample_runtime(temp.path(), Vec::new(), None);
         for stage in ["Download asset", "Persist pending"] {
             runtime.update_download_in_flight = Some("manual".to_string());
