@@ -11865,6 +11865,8 @@ fn evidence_status_name(status: crate::cli::verification_record::EvidenceStatus)
         EvidenceStatus::Fresh => "fresh",
         EvidenceStatus::FreshWithQuarantine => "fresh_with_quarantine",
         EvidenceStatus::MissingRecord => "missing_record",
+        EvidenceStatus::Running => "running",
+        EvidenceStatus::Interrupted => "interrupted",
         EvidenceStatus::WrongSession => "wrong_session",
         EvidenceStatus::WrongOwner => "wrong_owner",
         EvidenceStatus::WrongGeneration => "wrong_generation",
@@ -30945,6 +30947,7 @@ exit 1
 
             for (status, reason_code) in [
                 (EvidenceStatus::MissingRecord, "verification_missing_record"),
+                (EvidenceStatus::Interrupted, "verification_interrupted"),
                 (EvidenceStatus::WrongSession, "verification_wrong_session"),
                 (EvidenceStatus::WrongOwner, "verification_wrong_owner"),
                 (
