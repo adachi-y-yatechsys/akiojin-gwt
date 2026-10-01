@@ -5854,15 +5854,19 @@ fn with_issue_monitor_prefs_lock_observed<T>(
     // future writers as soon as the atomic rename replaces that inode. A
     // compare/retry loop still has a check-to-rename TOCTOU, while making the
     // daemon the sole writer is beyond this compatibility migration's scope.
-    let lock = fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(path.with_extension("lock"))?;
-    gwt_core::operation_deadline::lock_exclusive_with_observer(&lock, on_first_contention)?;
+    // Issue #4686 AC-5: the daemon takes this lock to claim its lifetime
+    // authority lease at startup (`cli/daemon/server.rs`), and that path fails
+    // closed — a daemon that cannot claim the lease does not start, which is the
+    // `authority recovery is blocked` shape. Name the holder so the refusal says
+    // which process is holding it rather than only that a deadline expired. The
+    // caller's own contention observer is preserved.
+    let lock = gwt_core::operation_deadline::NamedFileLock::acquire_observed(
+        &path.with_extension("lock"),
+        "issue_monitor_prefs",
+        on_first_contention,
+    )?;
     let result = operation();
-    let unlock_result = FileExt::unlock(&lock);
+    let unlock_result = lock.unlock();
     match (result, unlock_result) {
         (Ok(value), Ok(())) => Ok(value),
         (Err(error), _) => Err(error),
