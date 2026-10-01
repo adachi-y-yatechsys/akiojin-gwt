@@ -11,6 +11,22 @@ fn forbid_real_gh_in_tests() {
 
 fn main() -> ExitCode {
     let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str)
+        == Some(gwt::cli::verification_record::interruption::WATCHDOG_ARG)
+    {
+        return match argv.as_slice() {
+            [_, _, worktree, record_id] => {
+                match gwt::cli::verification_record::interruption::run_watchdog(
+                    std::path::Path::new(worktree),
+                    record_id,
+                ) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(_) => ExitCode::FAILURE,
+                }
+            }
+            _ => ExitCode::FAILURE,
+        };
+    }
     // Issue #3631: bound launches host their PTY start gate here rather than in
     // the GUI front door, because only a console subsystem image is attached to
     // the pane's pseudoconsole. Handle it before anything else touches stdio.

@@ -1151,6 +1151,15 @@ lint, coverage, direct headed browser checks, and pre-push checks run
 directly without a verification lease. Completion still requires canonical
 verification evidence.
 
+`verify.run` saves an unfinished record before starting commands. If the runner
+is terminated externally, a companion records the interruption, the last active
+command, and any completed command results. `execution.status` distinguishes
+`running` and `interrupted` from `missing_record`; interrupted evidence cannot
+authorize completion or a PR and requires a new run. The diagnostic copy at
+`.gwt/tmp/verify-run.json` is written atomically; the machine-local trusted record
+remains authoritative. The interruption reason says `signal unknown` when the
+exact signal cannot be observed.
+
 The `pre-push` hook deliberately runs only checks that do not compile the
 workspace: `cargo fmt --all -- --check`, Markdownlint, and the SKILL.md
 frontmatter validation. A Git hook runs under `git push` rather than under

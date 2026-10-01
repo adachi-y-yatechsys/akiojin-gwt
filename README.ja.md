@@ -1080,6 +1080,14 @@ lint、coverage、直接の headed browser 確認、pre-push 確認は verificat
 lease なしでそのまま実行します。完了判定には引き続き canonical な検証証跡が
 必要です。
 
+`verify.run` はコマンド開始前に未完了の記録を保存します。本体が外部終了すると、
+監視プロセスが中断理由、最後に実行中だったコマンド、完了したコマンドの結果を
+記録します。`execution.status` は `running`・`interrupted`・`missing_record`
+を区別します。中断記録では完了や PR 作成を許可せず、再実行が必要です。
+診断用の `.gwt/tmp/verify-run.json` は原子的に書き込み、マシンローカルの
+trusted record を引き続き正本とします。正確な終了シグナルを観測できない場合は、
+理由に `signal unknown` と記録します。
+
 `pre-push` hook は、ワークスペースをコンパイルしない検査だけを実行します
 （`cargo fmt --all -- --check`、Markdownlint、SKILL.md frontmatter の検証）。
 Git hook は `gwtd` ではなく `git push` の配下で動くため verification lease を
