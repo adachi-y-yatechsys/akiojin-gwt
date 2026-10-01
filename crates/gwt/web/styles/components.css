@@ -593,6 +593,90 @@ body::after {
    Command Rail — left chrome (SPEC-3038 US-1)
    ============================================================ */
 
+.split-surfaces {
+  display: flex;
+  position: absolute;
+  inset: 0;
+  gap: 1px;
+  background: var(--color-border-strong);
+}
+.split-surfaces[hidden],
+.canvas-area.is-split > :not(.split-surfaces) {
+  display: none !important;
+}
+.split-pane {
+  flex: 1 1 0;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border: 2px solid var(--color-border);
+  background: var(--color-surface);
+}
+.split-pane[data-active="true"] {
+  border-color: var(--color-focus-ring);
+}
+.split-pane__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px;
+  border-bottom: 1px solid var(--color-border);
+  color: var(--color-text-muted);
+  font-family: var(--font-body);
+}
+.split-pane__header label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.split-pane__header select {
+  min-width: 0;
+  max-width: 100%;
+  padding: 4px;
+  color: var(--color-text);
+  background: var(--color-surface-elevated);
+  border: 1px solid var(--color-border-strong);
+  font: inherit;
+}
+.split-pane__header select:focus-visible {
+  outline: 2px solid var(--color-focus-ring);
+  outline-offset: 2px;
+}
+.split-pane__focus { visibility: hidden; }
+.split-pane[data-active="true"] .split-pane__focus { visibility: visible; }
+.split-pane__body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+}
+.split-pane__body > .workspace-window {
+  position: relative !important;
+  left: auto !important;
+  top: auto !important;
+  width: 100% !important;
+  height: 100% !important;
+  min-width: 0 !important;
+  min-height: 0 !important;
+  transform: none !important;
+  box-shadow: none;
+  border: 0;
+  border-radius: 0;
+}
+.split-pane[data-surface="agents"] .split-pane__body > .workspace-window {
+  height: 360px !important;
+  border-bottom: 1px solid var(--color-border-strong);
+}
+.split-pane .resize-handle { display: none !important; }
+.split-pane .titlebar { cursor: default; }
+.split-pane__empty {
+  padding: 16px;
+  color: var(--color-text-muted);
+}
+
 .op-rail {
   grid-area: rail;
   display: flex;

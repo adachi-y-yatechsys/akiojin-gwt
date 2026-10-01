@@ -445,10 +445,6 @@ fn base_python_candidates() -> Vec<PythonCandidate> {
                 prefix_args: &[],
             },
             PythonCandidate {
-                executable: "python3.9".into(),
-                prefix_args: &[],
-            },
-            PythonCandidate {
                 executable: "python3".into(),
                 prefix_args: &[],
             },
@@ -480,10 +476,6 @@ fn base_python_candidates() -> Vec<PythonCandidate> {
             },
             PythonCandidate {
                 executable: "python3.10".into(),
-                prefix_args: &[],
-            },
-            PythonCandidate {
-                executable: "python3.9".into(),
                 prefix_args: &[],
             },
             PythonCandidate {
@@ -583,7 +575,7 @@ fn parse_python_version(version_str: &str) -> std::result::Result<(u32, u32), St
 }
 
 fn supported_project_index_python_version(major: u32, minor: u32) -> bool {
-    major == 3 && minor >= 9
+    major == 3 && minor >= 10
 }
 
 fn is_windows_store_python_alias(path: &Path) -> bool {
@@ -631,7 +623,7 @@ fn python_version(
 }
 
 fn project_index_python_install_guidance() -> String {
-    "Project index runtime requires Python 3.9+ on PATH. Install Python and ensure `python` or `py -3` works before reopening gwt.".into()
+    "Project index runtime requires Python 3.10+ on PATH. Install Python and ensure `python` or `py -3` works before reopening gwt.".into()
 }
 
 fn find_bootstrap_python() -> std::result::Result<BootstrapPython, String> {
@@ -678,7 +670,7 @@ where
             });
         }
         last_issue = Some(format!(
-            "{} reported Python {version}; project index requires Python 3.9+",
+            "{} reported Python {version}; project index requires Python 3.10+",
             path.display()
         ));
     }
@@ -691,7 +683,7 @@ where
     }
 
     let detail = format!(
-        "No supported Python 3.9+ bootstrap candidate was usable. {}",
+        "No supported Python 3.10+ bootstrap candidate was usable. {}",
         last_issue.unwrap_or_else(project_index_python_install_guidance)
     );
     Err(tag_project_index_runtime_error(
@@ -1137,9 +1129,9 @@ mod tests {
     }
 
     #[test]
-    fn find_bootstrap_python_with_falls_back_from_python_38_to_python_39() {
-        let unsupported_python = PathBuf::from("/tmp/python3.8");
-        let supported_python = PathBuf::from("/tmp/python3.9");
+    fn find_bootstrap_python_with_falls_back_from_python_39_to_python_310() {
+        let unsupported_python = PathBuf::from("/tmp/python3.9");
+        let supported_python = PathBuf::from("/tmp/python3.10");
 
         let selected = find_bootstrap_python_with(
             |name| match name {
@@ -1149,9 +1141,9 @@ mod tests {
             },
             |path, _| {
                 if path == unsupported_python.as_path() {
-                    Ok((3, 8, "3.8".into()))
-                } else {
                     Ok((3, 9, "3.9".into()))
+                } else {
+                    Ok((3, 10, "3.10".into()))
                 }
             },
         )
@@ -1171,7 +1163,7 @@ mod tests {
             Some(ProjectIndexRuntimeErrorKind::PythonInstallRequired)
         );
         let detail = project_index_runtime_error_detail(&error);
-        assert!(detail.contains("Python 3.9+"));
+        assert!(detail.contains("Python 3.10+"));
         assert!(detail.contains("py -3"));
         assert!(detail.contains("python"));
     }
@@ -1257,7 +1249,7 @@ mod tests {
             Some(ProjectIndexRuntimeErrorKind::PythonInstallRequired)
         );
         let detail = project_index_runtime_error_detail(&wrapped);
-        assert!(detail.contains("Python 3.9+"));
+        assert!(detail.contains("Python 3.10+"));
     }
 
     #[test]
@@ -1274,37 +1266,37 @@ mod tests {
 
     #[test]
     fn find_bootstrap_python_with_reports_supported_boundary_version() {
-        let python39 = PathBuf::from("/tmp/python3.9");
+        let python310 = PathBuf::from("/tmp/python3.10");
         let selected = find_bootstrap_python_with(
+            |name| match name {
+                "python3.13" => Some(python310.clone()),
+                _ => None,
+            },
+            |_path, _| Ok((3, 10, "3.10".into())),
+        )
+        .expect("python 3.10 should be accepted");
+
+        assert_eq!(selected.program, python310);
+    }
+
+    #[test]
+    fn find_bootstrap_python_with_returns_runtime_unavailable_for_too_old_python_only() {
+        let python39 = PathBuf::from("/tmp/python3.9");
+        let error = find_bootstrap_python_with(
             |name| match name {
                 "python3.13" => Some(python39.clone()),
                 _ => None,
             },
             |_path, _| Ok((3, 9, "3.9".into())),
         )
-        .expect("python 3.9 should be accepted");
-
-        assert_eq!(selected.program, python39);
-    }
-
-    #[test]
-    fn find_bootstrap_python_with_returns_runtime_unavailable_for_too_old_python_only() {
-        let python38 = PathBuf::from("/tmp/python3.8");
-        let error = find_bootstrap_python_with(
-            |name| match name {
-                "python3.13" => Some(python38.clone()),
-                _ => None,
-            },
-            |_path, _| Ok((3, 8, "3.8".into())),
-        )
-        .expect_err("python 3.8 should be rejected");
+        .expect_err("python 3.9 should be rejected");
 
         assert_eq!(
             project_index_runtime_error_kind(&error),
             Some(ProjectIndexRuntimeErrorKind::RuntimeUnavailable)
         );
         let detail = project_index_runtime_error_detail(&error);
-        assert!(detail.contains("3.8"));
+        assert!(detail.contains("3.9"));
     }
 
     #[test]
@@ -1329,8 +1321,8 @@ mod tests {
 
         assert_eq!(parse_python_version("3.12.7").unwrap(), (3, 12));
         assert!(parse_python_version("3").is_err());
-        assert!(supported_project_index_python_version(3, 9));
-        assert!(!supported_project_index_python_version(3, 8));
+        assert!(supported_project_index_python_version(3, 10));
+        assert!(!supported_project_index_python_version(3, 9));
 
         assert!(is_windows_store_python_alias(Path::new(
             "/Users/example/AppData/Local/Microsoft/WindowsApps/python.exe"

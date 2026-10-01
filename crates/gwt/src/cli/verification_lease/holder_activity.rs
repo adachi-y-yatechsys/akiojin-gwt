@@ -225,16 +225,14 @@ impl HolderActivity {
             return format!(
                 "holder orphaned: held {held}, its parent process exited and no command of its \
                  own is left running — in its tree or under the daemon — over the last \
-                 {window:.1}s. Nobody is waiting for this run and it will not release the lease \
-                 before the TTL; reclaim it with `verify.lease.release` and a reason"
+                 {window:.1}s. This describes the observed process set, not permission to stop it"
             );
         }
         if self.reclaimable() {
             return format!(
                 "holder reclaimable: held {held}, its in-tree commands have all exited and \
                  the driver gained no CPU beyond scheduler noise over the last {window:.1}s. \
-                 `verify.lease.release` with a reason re-checks that the workload remains \
-                 absent before reclaiming the lease"
+                 This describes the observed process set, not permission to stop it"
             );
         }
         if self.undecidable() {
@@ -242,8 +240,8 @@ impl HolderActivity {
                 "holder state unknown: held {held}, it launched its commands outside its own \
                  process tree (spawn-host daemon) and none of the {processes} processes this \
                  reading could reach gained CPU over the last {window:.1}s — that is not evidence \
-                 of a stopped holder, only that the work was not found. Confirm with `ps -eo \
-                 pid,ppid,time,command` before acting on it"
+                 of a stopped holder, only that the work was not found. Repeated sampling \
+                 does not authorize reclaiming or stopping it"
             );
         }
         if self.starved() {
@@ -790,7 +788,10 @@ mod tests {
         let described = activity.describe();
         assert!(!described.contains("may be hung"), "{described}");
         assert!(described.contains("not evidence"), "{described}");
-        assert!(described.contains("ps -eo"), "{described}");
+        assert!(
+            described.contains("Repeated sampling does not authorize"),
+            "{described}"
+        );
     }
 
     /// The daemon is the launcher, not the work. Its own CPU — Issue Monitor
@@ -832,7 +833,7 @@ mod tests {
 
         assert!(!idle.orphaned());
         assert_eq!(idle.state(), "reclaimable", "{idle:?}");
-        assert!(idle.describe().contains("verify.lease.release"));
+        assert!(idle.describe().contains("not permission to stop it"));
         assert_eq!(
             activity(&samples, &samples, 100, None).state(),
             "progressing"
@@ -910,7 +911,10 @@ mod tests {
         assert_eq!(activity.state(), "orphaned", "{activity:?}");
         let described = activity.describe();
         assert!(described.contains("orphaned"), "{described}");
-        assert!(described.contains("verify.lease.release"), "{described}");
+        assert!(
+            described.contains("not permission to stop it"),
+            "{described}"
+        );
         assert!(!described.contains("progressing"), "{described}");
     }
 

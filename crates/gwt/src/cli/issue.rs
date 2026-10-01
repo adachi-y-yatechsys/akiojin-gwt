@@ -682,12 +682,66 @@ fn run_monitor_status<E: CliEnv>(
         "uncertainties": inventory.uncertainties,
     });
     output["active_sessions"] = serde_json::json!(inventory.sessions);
+    output["session_row_mismatch"] =
+        serde_json::json!(session_row_mismatch(&status.inbox, &inventory.sessions));
     out.push_str(
         &serde_json::to_string(&output)
             .map_err(|error| io_as_api_error(io::Error::other(error)))?,
     );
     out.push('\n');
     Ok(0)
+}
+
+/// Issue #4862: where the inbox row and the live sessions disagree.
+///
+/// The Kanban column follows the row's `monitor_state`, so a row that stops
+/// saying `launched` moves its card out of Active — even when an agent is still
+/// working in that Issue's worktree. The PM has had to join three separate
+/// reads (the row, `pane.list`, and `worktree_sessions`) to notice, and once
+/// came close to orphaning a window that was mid-task. Report the disagreement
+/// where both sides are already in scope.
+///
+/// Both directions matter and they fail differently:
+/// `working_without_active_row` hides progress and invites a duplicate launch;
+/// `active_row_without_session` holds a slot for a window that is gone.
+fn session_row_mismatch(
+    inbox: &[crate::issue_monitor::IssueMonitorInboxSummary],
+    sessions: &[crate::session_inventory::SessionObservation],
+) -> serde_json::Value {
+    use crate::issue_monitor::MonitorInboxState;
+    let live: std::collections::BTreeSet<u64> = sessions
+        .iter()
+        .filter_map(|session| session.issue_number)
+        .collect();
+    let mut working_without_active_row = Vec::new();
+    let mut active_row_without_session = Vec::new();
+    for row in inbox {
+        let row_claims_a_window = matches!(
+            row.state,
+            MonitorInboxState::Launched | MonitorInboxState::Launching
+        );
+        let has_live_session = live.contains(&row.issue_number);
+        if has_live_session && !row_claims_a_window {
+            working_without_active_row.push(serde_json::json!({
+                "issue_number": row.issue_number,
+                "state": row.state,
+            }));
+        }
+        // A `launching` row legitimately has no session yet, so only a row that
+        // already claims a bound window counts as a phantom.
+        if !has_live_session && matches!(row.state, MonitorInboxState::Launched) {
+            active_row_without_session.push(serde_json::json!({
+                "issue_number": row.issue_number,
+                "launched_window_id": row.launched_window_id,
+            }));
+        }
+    }
+    serde_json::json!({
+        "consistent": working_without_active_row.is_empty()
+            && active_row_without_session.is_empty(),
+        "working_without_active_row": working_without_active_row,
+        "active_row_without_session": active_row_without_session,
+    })
 }
 
 /// The Issue Monitor projection `issue.monitor.status` reports: the daemon's
@@ -1546,6 +1600,43 @@ fn run_monitor_quota_hold_clear<E: CliEnv>(
     reason: &str,
     out: &mut String,
 ) -> Result<i32, SpecOpsError> {
+    run_monitor_quota_hold_clear_inner(env, project_root, provider, reason, None, out)
+}
+
+pub(super) fn run_monitor_quota_hold_clear_if_matches<E: CliEnv>(
+    env: &E,
+    project_root: Option<&std::path::Path>,
+    provider: &str,
+    reason: &str,
+    expected_reset_at: &str,
+    out: &mut String,
+) -> Result<i32, SpecOpsError> {
+    if expected_reset_at.trim().is_empty() {
+        return refuse_quota_hold_clear(
+            out,
+            provider,
+            "missing_expected_hold",
+            "expected reset time is required",
+        );
+    }
+    run_monitor_quota_hold_clear_inner(
+        env,
+        project_root,
+        provider,
+        reason,
+        Some(expected_reset_at),
+        out,
+    )
+}
+
+fn run_monitor_quota_hold_clear_inner<E: CliEnv>(
+    env: &E,
+    project_root: Option<&std::path::Path>,
+    provider: &str,
+    reason: &str,
+    expected_reset_at: Option<&str>,
+    out: &mut String,
+) -> Result<i32, SpecOpsError> {
     let project_root = issue_monitor_project_root(env, project_root)?;
     let prefs_path = crate::issue_monitor_prefs_path_for_repo_path(&project_root);
     // Refuse before publishing so the daemon never has to reject a control it
@@ -1564,15 +1655,20 @@ fn run_monitor_quota_hold_clear<E: CliEnv>(
     let before = crate::load_issue_monitor_prefs(&prefs_path).map_err(io_as_api_error)?;
     let held_before = issues_held_by_provider(&before, &provider);
 
+    let mut clear = serde_json::json!({
+        "provider": provider,
+        "reason": reason,
+        "released_at": released_at,
+    });
+    let key = if let Some(expected) = expected_reset_at {
+        clear["expected_reset_at"] = serde_json::json!(expected);
+        "quota_hold_clear_if_matches"
+    } else {
+        "quota_hold_clear"
+    };
     let payload = crate::runtime_daemon_events::issue_monitor_payload(
         "control",
-        serde_json::json!({
-            "quota_hold_clear": {
-                "provider": provider,
-                "reason": reason,
-                "released_at": released_at,
-            }
-        }),
+        serde_json::json!({key: clear}),
         std::process::id(),
     );
     let delivery = match publish_monitor_config_set(&project_root, payload) {
@@ -1584,6 +1680,17 @@ fn run_monitor_quota_hold_clear<E: CliEnv>(
             let written = crate::try_mutate_issue_monitor_prefs_without_authority_fence(
                 &prefs_path,
                 |prefs| {
+                    if expected_reset_at.is_some_and(|expected| {
+                        prefs
+                            .provider_quota_holds
+                            .get(&provider)
+                            .map(String::as_str)
+                            != Some(expected)
+                    }) {
+                        return Err(std::io::Error::other(
+                            "provider quota hold changed; release refused",
+                        ));
+                    }
                     let mut monitor = crate::IssueMonitorState::with_prefs(
                         crate::IssueMonitorConfig::default(),
                         prefs.clone(),
@@ -4944,6 +5051,180 @@ pub(crate) fn body_closes_issue(body: &str, issue_number: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
+    // ---- Issue #4862: inbox row vs live sessions ----
+
+    /// Build one inbox row with only the fields this mismatch check reads.
+    fn mismatch_row(
+        issue_number: u64,
+        state: crate::MonitorInboxState,
+        launched_window_id: Option<&str>,
+    ) -> crate::issue_monitor::IssueMonitorInboxSummary {
+        crate::issue_monitor::IssueMonitorInboxSummary {
+            launch_tier: None,
+            landing_tier: None,
+            non_agent_attempts: 0,
+            tier_input: 0,
+            issue_number,
+            state,
+            github_state: crate::IssueMonitorIssueState::Open,
+            issue_updated_at: None,
+            readiness: crate::IssueMonitorReadiness::NotApplicable,
+            recoverable_merged: false,
+            completion_reason: None,
+            blocked_by_owner: None,
+            claim_expires_at: None,
+            blocked_by_claim_id: None,
+            exclusion_reason: None,
+            launched_window_id: launched_window_id.map(str::to_string),
+            error_message: None,
+            last_activity_at: None,
+            retry_not_before: None,
+            retry_hold_reason: None,
+            claim_id: None,
+            delivery_id: None,
+            waiting: None,
+            steering: None,
+            idle_kind: None,
+            idle_since: None,
+            duplicate_launch_refusal: None,
+            attempts: 0,
+            last_failure_message: None,
+            failure_kind: None,
+            pane_state: None,
+            pane_hold_reason: None,
+            runtime_consistency: None,
+        }
+    }
+
+    /// A live session in some Issue's worktree. No window is created: the check
+    /// reads observations, which is what Issue #4862 AC-6 requires.
+    fn mismatch_session(issue_number: Option<u64>) -> crate::session_inventory::SessionObservation {
+        crate::session_inventory::SessionObservation {
+            session_id: format!("session-{}", issue_number.unwrap_or(0)),
+            issue_number,
+            agent_id: "codex".to_string(),
+            worktree_path: std::path::PathBuf::from(format!(
+                "/tmp/work/issue-{}",
+                issue_number.unwrap_or(0)
+            )),
+            worktree_exists: true,
+            host_pid: 1,
+            child_pid: 2,
+            child_started_at: 0,
+            started_at: "2026-10-01T00:00:00Z".to_string(),
+            launch_origin: gwt_agent::SessionLaunchOrigin::Launch,
+            restore_source_session_id: None,
+        }
+    }
+
+    /// The symptom a user reported: the card leaves Active while the agent is
+    /// still working, because the row stopped saying `launched`.
+    #[test]
+    fn a_queued_row_with_a_live_session_is_reported_as_working_without_an_active_row() {
+        let inbox = vec![mismatch_row(4777, crate::MonitorInboxState::Queued, None)];
+        let sessions = vec![mismatch_session(Some(4777))];
+
+        let report = session_row_mismatch(&inbox, &sessions);
+
+        assert_eq!(report["consistent"], false);
+        assert_eq!(
+            report["working_without_active_row"][0]["issue_number"],
+            4777
+        );
+        assert!(report["active_row_without_session"]
+            .as_array()
+            .expect("array")
+            .is_empty());
+    }
+
+    /// The other direction: the row holds a slot for a window that is gone.
+    #[test]
+    fn a_launched_row_without_a_live_session_is_reported_as_a_phantom() {
+        let inbox = vec![mismatch_row(
+            4777,
+            crate::MonitorInboxState::Launched,
+            Some("project-x::agent-1307"),
+        )];
+
+        let report = session_row_mismatch(&inbox, &[]);
+
+        assert_eq!(report["consistent"], false);
+        assert_eq!(
+            report["active_row_without_session"][0]["issue_number"],
+            4777
+        );
+        assert_eq!(
+            report["active_row_without_session"][0]["launched_window_id"],
+            "project-x::agent-1307"
+        );
+    }
+
+    /// `launching` has no window yet by design, so it must not be a phantom.
+    #[test]
+    fn a_launching_row_without_a_session_yet_is_not_a_phantom() {
+        let inbox = vec![mismatch_row(
+            4777,
+            crate::MonitorInboxState::Launching,
+            None,
+        )];
+
+        let report = session_row_mismatch(&inbox, &[]);
+
+        assert_eq!(report["consistent"], true);
+    }
+
+    /// A hold keeps the row out of Active deliberately, but the agent inside the
+    /// worktree is still working — the PM must still see that.
+    #[test]
+    fn a_held_row_with_a_live_session_still_reports_the_disagreement() {
+        let inbox = vec![mismatch_row(
+            4777,
+            crate::MonitorInboxState::HoldExcluded,
+            None,
+        )];
+        let sessions = vec![mismatch_session(Some(4777))];
+
+        let report = session_row_mismatch(&inbox, &sessions);
+
+        assert_eq!(report["consistent"], false);
+        assert_eq!(
+            report["working_without_active_row"][0]["issue_number"],
+            4777
+        );
+    }
+
+    #[test]
+    fn a_launched_row_with_its_live_session_is_consistent() {
+        let inbox = vec![mismatch_row(
+            4777,
+            crate::MonitorInboxState::Launched,
+            Some("project-x::agent-1343"),
+        )];
+        let sessions = vec![mismatch_session(Some(4777))];
+
+        let report = session_row_mismatch(&inbox, &sessions);
+
+        assert_eq!(report["consistent"], true);
+    }
+
+    /// The PM's own session carries no Issue number and must not be joined to
+    /// any row.
+    #[test]
+    fn a_session_without_an_issue_number_is_ignored() {
+        let inbox = vec![mismatch_row(
+            4777,
+            crate::MonitorInboxState::Launched,
+            Some("project-x::agent-1343"),
+        )];
+
+        let report = session_row_mismatch(&inbox, &[mismatch_session(None)]);
+
+        assert_eq!(
+            report["active_row_without_session"][0]["issue_number"], 4777,
+            "a PM session must not count as the Issue's window"
+        );
+    }
+
     use std::{
         fs::File,
         path::Path,
@@ -7538,6 +7819,15 @@ mod tests {
                 "session_observation": {
                     "complete": true,
                     "uncertainties": [],
+                },
+                // Issue #4862 AC-5: the row-versus-session disagreement is part
+                // of every status snapshot, including the rebuilt fallback —
+                // a `launching` row legitimately has no session yet, so this
+                // shape is the consistent one.
+                "session_row_mismatch": {
+                    "consistent": true,
+                    "working_without_active_row": [],
+                    "active_row_without_session": [],
                 },
                 "max_active": 3,
                 "enabled": true,
@@ -11066,6 +11356,50 @@ mod tests {
             profile.skip_permissions,
             "the wizard's permission choice is kept"
         );
+    }
+
+    #[test]
+    fn quota_hold_clear_if_matches_local_fallback_preserves_new_hold() {
+        let tmp = TempDir::new().unwrap();
+        let _home = ScopedGwtHome::set(tmp.path().join("home"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let prefs_path = crate::issue_monitor_prefs_path_for_repo_path(&repo);
+        let current = (chrono::Utc::now() + chrono::Duration::days(3)).to_rfc3339();
+        let seed = crate::IssueMonitorPrefs {
+            provider_quota_holds: std::collections::BTreeMap::from([(
+                "codex".into(),
+                current.clone(),
+            )]),
+            ..Default::default()
+        };
+        crate::save_issue_monitor_prefs(&prefs_path, &seed).unwrap();
+        let env = crate::cli::TestEnv::new(repo);
+        for (expected, code) in [("stale", 1), (current.as_str(), 0)] {
+            let mut out = String::new();
+            assert_eq!(
+                run_monitor_quota_hold_clear_if_matches(
+                    &env,
+                    None,
+                    "codex",
+                    "verified reset",
+                    expected,
+                    &mut out
+                )
+                .unwrap(),
+                code,
+                "{out}"
+            );
+            let persisted = crate::load_issue_monitor_prefs(&prefs_path).unwrap();
+            assert_eq!(
+                persisted.provider_quota_holds.contains_key("codex"),
+                code != 0
+            );
+            assert_eq!(
+                persisted.provider_quota_hold_releases.contains_key("codex"),
+                code == 0
+            );
+        }
     }
 
     /// Issue #3923 AC-1 / AC-4: the PM lists a provider hold with its evidence

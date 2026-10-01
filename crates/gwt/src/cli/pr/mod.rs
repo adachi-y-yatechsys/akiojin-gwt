@@ -1362,6 +1362,18 @@ pub(super) fn render_pr_inventory(out: &mut String, read: &gwt_git::PrInventoryR
                 "stale": item.stale,
                 "stale_after_hours": item.stale_after_hours,
                 "dwell_hours": item.dwell_hours,
+                // Issue #4836: `created_at` and `age_hours` were computed but
+                // never emitted, so the field the PM was told to read did not
+                // reach it. `dwell_hours` resets on every `updated_at` bump —
+                // a branch update, a label change, a check write — so a PR the
+                // PM re-bases each cycle reports a dwell of 0 however long it
+                // has actually waited. `age_hours` is the one that does not move.
+                "created_at": item.created_at,
+                "age_hours": item.age_hours,
+                // Issue #4836 AC-2: the native flag records only the intent to
+                // merge. Read it together with `lifecycle`:
+                // `AUTO-MERGE-STALLED` means armed, promotable, and still open.
+                "auto_merge_enabled": item.auto_merge_enabled,
                 "owner_issue_closed": item.owner_issue_closed,
                 "owner_issue": item.owner_issue,
                 "owner_issue_source": item.owner_issue_source,
@@ -1555,6 +1567,9 @@ mod tests {
     fn seeded_inventory_item() -> gwt_git::PrInventoryItem {
         gwt_git::PrInventoryItem {
             base_ref_name: "develop".to_string(),
+            created_at: None,
+            age_hours: None,
+            auto_merge_enabled: false,
             check_counts: None,
             conflict: None,
             unresolved_review_threads: None,
@@ -2877,6 +2892,7 @@ mod tests {
         let _env_lock = crate::env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _legacy = ScopedEnvVar::unset(crate::autonomous_handoff::GWT_AUTONOMOUS_EXECUTION_ENV);
         let _session =
             gwt_core::test_support::ScopedEnvVar::set(gwt_agent::GWT_SESSION_ID_ENV, "sess-pr");
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -4458,6 +4474,7 @@ mod tests {
         let _env_lock = crate::env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _legacy = ScopedEnvVar::unset(crate::autonomous_handoff::GWT_AUTONOMOUS_EXECUTION_ENV);
         let home = tempfile::tempdir().expect("home");
         let repo = home.path().join("repo");
         std::fs::create_dir_all(&repo).expect("create repo");
@@ -4808,6 +4825,7 @@ mod tests {
         let _env_lock = crate::env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _legacy = ScopedEnvVar::unset(crate::autonomous_handoff::GWT_AUTONOMOUS_EXECUTION_ENV);
         let home = tempfile::tempdir().expect("home");
         let repo = home.path().join("repo");
         std::fs::create_dir_all(&repo).expect("create repo");
