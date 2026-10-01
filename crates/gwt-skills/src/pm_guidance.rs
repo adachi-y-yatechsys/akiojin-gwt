@@ -921,6 +921,13 @@ quota:
 - Classes and default actions:
   - `READY_TO_PROMOTE`: mark the Draft Ready (see below)
   - `MERGE-CANDIDATE`: mark Ready if draft, otherwise propose merge
+  - `AUTO-MERGE-STALLED`: mergeable, green and `CLEAN` with auto-merge
+    armed, yet still open after more than one cycle. The native flag only
+    records the intent; the `Auto Merge PR` workflow performs the merge,
+    and a queued or failed run of it leaves the PR exactly here. Find
+    that run and rerun it with `actions.rerun`; waiting does not land it
+    (25 minutes measured). Never reach for `pr.draft` / `pr.ready` as a
+    nudge — Draft cancels auto-merge and no operation re-enables it.
   - `CONFLICTED`: relaunch the owner to resolve the conflict
   - `BEHIND`: update the PR branch
   - `CI-RED`: relaunch the owner to fix CI
@@ -930,7 +937,9 @@ quota:
     re-read next cycle. `lifecycle_source` is `held` when `pr.list` kept
     the previous class because the PR's real data did not change, so a
     class never flips on a non-final GitHub answer.
-- Every row also carries `dwell_hours` (hours since `updated_at`),
+- Every row also carries `auto_merge_enabled` (whether GitHub's native
+  auto-merge is armed — an intent, never a merge),
+  `dwell_hours` (hours since `updated_at`),
   `age_hours` (hours since the PR was opened), `stale_after_hours`
   (the threshold in force; default 72, overridable
   with `params.stale_after_hours`), `unchanged_cycles` (consecutive
