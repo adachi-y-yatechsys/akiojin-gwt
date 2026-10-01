@@ -1362,6 +1362,18 @@ pub(super) fn render_pr_inventory(out: &mut String, read: &gwt_git::PrInventoryR
                 "stale": item.stale,
                 "stale_after_hours": item.stale_after_hours,
                 "dwell_hours": item.dwell_hours,
+                // Issue #4836: `created_at` and `age_hours` were computed but
+                // never emitted, so the field the PM was told to read did not
+                // reach it. `dwell_hours` resets on every `updated_at` bump —
+                // a branch update, a label change, a check write — so a PR the
+                // PM re-bases each cycle reports a dwell of 0 however long it
+                // has actually waited. `age_hours` is the one that does not move.
+                "created_at": item.created_at,
+                "age_hours": item.age_hours,
+                // Issue #4836 AC-2: the native flag records only the intent to
+                // merge. Read it together with `lifecycle`:
+                // `AUTO-MERGE-STALLED` means armed, promotable, and still open.
+                "auto_merge_enabled": item.auto_merge_enabled,
                 "owner_issue_closed": item.owner_issue_closed,
                 "owner_issue": item.owner_issue,
                 "owner_issue_source": item.owner_issue_source,
@@ -1557,6 +1569,7 @@ mod tests {
             base_ref_name: "develop".to_string(),
             created_at: None,
             age_hours: None,
+            auto_merge_enabled: false,
             check_counts: None,
             conflict: None,
             unresolved_review_threads: None,
