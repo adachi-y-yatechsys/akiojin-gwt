@@ -1854,6 +1854,13 @@ enum IssueMonitorControl {
         reason: String,
         released_at: String,
     },
+    /// A reset may release only the exact hold observed before consent.
+    QuotaHoldClearIfMatches {
+        provider: String,
+        reason: String,
+        released_at: String,
+        expected_reset_at: String,
+    },
     ConfigSet {
         enabled: Option<bool>,
         autonomous_mode: Option<bool>,
@@ -2705,6 +2712,31 @@ fn apply_routine_issue_monitor_control(
                 crate::IssueMonitorProviderQuotaHoldClearOutcome::Cleared { .. }
             )
         }
+        IssueMonitorControl::QuotaHoldClearIfMatches {
+            provider,
+            reason,
+            released_at,
+            expected_reset_at,
+        } => {
+            let prefs = monitor.prefs();
+            if prefs.provider_quota_holds.get(&provider) != Some(&expected_reset_at) {
+                // An exact already-committed release can be replayed when
+                // converging a durable control receipt, never over a new hold.
+                return !prefs.provider_quota_holds.contains_key(&provider)
+                    && prefs
+                        .provider_quota_hold_releases
+                        .get(&provider)
+                        .is_some_and(|release| {
+                            release.released_at == released_at
+                                && release.released_reset_at.as_deref()
+                                    == Some(expected_reset_at.as_str())
+                        });
+            }
+            matches!(
+                monitor.clear_provider_quota_hold(&provider, &reason, &released_at),
+                crate::IssueMonitorProviderQuotaHoldClearOutcome::Cleared { .. }
+            )
+        }
         IssueMonitorControl::WindowClosed {
             target,
             classification,
@@ -3118,6 +3150,26 @@ fn decode_issue_monitor_control_in_repo(
             // Issue #3961: the PM's release reaches the authoritative state
             // instead of only the durable prefs. A blank provider or fence
             // instant is a malformed control, not a release of nothing.
+            // A distinct key makes old daemons reject rather than ignore the
+            // expected value and perform an unconditional release.
+            if let Some(clear) = payload.get("quota_hold_clear_if_matches") {
+                let provider = clear.get("provider")?.as_str()?.trim();
+                let released_at = clear.get("released_at")?.as_str()?.trim();
+                let expected_reset_at = clear.get("expected_reset_at")?.as_str()?.trim();
+                if provider.is_empty() || released_at.is_empty() || expected_reset_at.is_empty() {
+                    return None;
+                }
+                return Some(IssueMonitorControl::QuotaHoldClearIfMatches {
+                    provider: provider.to_string(),
+                    reason: clear
+                        .get("reason")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    released_at: released_at.to_string(),
+                    expected_reset_at: expected_reset_at.to_string(),
+                });
+            }
             if let Some(clear) = payload.get("quota_hold_clear") {
                 let provider = clear.get("provider")?.as_str()?.trim();
                 let released_at = clear.get("released_at")?.as_str()?.trim();
@@ -10779,6 +10831,57 @@ exit 0
                 std::process::id() + 1,
             );
             assert!(decode_issue_monitor_control(payload).is_none());
+        }
+    }
+
+    #[test]
+    fn quota_hold_clear_if_matches_preserves_new_hold_and_clears_matching_hold() {
+        let _prefs_budget = pin_prefs_hang_guard();
+        let _clock = ScopedOperationClock::set(Instant::now());
+        let temp = TempDir::new().unwrap();
+        let prefs_path = temp.path().join("issue-monitor.json");
+        let current = "2026-10-05T00:00:00Z";
+        let seed = crate::IssueMonitorPrefs {
+            provider_quota_holds: std::collections::BTreeMap::from([(
+                "codex".into(),
+                current.into(),
+            )]),
+            ..Default::default()
+        };
+        crate::save_issue_monitor_prefs(&prefs_path, &seed).unwrap();
+        let mut monitor =
+            crate::IssueMonitorState::with_prefs(crate::IssueMonitorConfig::default(), seed);
+        for (expected, clears) in [("2026-10-04T00:00:00Z", false), (current, true)] {
+            let control = decode_issue_monitor_control_for_test(
+                crate::runtime_daemon_events::issue_monitor_payload(
+                    "control",
+                    serde_json::json!({
+                        "quota_hold_clear_if_matches": {
+                            "provider": "codex", "reason": "verified free reset",
+                            "released_at": "2026-10-01T00:00:00Z", "expected_reset_at": expected
+                        }
+                    }),
+                    std::process::id() + 1,
+                ),
+            )
+            .expect("conditional clear decodes");
+            assert_eq!(
+                super::apply_issue_monitor_control_with_disk_migration(
+                    &prefs_path,
+                    &mut monitor,
+                    control
+                ),
+                clears
+            );
+            let persisted = crate::load_issue_monitor_prefs(&prefs_path).unwrap();
+            assert_eq!(
+                persisted.provider_quota_holds.contains_key("codex"),
+                !clears
+            );
+            assert_eq!(
+                persisted.provider_quota_hold_releases.contains_key("codex"),
+                clears
+            );
         }
     }
 

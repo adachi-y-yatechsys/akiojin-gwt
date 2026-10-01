@@ -431,6 +431,26 @@ Workspace パネルの `Clean Up Ready` 件数も、worktree 単位で同じ考�
 `.codex/hooks.json` / `.claude/settings.local.json`）だけであれば cleanup-ready のまま
 数えられます。それ以外の未コミット変更があれば、その Workspace は件数から外れます。
 
+### プロバイダの無料リセット
+
+`provider.reset.proposals` は provider hold を読み、残り待機時間が
+`min_reset_wait_secs`（既定: 86400 秒）以上なら Codex の無料リセット枠の確認を
+提案します。Claude の上限時は別プロバイダへの切替を提案します。
+**Claude の追加利用は課金を伴うため gwt からは実行しない**方針です。
+
+`provider.reset` に `provider: "codex"` と `pane.list` の正確な `window_id` を
+指定すると、無料枠を確認した後に OS の確認ダイアログを表示します。
+**Redeem free reset** を選ぶと、そのアカウントの無料リセットを1回消費します。
+既定は Cancel で、autonomous モードでも確認を省略しません。
+JSON の承認フラグや過去の承認は利用できません。canvas 上にある、直接インストールした
+Host Codex と既定プロバイダの window に対応し、Docker・package runner・独自 backend は拒否します。
+
+成功後はアカウントの利用再開を再確認し、provider hold を自動解除します。
+失敗や結果不明の場合は hold を保持します。承認・実行・結果は
+`~/.gwt/provider-resets/<request_id>.jsonl` に保存し、operation はそのパスと失敗理由を
+返します。クレジット購入や有料追加利用への切替は行いません。
+引数の詳細は `gwtd --help provider` を参照してください。
+
 ### Autonomous モード（opt-in）
 
 Autonomous モードはループ全体を無人で実行します: 適格 Issue → 自動起動 → 実装 →

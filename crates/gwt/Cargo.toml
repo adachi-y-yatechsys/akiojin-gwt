@@ -94,9 +94,15 @@ objc2-service-management = { version = "0.3", features = ["SMAppService", "objc2
 winresource.workspace = true
 
 [target.'cfg(target_os = "windows")'.dependencies]
+rfd = { version = "0.17", features = ["common-controls-v6"] }
 windows = { version = "0.62.2", features = ["UI_Notifications", "Win32_Foundation", "Win32_System_Threading"] }
 windows-registry = "0.100"
 windows-result = "0.100"
+
+# Native reset consent must not delegate approval to PATH's zenity. Keep the
+# existing rfd/portal folder picker unchanged and fail promptly without DISPLAY.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
 
 [features]
 # Issue #3675 AC-2: arms the unsandboxed-gh spawn guard at process start (see

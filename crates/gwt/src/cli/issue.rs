@@ -1546,6 +1546,43 @@ fn run_monitor_quota_hold_clear<E: CliEnv>(
     reason: &str,
     out: &mut String,
 ) -> Result<i32, SpecOpsError> {
+    run_monitor_quota_hold_clear_inner(env, project_root, provider, reason, None, out)
+}
+
+pub(super) fn run_monitor_quota_hold_clear_if_matches<E: CliEnv>(
+    env: &E,
+    project_root: Option<&std::path::Path>,
+    provider: &str,
+    reason: &str,
+    expected_reset_at: &str,
+    out: &mut String,
+) -> Result<i32, SpecOpsError> {
+    if expected_reset_at.trim().is_empty() {
+        return refuse_quota_hold_clear(
+            out,
+            provider,
+            "missing_expected_hold",
+            "expected reset time is required",
+        );
+    }
+    run_monitor_quota_hold_clear_inner(
+        env,
+        project_root,
+        provider,
+        reason,
+        Some(expected_reset_at),
+        out,
+    )
+}
+
+fn run_monitor_quota_hold_clear_inner<E: CliEnv>(
+    env: &E,
+    project_root: Option<&std::path::Path>,
+    provider: &str,
+    reason: &str,
+    expected_reset_at: Option<&str>,
+    out: &mut String,
+) -> Result<i32, SpecOpsError> {
     let project_root = issue_monitor_project_root(env, project_root)?;
     let prefs_path = crate::issue_monitor_prefs_path_for_repo_path(&project_root);
     // Refuse before publishing so the daemon never has to reject a control it
@@ -1564,15 +1601,20 @@ fn run_monitor_quota_hold_clear<E: CliEnv>(
     let before = crate::load_issue_monitor_prefs(&prefs_path).map_err(io_as_api_error)?;
     let held_before = issues_held_by_provider(&before, &provider);
 
+    let mut clear = serde_json::json!({
+        "provider": provider,
+        "reason": reason,
+        "released_at": released_at,
+    });
+    let key = if let Some(expected) = expected_reset_at {
+        clear["expected_reset_at"] = serde_json::json!(expected);
+        "quota_hold_clear_if_matches"
+    } else {
+        "quota_hold_clear"
+    };
     let payload = crate::runtime_daemon_events::issue_monitor_payload(
         "control",
-        serde_json::json!({
-            "quota_hold_clear": {
-                "provider": provider,
-                "reason": reason,
-                "released_at": released_at,
-            }
-        }),
+        serde_json::json!({key: clear}),
         std::process::id(),
     );
     let delivery = match publish_monitor_config_set(&project_root, payload) {
@@ -1584,6 +1626,17 @@ fn run_monitor_quota_hold_clear<E: CliEnv>(
             let written = crate::try_mutate_issue_monitor_prefs_without_authority_fence(
                 &prefs_path,
                 |prefs| {
+                    if expected_reset_at.is_some_and(|expected| {
+                        prefs
+                            .provider_quota_holds
+                            .get(&provider)
+                            .map(String::as_str)
+                            != Some(expected)
+                    }) {
+                        return Err(std::io::Error::other(
+                            "provider quota hold changed; release refused",
+                        ));
+                    }
                     let mut monitor = crate::IssueMonitorState::with_prefs(
                         crate::IssueMonitorConfig::default(),
                         prefs.clone(),
@@ -11066,6 +11119,50 @@ mod tests {
             profile.skip_permissions,
             "the wizard's permission choice is kept"
         );
+    }
+
+    #[test]
+    fn quota_hold_clear_if_matches_local_fallback_preserves_new_hold() {
+        let tmp = TempDir::new().unwrap();
+        let _home = ScopedGwtHome::set(tmp.path().join("home"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let prefs_path = crate::issue_monitor_prefs_path_for_repo_path(&repo);
+        let current = (chrono::Utc::now() + chrono::Duration::days(3)).to_rfc3339();
+        let seed = crate::IssueMonitorPrefs {
+            provider_quota_holds: std::collections::BTreeMap::from([(
+                "codex".into(),
+                current.clone(),
+            )]),
+            ..Default::default()
+        };
+        crate::save_issue_monitor_prefs(&prefs_path, &seed).unwrap();
+        let env = crate::cli::TestEnv::new(repo);
+        for (expected, code) in [("stale", 1), (current.as_str(), 0)] {
+            let mut out = String::new();
+            assert_eq!(
+                run_monitor_quota_hold_clear_if_matches(
+                    &env,
+                    None,
+                    "codex",
+                    "verified reset",
+                    expected,
+                    &mut out
+                )
+                .unwrap(),
+                code,
+                "{out}"
+            );
+            let persisted = crate::load_issue_monitor_prefs(&prefs_path).unwrap();
+            assert_eq!(
+                persisted.provider_quota_holds.contains_key("codex"),
+                code != 0
+            );
+            assert_eq!(
+                persisted.provider_quota_hold_releases.contains_key("codex"),
+                code == 0
+            );
+        }
     }
 
     /// Issue #3923 AC-1 / AC-4: the PM lists a provider hold with its evidence

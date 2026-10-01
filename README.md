@@ -472,6 +472,29 @@ the materialized `gwt-*` skills and commands, or a `.codex/hooks.json` /
 `.claude/settings.local.json` that still carries no hand-written content.
 Anything else you have not committed keeps the Workspace out of the count.
 
+### Free provider resets
+
+`provider.reset.proposals` reads provider holds and suggests checking a free
+Codex reset when the remaining wait exceeds `min_reset_wait_secs` (default:
+86400). Claude holds instead suggest switching providers: paid `/extra-usage`
+is never enabled by gwt.
+
+`provider.reset` takes `provider: "codex"` and the exact `window_id` from
+`pane.list`. It checks the available free credits, then displays an OS
+confirmation dialog. Choose **Redeem free reset** to consume one free reset
+for that account; Cancel is the default. Confirmation is mandatory even in
+autonomous mode. JSON approval flags and past approvals cannot replace it.
+Only canvas windows using a directly installed Host Codex and its default
+provider are supported; Docker, package-runner launches and custom backends
+are refused.
+
+After a confirmed reset, gwt rereads account availability and releases the
+provider hold automatically. Failure or an unconfirmed outcome retains the
+hold. Approval, execution and results are recorded under
+`~/.gwt/provider-resets/<request_id>.jsonl`; the operation returns that path
+and any failure reason. No credits are purchased, and no paid-usage fallback
+exists. See `gwtd --help provider` for parameters.
+
 ### Autonomous mode (opt-in)
 
 Autonomous mode runs the whole loop unattended: eligible issue → auto-launch →
