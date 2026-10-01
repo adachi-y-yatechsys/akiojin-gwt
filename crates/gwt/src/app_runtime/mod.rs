@@ -71,6 +71,31 @@ fn update_notice(level: &str, message: String) -> OutboundEvent {
     OutboundEvent::global_update_notice(level, message)
 }
 
+fn record_pending_update_observation(
+    version: &str,
+    project_root: Option<&Path>,
+    stage: &str,
+    reason: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    next_evaluation: Option<chrono::DateTime<chrono::Utc>>,
+) {
+    let observed_at = now.to_rfc3339();
+    let next_evaluation = next_evaluation.map(|time| time.to_rfc3339());
+    let project_root = project_root.map(|path| path.to_string_lossy());
+    let mut fields = vec![
+        ("version", version),
+        ("reason", reason),
+        ("observed_at", &observed_at),
+    ];
+    if let Some(project_root) = project_root.as_ref() {
+        fields.push(("project_root", project_root.as_ref()));
+    }
+    if let Some(next) = next_evaluation.as_ref() {
+        fields.push(("next_evaluation_at", next));
+    }
+    gwt_core::update::log_update_event(stage, &fields);
+}
+
 #[cfg(test)]
 pub(crate) type BlockingTestTask = Box<dyn FnOnce() + Send + 'static>;
 #[cfg(test)]
@@ -7531,6 +7556,30 @@ impl AppRuntime {
         }
     }
 
+    pub(crate) fn record_update_apply_observation(&self, version: &str, stage: &str, reason: &str) {
+        let contexts = self.project_contexts();
+        if contexts.is_empty() {
+            record_pending_update_observation(
+                version,
+                None,
+                stage,
+                reason,
+                chrono::Utc::now(),
+                None,
+            );
+        }
+        for context in contexts {
+            record_pending_update_observation(
+                version,
+                Some(&context.project_root),
+                stage,
+                reason,
+                chrono::Utc::now(),
+                None,
+            );
+        }
+    }
+
     /// Issue #3906 AC-3: a staged update (manifest persisted) raises the
     /// `Auto` update drain when the Issue Monitor runs unattended and
     /// auto-apply is on (the default while autonomous). Issue #4376 AC-1 /
@@ -7563,7 +7612,18 @@ impl AppRuntime {
         refusal: Option<gwt::update_drain::UpdateAutoApplyRefusal>,
     ) -> Vec<OutboundEvent> {
         let mut events = Vec::new();
-        for context in self.project_contexts() {
+        let contexts = self.project_contexts();
+        if contexts.is_empty() {
+            record_pending_update_observation(
+                version,
+                None,
+                "pending_refused",
+                "no open project; automatic drain is unavailable",
+                chrono::Utc::now(),
+                None,
+            );
+        }
+        for context in contexts {
             events.extend(self.update_staged_events_for_project(
                 &context,
                 version,
@@ -7581,8 +7641,25 @@ impl AppRuntime {
     ) -> Vec<OutboundEvent> {
         let project_root = context.project_root.clone();
         let prefs_path = gwt::issue_monitor_prefs_path_for_repo_path(&project_root);
-        let Ok(prefs) = gwt::load_issue_monitor_prefs(&prefs_path) else {
-            return Vec::new();
+        let observe = |stage: &str, reason: &str| {
+            record_pending_update_observation(
+                version,
+                Some(&project_root),
+                stage,
+                reason,
+                chrono::Utc::now(),
+                None,
+            );
+        };
+        let prefs = match gwt::load_issue_monitor_prefs(&prefs_path) {
+            Ok(prefs) => prefs,
+            Err(error) => {
+                observe(
+                    "pending_failed",
+                    &format!("cannot load update drain preferences: {error}"),
+                );
+                return Vec::new();
+            }
         };
         let auto_apply = prefs.auto_apply_updates.unwrap_or(prefs.autonomous_mode);
         if !(prefs.autonomous_mode && auto_apply) {
@@ -7598,6 +7675,10 @@ impl AppRuntime {
                 prefs.clone(),
             );
             if self.update_drain_blockers(&monitor).is_empty() {
+                observe(
+                    "pending_waiting",
+                    "automatic apply disabled; waiting for manual Restart now",
+                );
                 return Vec::new();
             }
             tracing::info!(
@@ -7607,6 +7688,7 @@ impl AppRuntime {
             );
         }
         if let Some(refusal) = refusal {
+            observe("pending_refused", &refusal.notice(version));
             tracing::warn!(
                 target: "gwt::update",
                 version,
@@ -7621,6 +7703,10 @@ impl AppRuntime {
             "staged update raises the Issue Monitor update drain (autonomous auto-apply)"
         );
         let Some(state) = self.project_state_mut(context) else {
+            observe(
+                "pending_failed",
+                "project state unavailable while starting drain",
+            );
             return Vec::new();
         };
         state.update_auto_apply.reset();
@@ -7648,24 +7734,32 @@ impl AppRuntime {
                         self.issue_monitor_snapshot_events_for(None, Some(&project_root), monitor)
                     }
                     Err(local_error) => {
+                        observe(
+                            "pending_failed",
+                            &format!("cannot commit update drain: {local_error}"),
+                        );
                         return self.issue_monitor_control_error_events(
                             Some(&context.project_root),
                             None,
                             local_error,
                             "update-drain",
                             None,
-                        )
+                        );
                     }
                 }
             }
             Err(error) => {
+                observe(
+                    "pending_failed",
+                    &format!("cannot publish update drain: {error}"),
+                );
                 return self.issue_monitor_control_error_events(
                     Some(&context.project_root),
                     None,
                     error,
                     "update-drain",
                     None,
-                )
+                );
             }
         };
         let monitor = gwt::IssueMonitorState::with_prefs(gwt::IssueMonitorConfig::default(), prefs);
@@ -7679,6 +7773,19 @@ impl AppRuntime {
                 ],
             );
         }
+        let now = chrono::Utc::now();
+        record_pending_update_observation(
+            &version,
+            Some(&project_root),
+            "pending_waiting",
+            "waiting for drain evaluation",
+            now,
+            Some(
+                now + chrono::Duration::seconds(
+                    terminal_convergence::TERMINAL_CONVERGENCE_TICK.as_secs() as i64,
+                ),
+            ),
+        );
         // AC-12: drain start is a notification-center record.
         events.push(update_notice(
             "info",
@@ -7738,6 +7845,12 @@ impl AppRuntime {
         let monitor =
             gwt::IssueMonitorState::with_prefs(gwt::IssueMonitorConfig::default(), prefs.clone());
         let snapshot = self.update_quiescence_snapshot(&monitor);
+        let outcome = gwt::update_drain::update_quiescence(&snapshot);
+        let wait_reason = match &outcome {
+            Ok(()) => "waiting for consecutive quiet observations or apply grace".to_string(),
+            Err(blockers) => serde_json::to_string(blockers)
+                .unwrap_or_else(|_| "host is not quiescent".to_string()),
+        };
         let drained_for_secs = chrono::DateTime::parse_from_rfc3339(&drain.since)
             .ok()
             .map(|since| {
@@ -7747,19 +7860,62 @@ impl AppRuntime {
             })
             .unwrap_or(0);
         let Some(state) = self.project_state_mut(context) else {
+            record_pending_update_observation(
+                &drain.version,
+                Some(&context.project_root),
+                "pending_failed",
+                "project state unavailable while evaluating drain",
+                now,
+                None,
+            );
             return Vec::new();
         };
+        let cancelled = state.update_auto_apply.is_cancelled(&drain.version);
         let step = state
             .update_auto_apply
             .tick(gwt::update_drain::UpdateAutoApplyObservation {
                 version: &drain.version,
                 now_secs: now.timestamp().max(0) as u64,
                 drained_for_secs,
-                outcome: gwt::update_drain::update_quiescence(&snapshot),
+                outcome,
                 notify_after_secs: prefs.autonomous_tuning.update_drain_notify_after_secs,
                 grace_secs: gwt::update_drain::DEFAULT_AUTO_APPLY_GRACE_SECS,
             });
         let version = drain.version.clone();
+        let (stage, reason, next) = if cancelled {
+            (
+                "pending_refused",
+                "automatic apply cancelled; waiting for manual Restart now".to_string(),
+                None,
+            )
+        } else {
+            let next = Some(
+                now + chrono::Duration::seconds(
+                    terminal_convergence::TERMINAL_CONVERGENCE_TICK.as_secs() as i64,
+                ),
+            );
+            match &step {
+                gwt::update_drain::UpdateAutoApplyStep::Apply => (
+                    "pending_applying",
+                    "host quiescent and grace elapsed".to_string(),
+                    None,
+                ),
+                gwt::update_drain::UpdateAutoApplyStep::Scheduled { apply_at_secs } => (
+                    "pending_scheduled",
+                    format!("automatic apply scheduled at unix time {apply_at_secs}"),
+                    next,
+                ),
+                _ => ("pending_waiting", wait_reason, next),
+            }
+        };
+        record_pending_update_observation(
+            &version,
+            Some(&context.project_root),
+            stage,
+            &reason,
+            now,
+            next,
+        );
         // Record identities when the bounded warning fires or a scheduled
         // apply is postponed, rather than writing the same blockers each tick.
         if let gwt::update_drain::UpdateAutoApplyStep::StillDraining(blockers)
@@ -7865,10 +8021,24 @@ impl AppRuntime {
         context: &ProjectContext,
     ) -> Option<(gwt::IssueMonitorPrefs, gwt::IssueMonitorUpdateDrain)> {
         let project_root = &context.project_root;
-        let prefs = gwt::load_issue_monitor_prefs(&gwt::issue_monitor_prefs_path_for_repo_path(
-            project_root,
-        ))
-        .ok()?;
+        let prefs = match gwt::load_issue_monitor_prefs(
+            &gwt::issue_monitor_prefs_path_for_repo_path(project_root),
+        ) {
+            Ok(prefs) => prefs,
+            Err(error) => {
+                if let Some(manifest) = gwt_core::update::load_pending_update_manifest() {
+                    record_pending_update_observation(
+                        &manifest.version,
+                        Some(project_root),
+                        "pending_failed",
+                        &format!("cannot read update drain preferences: {error}"),
+                        chrono::Utc::now(),
+                        None,
+                    );
+                }
+                return None;
+            }
+        };
         let drain = prefs
             .update_drain
             .clone()
@@ -7933,6 +8103,15 @@ impl AppRuntime {
                 ),
             ),
         };
+        self.record_update_apply_observation(
+            version,
+            if release == UpdateAutoApplyRelease::Cancelled {
+                "pending_refused"
+            } else {
+                "pending_failed"
+            },
+            &message,
+        );
         events.push(update_notice(level, message));
         events.push(OutboundEvent::broadcast(BackendEvent::UpdateAutoApply {
             version: version.to_string(),
