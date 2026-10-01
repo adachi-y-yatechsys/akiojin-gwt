@@ -730,6 +730,7 @@ pub fn build_shell_process_launch(
         install_launch_gwt_bin_env(&mut env, gwt_agent::LaunchRuntimeTarget::Host)?;
         config.env_vars = env.clone();
         return Ok(ProcessLaunch {
+            initial_prompt_file: None,
             command: shell.command,
             args: shell.args,
             env,
@@ -766,6 +767,7 @@ pub fn build_shell_process_launch(
     args.push(shell_command);
 
     Ok(ProcessLaunch {
+        initial_prompt_file: None,
         command: runtime.binary().to_string(),
         args,
         env,
@@ -827,6 +829,40 @@ pub fn apply_windows_host_shell_wrapper(
     config.command = command;
     config.args = args;
     Ok(())
+}
+
+/// Move the long task out of argv only after the actual worktree is known.
+/// The returned guard follows the launch into its runtime, including failures.
+pub fn prepare_initial_prompt(
+    config: &mut gwt_agent::LaunchConfig,
+    worktree: &Path,
+) -> Result<Option<std::sync::Arc<tempfile::TempPath>>, String> {
+    use std::io::Write as _;
+
+    let Some(prompt) = config.pending_initial_prompt.as_deref() else {
+        return Ok(None);
+    };
+    let directory = worktree.join(".gwt").join("tmp");
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| format!("create initial prompt directory: {error}"))?;
+    let mut file = tempfile::Builder::new()
+        .prefix("initial-prompt-")
+        .suffix(".txt")
+        .tempfile_in(&directory)
+        .map_err(|error| format!("create initial prompt file: {error}"))?;
+    file.write_all(prompt.as_bytes())
+        .map_err(|error| format!("write initial prompt file: {error}"))?;
+    let file = std::sync::Arc::new(file.into_temp_path());
+    let path = if config.runtime_target == gwt_agent::LaunchRuntimeTarget::Docker {
+        // The resolved worktree is mounted at the container's working directory.
+        format!(".gwt/tmp/{}", file.file_name().unwrap().to_string_lossy())
+    } else {
+        file.display().to_string()
+    };
+    config.args.push(format!(
+        "Read the complete initial task from the UTF-8 file `{path}`, then follow its instructions."
+    ));
+    Ok(Some(file))
 }
 
 fn wrap_windows_host_shell_command(
@@ -915,7 +951,19 @@ fn launch_display_command(command: &str, args: &[String]) -> String {
     let tokens = sanitize_launch_display_tokens(command, args);
     tokens
         .iter()
-        .map(|token| quote_display_token_if_needed(&gwt_core::process_console::redact_line(token)))
+        .map(|token| {
+            let token = gwt_core::process_console::redact_line(token);
+            let chars = token.chars().count();
+            let token = if chars > 200 {
+                format!(
+                    "{}...({chars} chars)",
+                    token.chars().take(200).collect::<String>()
+                )
+            } else {
+                token
+            };
+            quote_display_token_if_needed(&token)
+        })
         .collect::<Vec<_>>()
         .join(" ")
 }
@@ -2011,6 +2059,88 @@ mod tests {
             interactive_windows_shell_args(gwt_agent::WindowsShellKind::PowerShell7),
             vec!["-NoLogo"]
         );
+    }
+
+    #[test]
+    fn long_initial_prompt_file_preserves_bytes_and_lives_until_last_owner_drops() {
+        let worktree = tempdir().unwrap();
+        let _gwt_home = gwt_core::test_support::ScopedGwtHome::set(worktree.path());
+        let prompt = "a\"'\\é".repeat(8_000);
+        let mut config = gwt_agent::AgentLaunchBuilder::new(gwt_agent::AgentId::Codex).build();
+        config.pending_initial_prompt = Some(prompt.clone());
+        let file = prepare_initial_prompt(&mut config, worktree.path())
+            .unwrap()
+            .expect("long prompt file");
+        let path = file.to_path_buf();
+        assert!(path.starts_with(worktree.path().join(".gwt/tmp")));
+        assert_eq!(fs::read(&path).unwrap(), prompt.as_bytes());
+        assert!(config.args.iter().all(|arg| arg.chars().count() <= 4_096));
+        assert!(config.args.last().unwrap().contains(path.to_str().unwrap()));
+        let runtime_owner = file.clone();
+        drop(file);
+        assert!(path.exists());
+        drop(runtime_owner);
+        assert!(!path.exists(), "session end must remove its prompt file");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn long_initial_prompt_roundtrips_through_powershell() {
+        let root = tempdir().unwrap();
+        let _gwt_home = gwt_core::test_support::ScopedGwtHome::set(root.path());
+        let worktree = root.path().join("space ' worktree");
+        fs::create_dir(&worktree).unwrap();
+        let prompt = "a\"'\\é".repeat(8_000);
+        assert_eq!(prompt.chars().count(), 40_000);
+        let mut config = gwt_agent::AgentLaunchBuilder::new(gwt_agent::AgentId::Codex).build();
+        config.pending_initial_prompt = Some(prompt.clone());
+        let file = prepare_initial_prompt(&mut config, &worktree)
+            .unwrap()
+            .unwrap();
+        let probe = worktree.join("read-prompt.ps1");
+        fs::write(
+            &probe,
+            r#"param([string]$Prompt)
+$ErrorActionPreference = 'Stop'
+$path = $Prompt.Split('`')[1]
+[System.IO.File]::WriteAllBytes((Join-Path $PWD 'received.txt'), [System.IO.File]::ReadAllBytes($path))
+"#,
+        )
+        .unwrap();
+        let args = vec![
+            "-NoLogo".into(),
+            "-NoProfile".into(),
+            "-File".into(),
+            probe.to_string_lossy().into_owned(),
+            config.args.last().unwrap().clone(),
+        ];
+        let (command, args) = wrap_windows_host_shell_command(
+            gwt_agent::WindowsShellKind::PowerShell7,
+            "pwsh",
+            &args,
+            &mut HashMap::new(),
+        );
+        assert!(args.iter().all(|arg| arg.chars().count() <= 4_096));
+        let output = gwt_core::process::hidden_command(command)
+            .args(args)
+            .current_dir(&worktree)
+            .output()
+            .expect("run real pwsh wrapper");
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            fs::read(worktree.join("received.txt")).unwrap(),
+            prompt.as_bytes()
+        );
+        drop(file);
+    }
+
+    #[test]
+    fn long_prompt_banner_is_bounded() {
+        let prompt = "a".repeat(40_000);
+        let lines = launch_banner_lines("codex", &[prompt], None);
+        let banner = lines.last().unwrap();
+        assert!(banner.len() < 1_000, "banner length: {}", banner.len());
+        assert!(banner.contains("...(40000 chars)"));
     }
 
     #[test]

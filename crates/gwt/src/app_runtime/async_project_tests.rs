@@ -130,6 +130,7 @@ fn stale_project_launch_completion_cleans_exact_genesis_without_touching_reopene
         window_id: window_id.clone(),
         result: Box::new(Ok((
             ProcessLaunch {
+                initial_prompt_file: None,
                 command: "/definitely/missing/gwt-agent".to_string(),
                 args: Vec::new(),
                 env: HashMap::new(),
