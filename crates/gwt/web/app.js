@@ -7478,6 +7478,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
           createTerminalRuntime(id, root);
         },
         sendInput: sendPaneInput,
+        onFocus: focusWindowLocally,
         onLayout: () => requestAnimationFrame(() => {
           if (!agentsHost) return;
           for (const id of terminalMap.keys()) {

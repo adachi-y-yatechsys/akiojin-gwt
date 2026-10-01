@@ -2,7 +2,7 @@ import { surfaceForWindow } from "./surface-rail.js";
 
 // The grid owns presentation only. Sessions and terminal runtimes remain shared
 // with the existing window model; column changes never persist canvas geometry.
-export function createAgentsSurface({ document, mountTerminal, sendInput, onLayout }) {
+export function createAgentsSurface({ document, mountTerminal, sendInput, onLayout, onFocus = () => {} }) {
   const element = document.createElement("section");
   element.className = "agents-surface";
   element.setAttribute("aria-label", "Agents");
@@ -33,6 +33,8 @@ export function createAgentsSurface({ document, mountTerminal, sendInput, onLayo
         tile = document.createElement("article");
         tile.className = "agent-tile";
         tile.dataset.agentId = data.id;
+        tile.addEventListener("pointerdown", () => onFocus(data.id));
+        tile.addEventListener("focusin", () => onFocus(data.id));
         tile.innerHTML = `<header class="agent-tile__header"><h3></h3><span>Interactive</span></header>
           <div class="agent-tile__terminal terminal-root"></div>
           <form class="agent-tile__input"><textarea rows="2" aria-label="Message to agent" placeholder="Send a message"></textarea>

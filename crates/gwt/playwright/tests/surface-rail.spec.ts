@@ -110,6 +110,7 @@ test.describe("Surface rail", () => {
     await page.evaluate(() => (window as any).__surfaceRailSocket().emit({ kind: "terminal_output", id: "agent-one", data_base64: btoa("LIVE AGENT OUTPUT\r\n") }));
     await expect(tiles.first().locator(".xterm-rows")).toContainText("LIVE AGENT OUTPUT");
     await tiles.first().getByRole("textbox", { name: "Message to agent" }).fill("Continue");
+    await expect(windowById(page, "agent-one")).toHaveClass(/\bfocused\b/);
     await tiles.first().getByRole("button", { name: "Send", exact: true }).click();
     await expect.poll(async () => (await sentMessages(page)).filter(message => message.kind === "pane_send_input")).toEqual([{ kind: "pane_send_input", session_id: "session-one", text: "Continue" }]);
     await page.screenshot({ path: testInfo.outputPath("agents-grid.png") });
