@@ -22,6 +22,12 @@ const GWT_WORKTREE_HASH_ENV: &str = "GWT_WORKTREE_HASH";
 const CODEX_THREAD_ID_ENV: &str = "CODEX_THREAD_ID";
 const INHERITED_TERMINAL_COLOR_SUPPRESSOR_ENV_KEYS: &[&str] = &["NO_COLOR"];
 const INHERITED_LAUNCH_ENV_KEYS: &[&str] = &[
+    // Independent agents must not inherit Claude's parent-session identity or
+    // child marker, which can disable their own transcript persistence.
+    "CLAUDECODE",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_SESSION_ATTENDED",
     CODEX_THREAD_ID_ENV,
     GWT_BIN_PATH_ENV,
     GWT_CONTINUE_WORK_READY_NONCE_ENV,
@@ -1072,6 +1078,74 @@ mod tests {
                 "parent launch-scoped value must be removed regardless of Windows env-key casing: {key}"
             );
         }
+    }
+
+    #[test]
+    fn launch_environment_drops_claude_child_session_marker() {
+        for key in [
+            "CLAUDE_CODE_CHILD_SESSION",
+            "CLAUDECODE",
+            "CLAUDE_CODE_SESSION_ID",
+            "CLAUDE_CODE_SESSION_ATTENDED",
+        ] {
+            let (env, remove_env) =
+                LaunchEnvironment::from_base_env([(key.to_string(), "parent".to_string())])
+                    .into_parts();
+
+            assert!(!env.contains_key(key), "parent marker remains: {key}");
+            assert!(remove_env.iter().any(|candidate| candidate == key));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn launch_environment_drops_claude_child_session_marker_with_windows_casing() {
+        for key in [
+            "Claude_Code_Child_Session",
+            "ClaudeCode",
+            "Claude_Code_Session_Id",
+            "Claude_Code_Session_Attended",
+        ] {
+            let (env, remove_env) =
+                LaunchEnvironment::from_base_env([(key.to_string(), "parent".to_string())])
+                    .into_parts();
+
+            assert!(!env
+                .keys()
+                .any(|candidate| candidate.eq_ignore_ascii_case(key)));
+            assert!(remove_env
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(key)));
+        }
+    }
+
+    #[test]
+    fn child_process_does_not_inherit_claude_child_session_marker() {
+        let _lock = gwt_core::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _marker = gwt_core::test_support::ScopedEnvVar::set("CLAUDE_CODE_CHILD_SESSION", "1");
+        let (env, remove_env) = LaunchEnvironment::from_base_env(host_process_env()).into_parts();
+        #[cfg(not(windows))]
+        let mut child = {
+            let mut command = gwt_core::process::hidden_command("/bin/sh");
+            command.args(["-c", "test \"${CLAUDE_CODE_CHILD_SESSION+x}\" != x"]);
+            command
+        };
+        #[cfg(windows)]
+        let mut child = {
+            let mut command = gwt_core::process::hidden_command("cmd.exe");
+            command.args([
+                "/D",
+                "/C",
+                "if defined Claude_Code_Child_Session (exit /b 1) else (exit /b 0)",
+            ]);
+            command
+        };
+        for key in remove_env {
+            child.env_remove(key);
+        }
+        assert!(child.envs(env).status().unwrap().success());
     }
 
     #[test]
