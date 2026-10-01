@@ -130,9 +130,22 @@ struct ObservedLockHolder {
 impl NamedFileLock {
     /// Wait for ownership using the ambient operation deadline.
     pub fn acquire(path: &Path, operation: &str) -> io::Result<Self> {
+        Self::acquire_observed(path, operation, || {})
+    }
+
+    /// Like [`Self::acquire`], but also reports the first contention this exact
+    /// call observes. Callers that already instrument contention keep that
+    /// boundary while gaining holder diagnostics (Issue #4686 AC-5); lock timing
+    /// and deadline behavior are identical to [`Self::acquire`].
+    pub fn acquire_observed(
+        path: &Path,
+        operation: &str,
+        mut on_first_contention: impl FnMut(),
+    ) -> io::Result<Self> {
         let file = open_named_lock(path)?;
         let holder_path = named_lock_holder_path(path);
         lock_exclusive_with_observer(&file, || {
+            on_first_contention();
             let _ = named_lock_error(
                 &holder_path,
                 operation,

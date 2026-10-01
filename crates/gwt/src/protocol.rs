@@ -399,6 +399,8 @@ pub enum FrontendEvent {
     },
     ReopenRecentProject {
         path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
     },
     PreviewCloseProject {
         project_key: String,
@@ -2320,6 +2322,36 @@ pub enum BackendEvent {
     },
     ProjectOpenError {
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+    },
+    ProjectOpened {
+        project_key: String,
+        title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+    },
+    PickerStarted {
+        request_id: u64,
+        purpose: String,
+    },
+    PickerSelected {
+        request_id: u64,
+        purpose: String,
+        path: String,
+    },
+    PickerCancelled {
+        request_id: u64,
+        purpose: String,
+    },
+    PickerError {
+        request_id: u64,
+        purpose: String,
+        message: String,
+    },
+    PickerBusy {
+        purpose: String,
+        message: String,
     },
     CloneProjectParentSelected {
         path: String,
@@ -3350,6 +3382,12 @@ impl BackendEvent {
             BackendEvent::LogError { .. } => "log_error",
             BackendEvent::KnowledgeError { .. } => "knowledge_error",
             BackendEvent::ProjectOpenError { .. } => "project_open_error",
+            BackendEvent::ProjectOpened { .. } => "project_opened",
+            BackendEvent::PickerStarted { .. } => "picker_started",
+            BackendEvent::PickerSelected { .. } => "picker_selected",
+            BackendEvent::PickerCancelled { .. } => "picker_cancelled",
+            BackendEvent::PickerError { .. } => "picker_error",
+            BackendEvent::PickerBusy { .. } => "picker_busy",
             BackendEvent::CloneProjectParentSelected { .. } => "clone_project_parent_selected",
             BackendEvent::GithubRepositorySearchResults { .. } => {
                 "github_repository_search_results"
