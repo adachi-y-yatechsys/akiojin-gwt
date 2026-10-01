@@ -1080,6 +1080,20 @@ lint、coverage、直接の headed browser 確認、pre-push 確認は verificat
 lease なしでそのまま実行します。完了判定には引き続き canonical な検証証跡が
 必要です。
 
+`verify.lease.status` は `holder_project_relation`（`same_project` /
+`other_project` / `unknown`）、`holder_reclaim_candidate`、
+`holder_intervention` を判定として返します。他プロジェクトの holder、所有者を
+特定できない holder、活動を判定できない holder は
+`holder_intervention: forbidden` として保護されます。観測回数を増やしても
+`unknown` の holder を停止する根拠にはなりません。同一プロジェクトの回収候補または
+旧 control channel だけが `canonical_release_only` になり、canonical release が状態を確認します。
+他プロジェクトからの release は拒否されます。拒否を `kill` / `pkill` で迂回しないでください。
+
+ETA には `estimated_remaining_ms_uncertain: true` が併記されます。これはバッチの
+推定時間または lease TTL で、現在の進捗を測るカウンターではありません。値が不変でも
+固着の証拠にはなりません。`waiter_action: wait` は canonical admission を待つのが
+正しい挙動だと示します。待機列に並んでいることは holder を停止する権限になりません。
+
 `pre-push` hook は、ワークスペースをコンパイルしない検査だけを実行します
 （`cargo fmt --all -- --check`、Markdownlint、SKILL.md frontmatter の検証）。
 Git hook は `gwtd` ではなく `git push` の配下で動くため verification lease を
@@ -1092,7 +1106,7 @@ Git hook は `gwtd` ではなく `git push` の配下で動くため verificatio
 `verify.lease.extend` は holder や予約を作らずエラーを返すようになりました。
 canonical 検証を囲む手動取得は `verify.run` に置き換え、通常の Cargo 操作を
 囲む手動取得は削除してください。既存の旧 holder はプロセスを kill せず、
-明示的に解放できます。
+所有プロジェクトから明示的に解放できます。
 
 ```bash
 gwtd <<'JSON'
