@@ -20,10 +20,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
       import { createStartupMetrics } from "/startup-metrics.js";
       import {
         TITLEBAR_DOCK_HIT_HEIGHT,
-        clientPointFromDragEvent,
-        detachGeometryFromClientPoint,
         findTitlebarDockTarget,
-        resolveDragReleasePoint,
       } from "/window-docking.js";
       import {
         attentionForWorkspace,
@@ -74,7 +71,6 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
         expandWorldRectForLayoutSize,
       } from "/camera-framing.js";
       import { createTerminalWheelScrollController } from "/terminal-wheel-scroll.js";
-      import { renderWindowTabs as renderWindowTabsView } from "/window-tabs-renderer.js";
       // SPEC-3038 US-3: Close Guard confirm modal renderer.
       import { renderWindowCloseConfirmModal } from "/window-close-confirm-modal.js";
       // SPEC-3064 Phase 3 (E4): the Settings windows surface (and its
@@ -472,7 +468,6 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
       let reconnectTimer = null;
       let focusedId = null;
       let dragState = null;
-      let windowTabDragState = null;
       let panState = null;
       let resizeState = null;
       const geometrySyncState = createGeometrySyncState();
@@ -1539,13 +1534,6 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
         return windowData?.tab_group_id || windowData?.id || "";
       }
 
-      function windowTabsFor(windowData) {
-        const groupId = windowGroupId(windowData);
-        return (activeWorkspace().windows || []).filter(
-          (candidate) => windowGroupId(candidate) === groupId,
-        );
-      }
-
       function visibleWindowData(windowData) {
         if (isOffCanvasPlacement(windowData)) {
           return false;
@@ -1554,29 +1542,6 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
           return true;
         }
         return Boolean(windowData.tab_group_active);
-      }
-
-      function trackWindowTabDragPoint(event) {
-        if (!windowTabDragState) return;
-        const point = clientPointFromDragEvent(event, canvas.getBoundingClientRect());
-        if (point) {
-          windowTabDragState.lastClientPoint = point;
-        }
-      }
-
-      function detachGeometryFromTabDrag(event, drag, windowData) {
-        const canvasRect = canvas.getBoundingClientRect();
-        const releasePoint = resolveDragReleasePoint(
-          event,
-          drag?.lastClientPoint,
-          canvasRect,
-        );
-        return detachGeometryFromClientPoint(
-          releasePoint,
-          windowData,
-          canvasRect,
-          viewport,
-        );
       }
 
       function pointerWorldPoint(event) {
@@ -2443,6 +2408,13 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
           }
           // PM and legacy surfaces keep their existing single-view route.
           splitSurfaces.close();
+        }
+        // The Windows rail also lists inactive members of saved window groups.
+        // Activate first; the next workspace render completes the pending frame.
+        if (windowData.tab_group_id && !windowData.tab_group_active) {
+          pendingFrameWindowId = windowId;
+          send({ kind: "activate_window_tab", id: windowId });
+          return;
         }
         // Cap framing at 1:1 so the focused terminal never CSS-upscales (blur).
         const target = viewportForWorldRect(framingRectForWindow(windowData), {
@@ -3759,8 +3731,6 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
             const element = windowMap.get(windowId);
             if (!element) {
               renderWindowList();
-              refreshWindowTabTelemetry(windowData);
-
               return;
             }
             const chip = element.querySelector(".status-chip");
@@ -3790,7 +3760,6 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
             // expose either control.
             updateWindowKillSwitchControls(element, windowData, runtimeState);
             recomputeOperatorTelemetry();
-            refreshWindowTabTelemetry(windowData);
             label.textContent = windowRuntimeLabel(runtimeState);
             const runtimeDescription = windowRuntimeDescription(runtimeState, windowData?.preset);
             const statusTitle = effectiveDetail
@@ -4036,75 +4005,6 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
         ) {
           send({ kind: "stop_all_windows" });
         }
-      }
-
-      // SPEC-3038 US-2: tabs carry the same Living Telemetry the window chrome
-      // shows. Only agent panes (terminal surface) report a state; other
-      // surfaces render plain tabs.
-      function windowTabTelemetryState(tab) {
-        if (!shouldShowRuntimeStatus(tab)) return "";
-        return runtimeStateForWindow(tab);
-      }
-
-      // AS-2.2: a runtime state change must repaint the tab strip of every
-      // window in the group (the visible strip belongs to the active window's
-      // element, not necessarily the one whose status changed).
-      function refreshWindowTabTelemetry(windowData) {
-        if (!windowData?.tab_group_id) return;
-        for (const tab of windowTabsFor(windowData)) {
-          const tabElement = windowMap.get(tab.id);
-          if (tabElement) renderWindowTabs(tab, tabElement);
-        }
-      }
-
-      function renderWindowTabs(windowData, element) {
-        const strip = element.querySelector(".window-tab-strip");
-        if (!strip) return;
-        renderWindowTabsView({
-          strip,
-          tabs: windowTabsFor(windowData).map((tab) => ({
-            ...tab,
-            agent_state: windowTabTelemetryState(tab),
-          })),
-          activeWindowId: windowData.id,
-          tooltipForWindow: windowTitleTooltip,
-          send,
-          requestClose: requestCloseWindow,
-          onTabDragStart: (event, tabId) => {
-            if (splitSurfaces?.isOpen()) {
-              event.preventDefault();
-              return;
-            }
-            windowTabDragState = {
-              id: tabId,
-              docked: false,
-              lastClientPoint: clientPointFromDragEvent(
-                event,
-                canvas.getBoundingClientRect(),
-              ),
-            };
-            event.dataTransfer?.setData("text/plain", tabId);
-            if (event.dataTransfer) {
-              event.dataTransfer.effectAllowed = "move";
-            }
-          },
-          onTabDrag: trackWindowTabDragPoint,
-          onTabDragEnd: (event) => {
-            const drag = windowTabDragState;
-            trackWindowTabDragPoint(event);
-            windowTabDragState = null;
-            if (!drag || drag.docked) return;
-            const draggedWindow = workspaceWindowById(drag.id);
-            if (!draggedWindow?.tab_group_id) return;
-            const geometry = detachGeometryFromTabDrag(event, drag, draggedWindow);
-            if (!geometry) return;
-            send({
-              kind: "detach_window_tab",
-              id: drag.id,
-              geometry,
-            });
-          },
-        });
       }
 
       // SPEC-2008 camera-focus (UX fix): focus and camera move are SEPARATE.
@@ -5666,10 +5566,10 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
                 <button class="icon-button" data-action="restart" aria-label="Restart agent" title="Restart agent" hidden>↻</button>
                 <button class="icon-button" data-action="minimize-to-issue" aria-label="Return to Issue list" title="Return to Issue list" hidden>▁</button>
                 <button class="icon-button" data-action="open-issue" aria-label="Open Issue" title="Open Issue" hidden>⧉</button>
+                <button class="icon-button" data-action="ungroup" aria-label="Ungroup window" title="Ungroup window" hidden>↗</button>
                 <button class="icon-button" data-action="close" aria-label="Close window">×</button>
               </div>
             </div>
-            <div class="window-tab-strip" aria-label="Window tabs"></div>
             <div class="window-body"></div>
             <div class="resize-handle"></div>
           `;
@@ -5678,6 +5578,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
 
           const titlebar = element.querySelector(".titlebar");
           const closeButton = element.querySelector("[data-action='close']");
+          const ungroupButton = element.querySelector("[data-action='ungroup']");
           const restartButton = element.querySelector("[data-action='restart']");
           const minimizeToIssueButton = element.querySelector("[data-action='minimize-to-issue']");
           const openIssueButton = element.querySelector("[data-action='open-issue']");
@@ -5712,6 +5613,17 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
               "open-issue",
               workspaceWindowById(windowData.id) || windowData,
             );
+          });
+
+          ungroupButton.addEventListener("click", (event) => {
+            event.stopPropagation();
+            const currentWindow = workspaceWindowById(windowData.id);
+            if (!currentWindow?.tab_group_id) return;
+            send({
+              kind: "detach_window_tab",
+              id: currentWindow.id,
+              geometry: currentWindow.geometry,
+            });
           });
 
           // SPEC-2008 camera-focus: minimize/maximize buttons were removed
@@ -5760,30 +5672,6 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
             };
             titlebar.setPointerCapture(event.pointerId);
           });
-          titlebar.addEventListener("dragover", (event) => {
-            if (!windowTabDragState || windowTabDragState.id === windowData.id) {
-              return;
-            }
-            trackWindowTabDragPoint(event);
-            event.preventDefault();
-            if (event.dataTransfer) {
-              event.dataTransfer.dropEffect = "move";
-            }
-          });
-          titlebar.addEventListener("drop", (event) => {
-            if (!windowTabDragState || windowTabDragState.id === windowData.id) {
-              return;
-            }
-            event.preventDefault();
-            trackWindowTabDragPoint(event);
-            windowTabDragState.docked = true;
-            send({
-              kind: "dock_window_tab",
-              id: windowTabDragState.id,
-              target_id: windowData.id,
-            });
-          });
-
           resizeHandle.addEventListener("pointerdown", (event) => {
             event.stopPropagation();
             // SPEC-2014 Phase C1: Windows WebView2 occasionally fails to
@@ -5921,6 +5809,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
           return;
         }
 
+        element.querySelector("[data-action='ungroup']").hidden = !windowData.tab_group_id;
         element.querySelector(".title-text").textContent = windowDisplayTitle(windowData);
         const titleText = element.querySelector(".title-text");
         titleText.title = windowTitleTooltip(windowData);
@@ -5937,7 +5826,6 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
         } else {
           delete element.dataset.pm;
         }
-        renderWindowTabs(windowData, element);
         if (windowData.agent_color) {
           element.dataset.agentColor = windowData.agent_color;
         } else {
@@ -5956,7 +5844,6 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
         const shouldPersistTerminalGeometry =
           previousWidth !== windowData.geometry.width ||
           previousHeight !== windowData.geometry.height;
-        element.classList.toggle("tabbed", windowTabsFor(windowData).length > 1);
         element.style.left = `${windowData.geometry.x}px`;
         element.style.top = `${windowData.geometry.y}px`;
         element.style.width = `${windowData.geometry.width}px`;
@@ -7018,8 +6905,6 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
           scheduleResizePointermoveApply();
         }
       });
-
-      window.addEventListener("dragover", trackWindowTabDragPoint);
 
       window.addEventListener("pointerup", (event) => {
         if (panState && panState.pointerId === event.pointerId) {

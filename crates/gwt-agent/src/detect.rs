@@ -377,9 +377,15 @@ mod tests {
     fn detect_by_command_bounds_a_hanging_version_probe() {
         use std::os::unix::fs::PermissionsExt;
 
+        // Issue #4884: the fixture's sleep is what the assertion below reads as
+        // "the bound never engaged", so it is named rather than repeated.
+        const HANG_SECONDS: u64 = 30;
+        let hang = std::time::Duration::from_secs(HANG_SECONDS);
+
         let temp = tempfile::tempdir().expect("tempdir");
         let executable = temp.path().join("agy");
-        std::fs::write(&executable, "#!/bin/sh\nsleep 30\n").expect("write hanging fixture");
+        std::fs::write(&executable, format!("#!/bin/sh\nsleep {HANG_SECONDS}\n"))
+            .expect("write hanging fixture");
         let mut permissions = std::fs::metadata(&executable)
             .expect("fixture metadata")
             .permissions();
@@ -398,9 +404,21 @@ mod tests {
         assert_eq!(detected.agent_id, AgentId::Antigravity);
         assert_eq!(detected.path, executable);
         assert_eq!(detected.version, None);
+        // Issue #4884: assert the property, not the latency. What this test is
+        // for is that detection stops waiting on a probe that never returns —
+        // the bound engaged. `VERSION_PROBE_TIMEOUT + 3s` stood here, which
+        // measures how promptly the scheduler returned to this thread after the
+        // bound fired, so adding tests to this crate (PR #4851 added three)
+        // raised the parallel load until 3s of slack ran out roughly once in
+        // twenty runs. Raising that slack would only move the next failure.
+        //
+        // The two outcomes are 5s apart from 30s, so any threshold between them
+        // separates them with seconds of margin instead of milliseconds.
         assert!(
-            elapsed < VERSION_PROBE_TIMEOUT + std::time::Duration::from_secs(3),
-            "probe must be bounded by {VERSION_PROBE_TIMEOUT:?}, took {elapsed:?}"
+            elapsed < hang / 2,
+            "the probe must stop waiting on a child that never returns: \
+             took {elapsed:?}, bound is {VERSION_PROBE_TIMEOUT:?}, \
+             and the fixture would have hung for {hang:?}"
         );
     }
 

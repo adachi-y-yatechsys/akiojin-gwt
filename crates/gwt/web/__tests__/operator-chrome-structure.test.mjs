@@ -73,10 +73,6 @@ const windowWorktreeFormPath = resolve(here, "../window-worktree-form.js");
 const windowWorktreeFormSource = existsSync(windowWorktreeFormPath)
   ? readFileSync(windowWorktreeFormPath, "utf8")
   : "";
-const windowTabsRendererSource = readFileSync(
-  resolve(here, "../window-tabs-renderer.js"),
-  "utf8",
-);
 const branchCleanupSource = readFileSync(resolve(here, "../branch-cleanup-modal.js"), "utf8");
 const branchListStateSource = readFileSync(resolve(here, "../branch-list-state.js"), "utf8");
 const windowDockingSource = readFileSync(resolve(here, "../window-docking.js"), "utf8");
@@ -1577,11 +1573,11 @@ test("Command Rail is always visible — hover-reveal chrome is fully retired (S
   assert.match(rail.getAttribute("aria-label") ?? "", /command rail/i);
 });
 
-test("workspace windows expose draggable tab docking affordances", () => {
-  assert.match(
+test("workspace windows retain titlebar docking without a tab strip", () => {
+  assert.doesNotMatch(
     appSource,
     /class="window-tab-strip"|className\s*=\s*"window-tab-strip"/,
-    "expected grouped windows to render a tab strip",
+    "window tab strip is retired in favor of the rail",
   );
   assert.match(
     appSource,
@@ -1619,16 +1615,6 @@ test("workspace windows expose draggable tab docking affordances", () => {
     "expected tab drop to send dock_window_tab",
   );
   assert.match(
-    appSource,
-    /kind:\s*"detach_window_tab"/,
-    "expected tab drag outside a group to send detach_window_tab",
-  );
-  assert.match(
-    `${appSource}\n${windowTabsRendererSource}`,
-    /kind:\s*"activate_window_tab"/,
-    "expected tab click to activate a grouped window tab",
-  );
-  assert.match(
     inlineStyle,
     /\.workspace-window\.dock-target\s+\.titlebar/,
     "expected dockable titlebar targets to have a visible preview state",
@@ -1638,11 +1624,7 @@ test("workspace windows expose draggable tab docking affordances", () => {
     /\.workspace-window\.dock-target\s*\{/,
     "expected dockable targets to outline the whole window, not just the titlebar",
   );
-  assert.match(
-    inlineStyle,
-    /\.workspace-window\.dock-target\s+\.window-tab-strip::before/,
-    "expected dockable targets to expose a tab insertion indicator",
-  );
+
 });
 
 test("modal buttons follow the ghost / primary / destructive hierarchy (SPEC-3038 FR-011 / US-5)", () => {
@@ -1839,77 +1821,12 @@ test("window close always routes through the Close Guard confirm modal (SPEC-303
     /closeButton\.addEventListener\("click",[\s\S]{0,120}?send\(\{\s*kind:\s*"close_window"/,
     "titlebar × must not send close_window directly",
   );
-  // The tab strip passes the same entrypoint into the renderer.
-  const renderTabsBody = extractFunctionBody(appSource, "renderWindowTabs");
-  assert.match(
-    renderTabsBody,
-    /requestClose:\s*requestCloseWindow/,
-    "tab × must route through requestCloseWindow",
-  );
-  // The renderer itself must not own a direct close_window send anymore.
-  assert.doesNotMatch(
-    windowTabsRendererSource,
-    /close_window/,
-    "window-tabs-renderer must not send close_window directly",
-  );
+
 });
 
-test("window tabs receive agent runtime state from runtime status (SPEC-3038 US-2)", () => {
-  // SPEC-3038 AS-2.1: tabs carry compact runtime-state cues while the full
-  // window chrome keeps the semantic telemetry mapping.
-  assert.match(
-    appSource,
-    /function\s+windowTabTelemetryState\(tab\)[\s\S]{0,400}?shouldShowRuntimeStatus\(tab\)[\s\S]{0,400}?return\s+runtimeStateForWindow\(tab\)/,
-    "expected a tab telemetry helper that gates on agent windows and returns normalized runtime state for the tab cue",
-  );
-  const renderTabsBody = extractFunctionBody(appSource, "renderWindowTabs");
-  assert.match(
-    renderTabsBody,
-    /agent_state:\s*windowTabTelemetryState\(tab\)/,
-    "renderWindowTabs must decorate tab data with telemetry state",
-  );
-  // AS-2.2: runtime state changes refresh the visible tab strip of the group.
-  const applyStatusBody = extractFunctionBody(appSource, "applyStatus");
-  assert.match(
-    applyStatusBody,
-    /refreshWindowTabTelemetry\(windowData\)/,
-    "status changes must refresh tab telemetry across the tab group",
-  );
-  assert.match(
-    appSource,
-    /function\s+refreshWindowTabTelemetry\(windowData\)[\s\S]{0,400}?windowTabsFor\(windowData\)/,
-    "expected a group-wide tab telemetry refresh helper",
-  );
-});
-
-test("Window tab activation updates tab chrome in place without remounting terminal body", () => {
-  assert.match(
-    appSource,
-    /from\s+"\/window-tabs-renderer\.js"/,
-    "app.js must use the extracted stable window tab renderer",
-  );
-  const renderTabsBody = extractFunctionBody(appSource, "renderWindowTabs");
-  assert.match(
-    renderTabsBody,
-    /renderWindowTabsView\(\{/,
-    "window tab chrome updates must be delegated to the stable renderer",
-  );
-  assert.doesNotMatch(
-    renderTabsBody,
-    /innerHTML\s*=/,
-    "window tab activation must not clear and rebuild the tab strip",
-  );
-  assert.doesNotMatch(
-    windowTabsRendererSource,
-    /innerHTML\s*=/,
-    "stable window tab renderer must update keyed tab nodes in place",
-  );
-  assert.match(
-    windowTabsRendererSource,
-    /dataset\.windowTabId/,
-    "stable window tab renderer must key DOM nodes by window id",
-  );
-
+test("group activation preserves mounted terminal bodies without tab chrome", () => {
+  assert.doesNotMatch(appSource, /window-tabs-renderer/);
+  assert.match(appSource, /class="icon-button" data-action="ungroup" aria-label="Ungroup window" title="Ungroup window"/);
   const ensureWindowBody = extractFunctionBody(appSource, "ensureWindow");
   const mountCalls =
     ensureWindowBody.match(/mountWindowBody\(windowData,\s*element\)/g) || [];
@@ -4976,11 +4893,7 @@ test("Per-window renderer guards unchanged DOM writes after mount and preset syn
   ];
   const titleIndex = ensureWindowBody.indexOf(".title-text");
   const roleBadgeIndex = ensureWindowBody.indexOf("setWindowRoleBadge");
-  const tabsIndex = ensureWindowBody.indexOf("renderWindowTabs");
   const agentColorIndex = ensureWindowBody.indexOf("agentColor");
-  // SPEC-2008 camera-focus: the minimized/maximized class toggles were removed;
-  // the surviving guarded class write is the tab-group "tabbed" toggle.
-  const classIndex = ensureWindowBody.indexOf('classList.toggle("tabbed"');
   const styleIndex = ensureWindowBody.indexOf("element.style.zIndex");
   const statusIndex = ensureWindowBody.indexOf("applyStatus");
   const fitIndex = ensureWindowBody.indexOf("scheduleTerminalFit");
@@ -4996,9 +4909,7 @@ test("Per-window renderer guards unchanged DOM writes after mount and preset syn
   for (const [label, index] of [
     ["title", titleIndex],
     ["role badge", roleBadgeIndex],
-    ["tab strip", tabsIndex],
     ["agent color", agentColorIndex],
-    ["class", classIndex],
     ["style", styleIndex],
     ["status", statusIndex],
     ["terminal fit", fitIndex],
@@ -5425,7 +5336,7 @@ test("Runtime status updates skip unchanged DOM and dependent surface writes", (
   );
 });
 
-test("Runtime status updates repaint tab telemetry when the target window is hidden", () => {
+test("Runtime status updates repaint the Window List when the target window is hidden", () => {
   const statusBody = extractFunctionBody(appSource, "applyStatus");
   const branchMatch = statusBody.match(
     /if\s*\(\s*!element\s*\)\s*\{([\s\S]*?)return\s*;\s*\}/,
@@ -5438,11 +5349,7 @@ test("Runtime status updates repaint tab telemetry when the target window is hid
     /renderWindowList\s*\(\s*\)\s*;/,
     "hidden target status updates must still refresh the Window List",
   );
-  assert.match(
-    branchBody,
-    /refreshWindowTabTelemetry\s*\(\s*windowData\s*\)\s*;/,
-    "hidden target status updates must repaint visible sibling tab telemetry",
-  );
+
 });
 
 test("Runtime status key covers state detail preset visibility and cleanup", () => {
@@ -5839,4 +5746,13 @@ test("SPEC #3206 v2: the --z-* ladder keeps the persistent drawer below the tran
     "the notice stack takes its tier from the token",
   );
   assert.match(frontendStyle, /\.op-rail\s*\{[^}]*z-index:\s*var\(--z-rail\)/);
+});
+
+// SPEC-4777 T-3: the Windows rail must reveal legacy grouped windows.
+test("window framing activates a hidden group member after the split route", () => {
+  const body = extractFunctionBody(appSource, "frameWindow");
+  assert.match(body, /windowData\.tab_group_id && !windowData\.tab_group_active/);
+  assert.match(body, /pendingFrameWindowId\s*=\s*windowId/);
+  assert.match(body, /kind:\s*"activate_window_tab",\s*id:\s*windowId/);
+  assert.ok(body.indexOf('splitSurfaces?.isOpen()') < body.indexOf('windowData.tab_group_id && !windowData.tab_group_active'));
 });
