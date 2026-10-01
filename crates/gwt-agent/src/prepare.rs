@@ -1108,7 +1108,7 @@ where
     };
     launch_env
         .with_project_root(&worktree_path)
-        .apply_to_parts(&mut config.env_vars, &mut config.remove_env);
+        .apply_to_config(&mut config);
     refresh_worktree_assets(&worktree_path)?;
 
     let fallback_executable =
@@ -1187,6 +1187,10 @@ fn finalize_and_persist_prepared_launch(
         session.bind_docker_runtime(runtime_worktree, &project_state_root)?;
     }
 
+    session.codex_auth_root = config
+        .working_dir
+        .as_deref()
+        .and_then(|cwd| config.validated_codex_auth_root_for_cwd(cwd));
     session
         .save(sessions_dir)
         .map_err(|error| error.to_string())?;
