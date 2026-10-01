@@ -540,6 +540,14 @@ pub const OPERATIONS: &[Operation] = &[
         aliases: &[],
     },
     Operation {
+        name: "provider.reset",
+        aliases: &[],
+    },
+    Operation {
+        name: "provider.reset.proposals",
+        aliases: &[],
+    },
+    Operation {
         name: "register.abort",
         aliases: &[],
     },
