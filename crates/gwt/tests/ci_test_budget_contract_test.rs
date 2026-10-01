@@ -232,7 +232,7 @@ fn linux_infrastructure_regressions_run_beside_the_workspace_suite() {
     assert!(
         required.contains("needs: [test, test-linux-infrastructure, test-windows-verify-timings]")
     );
-    assert!(required.contains("if: always()"));
+    assert!(required.contains("if: ${{ !cancelled() }}"));
     assert!(required.contains("RUST_RESULT: ${{ needs.test.result }}"));
     assert!(required.contains("INFRA_RESULT: ${{ needs.test-linux-infrastructure.result }}"));
     assert!(required.contains("test \"$RUST_RESULT\" = success"));
@@ -263,8 +263,7 @@ fn paired_windows_timings_preserve_both_artifacts_and_gate_delivery() {
     assert!(upload.contains("if-no-files-found: error"));
     let required = job_body(&workflow, "  test-rust-required:");
     assert!(required.contains("TIMINGS_RESULT: ${{ needs.test-windows-verify-timings.result }}"));
-    assert!(required.contains("WORKFLOW_CANCELLED: ${{ cancelled() }}"));
-    assert!(required.contains("test \"$WORKFLOW_CANCELLED\" = false"));
+    assert!(required.contains("if: ${{ !cancelled() }}"));
     assert!(required.contains("case \"$TIMINGS_RESULT\" in success|skipped) ;; *) exit 1 ;; esac"));
 }
 
