@@ -112,13 +112,22 @@ pub(super) struct CodexModelCapability {
     pub(super) max_effort: &'static str,
 }
 
-// SPEC-1921 US-20 / FR-121..FR-123 + Issue #4677: fixed 2026-09-23 Codex
+// SPEC-1921 US-20 / FR-121..FR-123 + Issue #4795: fixed 2026-09-30 Codex
 // picker snapshot, in the CLI's own picker order — the first row is the Codex
 // default model. Model rows and reasoning rows both derive from this single
 // capability table so stop counts and defaults cannot drift from the model
 // list. A later snapshot update edits this table together with the focused
 // tests; the wizard never reads a runtime model cache for these rows.
-const CODEX_MODEL_CAPABILITIES: [CodexModelCapability; 7] = [
+const CODEX_MODEL_CAPABILITIES: [CodexModelCapability; 8] = [
+    CodexModelCapability {
+        model: ModelDisplayOption {
+            label: "gpt-6.1-sol",
+            stored_value: "gpt-6.1-sol",
+            description: "Latest workhorse model for coding and everyday work.",
+        },
+        default_effort: "low",
+        max_effort: "ultra",
+    },
     CodexModelCapability {
         model: ModelDisplayOption {
             label: "gpt-6-astra",
@@ -132,7 +141,7 @@ const CODEX_MODEL_CAPABILITIES: [CodexModelCapability; 7] = [
         model: ModelDisplayOption {
             label: "gpt-6-sol",
             stored_value: "gpt-6-sol",
-            description: "Workhorse model for coding and everyday work.",
+            description: "Previous generation workhorse model.",
         },
         default_effort: "medium",
         max_effort: "ultra",
@@ -150,7 +159,7 @@ const CODEX_MODEL_CAPABILITIES: [CodexModelCapability; 7] = [
         model: ModelDisplayOption {
             label: "gpt-5.6-sol",
             stored_value: "gpt-5.6-sol",
-            description: "Older coding model for complex work.",
+            description: "Older generation workhorse model.",
         },
         default_effort: "low",
         max_effort: "ultra",
@@ -1805,6 +1814,7 @@ mod tests {
         assert_eq!(
             current_model_options("codex"),
             vec![
+                "gpt-6.1-sol",
                 "gpt-6-astra",
                 "gpt-6-sol",
                 "gpt-6-luna",
@@ -1823,10 +1833,10 @@ mod tests {
         assert!(!model_display_options("codex").is_empty());
     }
 
-    // SPEC-1921 US-20 / FR-121 + Issue #4677 AC-1/2: visible rows from
-    // the 2026-09-23 cache snapshot, in ascending picker priority.
+    // SPEC-1921 US-20 / FR-121 + Issue #4795 AC-1/3/4: visible rows from
+    // the 2026-09-30 Codex v0.159.2 picker, in the CLI's order.
     #[test]
-    fn codex_model_catalog_matches_2026_09_23_snapshot() {
+    fn codex_model_catalog_matches_2026_09_30_snapshot() {
         let rows: Vec<(&str, &str)> = model_display_options("codex")
             .iter()
             .map(|option| (option.label, option.description))
@@ -1835,12 +1845,16 @@ mod tests {
             rows,
             vec![
                 (
+                    "gpt-6.1-sol",
+                    "Latest workhorse model for coding and everyday work."
+                ),
+                (
                     "gpt-6-astra",
                     "Frontier intelligence for the most demanding work."
                 ),
-                ("gpt-6-sol", "Workhorse model for coding and everyday work."),
+                ("gpt-6-sol", "Previous generation workhorse model."),
                 ("gpt-6-luna", "Fast and affordable model for easier tasks."),
-                ("gpt-5.6-sol", "Older coding model for complex work."),
+                ("gpt-5.6-sol", "Older generation workhorse model."),
                 (
                     "gpt-5.6-terra",
                     "Older balanced model for straightforward work."
@@ -1869,14 +1883,15 @@ mod tests {
     // expectations below mirror the CLI's own effort picker
     // (`supported_reasoning_levels` / `default_reasoning_level`), so Astra /
     // Sol / Terra expose six stops through Ultra, Luna five through Max, and
-    // gpt-5.5 four through Extra high. Only gpt-5.6-sol defaults to Low;
-    // every other visible model defaults to Medium.
+    // gpt-5.5 four through Extra high. gpt-6.1-sol and gpt-5.6-sol default
+    // to Low; every other visible model defaults to Medium.
     #[test]
     fn codex_reasoning_capability_rows_follow_model() {
         const SIX: [&str; 6] = ["low", "medium", "high", "xhigh", "max", "ultra"];
         const FIVE: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
         const FOUR: [&str; 4] = ["low", "medium", "high", "xhigh"];
 
+        assert_eq!(codex_capability_row("gpt-6.1-sol"), (SIX.to_vec(), "low"));
         assert_eq!(
             codex_capability_row("gpt-6-astra"),
             (SIX.to_vec(), "medium")
@@ -1900,6 +1915,7 @@ mod tests {
         // Every catalog row must be covered by the expectations above, so a
         // future snapshot cannot add a model whose effort ladder goes untested.
         let covered = [
+            "gpt-6.1-sol",
             "gpt-6-astra",
             "gpt-6-sol",
             "gpt-6-luna",
