@@ -2239,8 +2239,32 @@ mod tests {
         let project_path = worktree.join(".claude/agents/project.md");
         std::fs::create_dir_all(project_path.parent().unwrap()).unwrap();
         std::fs::write(&project_path, "project before").unwrap();
-        let socket_path = project_path.with_extension("sock");
-        let _socket = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        // Issue #4891: what this node is for is `capture`'s non-regular-file
+        // branch (`!metadata.file_type().is_file()`), reached through the parent
+        // `.claude/agents/` shares with the project-owned file above. A
+        // `UnixListener` stood here, and its path is bounded by the OS
+        // `sun_path` limit (104 bytes on macOS), which the fixture's own
+        // `/private/var/folders/.../T/.tmpXXXXXX/...` prefix already exhausts —
+        // so the test passed or failed on how long `TMPDIR` happened to be, and
+        // failed under the one the canonical verification actually uses. A FIFO
+        // carries no path limit and is likewise neither a regular file, nor a
+        // directory, nor a symlink, so the branch under test is unchanged.
+        let fifo_path = project_path.with_extension("fifo");
+        let fifo_cstr = std::ffi::CString::new(fifo_path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(
+            unsafe { libc::mkfifo(fifo_cstr.as_ptr(), 0o600) },
+            0,
+            "mkfifo {}: {}",
+            fifo_path.display(),
+            std::io::Error::last_os_error()
+        );
+        assert!(
+            !std::fs::symlink_metadata(&fifo_path)
+                .unwrap()
+                .file_type()
+                .is_file(),
+            "the fixture node must be a non-regular file for this test to exercise anything"
+        );
         let managed_path = worktree.join(".claude/settings.local.json");
         std::fs::write(&managed_path, "managed before").unwrap();
         repoint_git(&worktree, &["config", "core.hooksPath", ".git-hooks/_"]);
@@ -2279,7 +2303,10 @@ mod tests {
             std::fs::read_to_string(worktree.join(".claude/hooks/scripts/gwt-old.sh")).unwrap(),
             "old script"
         );
-        assert!(socket_path.exists());
+        assert!(
+            fifo_path.exists(),
+            "restore must leave the project-owned non-regular node in place"
+        );
         assert!(!worktree.join(".codex").exists());
     }
 
