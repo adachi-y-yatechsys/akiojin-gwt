@@ -11544,6 +11544,41 @@ fn app_runtime_detach_window_tab_preserves_real_fit_pty_size() {
 }
 
 #[test]
+fn app_runtime_dock_to_issue_refusals_notify_without_detaching() {
+    let temp = tempdir().expect("tempdir");
+    let _gwt_home = ScopedGwtHome::set(temp.path());
+    let tab = sample_project_tab(
+        "tab-1",
+        "Repo",
+        temp.path().to_path_buf(),
+        ProjectKind::Git,
+        &[WindowPreset::Agent, WindowPreset::Claude],
+    );
+    let mut runtime = sample_runtime(temp.path(), vec![tab], Some("tab-1"));
+    let agent_id = combined_window_id("tab-1", "agent-1");
+    runtime
+        .tab_mut("tab-1")
+        .unwrap()
+        .workspace
+        .dock_window_tab("agent-1", "claude-1");
+    for (linked_issue, reason) in [
+        (None, "no linked Issue"),
+        (Some(4812), "no Issue or Issue Monitor"),
+    ] {
+        let workspace = &mut runtime.tab_mut("tab-1").unwrap().workspace;
+        workspace.set_linked_issue_number("agent-1", linked_issue);
+        let before = workspace.persisted().clone();
+        let events = runtime.dock_agent_window_to_issue_events(&agent_id);
+        assert_eq!(events.len(), 1, "refusal must reach the frontend");
+        assert!(matches!(&events[0].event, BackendEvent::IssueMonitorToast {
+            level, message, issue_number, ..
+        } if level == "warn" && message.contains(reason) && *issue_number == linked_issue));
+        assert!(matches!(events[0].target, DispatchTarget::Project(_)));
+        assert_eq!(runtime.tab("tab-1").unwrap().workspace.persisted(), &before);
+    }
+}
+
+#[test]
 fn app_runtime_places_agent_window_in_kanban_from_frontend_event() {
     let temp = tempdir().expect("tempdir");
     let _gwt_home = ScopedGwtHome::set(temp.path());
