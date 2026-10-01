@@ -2064,6 +2064,7 @@ mod tests {
     #[test]
     fn long_initial_prompt_file_preserves_bytes_and_lives_until_last_owner_drops() {
         let worktree = tempdir().unwrap();
+        let _gwt_home = gwt_core::test_support::ScopedGwtHome::set(worktree.path());
         let prompt = "a\"'\\é".repeat(8_000);
         let mut config = gwt_agent::AgentLaunchBuilder::new(gwt_agent::AgentId::Codex).build();
         config.pending_initial_prompt = Some(prompt.clone());
@@ -2086,6 +2087,7 @@ mod tests {
     #[test]
     fn long_initial_prompt_roundtrips_through_powershell() {
         let root = tempdir().unwrap();
+        let _gwt_home = gwt_core::test_support::ScopedGwtHome::set(root.path());
         let worktree = root.path().join("space ' worktree");
         fs::create_dir(&worktree).unwrap();
         let prompt = "a\"'\\é".repeat(8_000);
