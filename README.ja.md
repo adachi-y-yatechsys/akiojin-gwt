@@ -111,7 +111,7 @@ curl -fsSL https://raw.githubusercontent.com/akiojin/gwt/main/installers/macos/u
   - `GOOGLE_API_KEY` または `GEMINI_API_KEY`
   - `XAI_API_KEY`
 - shared project index runtime の bootstrap / repair が必要な場合は
-  Python 3.9+ が使えること
+  Python 3.10+ が使えること
 
 Linux デスクトップ版のビルドには WebKitGTK 系の依存が必要です。CI と同じ依存は
 [docs/docker-usage.md](docs/docker-usage.md) を参照してください。
