@@ -238,7 +238,7 @@ fn scan_codex_hook_trust_from_path(
     // `E:\...` form. `std::fs::canonicalize` yields the `\\?\` verbatim
     // form there, and an entry under that key is inert. On macOS even dunce
     // resolves /var to /private/var, which also differs from Codex discovery.
-    let key_source = codex_hook_key_path(hooks_path)?;
+    let key_source = codex_hook_trust_key_path(hooks_path)?;
     let content = fs::read_to_string(hooks_path)?;
     let root: Value = serde_json::from_str(&content).map_err(|err| {
         io::Error::new(
@@ -315,7 +315,22 @@ fn scan_codex_hook_trust_from_path(
 }
 
 /// Codex normalizes discovered paths lexically, without following symlinks.
-fn codex_hook_key_path(path: &Path) -> io::Result<PathBuf> {
+/// Derive the path form Codex keys a `[hooks.state]` entry by.
+///
+/// Issue #4879: this is the single derivation every caller — the registration
+/// side and the tests that assert what it wrote — must use. Codex normalizes
+/// the hooks path it discovered but never canonicalizes it, so the key is
+/// lexical: `..` and `.` are folded away, symlinks are not resolved, and the
+/// Windows `\\?\` verbatim form `std::fs::canonicalize` returns never appears.
+///
+/// Do not substitute `dunce::canonicalize` here or in a caller's expectation.
+/// On macOS it resolves a `/var/...` launch path to `/private/var/...`, which
+/// is a key Codex never looks up: the entry is inert and the launch stops on
+/// "Hooks need review". The repository checkout is reached through git's
+/// `gitdir`, which is already canonical, so only the worktree-local copy
+/// differs — a mismatch no single-path test can see, which is why the
+/// derivation is shared rather than restated.
+pub fn codex_hook_trust_key_path(path: &Path) -> io::Result<PathBuf> {
     let absolute =
         std::path::absolute(gwt_core::paths::normalize_windows_child_process_path(path))?;
     let mut normalized = PathBuf::new();
@@ -525,7 +540,7 @@ fn codex_project_path_for_revocation(worktree: &Path) -> io::Result<PathBuf> {
             // Old registrations used realpaths. Resolve the surviving parent
             // even after the worktree disappears (e.g. /var -> /private/var),
             // then reattach only this worktree's missing suffix.
-            let lexical = codex_hook_key_path(worktree)?;
+            let lexical = codex_hook_trust_key_path(worktree)?;
             for ancestor in lexical.ancestors().skip(1) {
                 match fs::canonicalize(ancestor) {
                     Ok(parent) => {
@@ -598,9 +613,10 @@ fn revoke_codex_worktree_hook_state(
         .join(".codex/hooks.json")
         .to_string_lossy()
         .into_owned();
-    let discovered_target = codex_hook_key_path(&discovered_worktree.join(".codex/hooks.json"))?
-        .to_string_lossy()
-        .into_owned();
+    let discovered_target =
+        codex_hook_trust_key_path(&discovered_worktree.join(".codex/hooks.json"))?
+            .to_string_lossy()
+            .into_owned();
     let before = state.len();
     state.retain(|key, _| {
         let mut parts = key.rsplitn(4, ':');
@@ -4042,5 +4058,108 @@ trust_level = "trusted"
         );
         assert_eq!(first_state.len(), 5);
         assert_eq!(trust_state(&config_path), first_state);
+    }
+
+    /// Issue #4879: the key derivation is lexical, and the registration side
+    /// and every expectation must get it from here rather than restate it.
+    ///
+    /// The regression this pins down was a test helper that derived the same
+    /// key with `dunce::canonicalize`. On macOS a launch path under `/var`
+    /// resolves to `/private/var`, so the helper demanded an entry the product
+    /// never writes; worse, the product was right and the expectation was
+    /// wrong, which cost a misdiagnosis before anyone read the derivation.
+    #[test]
+    fn the_trust_key_keeps_a_symlinked_prefix_that_canonicalizing_would_resolve() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        let hooks_dir = real.join(".codex");
+        fs::create_dir_all(&hooks_dir).unwrap();
+        let hooks = hooks_dir.join("hooks.json");
+        fs::write(&hooks, "{}").unwrap();
+
+        let link = dir.path().join("via-link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        #[cfg(not(unix))]
+        if std::os::windows::fs::symlink_dir(&real, &link).is_err() {
+            // Creating a symlink needs a privilege Windows does not grant by
+            // default, and the key contract is not platform specific.
+            return;
+        }
+
+        let through_link = link.join(".codex/hooks.json");
+        let key = codex_hook_trust_key_path(&through_link).unwrap();
+
+        assert_eq!(
+            key, through_link,
+            "the key must keep the path Codex discovered, symlinked prefix and all"
+        );
+        let resolved = dunce::canonicalize(&through_link).unwrap();
+        assert_ne!(
+            key, resolved,
+            "fixture must exercise a prefix that canonicalizing would rewrite"
+        );
+    }
+
+    /// The lexical folding the key still has to perform: Codex normalizes the
+    /// path it discovered, so `.` and `..` never survive into a key.
+    #[test]
+    fn the_trust_key_folds_relative_components_without_touching_the_filesystem() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("a").join("b");
+        fs::create_dir_all(&base).unwrap();
+
+        let noisy = base
+            .join("..")
+            .join(".")
+            .join("b")
+            .join(".codex/hooks.json");
+        let key = codex_hook_trust_key_path(&noisy).unwrap();
+
+        assert_eq!(key, base.join(".codex/hooks.json"));
+        assert!(
+            !key.exists(),
+            "the derivation must not require the file to exist"
+        );
+    }
+
+    /// What the scan actually writes is keyed by that derivation, so a registered
+    /// entry is addressable by it for the path as given — not only for a path
+    /// that happens to already be canonical.
+    #[test]
+    fn registered_entries_are_addressable_by_the_shared_derivation() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("worktree");
+        fs::create_dir_all(&real).unwrap();
+        let link = dir.path().join("worktree-link");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        #[cfg(not(unix))]
+        if std::os::windows::fs::symlink_dir(&real, &link).is_err() {
+            return;
+        }
+
+        generate_codex_hooks_for_mode(&link, CodexHookDiscoveryMode::WorktreeLocal).unwrap();
+        let config_path = dir.path().join("codex-config.toml");
+        register_codex_managed_hook_trust_for_mode(
+            &link,
+            &config_path,
+            CodexHookDiscoveryMode::WorktreeLocal,
+        )
+        .unwrap();
+
+        let key_prefix =
+            codex_hook_trust_key_path(&link.join(crate::settings_local::CODEX_HOOKS_PATH))
+                .unwrap()
+                .display()
+                .to_string();
+        let state = trust_state(&config_path);
+        assert!(!state.is_empty(), "registration must write trust entries");
+        for key in state.keys() {
+            assert!(
+                key.starts_with(&key_prefix),
+                "entry {key} is not addressable by the shared derivation {key_prefix}"
+            );
+        }
     }
 }
