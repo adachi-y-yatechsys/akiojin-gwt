@@ -1067,6 +1067,11 @@ impl AppRuntime {
             )
         {
             self.persist_agent_session_exit_receipt(&id);
+            // Error panes may retain their runtime for diagnostics after exit.
+            // The task file belongs to the process lifetime, not the screen.
+            if let Some(runtime) = self.runtimes.get_mut(&id) {
+                runtime._initial_prompt_file = None;
+            }
         }
         let approval_was_active = self.window_approval_waiting.contains_key(&id)
             || (status == WindowProcessStatus::Error

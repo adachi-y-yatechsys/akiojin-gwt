@@ -211,12 +211,20 @@ impl LaunchWizardState {
             builder = builder.linked_issue_number(n);
         }
 
-        let initial_prompt = self.initial_prompt.trim();
+        let long_initial_prompt = self.initial_prompt.chars().count() > 4_096;
+        let initial_prompt = if long_initial_prompt {
+            self.initial_prompt.as_str()
+        } else {
+            self.initial_prompt.trim()
+        };
         if !initial_prompt.is_empty() {
             builder = builder.extra_arg(initial_prompt.to_string());
         }
 
         let mut config = builder.build();
+        if long_initial_prompt {
+            config.pending_initial_prompt = config.args.pop();
+        }
         // A saved Session owns the exact tool-runtime provenance only when the
         // launch continues that Session. StartNew and the interactive picker
         // intentionally have no source so `latest` is resolved again.
@@ -819,6 +827,30 @@ mod tests {
             }
             other => panic!("expected agent request, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn long_initial_prompt_is_not_embedded_in_launch_args() {
+        let mut state = LaunchWizardState::open_with(
+            context(branch("feature/spec-3165"), "feature/spec-3165"),
+            sample_agent_options(),
+            Vec::new(),
+        );
+        state.agent_id = "codex".to_string();
+        state.initial_prompt = format!(" $gwt-execute #4814\n{}\n", "a".repeat(40_000));
+        let config = state.build_launch_config().expect("launch config");
+        assert!(config.args.iter().all(|arg| arg.chars().count() <= 4_096));
+        assert_eq!(
+            config.pending_initial_prompt.as_deref(),
+            Some(state.initial_prompt.as_str())
+        );
+        assert_eq!(
+            gwt_agent::permission_mode::entrypoint_from_launch_args(
+                config.entrypoint_args(),
+                false
+            ),
+            "gwt-execute"
+        );
     }
 
     #[test]

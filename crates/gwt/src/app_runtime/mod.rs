@@ -169,6 +169,8 @@ pub(crate) fn next_window_runtime_incarnation() -> u64 {
 }
 
 pub struct WindowRuntime {
+    /// Removed when this session ends or its launch is torn down.
+    _initial_prompt_file: Option<Arc<tempfile::TempPath>>,
     /// Process-local identity of this exact PTY runtime. A window id may be
     /// reused by a successor, so background events must carry this value and
     /// prove they still belong to the runtime currently stored for the id.
@@ -200,6 +202,7 @@ impl WindowRuntime {
             .shared_pty();
         Self {
             incarnation,
+            _initial_prompt_file: None,
             started_at_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|since| since.as_millis() as u64)

@@ -5619,6 +5619,7 @@ mod tests {
             "tab-1::missing".to_string(),
             Ok((
                 ProcessLaunch {
+                    initial_prompt_file: None,
                     command: "echo".to_string(),
                     args: Vec::new(),
                     env: HashMap::new(),
@@ -5648,6 +5649,7 @@ mod tests {
         let shell_launch = runtime.handle_shell_launch_complete(
             "tab-1::missing".to_string(),
             Ok(ProcessLaunch {
+                initial_prompt_file: None,
                 command: "echo".to_string(),
                 args: Vec::new(),
                 env: HashMap::new(),
@@ -6880,6 +6882,7 @@ mod tests {
             project_missing_id.clone(),
             Ok((
                 ProcessLaunch {
+                    initial_prompt_file: None,
                     command: "echo".to_string(),
                     args: Vec::new(),
                     env: HashMap::new(),
@@ -6918,6 +6921,7 @@ mod tests {
             raw_missing_id.clone(),
             Ok((
                 ProcessLaunch {
+                    initial_prompt_file: None,
                     command: "echo".to_string(),
                     args: Vec::new(),
                     env: HashMap::new(),
@@ -6953,6 +6957,7 @@ mod tests {
         let shell_project_missing = runtime.handle_shell_launch_complete(
             project_missing_id.clone(),
             Ok(ProcessLaunch {
+                initial_prompt_file: None,
                 command: "echo".to_string(),
                 args: Vec::new(),
                 env: HashMap::new(),
@@ -6970,6 +6975,7 @@ mod tests {
         let shell_raw_missing = runtime.handle_shell_launch_complete(
             raw_missing_id.clone(),
             Ok(ProcessLaunch {
+                initial_prompt_file: None,
                 command: "echo".to_string(),
                 args: Vec::new(),
                 env: HashMap::new(),

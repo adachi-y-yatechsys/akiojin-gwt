@@ -89,6 +89,7 @@ fn bound_pty_gate_program() -> Result<PathBuf, String> {
 
 #[derive(Clone)]
 pub struct ProcessLaunch {
+    pub(crate) initial_prompt_file: Option<Arc<tempfile::TempPath>>,
     pub(crate) command: String,
     pub(crate) args: Vec<String>,
     pub(crate) env: HashMap<String, String>,
@@ -4623,6 +4624,7 @@ impl AppRuntime {
             &window_id,
             geometry,
             ProcessLaunch {
+                initial_prompt_file: None,
                 command: launch.command,
                 args: launch.args,
                 env,
@@ -4689,7 +4691,13 @@ impl AppRuntime {
             incarnation,
             observation,
         )?;
-        self.install_process_window(id, incarnation, pane, console_kind);
+        self.install_process_window(
+            id,
+            incarnation,
+            pane,
+            console_kind,
+            launch.initial_prompt_file,
+        );
         Ok(())
     }
 
@@ -4723,7 +4731,13 @@ impl AppRuntime {
             expected,
             handshake_cleanup,
         )?;
-        self.install_process_window(id, incarnation, pane, console_kind);
+        self.install_process_window(
+            id,
+            incarnation,
+            pane,
+            console_kind,
+            launch.initial_prompt_file,
+        );
         Ok(())
     }
 
@@ -4733,9 +4747,11 @@ impl AppRuntime {
         incarnation: u64,
         pane: Pane,
         console_kind: Option<gwt_core::process_console::ProcessKind>,
+        initial_prompt_file: Option<Arc<tempfile::TempPath>>,
     ) {
         let pane = Arc::new(Mutex::new(pane));
         let mut runtime = WindowRuntime::new(incarnation, pane.clone());
+        runtime._initial_prompt_file = initial_prompt_file;
         let output_thread =
             self.spawn_output_thread(id.to_string(), incarnation, pane.clone(), console_kind);
         let status_thread = self.spawn_status_thread(id.to_string(), incarnation, pane.clone());
@@ -5357,6 +5373,8 @@ impl AppRuntime {
             if config.working_dir.is_some() {
                 config.working_dir = Some(worktree_path.clone());
             }
+            let initial_prompt_file =
+                crate::launch_runtime::prepare_initial_prompt(&mut config, &worktree_path)?;
             gwt_agent::LaunchEnvironment::from_active_profile(
                 &profile_config_path,
                 config.runtime_target,
@@ -5482,7 +5500,7 @@ impl AppRuntime {
             // (the `$gwt-*` prompt token moves into an env var / embedded
             // script on wrapped launches).
             let execution_entrypoint = gwt::cli::execution_state::entrypoint_from_launch(
-                &config.args,
+                config.entrypoint_args(),
                 config.session_mode == gwt_agent::SessionMode::Resume,
             );
             let durable_tool_runtime_command = config
@@ -5805,6 +5823,7 @@ impl AppRuntime {
                 gwt_agent::SessionExecutionIdentity::from_session(&session)?;
 
             let process_launch = ProcessLaunch {
+                initial_prompt_file,
                 command: config.command.clone(),
                 args: config.args.clone(),
                 env: config.env_vars.clone(),
@@ -6541,6 +6560,7 @@ mod docker_session_persistence_tests {
         .expect("persist finalized production launch");
 
         let process_launch = ProcessLaunch {
+            initial_prompt_file: None,
             command: config.command,
             args: config.args,
             env: config.env_vars,
