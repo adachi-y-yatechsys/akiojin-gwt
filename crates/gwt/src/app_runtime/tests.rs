@@ -49741,6 +49741,18 @@ fn app_runtime_manual_drain_applies_gracefully_once_quiescent() {
     let at = |secs: i64| since + chrono::Duration::seconds(secs);
 
     assert!(runtime.update_drain_tick_events_at(at(15)).is_empty());
+    let early_log = fs::read_to_string(gwt_core::update::update_log_path()).unwrap_or_default();
+    assert!(
+        early_log.lines().any(|line| {
+            let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+            entry["stage"] == "pending_waiting"
+                && entry["reason"]
+                    .as_str()
+                    .is_some_and(|reason| reason.contains("agent-1"))
+                && entry["next_evaluation_at"] == at(30).to_rfc3339()
+        }),
+        "waiting must be observable before the warning cadence: {early_log}"
+    );
     assert!(runtime.update_drain_tick_events_at(at(30)).is_empty());
     assert_eq!(drained_events(&user_events), 0, "a Running pane blocks");
     assert_eq!(
@@ -50238,6 +50250,14 @@ fn app_runtime_staged_update_falls_back_to_manual_when_auto_apply_is_refused() {
         },
     ] {
         let events = runtime.update_staged_events_with("9.99.0", Some(refusal.clone()));
+        let log = fs::read_to_string(gwt_core::update::update_log_path()).unwrap_or_default();
+        assert!(
+            log.lines().any(|line| {
+                let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+                entry["stage"] == "pending_refused" && entry["reason"] == refusal.notice("9.99.0")
+            }),
+            "automatic apply refusal must be in the update log: {log}"
+        );
         assert!(
             gwt::load_issue_monitor_prefs(&prefs_path)
                 .expect("reload")

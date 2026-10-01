@@ -2,6 +2,38 @@ use super::*;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+/// Event-loop-owned admission for every apply route. Successful commits stay
+/// latched until process exit; failures release admission for a later retry.
+#[derive(Default)]
+pub enum UpdateApplyAdmission {
+    #[default]
+    Idle,
+    Resolving,
+    Committing,
+}
+
+impl UpdateApplyAdmission {
+    pub fn begin_resolution(&mut self) -> bool {
+        if !matches!(self, Self::Idle) {
+            return false;
+        }
+        *self = Self::Resolving;
+        true
+    }
+
+    pub fn begin_commit(&mut self) -> bool {
+        if !matches!(self, Self::Resolving) {
+            return false;
+        }
+        *self = Self::Committing;
+        true
+    }
+
+    pub fn failed(&mut self) {
+        *self = Self::Idle;
+    }
+}
+
 /// Initial delay after GUI launch before the first update check (FR-001 / FR-035).
 pub const STARTUP_INITIAL_DELAY: Duration = Duration::from_millis(3000);
 
@@ -976,5 +1008,33 @@ mod poll_state_tests {
             1,
             "exactly one exit(0) remains, owned by the bootstrap swap route"
         );
+    }
+}
+
+#[cfg(test)]
+mod apply_admission_tests {
+    use super::UpdateApplyAdmission;
+
+    #[test]
+    fn update_apply_admission_coalesces_requests_and_commits_once() {
+        let mut admission = UpdateApplyAdmission::default();
+        assert!(admission.begin_resolution());
+        // Restart now, legacy toast, and automatic drain share this admission.
+        assert!(!admission.begin_resolution());
+        assert!(admission.begin_commit());
+        assert!(!admission.begin_commit());
+        assert!(!admission.begin_resolution());
+    }
+
+    #[test]
+    fn update_apply_admission_retries_after_resolution_or_commit_failure() {
+        let mut admission = UpdateApplyAdmission::default();
+        assert!(admission.begin_resolution());
+        admission.failed();
+        assert!(admission.begin_resolution());
+        assert!(admission.begin_commit());
+        admission.failed();
+        assert!(admission.begin_resolution());
+        assert!(admission.begin_commit());
     }
 }
