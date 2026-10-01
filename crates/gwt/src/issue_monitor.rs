@@ -2645,6 +2645,9 @@ pub struct IssueMonitorTerminalWindowFacts {
     /// A failure record (launch / agent failure or operator stop) holds the
     /// Issue.
     pub failure_hold: bool,
+    /// Issue #4802 AC-3: the hold is an operator stop through the Monitor
+    /// (`issue.monitor.stop`), not a launch or agent failure.
+    pub monitor_stopped: bool,
 }
 
 /// Issue #3992 AC-3: who holds the launch a stop request named.
@@ -10766,6 +10769,12 @@ impl IssueMonitorState {
                     .is_some_and(|pid| !is_process_alive(pid));
                 let stale = rfc3339_elapsed_secs(&delivery.created_at, now)
                     .is_some_and(|elapsed| elapsed >= ttl);
+                // Issue #4802 AC-1: a stale launch whose pane is running lost
+                // its ACK, not its launch. Bind the pane; never requeue an
+                // Issue that is already being worked.
+                if stale && self.bind_observed_live_pane_to_unbound_launch(issue_number, now) {
+                    continue;
+                }
                 if !(materializer_dead && stale) {
                     continue;
                 }
@@ -10786,6 +10795,10 @@ impl IssueMonitorState {
                 Some(claimed_at) => {
                     let stale =
                         rfc3339_elapsed_secs(claimed_at, now).is_some_and(|elapsed| elapsed >= ttl);
+                    // Issue #4802 AC-1: see the delivery branch above.
+                    if stale && self.bind_observed_live_pane_to_unbound_launch(issue_number, now) {
+                        continue;
+                    }
                     if stale {
                         self.active_launches
                             .retain(|active| *active != issue_number);
@@ -10806,6 +10819,79 @@ impl IssueMonitorState {
             }
         }
         expired
+    }
+
+    /// Issue #4802 AC-1: the live implementation pane the latest fresh canvas
+    /// snapshot shows for `issue_number`, when no other Issue holds it.
+    ///
+    /// The snapshot is the same judgement source the idle classifier uses:
+    /// complete, fresh, and scoped to its own tab. A review window observes
+    /// the Issue and never owns its launch, so it is never offered here.
+    fn observed_live_issue_pane(&self, issue_number: u64, now: &str) -> Option<String> {
+        let snapshot = self.fresh_window_snapshot(now)?;
+        let candidates = snapshot
+            .windows
+            .iter()
+            .filter(|observed| {
+                observed.issue_number == Some(issue_number)
+                    && !observed.review_dispatch
+                    && idle_window_is_alive(observed.status)
+                    && issue_monitor_qualified_window_id(&observed.window_id)
+                        .is_some_and(|(tab_id, _)| tab_id == snapshot.project_tab_id)
+                    && !self.launched_windows.iter().any(|(other, bound)| {
+                        *other != issue_number
+                            && issue_monitor_window_ids_match(bound, &observed.window_id)
+                    })
+            })
+            .collect::<Vec<_>>();
+        // Prefer a pane that is doing work over one sitting at its prompt, so
+        // an idle duplicate is the one left to lose ownership (AC-3).
+        candidates
+            .iter()
+            .find(|observed| observed.status != WindowState::Idle)
+            .or_else(|| candidates.first())
+            .map(|observed| observed.window_id.clone())
+    }
+
+    /// Issue #4802 AC-1: bind the live pane of an unbound launch to its row.
+    ///
+    /// `expire_stale_unbound_launches` used to requeue every launch that had
+    /// no bound window after `claim_ttl_secs`, even while the pane it started
+    /// was running. When the ACK never lands (#4780) that requeue relaunched
+    /// the same Issue every half hour, and #4758 collected sixteen panes. The
+    /// pane on the canvas is the launch; recording it is the ACK that never
+    /// arrived. Returns `false`, touching nothing, when no such pane is
+    /// observed.
+    fn bind_observed_live_pane_to_unbound_launch(&mut self, issue_number: u64, now: &str) -> bool {
+        let Some(window_id) = self.observed_live_issue_pane(issue_number, now) else {
+            return false;
+        };
+        let (claim_id, delivery_id) = self
+            .pending_launch_deliveries
+            .iter()
+            .find(|delivery| delivery.issue_number == issue_number)
+            .map(|delivery| {
+                (
+                    Some(delivery.claim_id.clone()),
+                    Some(delivery.delivery_id.clone()),
+                )
+            })
+            .unwrap_or_default();
+        self.pending_launch_deliveries
+            .retain(|delivery| delivery.issue_number != issue_number);
+        tracing::warn!(
+            issue_number,
+            window_id = %window_id,
+            "issue monitor bound a running pane to its unbound launch instead of relaunching"
+        );
+        self.complete_active_launch_with_claim(
+            issue_number,
+            window_id,
+            claim_id,
+            delivery_id,
+            Some(now),
+        );
+        true
     }
 
     /// The primary candidate's provider (pool head). Retained for the
@@ -16794,6 +16880,7 @@ impl IssueMonitorState {
                     .get(&issue_number)
                     .is_some_and(|record| record.phase == AutonomousPhase::NeedsHuman),
             failure_hold: self.failed_issues.contains_key(&issue_number),
+            monitor_stopped: self.stop_only_reason(issue_number).is_some(),
         }
     }
 
@@ -18957,6 +19044,238 @@ mod tests {
             Some(MonitorInboxState::Queued)
         );
         assert!(monitor.queue.contains(&42), "the issue is claimable again");
+    }
+
+    fn live_pane_observation(
+        window_id: &str,
+        issue_number: u64,
+        status: WindowState,
+    ) -> IssueMonitorWindowObservation {
+        IssueMonitorWindowObservation {
+            monitor_owned: true,
+            window_id: window_id.to_string(),
+            issue_number: Some(issue_number),
+            status,
+            review_dispatch: false,
+            hold_reason: None,
+            last_output_at: None,
+        }
+    }
+
+    fn pane_snapshot(
+        observed_at: &str,
+        windows: Vec<IssueMonitorWindowObservation>,
+    ) -> IssueMonitorWindowSnapshot {
+        IssueMonitorWindowSnapshot {
+            project_tab_id: "tab-1".to_string(),
+            observed_at: observed_at.to_string(),
+            windows,
+        }
+    }
+
+    /// Issue #4802 AC-1: the stale-unbound expiry used to requeue a launch
+    /// whose pane was running, so every lost ACK became another pane. A live
+    /// pane on the owning tab is the launch: it is bound, never requeued.
+    #[test]
+    fn stale_unbound_launch_with_a_live_pane_binds_the_pane_instead_of_requeueing() {
+        // The anchor-only shape (no durable delivery).
+        let mut monitor = IssueMonitorState::new(IssueMonitorConfig::default());
+        scan_queued_candidates(&mut monitor, &[issue(42)], "2026-07-02T00:00:00Z");
+        monitor.set_gui_connected(true);
+        assert!(monitor
+            .next_launch_request("2026-07-02T00:00:00Z")
+            .is_some());
+        monitor.record_window_snapshot(pane_snapshot(
+            "2026-07-02T00:30:30Z",
+            vec![live_pane_observation(
+                "tab-1::agent-7",
+                42,
+                WindowState::Idle,
+            )],
+        ));
+        let expired = monitor.expire_stale_unbound_launches("2026-07-02T00:31:00Z");
+        assert!(expired.is_empty(), "a worked Issue is never requeued");
+        assert_eq!(monitor.active_count(), 1, "the slot stays held");
+        assert!(!monitor.queue.contains(&42));
+        assert_eq!(monitor.launched_window_issue("tab-1::agent-7"), Some(42));
+        assert_eq!(
+            monitor.inbox_item(42).map(|item| item.state),
+            Some(MonitorInboxState::Launched)
+        );
+        assert!(
+            monitor
+                .expire_stale_unbound_launches("2026-07-03T00:00:00Z")
+                .is_empty(),
+            "a bound launch never expires this way"
+        );
+
+        // The durable-delivery shape whose materializer died.
+        let mut monitor = IssueMonitorState::new(IssueMonitorConfig::default());
+        scan_queued_candidates(&mut monitor, &[issue(42)], "2026-07-02T00:00:00Z");
+        assert!(monitor.apply_confirmed_claim(
+            42,
+            "claim-42",
+            "host/session",
+            "effect-42",
+            "2026-07-02T00:00:00Z",
+        ));
+        assert!(monitor.claim_launch_delivery(
+            42,
+            "launch:effect-42",
+            "gui-a",
+            101,
+            "tab-1::agent-9",
+            |_| false,
+        ));
+        monitor.record_window_snapshot(pane_snapshot(
+            "2026-07-02T00:30:30Z",
+            vec![live_pane_observation(
+                "tab-1::agent-9",
+                42,
+                WindowState::Running,
+            )],
+        ));
+        assert!(monitor
+            .expire_stale_unbound_launches_with("2026-07-02T00:31:00Z", |_| false)
+            .is_empty());
+        assert_eq!(monitor.active_count(), 1);
+        assert!(monitor.prefs().pending_launch_deliveries.is_empty());
+        assert_eq!(monitor.launched_window_issue("tab-1::agent-9"), Some(42));
+        assert_eq!(monitor.live_claim_id(42).as_deref(), Some("claim-42"));
+    }
+
+    /// Issue #4802 AC-1 (negative half): only a live implementation pane on
+    /// the owning tab, observed by a fresh snapshot, stands in for the ACK.
+    #[test]
+    fn stale_unbound_launch_without_a_live_pane_still_expires() {
+        let cases: Vec<(&str, Vec<IssueMonitorWindowObservation>, &str)> = vec![
+            (
+                "stopped pane",
+                vec![live_pane_observation(
+                    "tab-1::agent-1",
+                    42,
+                    WindowState::Stopped,
+                )],
+                "2026-07-02T00:30:30Z",
+            ),
+            (
+                "review pane",
+                vec![IssueMonitorWindowObservation {
+                    review_dispatch: true,
+                    ..live_pane_observation("tab-1::agent-1", 42, WindowState::Running)
+                }],
+                "2026-07-02T00:30:30Z",
+            ),
+            (
+                "another Issue's pane",
+                vec![live_pane_observation(
+                    "tab-1::agent-1",
+                    43,
+                    WindowState::Running,
+                )],
+                "2026-07-02T00:30:30Z",
+            ),
+            (
+                "another tab's pane",
+                vec![live_pane_observation(
+                    "tab-2::agent-1",
+                    42,
+                    WindowState::Running,
+                )],
+                "2026-07-02T00:30:30Z",
+            ),
+            (
+                "stale snapshot",
+                vec![live_pane_observation(
+                    "tab-1::agent-1",
+                    42,
+                    WindowState::Running,
+                )],
+                "2026-07-02T00:05:00Z",
+            ),
+        ];
+        for (label, windows, observed_at) in cases {
+            let mut monitor = IssueMonitorState::new(IssueMonitorConfig::default());
+            scan_queued_candidates(&mut monitor, &[issue(42)], "2026-07-02T00:00:00Z");
+            monitor.set_gui_connected(true);
+            assert!(monitor
+                .next_launch_request("2026-07-02T00:00:00Z")
+                .is_some());
+            monitor.record_window_snapshot(pane_snapshot(observed_at, windows));
+            assert_eq!(
+                monitor.expire_stale_unbound_launches("2026-07-02T00:31:00Z"),
+                vec![42],
+                "{label}: nothing running stands in for the ACK"
+            );
+        }
+    }
+
+    /// Issue #4802 AC-5: an hour of one-minute scans against a materializer
+    /// whose ACK never lands (#4780) ends with exactly one pane per active
+    /// Issue. Before the fix the half-hour expiry relaunched both Issues.
+    #[test]
+    fn an_hour_of_scans_without_launch_acks_keeps_one_pane_per_active_issue() {
+        let mut monitor = IssueMonitorState::new(IssueMonitorConfig {
+            max_active: 2,
+            ..IssueMonitorConfig::default()
+        });
+        let start = chrono::DateTime::parse_from_rfc3339("2026-07-02T00:00:00Z")
+            .expect("start")
+            .to_utc();
+        let at = |minute: i64| {
+            (start + chrono::Duration::minutes(minute))
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        };
+        scan_queued_candidates(&mut monitor, &[issue(42), issue(43)], &at(0));
+        monitor.set_gui_connected(true);
+
+        // (window id, Issue, pane state): 42 keeps working, 43 sits idle.
+        let mut panes: Vec<(String, u64)> = Vec::new();
+        let status_of = |issue_number: u64| {
+            if issue_number == 42 {
+                WindowState::Running
+            } else {
+                WindowState::Idle
+            }
+        };
+        for minute in 0..=60 {
+            let now = at(minute);
+            monitor.record_window_snapshot(pane_snapshot(
+                &now,
+                panes
+                    .iter()
+                    .map(|(window_id, issue_number)| {
+                        live_pane_observation(window_id, *issue_number, status_of(*issue_number))
+                    })
+                    .collect(),
+            ));
+            monitor.expire_stale_unbound_launches_with(&now, |_| true);
+            while let Some(request) = monitor.next_launch_request(&now) {
+                // The materializer opens a pane and never ACKs it.
+                panes.push((
+                    format!("tab-1::agent-{}", panes.len() + 1),
+                    request.issue_number,
+                ));
+            }
+        }
+
+        for issue_number in [42, 43] {
+            let owned = panes
+                .iter()
+                .filter(|(_, owner)| *owner == issue_number)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                owned.len(),
+                1,
+                "#{issue_number} must end with exactly one pane, got {panes:?}"
+            );
+            assert_eq!(
+                monitor.launched_window_issue(&owned[0].0),
+                Some(issue_number),
+                "the one pane is the bound one"
+            );
+        }
+        assert_eq!(monitor.active_count(), 2);
     }
 
     #[test]

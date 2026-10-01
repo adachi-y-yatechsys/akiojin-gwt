@@ -446,14 +446,31 @@ impl AppRuntime {
         let Some(address) = self.window_lookup.get(id).cloned() else {
             return Vec::new();
         };
+        let Some(project_key) = self.project_key_for_window(id).cloned() else {
+            return Vec::new();
+        };
         let updated = {
             let Some(tab) = self.tab_mut(&address.tab_id) else {
                 return Vec::new();
             };
-            tab.workspace.dock_agent_window_to_issue(&address.raw_id)
+            let issue_number = tab
+                .workspace
+                .window(&address.raw_id)
+                .and_then(|window| window.linked_issue_number);
+            tab.workspace
+                .dock_agent_window_to_issue(&address.raw_id)
+                .map_err(|reason| (reason, issue_number))
         };
-        if !updated {
-            return Vec::new();
+        if let Err((reason, issue_number)) = updated {
+            return vec![OutboundEvent::project(
+                project_key,
+                BackendEvent::IssueMonitorToast {
+                    notification_transition: None,
+                    level: "warn".to_string(),
+                    message: format!("Cannot return to list: {reason}."),
+                    issue_number,
+                },
+            )];
         }
         self.activate_tab_for_window_events(address.tab_id)
     }

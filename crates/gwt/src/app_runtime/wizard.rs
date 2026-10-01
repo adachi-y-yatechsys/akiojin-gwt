@@ -2843,6 +2843,113 @@ impl AppRuntime {
         }
     }
 
+    /// Issue #4802 AC-2: the live implementation agent pane already working
+    /// `issue_number` on this tab — linked to the Issue, or running in the
+    /// Issue's work branch worktree. Stopped and Error panes are finished, and
+    /// an independent review window only observes the Issue.
+    pub(super) fn live_issue_agent_window(
+        &self,
+        tab_id: &str,
+        issue_number: u64,
+        target_branch: &str,
+    ) -> Option<String> {
+        let tab = self.tab(tab_id)?;
+        let target_branch = normalize_branch_name(target_branch);
+        tab.workspace
+            .persisted()
+            .windows
+            .iter()
+            .filter(|window| window.preset == WindowPreset::Agent)
+            .map(|window| (combined_window_id(tab_id, &window.id), window))
+            .find(|(window_id, window)| {
+                let linked_issue = window.linked_issue_number.or_else(|| {
+                    let session_id = window.session_id.as_deref()?;
+                    self.launch_wizard_cache
+                        .session_by_id(session_id)
+                        .and_then(|session| session.linked_issue_number)
+                });
+                let in_issue_worktree =
+                    self.active_agent_sessions
+                        .get(window_id)
+                        .is_some_and(|active| {
+                            normalize_branch_name(&active.branch_name) == target_branch
+                        });
+                (linked_issue == Some(issue_number) || in_issue_worktree)
+                    && !self
+                        .issue_monitor_review_dispatch_windows
+                        .contains(window_id)
+                    && self.window_status(window_id).is_some_and(|status| {
+                        !matches!(
+                            status,
+                            WindowProcessStatus::Stopped | WindowProcessStatus::Error
+                        )
+                    })
+            })
+            .map(|(window_id, _)| window_id)
+    }
+
+    /// Issue #4802 AC-2: acknowledge a launch onto the pane that is already
+    /// working its Issue instead of opening a second one. The delivery goes
+    /// through the same claim / materialized / durable / launched sequence a
+    /// freshly spawned window uses, so the Monitor binds the running pane.
+    fn adopt_live_issue_agent_window_events(
+        &mut self,
+        context: &super::ProjectContext,
+        project_root: &Path,
+        issue_number: u64,
+        live_window_id: &str,
+        delivery_id: Option<&str>,
+    ) -> Vec<OutboundEvent> {
+        tracing::warn!(
+            issue_number,
+            window_id = %live_window_id,
+            "Issue Monitor launch refused: the Issue's worktree already has a live agent pane"
+        );
+        let mut events = match delivery_id {
+            Some(delivery_id) => match self.claim_issue_monitor_launch_delivery(
+                project_root,
+                issue_number,
+                delivery_id,
+                live_window_id,
+            ) {
+                Ok(true) => self.issue_monitor_launch_completed_delivery_events(
+                    project_root,
+                    issue_number,
+                    live_window_id,
+                    Some(delivery_id),
+                ),
+                Ok(false) => return Vec::new(),
+                Err(error) => {
+                    return self.issue_monitor_control_error_events(
+                        Some(project_root),
+                        None,
+                        error,
+                        "adopt-live-issue-window",
+                        Some(issue_number),
+                    )
+                }
+            },
+            None => self.issue_monitor_launch_succeeded_delivery_events(
+                project_root,
+                issue_number,
+                live_window_id,
+                None,
+            ),
+        };
+        events.push(OutboundEvent::project(
+            context.project_key.clone(),
+            BackendEvent::IssueMonitorToast {
+                notification_transition: None,
+                level: "warn".to_string(),
+                message: format!(
+                    "Issue Monitor did not open a second pane for #{issue_number}: window {live_window_id} is already working it"
+                ),
+                issue_number: Some(issue_number),
+            },
+        ));
+        events
+    }
+
     fn existing_issue_monitor_delivery_window(
         &self,
         project_root: &Path,
@@ -3162,6 +3269,25 @@ impl AppRuntime {
         // (no shared context with the implementation agent), so the review path
         // skips resume and always launches a new agent.
         let target_branch = knowledge_launch_target_branch_name(linked_issue_kind, issue_number);
+        // Issue #4802 AC-2: a second implementation launch into a worktree
+        // that already has a live agent pane is refused. The running pane is
+        // this launch, so the delivery is acknowledged onto it rather than
+        // opening another one. An answered handoff is delivered into its live
+        // holder by the resume path below, and the independent review is a
+        // deliberate second pane, so both keep their own routes.
+        if review_prompt.is_none() && !answered_handoff_pending {
+            if let Some(live_window_id) =
+                self.live_issue_agent_window(&tab_id, issue_number, &target_branch)
+            {
+                return Ok(Some(self.adopt_live_issue_agent_window_events(
+                    &context,
+                    &project_root,
+                    issue_number,
+                    &live_window_id,
+                    delivery_id.as_deref(),
+                )));
+            }
+        }
         // Auto uses a fresh launch even at the same tier index: an override
         // may have changed that tier's model or effort since the last launch.
         let resume_holder_window_id = if review_prompt.is_none()
