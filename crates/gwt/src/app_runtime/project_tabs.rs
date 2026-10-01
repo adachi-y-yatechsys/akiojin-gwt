@@ -55,26 +55,20 @@ impl PickerPurpose {
 pub(crate) struct ProjectPickerState {
     next_id: u64,
     pending: HashMap<String, (u64, PickerPurpose)>,
+    // A terminal timeout reply does not mean the native dialog has closed.
+    workers: HashMap<String, u64>,
 }
 
 fn pick_project_folder_with_deadline(deadline: Instant) -> Result<Option<PathBuf>, String> {
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    // A dedicated thread owns the native modal loop. The supervising worker
-    // also bounds platforms whose dialog API cannot programmatically close.
+    // The independent runtime timer sends the deadline reply. Keep this worker
+    // alive until the native thread exits, including on platforms without a
+    // programmatic dialog cancellation API, so another dialog cannot overlap.
     std::thread::Builder::new()
         .name("gwt-project-picker".into())
-        .spawn(move || {
-            let _ = sender.send(super::native_project_picker::pick_project_folder(deadline));
-        })
-        .map_err(|error| error.to_string())?;
-    receiver
-        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        .map_err(|error| match error {
-            std::sync::mpsc::RecvTimeoutError::Timeout => "Folder selection timed out".to_string(),
-            std::sync::mpsc::RecvTimeoutError::Disconnected => {
-                "Folder selection worker stopped".to_string()
-            }
-        })?
+        .spawn(move || super::native_project_picker::pick_project_folder(deadline))
+        .map_err(|error| error.to_string())?
+        .join()
+        .map_err(|_| "Folder selection worker stopped".to_string())?
 }
 
 pub(crate) fn initial_project_tab_incarnations(
@@ -307,7 +301,7 @@ impl AppRuntime {
         client_id: &str,
         purpose: PickerPurpose,
     ) -> Vec<OutboundEvent> {
-        if self.project_picker.pending.contains_key(client_id) {
+        if self.project_picker.workers.contains_key(client_id) {
             return vec![OutboundEvent::reply(
                 client_id,
                 BackendEvent::PickerBusy {
@@ -325,6 +319,9 @@ impl AppRuntime {
         self.project_picker
             .pending
             .insert(client_id.into(), (request_id, purpose));
+        self.project_picker
+            .workers
+            .insert(client_id.into(), request_id);
         let deadline = Instant::now() + Duration::from_secs(120);
         // The deadline must run independently of the blocking pool: a queued
         // dialog still owes its client a terminal reply within the same budget.
@@ -337,6 +334,7 @@ impl AppRuntime {
                     proxy.send(UserEvent::ProjectPickerFinished {
                         client_id,
                         request_id,
+                        worker_finished: false,
                         result: Err("Folder selection timed out".into()),
                     });
                 }));
@@ -364,10 +362,16 @@ impl AppRuntime {
             proxy.send(UserEvent::ProjectPickerFinished {
                 client_id: client,
                 request_id,
+                worker_finished: true,
                 result,
             });
         }) {
-            events.extend(self.handle_project_picker_finished(client_id, request_id, Err(error)));
+            events.extend(self.handle_project_picker_finished(
+                client_id,
+                request_id,
+                true,
+                Err(error),
+            ));
         }
         events
     }
@@ -376,8 +380,12 @@ impl AppRuntime {
         &mut self,
         client_id: &str,
         request_id: u64,
+        worker_finished: bool,
         result: Result<Option<PathBuf>, String>,
     ) -> Vec<OutboundEvent> {
+        if worker_finished && self.project_picker.workers.get(client_id) == Some(&request_id) {
+            self.project_picker.workers.remove(client_id);
+        }
         let Some(&(pending_id, purpose)) = self.project_picker.pending.get(client_id) else {
             return Vec::new();
         };
@@ -396,7 +404,10 @@ impl AppRuntime {
                     path: path.display().to_string(),
                 };
                 if matches!(purpose, PickerPurpose::Open) {
-                    events.extend(self.open_project_dialog_selection_events(Some(path)));
+                    events.extend(self.open_project_path_with_request_events(
+                        path,
+                        Some(format!("picker:{request_id}")),
+                    ));
                 }
                 selected
             }
@@ -420,6 +431,7 @@ impl AppRuntime {
         events
     }
 
+    #[cfg(test)]
     pub(crate) fn open_project_dialog_selection_events(
         &mut self,
         selected: Option<PathBuf>,
@@ -427,7 +439,7 @@ impl AppRuntime {
         let Some(path) = selected else {
             return Vec::new();
         };
-        self.request_project_open(path, ProjectNavigationSource::Open)
+        self.request_project_open(path, ProjectNavigationSource::Open { request_id: None })
     }
 
     pub(crate) fn select_clone_project_parent_events(
@@ -522,7 +534,15 @@ impl AppRuntime {
     }
 
     pub(crate) fn open_project_path_events(&mut self, path: PathBuf) -> Vec<OutboundEvent> {
-        self.request_project_open(path, ProjectNavigationSource::Open)
+        self.request_project_open(path, ProjectNavigationSource::Open { request_id: None })
+    }
+
+    pub(crate) fn open_project_path_with_request_events(
+        &mut self,
+        path: PathBuf,
+        request_id: Option<String>,
+    ) -> Vec<OutboundEvent> {
+        self.request_project_open(path, ProjectNavigationSource::Open { request_id })
     }
 
     pub(crate) fn handle_clone_project_done(
@@ -598,9 +618,15 @@ impl AppRuntime {
     ) -> Vec<OutboundEvent> {
         let event = match source {
             ProjectNavigationSource::Clone { .. } => BackendEvent::CloneProjectError { message },
-            ProjectNavigationSource::Open => BackendEvent::ProjectOpenError { message },
+            ProjectNavigationSource::Open { request_id } => BackendEvent::ProjectOpenError {
+                message,
+                request_id: request_id.clone(),
+            },
             #[cfg(test)]
-            ProjectNavigationSource::Switch { .. } => BackendEvent::ProjectOpenError { message },
+            ProjectNavigationSource::Switch { .. } => BackendEvent::ProjectOpenError {
+                message,
+                request_id: None,
+            },
         };
         vec![OutboundEvent::hub(event)]
     }
@@ -780,6 +806,10 @@ impl AppRuntime {
             OutboundEvent::hub(BackendEvent::ProjectOpened {
                 project_key: prepared.project_key.to_string(),
                 title: prepared.target.title.clone(),
+                request_id: match &source {
+                    ProjectNavigationSource::Open { request_id } => request_id.clone(),
+                    _ => None,
+                },
             }),
         ];
         if new_tab {

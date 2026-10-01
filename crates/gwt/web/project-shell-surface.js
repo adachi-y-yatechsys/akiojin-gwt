@@ -292,7 +292,7 @@ export function createProjectShellSurface({
 
       const openPathDialog = createOpenProjectPathDialog(document, {
         onChoose: () => folderPicker.begin("open"),
-        onOpen: (path) => send({ kind: "reopen_recent_project", path }),
+        onOpen: (path, request_id) => send({ kind: "reopen_recent_project", path, request_id }),
       });
 
       const folderPicker = createFolderPickerController({
@@ -307,7 +307,7 @@ export function createProjectShellSurface({
           renderProjectCloneModal();
         },
         onSelected: (event) => {
-          if (event.purpose === "open") openPathDialog.waitForOpen(event.path);
+          if (event.purpose === "open") openPathDialog.waitForOpen(event.path, `picker:${event.request_id}`);
           if (event.purpose === "clone_parent") {
             cloneProjectModalState = { ...cloneProjectModalState, parentPath: event.path, error: "" };
             renderProjectCloneModal();

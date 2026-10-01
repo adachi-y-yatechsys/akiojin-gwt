@@ -17,7 +17,11 @@ export function createFolderPickerController({ send, onChange, onSelected }) {
     },
     receive(event) {
       if (!event.kind?.startsWith("picker_")) return false;
-      if (event.kind === "picker_busy") { update(event.message); return true; }
+      if (event.kind === "picker_busy") {
+        if (pending?.request_id === null) pending = null;
+        update(event.message);
+        return true;
+      }
       if (!pending || event.purpose !== pending.purpose) return true;
       if (event.kind === "picker_started") {
         if (pending.request_id === null) pending.request_id = event.request_id;
@@ -54,7 +58,7 @@ export function createOpenProjectPathForm(ownerDoc, onOpen) {
 }
 
 export function createOpenProjectPathDialog(ownerDoc, { onChoose, onOpen }) {
-  let awaitingOpen = false;
+  let awaitingOpen = null;
   const node = (tag, className, text) => {
     const element = ownerDoc.createElement(tag);
     element.className = className;
@@ -77,7 +81,12 @@ export function createOpenProjectPathDialog(ownerDoc, { onChoose, onOpen }) {
   const status = node("p", "project-picker-copy", "");
   status.setAttribute("role", "status");
   status.hidden = true;
-  const form = createOpenProjectPathForm(ownerDoc, (path) => { waitForOpen(path); onOpen(path); });
+  const form = createOpenProjectPathForm(ownerDoc, (path) => {
+    const requestId = globalThis.crypto?.randomUUID?.()
+      ?? `open-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+    waitForOpen(path, requestId);
+    onOpen(path, requestId);
+  });
   form.open = true;
   body.append(status, form);
   const footer = node("div", "modal-footer");
@@ -85,9 +94,9 @@ export function createOpenProjectPathDialog(ownerDoc, { onChoose, onOpen }) {
   footer.append(button(ownerDoc, "Close", "text-button", hide), choose);
   dialog.append(header, body, footer);
   modal.append(dialog);
-  function hide() { closeModal(modal, dialog); }
-  function waitForOpen(path) {
-    awaitingOpen = true;
+  function hide() { awaitingOpen = null; closeModal(modal, dialog); }
+  function waitForOpen(path, requestId) {
+    awaitingOpen = requestId;
     const input = form.querySelector('[data-open-project-path]');
     input.value = path;
     form.querySelector('[data-open-project-submit]').disabled = !path.trim();
@@ -104,8 +113,8 @@ export function createOpenProjectPathDialog(ownerDoc, { onChoose, onOpen }) {
     hide,
     waitForOpen,
     receive(event) {
-      if (!awaitingOpen || !["project_opened", "project_open_error"].includes(event.kind)) return;
-      awaitingOpen = false;
+      if (!awaitingOpen || event.request_id !== awaitingOpen || !["project_opened", "project_open_error"].includes(event.kind)) return;
+      awaitingOpen = null;
       if (event.kind === "project_opened") { hide(); return; }
       openModal(modal, dialog, ownerDoc);
       status.textContent = event.message || "Could not open the project.";

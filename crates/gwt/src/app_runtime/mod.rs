@@ -1046,7 +1046,9 @@ pub(crate) struct ProjectIncarnation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProjectNavigationSource {
-    Open,
+    Open {
+        request_id: Option<String>,
+    },
     Clone {
         workspace_home: PathBuf,
     },
@@ -8255,8 +8257,8 @@ impl AppRuntime {
             FrontendEvent::CloneProjectStart { url, parent_path } => {
                 self.clone_project_start_events(&client_id, &url, &parent_path)
             }
-            FrontendEvent::ReopenRecentProject { path } => {
-                self.open_project_path_events(PathBuf::from(path))
+            FrontendEvent::ReopenRecentProject { path, request_id } => {
+                self.open_project_path_with_request_events(PathBuf::from(path), request_id)
             }
             FrontendEvent::ApplyUpdate => self.apply_pending_update_events(&client_id),
             FrontendEvent::ApplyUpdateStart => self.apply_update_start_events(&client_id),
@@ -8582,8 +8584,8 @@ impl AppRuntime {
             FrontendEvent::CloneProjectStart { url, parent_path } => {
                 self.clone_project_start_events(&client_id, &url, &parent_path)
             }
-            FrontendEvent::ReopenRecentProject { path } => {
-                self.open_project_path_events(PathBuf::from(path))
+            FrontendEvent::ReopenRecentProject { path, request_id } => {
+                self.open_project_path_with_request_events(PathBuf::from(path), request_id)
             }
             FrontendEvent::PreviewCloseProject { .. }
             | FrontendEvent::ConfirmCloseProject { .. }

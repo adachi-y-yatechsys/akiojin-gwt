@@ -199,6 +199,20 @@ test("open and clone share pending state and selected destination clears it", ()
   assert.equal(document.querySelector('.gwt-hub__error').hidden, true);
 });
 
+test("busy refusal after a timeout clears the unaccepted retry", () => {
+  const { document, sockets } = fixture();
+  sockets[0].open();
+  const open = document.querySelector('[data-hub-action="open-folder"]');
+  open.click();
+  sockets[0].deliver({ kind: 'picker_started', purpose: 'open', request_id: 10 });
+  sockets[0].deliver({ kind: 'picker_error', purpose: 'open', request_id: 10, message: 'Timed out' });
+  open.click();
+  sockets[0].deliver({ kind: 'picker_busy', purpose: 'open', message: 'Close the existing dialog first' });
+  assert.equal(open.textContent, 'Open Folder…');
+  open.click();
+  assert.equal(sockets[0].sent.filter((event) => event.kind === 'open_project_dialog').length, 3);
+});
+
 test("manual open and clone destination work without a native picker", () => {
   const { document, sockets } = fixture();
   sockets[0].open();

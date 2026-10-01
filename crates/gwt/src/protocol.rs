@@ -399,6 +399,8 @@ pub enum FrontendEvent {
     },
     ReopenRecentProject {
         path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
     },
     PreviewCloseProject {
         project_key: String,
@@ -2320,10 +2322,14 @@ pub enum BackendEvent {
     },
     ProjectOpenError {
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
     },
     ProjectOpened {
         project_key: String,
         title: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
     },
     PickerStarted {
         request_id: u64,

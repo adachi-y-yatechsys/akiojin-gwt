@@ -90,12 +90,24 @@ test.describe("Project open entry surfaces", () => {
     await modal.locator('[data-open-project-submit]').click();
     await expect.poll(() => sentMessageKinds(page)).toContain('reopen_recent_project');
     await expect(modal).toBeVisible();
-    await page.evaluate(() => (window as any).__gwtProjectOpenFixture.reply({ kind: 'project_open_error', message: 'Folder does not exist' }));
+    const firstRequestId = await page.evaluate(() => (window as any).__gwtProjectOpenFixture.recordedSends.map(JSON.parse).filter((message: any) => message.kind === 'reopen_recent_project').at(-1).request_id);
+    expect(firstRequestId).toBeTruthy();
+    await page.evaluate(() => {
+      const fixture = (window as any).__gwtProjectOpenFixture;
+      fixture.reply({ kind: 'project_opened', request_id: 'another-client', project_key: '0123456789abcdef', title: 'Other Project' });
+      fixture.reply({ kind: 'project_open_error', message: 'Unrelated failure' });
+    });
+    await expect(modal.getByRole('status')).toHaveText('Opening project…');
+    await page.evaluate((request_id) => (window as any).__gwtProjectOpenFixture.reply({ kind: 'project_open_error', request_id, message: 'Folder does not exist' }), firstRequestId);
     await expect(modal.getByRole('status')).toHaveText('Folder does not exist');
     await expect(modal.locator('[data-open-project-path]')).toHaveValue('E:\\repos\\manual');
     await modal.locator('[data-open-project-path]').fill('E:\\repos\\valid');
     await modal.locator('[data-open-project-submit]').click();
-    await page.evaluate(() => (window as any).__gwtProjectOpenFixture.reply({ kind: 'project_opened', project_key: '0123456789abcdef', title: 'Valid Project' }));
+    const secondRequestId = await page.evaluate(() => (window as any).__gwtProjectOpenFixture.recordedSends.map(JSON.parse).filter((message: any) => message.kind === 'reopen_recent_project').at(-1).request_id);
+    expect(secondRequestId).not.toBe(firstRequestId);
+    await page.evaluate((request_id) => (window as any).__gwtProjectOpenFixture.reply({ kind: 'project_opened', request_id, project_key: '0123456789abcdef', title: 'Superseded Project' }), firstRequestId);
+    await expect(modal).toBeVisible();
+    await page.evaluate((request_id) => (window as any).__gwtProjectOpenFixture.reply({ kind: 'project_opened', request_id, project_key: '0123456789abcdef', title: 'Valid Project' }), secondRequestId);
     await expect(modal).toBeHidden();
   });
 
