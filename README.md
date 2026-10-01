@@ -1070,6 +1070,33 @@ exceeds 100%. On a host with hundreds of worktrees the daemon can outrank the
 agents themselves, which otherwise only reads as a slow host. The block is
 present with no processes and no warning on platforms without Spotlight.
 
+## Pending application updates
+
+A downloaded update can remain staged while agents finish their work. The
+existing drain evaluates safety on the 15-second terminal convergence tick:
+two quiet observations start a 60-second grace period before applying. The
+`autonomous_tuning.update_drain_notify_after_secs` setting controls the repeated
+waiting notification (default: 1800 seconds); it is not a forced restart deadline.
+Agents are never terminated merely because that interval elapsed.
+
+`~/.gwt/logs/update-YYYY-MM-DD.log` records the stage, wait/refusal reason and,
+when another automatic evaluation is scheduled, `next_evaluation_at`. Unchanged
+wait reasons do not create a log line every tick. The latest per-project
+observation is refreshed on each evaluation; its timestamp is an observation,
+not a guarantee that a stalled or stopped app will run the next tick.
+
+The `release.status` JSON operation distinguishes `pending_update_version`
+(the locally saved manifest version) from `pending_version` (a remote
+release branch's unreleased version bump). `update_wait` reports the latest
+matching local wait observation. If the payload is missing, `update_stage` is
+`payload_missing` and the recovery action asks for a fresh download. `last_apply_result` and `last_apply_failure`
+report the latest completed attempt; `attempt` is the resume marker's counter,
+not a lifetime retry count. A successful result replaces the previous failure.
+A failed install may restart into the old version: restarting alone does not
+prove the update was applied. Follow the reported recovery action and check
+`observed_version`. Requests made while an apply is already resolving or
+committing are coalesced; a failed request permits an explicit retry.
+
 ## Development
 
 ### Build
