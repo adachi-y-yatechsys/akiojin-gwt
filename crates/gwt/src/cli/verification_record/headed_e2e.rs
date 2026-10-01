@@ -75,6 +75,18 @@ impl Capture {
     pub fn evidence(&self) -> Option<HeadedE2eEvidence> {
         serde_json::from_slice(&fs::read(&self.report_path).ok()?).ok()
     }
+
+    /// Playwright tried to load only the drive letter after a wrapper split
+    /// our reporter argument. This is a launch defect, before any test ran.
+    pub fn reporter_argument_was_split(&self, output: &str) -> bool {
+        let path = self.directory.path().display().to_string();
+        let bytes = path.as_bytes();
+        bytes.len() > 1
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && output.contains(&format!("Cannot find module '{}'", bytes[0] as char))
+            && output.contains("at resolveReporter (")
+    }
 }
 
 #[cfg(test)]
@@ -138,5 +150,12 @@ mod tests {
         assert!(command.get_envs().any(|(key, value)| {
             key == "GWT_HEADED_E2E_REPORT" && value == Some(capture.report_path.as_os_str())
         }));
+    }
+
+    #[test]
+    fn missing_application_module_is_not_a_reporter_split() {
+        let capture = Capture::new().unwrap();
+        assert!(!capture
+            .reporter_argument_was_split("Cannot find module 'C'\n at loadConfig (config.js:1:1)"));
     }
 }
