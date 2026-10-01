@@ -326,3 +326,108 @@ fn failed_canonical_commands_release_the_lease() {
         assert!(ok && output.contains("verify: PASS"), "{output}");
     }
 }
+
+// Issue #4789: kill the canonical runner itself, not its command. The command's
+// ready marker proves the run started, and the record transition is the event
+// we await; no elapsed duration decides the ordering.
+fn assert_killed_runner_is_recorded(signal: i32) {
+    let arena = Arena::new();
+    let (ok, output) = arena.run_in(&arena.repo, &verify_run(0));
+    assert!(ok, "initial successful run: {output}");
+    let record_path = arena.repo.join(".gwt/skill-state/verification-run.json");
+    let previous: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+    let mut run = CanonicalRun::start(&arena, &arena.repo);
+    let running: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+    let mut child = run.child.take().unwrap();
+    // SAFETY: this PID belongs to the child we just spawned and have not reaped.
+    assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);
+    let status = child.wait().unwrap();
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(status.signal(), Some(signal));
+    std::fs::write(&run.release, "release").unwrap();
+
+    assert_ne!(
+        running["record_id"], previous["record_id"],
+        "a new run must replace old PASS before commands start"
+    );
+    assert_eq!(running["all_passed"], false);
+    assert_eq!(running["lifecycle"]["status"], "running");
+    let mirror_path = arena.repo.join(".gwt/tmp/verify-run.json");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let interrupted = loop {
+        let record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&mirror_path).unwrap()).unwrap();
+        if record["lifecycle"]["status"] == "interrupted" {
+            break record;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "runner termination was not recorded: {record}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(interrupted["record_id"], running["record_id"]);
+    assert_eq!(interrupted["all_passed"], false);
+    assert!(interrupted["lifecycle"]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("external"));
+    assert!(interrupted["lifecycle"]["current_command"]
+        .as_str()
+        .unwrap()
+        .contains("canonical_command_parks"));
+    let mirror: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&record_path).unwrap()).unwrap();
+    assert_eq!(
+        mirror, interrupted,
+        "the diagnostic mirror must carry the same nonempty record"
+    );
+    let record = serde_json::from_value(interrupted).unwrap();
+    let evidence = gwt::cli::verification_record::evaluate_evidence_snapshot(
+        &arena.repo,
+        SESSION,
+        None,
+        None,
+        &record,
+    );
+    assert!(evidence.describe().contains("interrupted"), "{evidence:?}");
+    assert!(!evidence.is_delivery_acceptable());
+    let (_, lease) = arena.run_in(&arena.repo, STATUS);
+    assert!(lease.starts_with("verification lease: free"), "{lease}");
+}
+
+#[test]
+fn sigterm_of_verify_runner_preserves_interruption_record() {
+    assert_killed_runner_is_recorded(libc::SIGTERM);
+}
+
+#[test]
+fn sigkill_of_verify_runner_preserves_interruption_record() {
+    assert_killed_runner_is_recorded(libc::SIGKILL);
+}
+
+#[test]
+fn a_separate_watchdog_cannot_interrupt_another_live_runner() {
+    let arena = Arena::new();
+    let run = CanonicalRun::start(&arena, &arena.repo);
+    let path = arena.repo.join(".gwt/skill-state/verification-run.json");
+    let before: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let output = hidden_command(env!("CARGO_BIN_EXE_gwtd"))
+        .arg("--verification-watchdog")
+        .arg(&arena.repo)
+        .arg(before["record_id"].as_str().unwrap())
+        .env("HOME", arena.home.path())
+        .env("USERPROFILE", arena.home.path())
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let after: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let (ok, result) = run.finish();
+    assert_eq!(
+        before, after,
+        "unrelated companion must not change the live record: {output:?}"
+    );
+    assert!(ok, "{result}");
+}
