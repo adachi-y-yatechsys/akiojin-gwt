@@ -334,6 +334,10 @@ pub struct PrInventoryFields {
     /// measured against (SPEC #3835 AC-4).
     pub base_ref_name: String,
     pub updated_at: Option<DateTime<Utc>>,
+    /// When the PR was opened. Unlike `updated_at`, no bookkeeping action moves
+    /// it, so it is the only sound basis for "how long has this been waiting"
+    /// (Issue #4836).
+    pub created_at: Option<DateTime<Utc>>,
     pub mergeable: String,
     pub merge_state_status: String,
     pub ci_status: String,
@@ -371,6 +375,10 @@ pub struct PrLifecycleDecision {
     pub default_action: String,
     /// Hours since `updated_at` (Issue #3868 AC-4); `None` without a timestamp.
     pub dwell_hours: Option<i64>,
+    /// Hours since the PR was opened (Issue #4836). `dwell_hours` resets on
+    /// every `updated_at` bump, so a PR the PM re-bases each cycle reports a
+    /// dwell of 0 however long it has waited; this one does not move.
+    pub age_hours: Option<i64>,
     /// Whether the PM can execute `default_action` through JSON operations.
     pub default_action_executable: bool,
     /// SPEC #3835 AC-17: the JSON operation that performs `default_action`,
@@ -400,6 +408,8 @@ pub struct PrInventoryItem {
     #[serde(default)]
     pub base_ref_name: String,
     pub updated_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub created_at: Option<DateTime<Utc>>,
     pub mergeable: String,
     pub merge_state_status: String,
     pub ci_status: String,
@@ -438,6 +448,13 @@ pub struct PrInventoryItem {
     pub default_action: String,
     #[serde(default)]
     pub dwell_hours: Option<i64>,
+    /// Hours since the PR was opened. `dwell_hours` counts from `updated_at`,
+    /// which every branch update, label change and check write bumps, so a PR
+    /// the PM touches each cycle reports a dwell of 0 no matter how long it has
+    /// been waiting to land. This one answers "how long has this been open"
+    /// (Issue #4836); staleness keeps its own `updated_at` basis.
+    #[serde(default)]
+    pub age_hours: Option<i64>,
     #[serde(default = "default_stale_after_hours")]
     pub stale_after_hours: i64,
     #[serde(default = "default_true")]
@@ -584,6 +601,7 @@ impl PrInventoryItem {
             head_ref_name: self.head_ref_name.clone(),
             base_ref_name: self.base_ref_name.clone(),
             updated_at: self.updated_at,
+            created_at: self.created_at,
             mergeable: self.mergeable.clone(),
             merge_state_status: self.merge_state_status.clone(),
             ci_status: self.ci_status.clone(),
@@ -631,8 +649,10 @@ fn owner_issue_is_closed(issues: &[PrClosingIssue]) -> bool {
     })
 }
 
-fn pr_dwell_hours(updated_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Option<i64> {
-    updated_at.map(|updated| (now - updated).num_hours().max(0))
+/// Whole hours between `since` and `now`, floored at zero. Used for both
+/// `dwell_hours` (from `updated_at`) and `age_hours` (from `created_at`).
+fn pr_dwell_hours(since: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Option<i64> {
+    since.map(|instant| (now - instant).num_hours().max(0))
 }
 
 fn mergeability_unknown(fields: &PrInventoryFields) -> bool {
@@ -748,6 +768,7 @@ pub fn classify_pr_lifecycle_with(
     };
     let mut decision = decide_for_class(fields, class);
     decision.dwell_hours = pr_dwell_hours(fields.updated_at, now);
+    decision.age_hours = pr_dwell_hours(fields.created_at, now);
     decision.stale = decision
         .dwell_hours
         .is_some_and(|hours| hours >= options.stale_after_hours);
@@ -801,6 +822,7 @@ fn decide_for_class(fields: &PrInventoryFields, class: PrLifecycleClass) -> PrLi
         owner_issue_source,
         default_action,
         dwell_hours: None,
+        age_hours: None,
         default_action_executable,
         default_action_operation,
         blocker: blocker.map(str::to_string),
@@ -858,6 +880,7 @@ fn inventory_item_from_fields(
         head_ref_name: fields.head_ref_name,
         base_ref_name: fields.base_ref_name,
         updated_at: fields.updated_at,
+        created_at: fields.created_at,
         mergeable: fields.mergeable,
         merge_state_status: fields.merge_state_status,
         ci_status: fields.ci_status,
@@ -877,6 +900,7 @@ fn inventory_item_from_fields(
         owner_issue_source: decision.owner_issue_source.map(str::to_string),
         default_action: decision.default_action,
         dwell_hours: decision.dwell_hours,
+        age_hours: decision.age_hours,
         stale_after_hours: options.stale_after_hours,
         default_action_executable: decision.default_action_executable,
         default_action_operation: decision.default_action_operation.map(str::to_string),
@@ -938,6 +962,10 @@ fn inventory_item_from_value(
             .to_string(),
         updated_at: parse_github_timestamp(
             value.get("updatedAt").and_then(serde_json::Value::as_str),
+        )
+        .or(status.created_at),
+        created_at: parse_github_timestamp(
+            value.get("createdAt").and_then(serde_json::Value::as_str),
         )
         .or(status.created_at),
         mergeable: status.mergeable,
@@ -4922,6 +4950,7 @@ mod tests {
             head_ref_name: "work/issue-10".to_string(),
             base_ref_name: "develop".to_string(),
             updated_at: Some("2026-08-30T00:00:00Z".parse().expect("now")),
+            created_at: Some("2026-08-30T00:00:00Z".parse().expect("created")),
             mergeable: "MERGEABLE".to_string(),
             merge_state_status: "CLEAN".to_string(),
             ci_status: "SUCCESS".to_string(),
@@ -5190,6 +5219,46 @@ mod tests {
         fields.updated_at = None;
         let decision = classify_pr_lifecycle(&fields, now_3868());
         assert_eq!(decision.dwell_hours, None);
+    }
+
+    /// Issue #4836: `updated_at` moves on every branch update, label change and
+    /// check write, so a PR the PM re-bases each cycle reports a dwell of zero
+    /// however long it has been waiting to land. `age_hours` counts from the
+    /// opening instant, which no bookkeeping action resets, so the two must not
+    /// collapse into one another.
+    #[test]
+    fn age_hours_counts_from_opening_while_dwell_resets_on_every_update() {
+        let mut fields = sample_inventory_fields();
+        fields.created_at = Some("2026-08-29T12:00:00Z".parse().expect("created"));
+        // A bookkeeping touch one minute ago — exactly what `pr.update_branch`
+        // does to a BEHIND row on every supervision cycle.
+        fields.updated_at = Some("2026-09-01T11:59:00Z".parse().expect("updated"));
+
+        let decision = classify_pr_lifecycle(&fields, now_3868());
+
+        assert_eq!(
+            decision.dwell_hours,
+            Some(0),
+            "a fresh bookkeeping touch leaves no dwell, which is why dwell alone \
+             cannot answer how long the PR has waited"
+        );
+        assert_eq!(
+            decision.age_hours,
+            Some(72),
+            "the PR has been open for three days regardless of that touch"
+        );
+        assert!(
+            !decision.stale,
+            "staleness keeps its updated_at basis: something did just happen"
+        );
+    }
+
+    #[test]
+    fn age_hours_is_absent_without_an_opening_timestamp() {
+        let mut fields = sample_inventory_fields();
+        fields.created_at = None;
+        let decision = classify_pr_lifecycle(&fields, now_3868());
+        assert_eq!(decision.age_hours, None);
     }
 
     #[test]

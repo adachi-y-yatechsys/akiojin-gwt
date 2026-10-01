@@ -931,7 +931,8 @@ quota:
     the previous class because the PR's real data did not change, so a
     class never flips on a non-final GitHub answer.
 - Every row also carries `dwell_hours` (hours since `updated_at`),
-  `stale_after_hours` (the threshold in force; default 72, overridable
+  `age_hours` (hours since the PR was opened), `stale_after_hours`
+  (the threshold in force; default 72, overridable
   with `params.stale_after_hours`), `unchanged_cycles` (consecutive
   `pr.list` reads with identical real data), `escalate_after_cycles`
   (default 3, overridable with `params.escalate_after_cycles`), and
