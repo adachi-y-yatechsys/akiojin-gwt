@@ -47,7 +47,7 @@ pub use codex_shared_state::{
 };
 pub use custom::CustomCodingAgent;
 pub use detect::{AgentDetector, DetectedAgent};
-pub use environment::LaunchEnvironment;
+pub use environment::{CodexAuthRoot, CodexAuthRootOrigin, LaunchEnvironment};
 pub use launch::{
     apply_host_bunx_cache_fast_path, canonical_launch_args, normalize_launch_args,
     resolve_host_npx_fallback_executable, resolve_runner, AgentLaunchBuilder,

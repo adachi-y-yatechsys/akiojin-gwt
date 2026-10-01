@@ -5380,7 +5380,7 @@ impl AppRuntime {
                 config.runtime_target,
             )?
             .with_project_root(&worktree_path)
-            .apply_to_parts(&mut config.env_vars, &mut config.remove_env);
+            .apply_to_config(&mut config);
             if let Some(managed_worktree) = managed_codex_worktree.as_ref() {
                 let report = register_codex_managed_project_trust_for_resolved_launch(
                     &profile_config_path,
@@ -5779,6 +5779,12 @@ impl AppRuntime {
                     })
                 })
                 .transpose()?;
+            // Recheck the proof against the actual child cwd and final environment.
+            // A PM runtime may use a cwd different from the worktree.
+            session.codex_auth_root = pm_provider_runtime_dir(&config)
+                .as_deref()
+                .or(config.working_dir.as_deref())
+                .and_then(|cwd| config.validated_codex_auth_root_for_cwd(cwd));
             if let Err(error) =
                 persist_finalized_launch_session(&sessions_dir, &runtime_path, &mut session, None)
             {

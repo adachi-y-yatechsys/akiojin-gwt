@@ -66,7 +66,7 @@ fn codex_hook_discovery_reuses_the_single_canonical_host_health_result() {
         "codex_hook_discovery_mode_for_launch_config(&config, runner_health_report.as_ref())"
     ));
     let profile_env = launch
-        .find(".apply_to_parts(")
+        .find(".apply_to_config(")
         .expect("profile env applied");
     let health = launch
         .find("resolve_host_runner_health_checked(")
