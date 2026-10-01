@@ -108,13 +108,6 @@ root_js_modules! {
     "operator-shell.js" => "initOperatorShell",
     "focus-trap.js" => "createFocusTrap",
     "recovery-center-modal.js" => "createRecoveryCenterController",
-    // Issue #2698 — stable project tab renderer. Keeps tab DOM keyed by
-    // project tab id so status-only workspace refreshes do not rebuild the
-    // whole tab strip.
-    // SPEC-2008 Phase 34 — stable window tab renderer. Keeps grouped-window
-    // tab DOM keyed by window id so active-tab switches do not blank/rebuild
-    // the tab strip or disturb the terminal body.
-    "window-tabs-renderer.js" => "renderWindowTabs",
     // SPEC-1939 Phase 12 / T-IDX-106 — Settings.Index tab renderer.
     "index-settings-panel.js" => "renderIndexSettingsPanel",
     // SPEC-2008 Phase 24 — terminal viewport reflow primitives.

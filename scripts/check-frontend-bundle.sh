@@ -48,7 +48,6 @@ node_check crates/gwt/web/render-degradation-banner.js
 node_check crates/gwt/web/interaction-guard.js
 node_check crates/gwt/web/viewport-persist-throttle.js
 node_check crates/gwt/web/viewport-sync.js
-node_check crates/gwt/web/window-tabs-renderer.js
 node_check crates/gwt/web/clone-modal-focus-guard.js
 node_check crates/gwt/web/ui-trace-profiler.js
 node_check crates/gwt/web/ui-trace-wiring.js
