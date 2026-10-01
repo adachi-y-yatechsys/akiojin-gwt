@@ -185,6 +185,21 @@ executed tests in the same fresh verification record; skipped tests, metadata
 claims, or a headless run cannot satisfy this evidence requirement. The E2E
 suite remains responsible for console/page-error checks and behavior assertions.
 
+On Windows, canonical `verify.run` normalizes `pwsh` / `powershell -File`
+commands to a quoted script invocation through `-EncodedCommand` and sets
+PowerShell input/output encodings to UTF-8. This preserves drive colons,
+spaces, `=`, and non-ASCII paths, including Japanese user profiles. Keep the
+reporter argument in its canonical `--reporter=list,<path>` format. A project
+PowerShell script only needs to forward remaining arguments with `@args` (or
+its declared remaining-arguments array) to Playwright; do not add per-Issue
+reporter token re-joining or encoding workarounds.
+
+If a reporter argument is split and Playwright fails before tests start, such
+as `Cannot find module 'C'`, treat the verification record as a wrapper defect,
+not a failing application test. Preserve the failed record, repair the
+canonical wrapper, and rerun `verify.run` for fresh headed evidence. A local
+argument-repair wrapper does not establish that the canonical defect is fixed.
+
 ## Invocation Sequence
 
 ```text
