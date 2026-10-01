@@ -352,6 +352,15 @@ reserving a lease. Use `verify.lease.status` to inspect contention;
 when admission times out. Inspect the reported holder before retrying;
 there is no manual acquire loop or fixed retry schedule.
 
+### Process ownership
+
+Never use `pkill`, `killall`, or name/pattern-based process termination:
+process names are shared across worktrees and projects. When stopping your
+own work, target only the exact PID of a process you started yourself.
+If ownership is unknown or the holder belongs to another agent, do not stop it;
+inspect `verify.lease.status` / `execution.status` and report to the PM
+through the Board instead.
+
 ### gwtd bootstrap order
 
 In a checkout that builds gwtd from source (the gwt repository itself), the
@@ -898,6 +907,18 @@ mod tests {
             assert!(body.contains("do not require a verification lease"));
             assert!(!body.contains("\"operation\":\"verify.lease.acquire\""));
             assert!(!body.contains("even a single focused test"));
+            // Issue #4789 AC-5: shared process names cannot establish ownership.
+            assert!(body.contains(
+                "Never use `pkill`, `killall`, or name/pattern-based process termination"
+            ));
+            assert!(body.contains("exact PID of a process you started yourself"));
+            assert!(body.contains("across worktrees and projects"));
+            assert!(body.contains(
+                "If ownership is unknown or the holder belongs to another agent, do not stop it"
+            ));
+            assert!(body.contains(
+                "inspect `verify.lease.status` / `execution.status` and report to the PM"
+            ));
         }
         assert!(SKILL_BODY_JA.contains("canonical `verify.run` だけ"));
     }
