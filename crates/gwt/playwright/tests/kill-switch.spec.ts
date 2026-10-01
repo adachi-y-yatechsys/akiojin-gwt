@@ -301,6 +301,9 @@ test.describe("Anshin Phase 1 kill-switch + attention", () => {
     await expect(monitor.win).toBeVisible();
     await expect(manual.win).toBeHidden();
     await emitStatePair("agent-3", "waiting");
+    // A focus response also carries the backend workspace model. Deliver that
+    // snapshot explicitly so stale fixture status cannot hide behind timing.
+    await page.evaluate(() => (window as any).__killSwitchFixture.focusAndWait("agent-3"));
     await expect(monitor.toast).toHaveCount(1);
     await expect(monitor.toast.locator(".toast-alerts__title")).toHaveText(
       "Waiting for input",
@@ -432,7 +435,7 @@ async function installKillSwitchBackend(page) {
           const target = windows.find((w) => w.id === msg.id);
           if (target) {
             target.z_index += 100;
-            this.emit(stateMsg());
+            return this.emit(stateMsg());
           }
         }
         if (msg.kind === "activate_window_tab") {
@@ -456,6 +459,13 @@ async function installKillSwitchBackend(page) {
       emit(payload) {
         return new Promise((resolve) => {
           setTimeout(() => {
+            // The backend persists status before broadcasting it. Later focus
+            // snapshots must include that state instead of the spawn status.
+            if (payload.kind === "window_state" || payload.kind === "terminal_status") {
+              const id = payload.kind === "window_state" ? payload.window_id : payload.id;
+              const target = windows.find(data => data.id === id);
+              if (target) target.status = payload.kind === "window_state" ? payload.state : payload.status;
+            }
             this.dispatchEvent(
               new MessageEvent("message", { data: JSON.stringify(payload) }),
             );
@@ -470,6 +480,10 @@ async function installKillSwitchBackend(page) {
       if (socketRef) socketRef.emit(payload);
     };
     window.__killSwitchFixture = {
+      async focusAndWait(id) {
+        if (!socketRef) throw new Error("fixture socket is not connected");
+        await socketRef.send(JSON.stringify({ kind: "focus_window", id }));
+      },
       async emitBatchAndWait(payloads) {
         if (!socketRef) throw new Error("fixture socket is not connected");
         for (const payload of payloads) {
