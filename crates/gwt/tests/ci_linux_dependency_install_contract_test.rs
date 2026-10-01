@@ -586,21 +586,16 @@ exec "$@"
     }
 
     #[test]
-    fn all_immediate_failures_report_inconsistent_state_and_preserve_stderr() {
-        let harness = Harness::new("immediate");
+    fn an_apt_state_refusal_does_not_consume_an_attempt() {
+        let harness = Harness::new("state-refusal");
         harness.write_executable("no-lock", no_lock_probe());
         let apt = harness.write_executable(
             "apt",
-            "#!/usr/bin/env bash\necho 'E: invalid apt state' >&2\nexit 100\n",
+            "#!/usr/bin/env bash\necho 'E: dpkg was interrupted, run dpkg --configure -a' >&2\nexit 100\n",
         );
-        // Unsetting Bash SECONDS removes its clock behaviour. Freeze the
-        // observation deterministically rather than racing a loaded CI host.
-        let clock = harness.path("clock");
-        fs::write(&clock, "unset SECONDS\nSECONDS=0\n").unwrap();
         let output = harness.run(
             &["install"],
             &[
-                ("BASH_ENV", clock.to_str().unwrap()),
                 ("GWT_APT_GET", apt.to_str().unwrap()),
                 ("GWT_APT_RETRY_DELAY", "0"),
             ],
@@ -608,7 +603,27 @@ exec "$@"
         let log = combined(&output);
         assert!(!output.status.success(), "{log}");
         assert!(
-            log.contains("state inconsistency") && log.contains("E: invalid apt state"),
+            log.contains("attempts=0/3") && log.contains("E: dpkg was interrupted"),
+            "{log}"
+        );
+        assert!(!log.contains("attempt=2/3"), "{log}");
+    }
+
+    #[test]
+    fn an_apt_spawn_failure_does_not_consume_an_attempt() {
+        let harness = Harness::new("spawn-refusal");
+        harness.write_executable("no-lock", no_lock_probe());
+        let output = harness.run(
+            &["install"],
+            &[
+                ("GWT_APT_GET", harness.path("missing-apt").to_str().unwrap()),
+                ("GWT_APT_RETRY_DELAY", "0"),
+            ],
+        );
+        let log = combined(&output);
+        assert!(!output.status.success(), "{log}");
+        assert!(
+            log.contains("attempts=0/3") && !log.contains("attempt=2/3"),
             "{log}"
         );
     }
@@ -747,6 +762,10 @@ exec "$@"
         );
         let log = combined(&output);
         assert!(output.status.success(), "ci-apt must succeed:\n{log}");
+        assert!(
+            log.contains("step=update apt_exit=0") && log.contains("step=install apt_exit=0"),
+            "{log}"
+        );
 
         let argv = fs::read_to_string(harness.path("state/argv")).expect("read argv");
         let expected = format!("Dir::Cache::archives={}", cache.display());

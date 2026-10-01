@@ -122,6 +122,7 @@ GTK_PACKAGES=(
 # in the reason line the job summary quotes.
 DEADLINE_EXHAUSTED=199
 LOCK_CONTENTION=198
+APT_UNAVAILABLE=197
 
 LAST_REASON="unknown"
 LAST_ATTEMPT_BUDGET="${ATTEMPT_TIMEOUT}"
@@ -359,11 +360,16 @@ summarize_attempt() {
 run_apt_get() {
   LAST_STEP="$1"
   LAST_ELAPSED=0
+  : >"${ATTEMPT_LOG}"
   wait_for_apt_lock || return "${LOCK_CONTENTION}"
+  if ! command -v "${APT_GET}" >/dev/null 2>&1; then
+    log "apt-start=refused reason=command unavailable: ${APT_GET}"
+    return "${APT_UNAVAILABLE}"
+  fi
   # Preserve apt's resumable partial downloads, but recreate the directory
   # before every call (including recovery), not only before attempt one.
   if [[ -n "${CACHE_DIR}" ]]; then
-    mkdir -p "${CACHE_DIR}/partial" || return $?
+    mkdir -p "${CACHE_DIR}/partial" || return "${APT_UNAVAILABLE}"
   fi
   # The last attempt before the total deadline is truncated to whatever is
   # left, so the reason line has to quote the budget actually applied rather
@@ -377,10 +383,11 @@ run_apt_get() {
   # the kill with everything apt managed to print already written.
   local started="${SECONDS}"
   local status=0
-  : >"${ATTEMPT_LOG}"
-  run_with_timeout "${LAST_ATTEMPT_BUDGET}" "${APT_GET}" "${APT_OPTIONS[@]}" "$@" 2>&1 |
+  # State-refusal diagnostics below must be independent of the runner locale.
+  LC_ALL=C run_with_timeout "${LAST_ATTEMPT_BUDGET}" "${APT_GET}" "${APT_OPTIONS[@]}" "$@" 2>&1 |
     tee "${ATTEMPT_LOG}" || status=$?
   LAST_ELAPSED=$((SECONDS - started))
+  log "step=${LAST_STEP} apt_exit=${status}"
   return "${status}"
 }
 
@@ -449,6 +456,8 @@ describe_failure() {
     printf 'total deadline of %ss exhausted' "${TOTAL_DEADLINE}"
   elif ((status == LOCK_CONTENTION)); then
     printf 'dpkg lock contention'
+  elif ((status == APT_UNAVAILABLE)); then
+    printf 'apt could not start; inspect preparation diagnostics'
   else
     printf 'apt-get exited %s' "${status}"
   fi
@@ -457,31 +466,34 @@ describe_failure() {
 run_with_retries() {
   local attempt=1
   local status=0
-  local immediate_failures=0 started=0
   while ((attempt <= ATTEMPTS)); do
     log "phase=${MODE} attempt=${attempt}/${ATTEMPTS} elapsed=${SECONDS}s deadline=${TOTAL_DEADLINE}s"
-    started="${SECONDS}"
     status=0
     run_once || status=$?
+    # A refused start is not an installation attempt. Use explicit launch
+    # failures and apt's state diagnostics, never elapsed time: a warm cache
+    # can legitimately finish in zero seconds. Stop on a state refusal rather
+    # than retrying a permanent error forever without spending the budget.
+    if ((status == LOCK_CONTENTION || status == APT_UNAVAILABLE || status == DEADLINE_EXHAUSTED || status == 126 || status == 127)) ||
+      { ((status == 100)) && grep -aqE '^E: (dpkg was interrupted|Could not get lock |Could not open lock file |Unable to acquire the dpkg frontend lock|Unable to lock directory )' "${ATTEMPT_LOG}"; }; then
+      LAST_REASON="apt state refusal (attempt not consumed): $(describe_failure "${status}")"
+      log "phase=${MODE} attempt=${attempt}/${ATTEMPTS} status=refused exit=${status} reason=${LAST_REASON}"
+      summarize_attempt
+      break
+    fi
     ATTEMPTS_USED="${attempt}"
     if ((status == 0)); then
-      log "phase=${MODE} attempt=${attempt}/${ATTEMPTS} status=ok"
+      log "phase=${MODE} attempt=${attempt}/${ATTEMPTS} status=ok exit=0"
       summarize_attempt
       log "diagnosis attempt=${attempt}/${ATTEMPTS} ${LAST_DIAGNOSIS}"
       return 0
     fi
-    if ((SECONDS == started && status != DEADLINE_EXHAUSTED && status != LOCK_CONTENTION)); then
-      immediate_failures=$((immediate_failures + 1))
-    fi
 
     LAST_REASON="$(describe_failure "${status}")"
-    log "phase=${MODE} attempt=${attempt}/${ATTEMPTS} status=failed reason=${LAST_REASON}"
+    log "phase=${MODE} attempt=${attempt}/${ATTEMPTS} status=failed exit=${status} reason=${LAST_REASON}"
     summarize_attempt
     log "diagnosis attempt=${attempt}/${ATTEMPTS} ${LAST_DIAGNOSIS}"
 
-    if ((status == DEADLINE_EXHAUSTED)); then
-      break
-    fi
     attempt=$((attempt + 1))
     if ((attempt <= ATTEMPTS)); then
       if (($(remaining_seconds) <= RETRY_DELAY)); then
@@ -501,9 +513,6 @@ run_with_retries() {
       fi
     fi
   done
-  if ((immediate_failures == ATTEMPTS_USED)); then
-    LAST_REASON="state inconsistency: all attempts failed immediately; inspect apt stderr (${LAST_REASON})"
-  fi
   return 1
 }
 
