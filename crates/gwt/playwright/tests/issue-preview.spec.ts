@@ -342,6 +342,10 @@ test.describe("Issue preview placement", () => {
     await expect(menu).toHaveCount(1);
     await menu.locator("summary").click();
     await expect(menu).toHaveAttribute("open", "");
+    // Issue #4886: a background workspace refresh must not close the menu.
+    await page.evaluate(() => window.__patchWindow("tab-issue::agent-preview", { title: "Background refresh" }));
+    await expect(page.locator(".issue-preview-title")).toHaveText("Background refresh");
+    await expect(menu).toHaveAttribute("open", "");
     await expect(menu.locator('[data-action="continue-work"]')).toBeVisible();
     await expect(menu.locator('[data-action="continue-work"]')).toBeEnabled();
     await expect(menu.locator('[data-action="resume-work"]')).toBeEnabled();
