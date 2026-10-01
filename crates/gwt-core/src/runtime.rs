@@ -273,18 +273,12 @@ pub fn invalidate_project_index_probe_cache() {
     let _ = std::fs::remove_file(cache);
 }
 
-fn acquire_probe_lock(runtime_dir: &Path) -> Result<std::fs::File> {
+fn acquire_probe_lock(runtime_dir: &Path) -> Result<crate::operation_deadline::NamedFileLock> {
     let lock_path = runtime_dir.join(PROBE_LOCK_FILE);
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)
-        .map_err(|err| GwtError::Other(format!("open probe lock: {err}")))?;
-    crate::operation_deadline::lock_exclusive(&lock)
-        .map_err(|err| GwtError::Other(format!("acquire probe lock: {err}")))?;
-    Ok(lock)
+    // Issue #4686 AC-5: the runtime probe runs on hook and launch paths that
+    // fail closed, so name the holder rather than reporting a bare deadline.
+    crate::operation_deadline::NamedFileLock::acquire(&lock_path, "runtime_probe")
+        .map_err(|err| GwtError::Other(format!("acquire probe lock: {err}")))
 }
 
 fn venv_python_identity(venv_python: &Path) -> String {

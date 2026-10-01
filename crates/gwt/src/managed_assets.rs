@@ -10,7 +10,6 @@ use std::{
 
 use crate::cli::gwtd_resolver::default_installed_candidates;
 use crate::native_app::{GUI_FRONT_DOOR_BINARY_NAME, INTERNAL_DAEMON_BINARY_NAME};
-use fs2::FileExt;
 use gwt_agent::AgentId;
 use gwt_skills::pm_guidance::{generate_pm_guidance_for_claude, generate_pm_guidance_for_codex};
 use gwt_skills::{
@@ -107,23 +106,18 @@ fn with_lock_at<T>(path: &Path, operation: impl FnOnce() -> io::Result<T>) -> io
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let lock = fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(path)?;
     let started = Instant::now();
-    gwt_core::operation_deadline::lock_exclusive(&lock)?;
+    // Issue #4686 AC-2: take the named lock rather than a bare exclusive lock,
+    // so a deadline expiry names the pid, operation, and acquisition time of
+    // the holder. The bare path reports only "operation deadline expired during
+    // file lock", which cannot distinguish a genuinely busy peer from a stale
+    // lock file and leaves the caller nothing to act on.
+    let lock = gwt_core::operation_deadline::NamedFileLock::acquire(path, "managed_assets")?;
     let waited = started.elapsed();
     ASSET_LOCK_WAIT.with(|total| total.set(total.get().saturating_add(waited)));
     let result = operation();
-    let unlock = FileExt::unlock(&lock);
-    match (result, unlock) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
-    }
+    drop(lock);
+    result
 }
 
 /// Every `.codex/hooks.json` gwt owns for `worktree`: the worktree-local copy
