@@ -435,14 +435,15 @@ fn windows_ci_runs_the_real_resolver_pty_and_caller_regression_targets() {
 
     assert!(!workflow.contains("cargo test -p gwt-core terminal::pty"));
     for command in [
-        "cargo test -p gwt-core --test windows_process_resolver --test process_adapter_parity",
-        "cargo test -p gwt-core --test windows_claude_user_agent",
-        "cargo test -p gwt-agent --lib real_bun_global_placeholder_fixture",
-        "cargo test -p gwt-agent --lib package_runner_resolution_failure_still_emits_an_end_summary",
-        "cargo test -p gwt --bin gwt real_bun_global_placeholder_fixture",
-        "cargo test -p gwt --bin gwt command_prompt_agent_wrapper",
-        "cargo test -p gwt-terminal --lib pty::windows_spawn::tests",
-        "cargo test -p gwt --test agent_process_resolution_contract_test",
+        "node scripts/ci-windows-tests.mjs run gwt-core test windows_process_resolver",
+        "node scripts/ci-windows-tests.mjs run gwt-core test process_adapter_parity",
+        "node scripts/ci-windows-tests.mjs run gwt-core test windows_claude_user_agent",
+        "node scripts/ci-windows-tests.mjs run gwt-agent lib gwt_agent real_bun_global_placeholder_fixture",
+        "node scripts/ci-windows-tests.mjs run gwt-agent lib gwt_agent package_runner_resolution_failure_still_emits_an_end_summary",
+        "node scripts/ci-windows-tests.mjs run gwt bin gwt real_bun_global_placeholder_fixture",
+        "node scripts/ci-windows-tests.mjs run gwt bin gwt command_prompt_agent_wrapper",
+        "node scripts/ci-windows-tests.mjs run gwt-terminal lib gwt_terminal pty::windows_spawn::tests",
+        "node scripts/ci-windows-tests.mjs run gwt test agent_process_resolution_contract_test",
     ] {
         assert!(
             workflow.contains(command),
@@ -532,15 +533,15 @@ fn windows_ci_runs_issue_monitor_launch_now_control_path_contracts() {
     );
     let command_lines = step.lines().map(str::trim).collect::<Vec<_>>();
     for command in [
-        "cargo test -p gwt --lib cli::issue::tests::windows_launch_now_ -- --test-threads=1",
-        "cargo test -p gwt --lib cli::issue::tests::immediate_scan_delivery_never_claims_an_unacknowledged_schedule -- --exact --test-threads=1",
-        "cargo test -p gwt --lib cli::pane::tests::pane_websocket_request_carries_the_agent_capability_in_authorization -- --exact --test-threads=1",
-        "cargo test -p gwt --lib cli::pane::tests::issue_monitor_scan_client_ -- --test-threads=1",
-        "cargo test -p gwt --bin gwt embedded_server::tests::authenticated_monitor_scan_routes_scope_guard_and_result_only_to_origin_socket -- --exact --test-threads=1",
-        "cargo test -p gwt --bin gwt authenticated_pm_scan_now_ -- --test-threads=1",
-        "cargo test -p gwt --bin gwt authenticated_scan_now_ -- --test-threads=1",
-        "cargo test -p gwt --test issue_monitor_protocol_test frontend_issue_monitor_events_use_snake_case_wire_shape -- --exact --test-threads=1",
-        "cargo test -p gwt --test issue_monitor_protocol_test agent_issue_monitor_scan_ -- --test-threads=1",
+        "node scripts/ci-windows-tests.mjs run gwt lib gwt cli::issue::tests::windows_launch_now_ -- --test-threads=1",
+        "node scripts/ci-windows-tests.mjs run gwt lib gwt cli::issue::tests::immediate_scan_delivery_never_claims_an_unacknowledged_schedule -- --exact --test-threads=1",
+        "node scripts/ci-windows-tests.mjs run gwt lib gwt cli::pane::tests::pane_websocket_request_carries_the_agent_capability_in_authorization -- --exact --test-threads=1",
+        "node scripts/ci-windows-tests.mjs run gwt lib gwt cli::pane::tests::issue_monitor_scan_client_ -- --test-threads=1",
+        "node scripts/ci-windows-tests.mjs run gwt bin gwt embedded_server::tests::authenticated_monitor_scan_routes_scope_guard_and_result_only_to_origin_socket -- --exact --test-threads=1",
+        "node scripts/ci-windows-tests.mjs run gwt bin gwt authenticated_pm_scan_now_ -- --test-threads=1",
+        "node scripts/ci-windows-tests.mjs run gwt bin gwt authenticated_scan_now_ -- --test-threads=1",
+        "node scripts/ci-windows-tests.mjs run gwt test issue_monitor_protocol_test frontend_issue_monitor_events_use_snake_case_wire_shape -- --exact --test-threads=1",
+        "node scripts/ci-windows-tests.mjs run gwt test issue_monitor_protocol_test agent_issue_monitor_scan_ -- --test-threads=1",
     ] {
         assert!(
             command_lines.contains(&command),
@@ -568,7 +569,7 @@ fn windows_multi_command_test_steps_use_a_fail_fast_shell() {
             .map_or(tail, |(step, _)| step);
         assert!(
             step.contains("\n        shell: bash\n"),
-            "Windows multi-command step `{step_name}` must stop at the first failed cargo command"
+            "Windows multi-command step `{step_name}` must stop at the first failed test command"
         );
     }
 }
