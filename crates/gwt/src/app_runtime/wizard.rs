@@ -5032,7 +5032,7 @@ impl AppRuntime {
                     ),
                     initial_session_id: candidate_session_id.clone(),
                     entrypoint: gwt::cli::execution_state::entrypoint_from_launch(
-                        &config.args,
+                        config.entrypoint_args(),
                         false,
                     ),
                     requested_at,

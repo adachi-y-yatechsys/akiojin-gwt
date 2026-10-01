@@ -1099,6 +1099,9 @@ pub struct LaunchConfig {
     pub agent_id: AgentId,
     pub command: String,
     pub args: Vec<String>,
+    /// Long initial task materialized as a file after worktree resolution.
+    /// Retained separately from argv so launch provenance still sees its skill.
+    pub pending_initial_prompt: Option<String>,
     pub env_vars: HashMap<String, String>,
     pub remove_env: Vec<String>,
     pub working_dir: Option<PathBuf>,
@@ -1170,6 +1173,16 @@ pub struct LaunchConfig {
     /// the forced-skip contract is decided and the one place the per-provider
     /// mapping is verified to have survived materialization.
     pub permission_decision: PermissionModeDecision,
+}
+
+impl LaunchConfig {
+    /// Original task arguments for provenance, before file/shell transport.
+    pub fn entrypoint_args(&self) -> &[String] {
+        self.pending_initial_prompt
+            .as_ref()
+            .map(std::slice::from_ref)
+            .unwrap_or(&self.args)
+    }
 }
 
 /// Permission mode for agent launch.
@@ -1711,6 +1724,7 @@ impl AgentLaunchBuilder {
             agent_id,
             command: runner.executable,
             args,
+            pending_initial_prompt: None,
             env_vars,
             remove_env: Vec::new(),
             working_dir: self.working_dir,

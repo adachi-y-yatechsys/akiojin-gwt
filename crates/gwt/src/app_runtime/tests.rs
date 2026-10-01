@@ -416,6 +416,7 @@ fn process_launch_debug_redacts_agent_capability_and_session_identity() {
     let secret = "agent-capability-secret-sentinel";
     let readiness = "continue-readiness-secret-sentinel";
     let launch = ProcessLaunch {
+        initial_prompt_file: None,
         command: "docker".to_string(),
         args: vec![
             format!("{}={secret}", gwt_agent::GWT_HOOK_FORWARD_TOKEN_ENV),
@@ -1071,6 +1072,13 @@ fn terminal_agent_error_invalidates_input_even_when_pane_is_kept_for_diagnostics
         sample_active_agent_session("tab-1", &window_id),
     );
     insert_test_pane_runtime(&mut runtime, &window_id);
+    let prompt_file = tempfile::NamedTempFile::new_in(temp.path())
+        .expect("initial prompt")
+        .into_temp_path();
+    let prompt_path = prompt_file.to_path_buf();
+    let window_runtime = runtime.runtimes.get_mut(&window_id).expect("runtime");
+    let incarnation = window_runtime.incarnation;
+    window_runtime._initial_prompt_file = Some(Arc::new(prompt_file));
     let pane = runtime
         .runtimes
         .get(&window_id)
@@ -1110,6 +1118,22 @@ fn terminal_agent_error_invalidates_input_even_when_pane_is_kept_for_diagnostics
     assert!(
         generation.write_input(b"late PM body").is_err(),
         "a delivery prepared before terminal status must not begin a later physical write"
+    );
+    assert!(
+        prompt_path.exists(),
+        "an unconfirmed transport error must retain the prompt"
+    );
+    runtime.handle_runtime_status_event(
+        window_id.clone(),
+        incarnation,
+        WindowProcessStatus::Error,
+        Some("PTY process exited".to_string()),
+        true,
+    );
+    assert!(runtime.runtimes.contains_key(&window_id));
+    assert!(
+        !prompt_path.exists(),
+        "confirmed exit must release the prompt even while diagnostics remain"
     );
 }
 
@@ -8445,6 +8469,7 @@ fn agent_launch_success_dispatches_launch_complete_before_project_index_status()
     let (proxy, events) = AppEventProxy::stub();
     let completion: AgentLaunchCompletion = (
         ProcessLaunch {
+            initial_prompt_file: None,
             command: "agent".to_string(),
             args: Vec::new(),
             env: HashMap::new(),
@@ -14990,6 +15015,7 @@ fn issue_monitor_review_launch_completion(
     };
     (
         ProcessLaunch {
+            initial_prompt_file: None,
             command,
             args,
             env: HashMap::new(),
@@ -15190,6 +15216,7 @@ fn genesis_pty_spawn_failure_terminalizes_generation_and_allows_successor_retry(
         window_id.clone(),
         Ok((
             ProcessLaunch {
+                initial_prompt_file: None,
                 command: "/definitely/missing/gwt-agent".to_string(),
                 args: Vec::new(),
                 env: HashMap::new(),
@@ -15371,6 +15398,7 @@ fn genesis_receipt_cleanup_failure_discards_published_work_and_active_owner() {
         window_id.clone(),
         Ok((
             ProcessLaunch {
+                initial_prompt_file: None,
                 command,
                 args,
                 env: HashMap::new(),
@@ -28032,6 +28060,7 @@ fn fresh_execution_launch_completion_recovers_prepared_receipt_and_defers_projec
         fixture.window_id.clone(),
         Ok((
             ProcessLaunch {
+                initial_prompt_file: None,
                 command,
                 args,
                 env: HashMap::from([
@@ -28845,6 +28874,7 @@ fn app_runtime_issue_monitor_launch_complete_marks_issue_launched_and_keeps_acti
         window_id.clone(),
         Ok((
             ProcessLaunch {
+                initial_prompt_file: None,
                 command,
                 args,
                 env: HashMap::new(),
@@ -28956,6 +28986,7 @@ fn app_runtime_close_finalizer_completes_while_a_live_pty_reader_is_attached() {
             &window_id,
             canvas_bounds(),
             ProcessLaunch {
+                initial_prompt_file: None,
                 command,
                 args,
                 env: HashMap::new(),
@@ -29060,6 +29091,7 @@ fn app_runtime_closing_issue_monitor_window_returns_issue_to_pending() {
         window_id.clone(),
         Ok((
             ProcessLaunch {
+                initial_prompt_file: None,
                 command,
                 args,
                 env: HashMap::new(),
@@ -29569,6 +29601,7 @@ fn app_runtime_start_work_launch_completion_registers_unassigned_agent() {
         window_id,
         Ok((
             ProcessLaunch {
+                initial_prompt_file: None,
                 command,
                 args,
                 env: HashMap::new(),
@@ -29661,6 +29694,7 @@ fn app_runtime_non_work_launch_registers_unassigned_agent() {
         window_id,
         Ok((
             ProcessLaunch {
+                initial_prompt_file: None,
                 command,
                 args,
                 env: HashMap::new(),
@@ -29764,6 +29798,7 @@ fn app_runtime_linked_launch_projection_failure_is_visible_and_stops_session() {
         window_id.clone(),
         Ok((
             ProcessLaunch {
+                initial_prompt_file: None,
                 command,
                 args,
                 env: HashMap::new(),
@@ -29878,6 +29913,7 @@ fn app_runtime_workspace_resume_launch_completion_carries_context_to_projection(
         window_id,
         Ok((
             ProcessLaunch {
+                initial_prompt_file: None,
                 command,
                 args,
                 env: HashMap::new(),
@@ -29976,6 +30012,7 @@ fn app_runtime_unlinked_resume_launch_completion_records_work_projection() {
         window_id.clone(),
         Ok((
             ProcessLaunch {
+                initial_prompt_file: None,
                 command,
                 args,
                 env: HashMap::new(),
@@ -30084,6 +30121,7 @@ fn automatic_resume_with_stale_execution_binding_completes_without_genesis_authe
         window_id.clone(),
         Ok((
             ProcessLaunch {
+                initial_prompt_file: None,
                 command,
                 args,
                 env: HashMap::new(),
@@ -30326,6 +30364,7 @@ fn app_runtime_issue_launch_completion_records_issue_owned_start_work_event() {
         window_id,
         Ok((
             ProcessLaunch {
+                initial_prompt_file: None,
                 command,
                 args,
                 env: HashMap::new(),
@@ -30423,6 +30462,7 @@ fn app_runtime_start_work_launch_completion_registers_multiple_unassigned_agents
             )
         };
         ProcessLaunch {
+            initial_prompt_file: None,
             command,
             args,
             env: HashMap::new(),
@@ -33398,6 +33438,7 @@ fn bound_runtime_launch_completion(
 ) -> AgentLaunchCompletion {
     (
         ProcessLaunch {
+            initial_prompt_file: None,
             command,
             args,
             env: HashMap::new(),
@@ -33620,6 +33661,7 @@ fn unbound_agent_pty_publishes_process_identity_for_session_observation() {
             &window_id,
             geometry,
             ProcessLaunch {
+                initial_prompt_file: None,
                 command,
                 args,
                 env: HashMap::new(),
@@ -78490,6 +78532,7 @@ fn startup_restore_admits_only_resumable_sessions_with_live_work() {
                 &window_id,
                 canvas_bounds(),
                 ProcessLaunch {
+                    initial_prompt_file: None,
                     command: command.to_string(),
                     args: args.into_iter().map(str::to_string).collect(),
                     env: HashMap::new(),
