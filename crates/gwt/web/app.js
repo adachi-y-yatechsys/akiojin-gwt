@@ -173,6 +173,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
         installSurfaceRail,
         surfaceForWindow,
       } from "/surface-rail.js";
+      import { createSplitSurfaces } from "/split-surfaces.js";
       import { shouldSkipTerminalFocusActivation } from "/clone-modal-focus-guard.js";
       import { createUiTraceProfiler } from "/ui-trace-profiler.js";
       import { UI_TRACE_EVENT, createUiTraceWiring } from "/ui-trace-wiring.js";
@@ -305,6 +306,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
         },
       });
       const windowMap = new Map();
+      let splitSurfaces = null;
       const renderedWindowElementKeys = new Map();
       const renderedRuntimeStatusKeys = new Map();
       const renderedAgentKanbanBodyKeys = new Map();
@@ -1882,6 +1884,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
           UI_TRACE_EVENT.renderAppState,
           { tabs: Array.isArray(nextState?.tabs) ? nextState.tabs.length : 0 },
           () => {
+            if (nextState?.active_tab_id !== appState.active_tab_id) splitSurfaces?.close();
             appState = mergeProjectCatalog(nextState || {
               app_version: "",
               tabs: [],
@@ -1892,6 +1895,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
             connectSocket();
             setVersionState(appState.app_version, versionState.latest);
             const tab = activeProjectTab();
+            document.getElementById("split-view-button").disabled = !tab;
             renderProjectPicker(tab);
             updateActionAvailability(tab);
             renderProjectOnboarding(tab);
@@ -2044,6 +2048,15 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
       // The PM is not one of them. With no agent yet, it opens the Add Window
       // deck to launch one.
       function openSurface(surface) {
+        if (splitSurfaces?.isOpen()) {
+          if (!splitSurfaces.select(surface)) {
+            const existing = (activeWorkspace().windows || []).find(
+              (data) => surfaceForWindow(data) === surface && splitSurfaces.containsWindow(data.id),
+            );
+            if (existing) splitSurfaces.focusWindow(existing.id);
+          }
+          return;
+        }
         switch (surface) {
           case "issues":
             openWorkspaceOverview();
@@ -2304,6 +2317,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
       }
 
       function clampWindowElementToCameraFrame(windowId) {
+        if (splitSurfaces?.isOpen()) return;
         const element = windowMap.get(windowId);
         if (!element) {
           return;
@@ -2416,6 +2430,18 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
         if (!windowData) {
           return;
         }
+        if (splitSurfaces?.isOpen()) {
+          if (!splitSurfaces.containsWindow(windowId)) {
+            splitSurfaces.select(surfaceForWindow(windowData));
+          }
+          if (splitSurfaces.containsWindow(windowId)) {
+            if (notifyFocus) focusWindowRemotely(windowId);
+            else focusWindowLocally(windowId);
+            return;
+          }
+          // PM and legacy surfaces keep their existing single-view route.
+          splitSurfaces.close();
+        }
         // Cap framing at 1:1 so the focused terminal never CSS-upscales (blur).
         const target = viewportForWorldRect(framingRectForWindow(windowData), {
           maxZoom: FRAME_ZOOM_MAX,
@@ -2480,7 +2506,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
       let focusedWindowViewportReframeFrame = null;
 
       function frameFocusedWindowAfterViewportResize() {
-        if (!focusedId) {
+        if (splitSurfaces?.isOpen() || !focusedId) {
           return;
         }
         const windowData = workspaceWindowById(focusedId);
@@ -2739,6 +2765,9 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
       // unit tests can reuse it.
       function canRefreshTerminalViewport(windowId) {
         const workspaceWindow = workspaceWindowById(windowId);
+        if (splitSurfaces?.isOpen() && !isOffCanvasPlacement(workspaceWindow)) {
+          return splitSurfaces.containsWindow(windowId);
+        }
         if (isOffCanvasPlacement(workspaceWindow)) {
           const terminalHost = terminalMap.get(windowId)?.terminal?.element?.parentElement;
           return elementHasLayoutBox(terminalHost);
@@ -3277,7 +3306,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
         ),
       ) {
         const windowData = workspaceWindowById(windowId);
-        if (isOffCanvasPlacement(windowData)) {
+        if (isOffCanvasPlacement(windowData) || splitSurfaces?.containsWindow(windowId)) {
           send(updateTerminalGridMessage(windowId, cols, rows));
           return;
         }
@@ -3853,6 +3882,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
       }
 
       function focusWindowLocally(windowId) {
+        splitSurfaces?.focusWindow(windowId);
         const targetElement = windowMap.get(windowId);
         if (focusedId === windowId && targetElement?.classList.contains("focused")) {
           raiseWindowElementLocally(targetElement);
@@ -3874,6 +3904,10 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
       // Issue #4777 T-1: the pressed rail surface is the one the focused
       // window belongs to; no second selection state is kept.
       function syncSurfaceRail() {
+        if (splitSurfaces?.isOpen()) {
+          applySurfaceSelection(document, splitSurfaces.activeSurface());
+          return;
+        }
         const focused = focusedId
           ? (activeWorkspace().windows || []).find((windowData) => windowData.id === focusedId)
           : null;
@@ -4034,6 +4068,10 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
           send,
           requestClose: requestCloseWindow,
           onTabDragStart: (event, tabId) => {
+            if (splitSurfaces?.isOpen()) {
+              event.preventDefault();
+              return;
+            }
             windowTabDragState = {
               id: tabId,
               docked: false,
@@ -5685,6 +5723,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
               return;
             }
             focusWindowRemotely(windowData.id);
+            if (splitSurfaces?.containsWindow(windowData.id)) return;
             // Issue #3364 — arm the same local edit guard as the resize path
             // so backlogged workspace_state broadcasts cannot fight the
             // pointer mid-drag, and capture the base revision for the drop
@@ -6073,6 +6112,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
               // with agent status events.
               recompute: recomputeOperatorTelemetry,
               afterSync: () => {
+                if (splitSurfaces?.isOpen()) return;
                 const topmostId = topmostWindowId(workspace);
                 if (topmostId && activeWindowIdSet?.has(topmostId)) {
                   focusWindowLocally(topmostId);
@@ -6086,6 +6126,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
                 }
               },
             });
+            splitSurfaces?.sync();
           },
         );
       }
@@ -7485,6 +7526,31 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
       if (kanbanDrawerBackdrop) {
         kanbanDrawerBackdrop.addEventListener("click", closeKanbanDrawer);
       }
+      splitSurfaces = createSplitSurfaces({
+        document,
+        stage,
+        getWindows: () => (activeWorkspace().windows || []).filter((data) => !isOffCanvasPlacement(data)),
+        getElement: (id) => windowMap.get(id),
+        restoreVisibility: (id, element) => { element.hidden = !visibleWindowData(workspaceWindowById(id)); },
+        openSurface: (surface) => {
+          const preset = surface === "issues" ? "issue" : surface;
+          send({ kind: "create_window", preset, bounds: visibleBounds() });
+        },
+        onChange: () => syncSurfaceRail(),
+        onLayout: (ids) => {
+          for (const id of ids) activateTerminalOnReveal(id);
+        },
+      });
+      document.getElementById("split-view-button").addEventListener("click", () => {
+        if (splitSurfaces.isOpen()) splitSurfaces.close();
+        else splitSurfaces.open(surfaceForWindow(workspaceWindowById(focusedId)));
+      });
+      window.addEventListener("resize", () => {
+        if (!splitSurfaces.isOpen()) return;
+        for (const id of windowMap.keys()) {
+          if (splitSurfaces.containsWindow(id)) scheduleTerminalFit(id, true);
+        }
+      });
       installSurfaceRail(document, { openSurface });
       // SPEC-2356 — keyboard equivalent for clicking the modal backdrop.
       // Without this, Esc only worked for the Hotkey overlay and Command
