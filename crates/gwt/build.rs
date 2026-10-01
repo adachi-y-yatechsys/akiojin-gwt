@@ -83,6 +83,8 @@ fn embed_windows_resources() {
     // UAC installer detection treats keyword-named copies of these binaries
     // (e.g. the self-update helper) as legacy installers and CreateProcess
     // fails with ERROR_ELEVATION_REQUIRED (os error 740).
+    // rfd's custom approval buttons use TaskDialogIndirect, which requires
+    // selecting Common Controls v6 before the executable is loaded.
     resource.set_manifest(
         r#"<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
 <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
@@ -92,6 +94,13 @@ fn embed_windows_resources() {
         </requestedPrivileges>
     </security>
 </trustInfo>
+<dependency>
+    <dependentAssembly>
+        <assemblyIdentity type="win32" name="Microsoft.Windows.Common-Controls"
+            version="6.0.0.0" processorArchitecture="*"
+            publicKeyToken="6595b64144ccf1df" language="*" />
+    </dependentAssembly>
+</dependency>
 </assembly>"#,
     );
 
