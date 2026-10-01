@@ -1,5 +1,3 @@
-import { surfaceForWindow } from "./surface-rail.js";
-
 const SURFACES = { issues: "Issues", agents: "Agents", board: "Board", settings: "Settings" };
 const PRESETS = { issues: "issue", board: "board", settings: "settings" };
 
@@ -8,7 +6,7 @@ const PRESETS = { issues: "issue", board: "board", settings: "settings" };
 // layout until the later #4777 migration slices retire it.
 export function createSplitSurfaces({
   document, stage, getWindows, getElement, openSurface, onChange, onLayout,
-  restoreVisibility = () => {},
+  restoreVisibility = () => {}, onAgentsHost = () => {},
 }) {
   const host = document.getElementById("split-surfaces");
   const button = document.getElementById("split-view-button");
@@ -53,6 +51,7 @@ export function createSplitSurfaces({
     if (!opened) return;
     const windows = getWindows();
     const desired = new Map();
+    if (!selections.includes("agents")) onAgentsHost(null);
     for (const [index, pane] of panes.entries()) {
       const surface = selections[index];
       pane.dataset.surface = surface;
@@ -61,17 +60,17 @@ export function createSplitSurfaces({
         option.disabled = option.value === selections[1 - index];
         option.textContent = `${SURFACES[option.value]}${option.disabled ? " (open in other pane)" : ""}`;
       }
-      const matches = windows.filter((data) => surface === "agents"
-        ? surfaceForWindow(data) === "agents"
-        : data.preset === PRESETS[surface]);
-      const selected = surface === "agents" ? matches : matches.slice(0, 1);
+      if (surface === "agents") {
+        pane.querySelector(".split-pane__empty").hidden = true;
+        onAgentsHost(pane.querySelector(".split-pane__body"));
+        continue;
+      }
+      const selected = windows.filter((data) => data.preset === PRESETS[surface]).slice(0, 1);
       const empty = pane.querySelector(".split-pane__empty");
       empty.hidden = selected.length > 0;
-      empty.textContent = surface === "agents"
-        ? "No agent windows on the canvas. Open an agent from Issues."
-        : `Opening ${SURFACES[surface]}…`;
+      empty.textContent = `Opening ${SURFACES[surface]}…`;
       if (selected.length) requested.delete(surface);
-      else if (surface !== "agents" && !requested.has(surface)) {
+      else if (!requested.has(surface)) {
         requested.add(surface);
         openSurface(surface);
       }
@@ -139,6 +138,7 @@ export function createSplitSurfaces({
     mounted.clear();
     requested.clear();
     opened = false;
+    onAgentsHost(null);
     host.hidden = true;
     area.classList.remove("is-split");
     button.setAttribute("aria-pressed", "false");
@@ -153,6 +153,10 @@ export function createSplitSurfaces({
     isOpen: () => opened,
     activeSurface: () => opened ? selections[active] : null,
     containsWindow: (id) => mounted.has(id),
+    focusSurface(surface) {
+      const index = selections.indexOf(surface);
+      if (opened && index >= 0) focusPane(index);
+    },
     focusWindow(id) {
       const pane = mounted.get(id)?.closest(".split-pane");
       if (!pane) return false;

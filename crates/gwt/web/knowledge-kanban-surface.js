@@ -3023,6 +3023,7 @@ export function createKnowledgeKanbanSurface({
 
         const header = createNode("div", "issue-preview-header");
         const titleWrap = createNode("div", "issue-preview-title-wrap");
+        header.appendChild(createNode("span", "issue-preview-mode", "Read-only preview"));
         titleWrap.appendChild(
           createNode(
             "div",
@@ -4119,6 +4120,11 @@ export function createKnowledgeKanbanSurface({
 
         renderKnowledgeStatusOnly(windowId, state);
 
+        // Issue menus are recreated; retain disclosure state by Issue identity.
+        const openIssueMenus = new Set(
+          Array.from(list.querySelectorAll(".knowledge-row-menu[open]"),
+            menu => menu.closest(".knowledge-row, .issue-split-pair")?.dataset.issueNumber),
+        );
         // Keep the native disclosure connected while cache projections refresh;
         // replacing it between pointerdown and pointerup loses the user's click.
         const other = list.querySelector(".issue-other-group");
@@ -4141,6 +4147,11 @@ export function createKnowledgeKanbanSurface({
           }
         } else {
           renderIssueQueueBoard(windowId, state, list, visibleEntries);
+        }
+        for (const menu of list.querySelectorAll(".knowledge-row-menu")) {
+          if (openIssueMenus.has(menu.closest(".knowledge-row, .issue-split-pair")?.dataset.issueNumber)) {
+            menu.setAttribute("open", "");
+          }
         }
         renderOtherWork(list, windowId, { laneFilter: state.issueLaneFilter || "all" });
         renderKnowledgeDetailPane(windowId, state, detailPane, { agentPreview: !splitMode });
