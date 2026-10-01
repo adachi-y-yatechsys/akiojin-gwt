@@ -205,6 +205,7 @@ fn prepare_agent_launch_composes_session_env_without_spawning() {
         agent_id: AgentId::Custom("integration-fake-agent".to_string()),
         command: "integration-fake-agent".to_string(),
         args: vec!["--flag".to_string()],
+        pending_initial_prompt: None,
         env_vars: HashMap::from([("EXPLICIT_LAUNCH".to_string(), "yes".to_string())]),
         remove_env: Vec::new(),
         working_dir: Some(worktree.clone()),
