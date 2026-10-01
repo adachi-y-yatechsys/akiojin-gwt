@@ -4458,6 +4458,7 @@ mod tests {
         let dispatch_handle = std::thread::spawn(move || {
             dispatch_hub.dispatch(vec![transport_all(BackendEvent::ProjectOpenError {
                 message: "blocked enqueue".to_string(),
+                request_id: None,
             })]);
         });
 

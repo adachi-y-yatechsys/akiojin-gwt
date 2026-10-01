@@ -96,6 +96,7 @@ test("Open Folder asks the runtime and then offers the new Project as a link", (
   document.querySelector('[data-hub-action="open-folder"]').click();
   assert.deepEqual(sockets[0].sent.at(-1), { kind: "open_project_dialog" });
   sockets[0].deliver(hubState([projectA, projectB]));
+  sockets[0].deliver({ ...projectB, kind: "project_opened" });
   const notice = document.querySelector(".gwt-hub__notice");
   assert.equal(notice.hidden, false);
   const link = notice.querySelector("a");
@@ -147,6 +148,91 @@ test("the Hub reconnects after its socket closes", () => {
   timers[0]();
   assert.equal(sockets.length, 2);
   assert.equal(new URL(sockets[1].url).search, "");
+});
+
+test("folder picker refuses repeats and cancellation clears pending without an error", () => {
+  const { document, sockets } = fixture();
+  sockets[0].open();
+  const open = document.querySelector('[data-hub-action="open-folder"]');
+  open.click();
+  assert.match(open.textContent, /Choosing/);
+  sockets[0].deliver({ kind: "picker_started", request_id: 1, purpose: "open" });
+  open.click();
+  assert.equal(sockets[0].sent.filter((event) => event.kind === "open_project_dialog").length, 1);
+  sockets[0].deliver({ kind: "picker_cancelled", request_id: 1, purpose: "open" });
+  assert.equal(open.textContent, "Open Folder…");
+  assert.equal(document.querySelector('.gwt-hub__error').hidden, true);
+  open.click();
+  sockets[0].deliver({ kind: "picker_started", request_id: 2, purpose: "open" });
+  sockets[0].deliver({ kind: "picker_cancelled", request_id: 1, purpose: "open" });
+  assert.match(open.textContent, /Choosing/);
+  sockets[0].deliver({ kind: "picker_error", request_id: 2, purpose: "open", message: "Picker timed out" });
+  assert.equal(open.textContent, "Open Folder…");
+  assert.equal(document.querySelector('.gwt-hub__error').textContent, "Picker timed out");
+});
+
+test("explicit open success shows a link even for an already-open Project", () => {
+  const { document, sockets } = fixture();
+  sockets[0].open();
+  sockets[0].deliver(hubState([projectA]));
+  document.querySelector('[data-hub-action="open-folder"]').click();
+  sockets[0].deliver({ ...projectA, kind: "project_opened" });
+  const notice = document.querySelector('.gwt-hub__notice');
+  assert.equal(notice.hidden, false);
+  assert.match(notice.textContent, /Opened Alpha/);
+  assert.equal(notice.querySelector('a').getAttribute('href'), '/p/0123456789abcdef');
+});
+
+test("open and clone share pending state and selected destination clears it", () => {
+  const { document, sockets } = fixture();
+  sockets[0].open();
+  document.querySelector('[data-hub-action="clone"]').click();
+  document.querySelector('#clone-project-parent-button').click();
+  sockets[0].deliver({ kind: 'picker_started', purpose: 'clone_parent', request_id: 8 });
+  document.querySelector('[data-hub-action="open-folder"]').click();
+  assert.equal(sockets[0].sent.filter((event) => event.kind === 'open_project_dialog').length, 0);
+  sockets[0].deliver({ kind: 'picker_busy', purpose: 'open', message: 'Picker is busy' });
+  assert.match(document.querySelector('#clone-project-parent-button').textContent, /Choosing/);
+  sockets[0].deliver({ kind: 'picker_selected', purpose: 'clone_parent', request_id: 8, path: 'E:\\repos' });
+  assert.equal(document.querySelector('#clone-project-parent-input').value, 'E:\\repos');
+  assert.equal(document.querySelector('#clone-project-parent-button').textContent, 'Choose Folder...');
+  assert.equal(document.querySelector('.gwt-hub__error').hidden, true);
+});
+
+test("busy refusal after a timeout clears the unaccepted retry", () => {
+  const { document, sockets } = fixture();
+  sockets[0].open();
+  const open = document.querySelector('[data-hub-action="open-folder"]');
+  open.click();
+  sockets[0].deliver({ kind: 'picker_started', purpose: 'open', request_id: 10 });
+  sockets[0].deliver({ kind: 'picker_error', purpose: 'open', request_id: 10, message: 'Timed out' });
+  open.click();
+  sockets[0].deliver({ kind: 'picker_busy', purpose: 'open', message: 'Close the existing dialog first' });
+  assert.equal(open.textContent, 'Open Folder…');
+  open.click();
+  assert.equal(sockets[0].sent.filter((event) => event.kind === 'open_project_dialog').length, 3);
+});
+
+test("manual open and clone destination work without a native picker", () => {
+  const { document, sockets } = fixture();
+  sockets[0].open();
+  const path = document.querySelector('[data-open-project-path]');
+  assert.ok(path);
+  path.value = 'E:\\repos\\alpha';
+  path.dispatchEvent(new document.defaultView.Event('input'));
+  document.querySelector('[data-open-project-submit]').click();
+  assert.deepEqual(sockets[0].sent.at(-1), { kind: 'reopen_recent_project', path: 'E:\\repos\\alpha' });
+  document.querySelector('[data-hub-action="clone"]').click();
+  const parent = document.querySelector('#clone-project-parent-input');
+  assert.ok(parent);
+  parent.value = 'E:\\repos';
+  parent.dispatchEvent(new document.defaultView.Event('input'));
+  const url = document.querySelector('#clone-project-url-input');
+  url.value = 'https://github.com/o/r.git';
+  url.dispatchEvent(new document.defaultView.Event('input'));
+  assert.equal(document.querySelector('#clone-project-start').disabled, false);
+  document.querySelector('#clone-project-start').click();
+  assert.deepEqual(sockets[0].sent.at(-1), { kind: 'clone_project_start', url: url.value, parent_path: parent.value });
 });
 
 test("Hub Close Project previews the selected key and removes only a closed project", () => {
