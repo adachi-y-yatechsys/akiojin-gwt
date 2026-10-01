@@ -184,13 +184,23 @@ static NEXT_WINDOW_RUNTIME_INCARNATION: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
 
 pub(crate) fn next_window_runtime_incarnation() -> u64 {
-    NEXT_WINDOW_RUNTIME_INCARNATION
-        .fetch_update(
-            std::sync::atomic::Ordering::Relaxed,
-            std::sync::atomic::Ordering::Relaxed,
-            |incarnation| incarnation.checked_add(1),
-        )
-        .expect("window runtime incarnation space exhausted")
+    claim_incarnation(&NEXT_WINDOW_RUNTIME_INCARNATION)
+}
+
+/// Claim the next incarnation from `counter`, returning the value claimed.
+///
+/// Issue #4868: Rust 1.99 deprecated `AtomicU64::fetch_update` in favour of
+/// `try_update`, which does not exist on the older toolchains this repository
+/// still builds with, so neither name is used. `fetch_add` wraps where the
+/// previous `fetch_update` + `checked_add` refused to, so the exhaustion check
+/// moves onto the value just claimed: the successor this call promises must
+/// still be representable.
+fn claim_incarnation(counter: &std::sync::atomic::AtomicU64) -> u64 {
+    let claimed = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    claimed
+        .checked_add(1)
+        .expect("window runtime incarnation space exhausted");
+    claimed
 }
 
 pub struct WindowRuntime {
