@@ -257,9 +257,13 @@ test("live Codex picker exposes the current visible snapshot", async ({ page }, 
     await openLiveGwtProject(page);
     await clearLiveLaunchWizard(page);
     cleanup = (await openLiveLaunchWizardForBranch(page)).cleanup;
-    // Opening the wizard hydrates asynchronously; actions sent before its state
-    // arrives are ignored by the backend. Wait for the real wizard first.
-    await expect(page.locator("#wizard-modal")).toHaveClass(/open/, { timeout: 30_000 });
+    // Opening and hydration are asynchronous. Hydration resets the selected
+    // launch path, so wait for its final state before applying picker choices.
+    await page.waitForFunction(() => {
+      const states = (window as any).__gwtPlaywrightMessages
+        .filter((entry: any) => entry.payload?.kind === "launch_wizard_state");
+      return states.at(-1)?.payload.wizard?.is_hydrating === false;
+    }, undefined, { timeout: 30_000 });
     await sendLiveGwtEvent(page, {
       kind: "launch_wizard_action",
       action: { kind: "set_launch_path", path: "manual_setup" }, bounds: null,
