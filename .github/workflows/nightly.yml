@@ -104,6 +104,34 @@ jobs:
           }
         timeout-minutes: 150
 
+  # Issue #4821: the ten-minute native tray measurement is outside the PR path.
+  # Select #4730 exactly; #4803's update-marker fixture is a dev-host budget.
+  test-windows-startup-tray:
+    name: Measure native startup tray (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: develop
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-workspace
+        continue-on-error: true
+      - name: Build native tray measurement
+        run: cargo test -p gwt --test startup_tray_performance --no-run
+        timeout-minutes: 30
+      - name: Measure native tray readiness and dispatch
+        run: cargo test -p gwt --test startup_tray_performance startup_tray_under_large_stopped_session_load -- --exact --ignored --test-threads=1 --nocapture
+        timeout-minutes: 25
+      - name: Upload Windows startup tray measurements
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-startup-tray-performance
+          path: target/startup-tray-performance.json
+          if-no-files-found: warn
+
   # A scheduled run has no pull request to turn red, so a failure that only
   # lands in the Actions tab is a failure nobody sees. This is the named
   # notification target Issue #4134 AC-1 asks for: one open Issue assigned to
@@ -111,7 +139,7 @@ jobs:
   report-nightly-failure:
     name: Report nightly failure
     runs-on: ubuntu-latest
-    needs: [test-windows-default-parallel]
+    needs: [test-windows-default-parallel, test-windows-startup-tray]
     if: failure()
     steps:
       - name: File or update the nightly failure Issue
@@ -120,11 +148,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          TITLE: 'fix(ci): nightly Windows default-parallel determinism run failed'
+          TITLE: 'fix(ci): nightly Windows verification failed'
           # The title carries `fix(ci):` for commitlint-shaped consistency, but
           # a colon and parentheses are search operators, so the lookup uses the
           # punctuation-free part of the same title.
-          SEARCH: 'nightly Windows default-parallel determinism in:title'
+          SEARCH: 'nightly Windows verification in:title'
         run: |
           set -euo pipefail
           existing=$(
@@ -133,8 +161,8 @@ jobs:
           )
           if [ -n "$existing" ]; then
             gh issue comment "$existing" --repo "$REPO" \
-              --body "The nightly determinism run failed again: $RUN_URL"
+              --body "The nightly Windows verification failed again: $RUN_URL"
           else
             gh issue create --repo "$REPO" --title "$TITLE" --assignee akiojin \
-              --body "$(printf 'The nightly Windows default-parallel determinism job failed.\n\nRun: %s\n\nThis job left pull-request CI in Issue #4134 AC-1; this Issue is its notification target.\n' "$RUN_URL")"
+              --body "$(printf 'A nightly Windows determinism or native tray measurement job failed.\n\nRun: %s\n\nThese jobs run outside pull-request CI (Issues #4134 and #4821); this Issue is their notification target.\n' "$RUN_URL")"
           fi

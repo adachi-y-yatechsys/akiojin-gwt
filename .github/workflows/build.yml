@@ -60,6 +60,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/develop' }}
           shared-key: linux-workspace
         continue-on-error: true
       - name: Build workspace targets
@@ -73,6 +74,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/develop' }}
           shared-key: windows-workspace
         continue-on-error: true
       - name: Check Windows compilation
@@ -94,6 +96,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/develop' }}
           shared-key: macos-workspace
         continue-on-error: true
       - name: Check macOS compilation
