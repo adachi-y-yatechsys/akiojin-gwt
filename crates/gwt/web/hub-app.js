@@ -3,12 +3,13 @@ import { createCloseProjectController } from "./close-project-confirm-modal.js";
 // Clone, Recent, and the open Projects — and never a workspace, dashboard, or
 // tab strip. Every Project entry is a real, path-free link that opens the
 // Project in its own browser tab.
-import { renderProjectCloneModal } from "./project-clone-modal.js";
+import { renderProjectCloneModal, createFolderPickerController, createOpenProjectPathForm } from "./project-clone-modal.js";
 import { HUB_URL_PATH, projectUrlPath, routeWebSocketUrl } from "./frontend-route.js";
 
 const HUB_RESULT_KINDS = new Set([
   "hub_state",
   "project_open_error",
+  "project_opened",
   "clone_project_parent_selected",
   "github_repository_search_results",
   "github_repository_search_error",
@@ -43,9 +44,6 @@ export function createHubApp({ document: doc, window: win }) {
 
   let catalog = { app_version: "", projects: [], recent_projects: [] };
   let cloneState = initialCloneState();
-  // Keys already open when this Hub asked for Open Folder / Clone. The first
-  // new key in a later catalog is the Project that request produced.
-  let pendingOpenKeys = null;
   let socket = null;
   let reconnectTimer = null;
   const queued = [];
@@ -66,6 +64,10 @@ export function createHubApp({ document: doc, window: win }) {
   cloneButton.type = "button";
   cloneButton.dataset.hubAction = "clone";
   actions.append(openFolder, cloneButton);
+  actions.append(createOpenProjectPathForm(doc, (path) => {
+    beginOpenRequest();
+    send({ kind: "reopen_recent_project", path });
+  }));
 
   const notice = node("p", "gwt-hub__notice");
   notice.setAttribute("role", "status");
@@ -97,6 +99,23 @@ export function createHubApp({ document: doc, window: win }) {
   cloneDialog.setAttribute("aria-labelledby", "clone-project-modal-title");
   cloneDialog.tabIndex = -1;
   cloneModal.append(cloneDialog);
+
+  const picker = createFolderPickerController({
+    send,
+    onChange: (pending, message) => {
+      openFolder.textContent = pending ? "Choosing folder…" : "Open Folder…";
+      openFolder.setAttribute("aria-busy", String(Boolean(pending)));
+      cloneState = { ...cloneState, pickerPending: Boolean(pending), pickerMessage: message };
+      showError(message);
+      renderClone();
+    },
+    onSelected: (event) => {
+      if (event.purpose === "clone_parent") {
+        cloneState = { ...cloneState, parentPath: event.path, error: "" };
+        renderClone();
+      }
+    },
+  });
 
   root.append(header, actions, notice, error, openSection.element, recentSection.element);
 
@@ -170,18 +189,10 @@ export function createHubApp({ document: doc, window: win }) {
       projects: Array.isArray(hub?.projects) ? hub.projects : [],
       recent_projects: Array.isArray(hub?.recent_projects) ? hub.recent_projects : [],
     };
-    if (pendingOpenKeys) {
-      const opened = catalog.projects.find((project) => !pendingOpenKeys.has(project.project_key));
-      if (opened) {
-        pendingOpenKeys = null;
-        showNotice(opened);
-      }
-    }
     render();
   }
 
   function beginOpenRequest() {
-    pendingOpenKeys = new Set(catalog.projects.map((project) => project.project_key));
     notice.hidden = true;
     showError("");
   }
@@ -204,7 +215,8 @@ export function createHubApp({ document: doc, window: win }) {
       onUrlChange: (url) => {
         cloneState = { ...cloneState, url };
       },
-      onParentSelect: () => send({ kind: "select_clone_project_parent" }),
+      onParentSelect: () => picker.begin("clone_parent"),
+      onParentChange: (parentPath) => { cloneState = { ...cloneState, parentPath }; },
       onSearchQueryChange: (query) => {
         cloneState = { ...cloneState, query };
       },
@@ -264,7 +276,6 @@ export function createHubApp({ document: doc, window: win }) {
         cloneState = { ...cloneState, open: false, cloning: false, searching: false, progress: "", error: "" };
         break;
       case "clone_project_error":
-        pendingOpenKeys = null;
         cloneState = { ...cloneState, cloning: false, progress: "", error: event.message || "Clone failed." };
         break;
       default:
@@ -274,12 +285,14 @@ export function createHubApp({ document: doc, window: win }) {
   }
 
   function receive(event) {
+    if (event && picker.receive(event)) return;
     if (event && closeController.receive(event)) return;
     if (!event || !HUB_RESULT_KINDS.has(event.kind)) return;
     if (event.kind === "hub_state") {
       receiveCatalog(event.hub);
+    } else if (event.kind === "project_opened") {
+      showNotice(event);
     } else if (event.kind === "project_open_error") {
-      pendingOpenKeys = null;
       showError(event.message || "Could not open the project.");
     } else {
       receiveClone(event);
@@ -316,13 +329,14 @@ export function createHubApp({ document: doc, window: win }) {
     connection.addEventListener("close", () => {
       if (socket !== connection) return;
       closeController.connectionLost();
+      picker.connectionLost();
       reconnectTimer = win.setTimeout(connect, 1000);
     });
   }
 
   openFolder.addEventListener("click", () => {
     beginOpenRequest();
-    send({ kind: "open_project_dialog" });
+    picker.begin("open");
   });
   cloneButton.addEventListener("click", () => {
     cloneState = { ...cloneState, open: true, error: "", progress: "" };

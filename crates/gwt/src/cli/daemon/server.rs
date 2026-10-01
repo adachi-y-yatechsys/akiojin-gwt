@@ -77,12 +77,12 @@ const DAEMON_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 /// short budget they assert on, and none of them take the process-wide env
 /// lock. A prefs transaction that runs on another thread is pinned through
 /// `GWT_TEST_BUDGET_ISSUE_MONITOR_PREFS_MS` under the env lock instead.
-#[cfg(all(test, unix))]
-struct ScopedIssueMonitorPrefsTimeout(
+#[cfg(test)]
+pub(super) struct ScopedIssueMonitorPrefsTimeout(
     #[allow(dead_code)] gwt_core::deadline_budget::ScopedDeadlineBudget,
 );
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 impl ScopedIssueMonitorPrefsTimeout {
     fn set(timeout: Duration) -> Self {
         Self(gwt_core::deadline_budget::ScopedDeadlineBudget::pin(
@@ -90,6 +90,12 @@ impl ScopedIssueMonitorPrefsTimeout {
             timeout,
         ))
     }
+}
+
+/// Fixture transactions assert outcomes, not the production filesystem budget.
+#[cfg(test)]
+pub(super) fn pin_prefs_hang_guard() -> ScopedIssueMonitorPrefsTimeout {
+    ScopedIssueMonitorPrefsTimeout::set(gwt_core::deadline_budget::HANG_GUARD)
 }
 
 /// The single seam for the prefs read-lock-modify-write budget.
@@ -255,6 +261,8 @@ pub fn spawn_server(
     hub: BroadcastHub,
 ) -> Result<tokio::task::JoinHandle<Result<i32, SpecOpsError>>, SpecOpsError> {
     // Bind synchronously so test clients never race a scheduled server task.
+    // Pin only this synchronous fixture setup, on Unix and Windows alike.
+    let _prefs_budget = pin_prefs_hang_guard();
     let authority_lease = acquire_daemon_startup_lease(&endpoint.scope)?;
     let bound = bind_daemon(&endpoint, &socket_path, &endpoint_path, authority_lease)?;
     let shutdown = Arc::new(DaemonShutdown::new());
@@ -5683,20 +5691,12 @@ mod tests {
     use super::{
         apply_issue_monitor_control, build_handshake_response, decode_issue_monitor_control,
         decode_issue_monitor_control_in_repo, handle_connection,
-        issue_monitor_control_is_authorizing, run_server,
+        issue_monitor_control_is_authorizing, pin_prefs_hang_guard, run_server,
         run_server_with_shutdown_and_worker_config, spawn_issue_monitor_worker_with_config,
         spawn_issue_monitor_worker_with_config_and_scan_probe,
         spawn_issue_monitor_worker_with_config_and_timeout, BroadcastHub, ConnectionGuard,
         DaemonShutdown, IssueMonitorControl, IssueMonitorScanConcurrencyProbe,
     };
-
-    /// SPEC #4740: pin the prefs budget for a test whose verdict must not
-    /// depend on how fast the runner's filesystem is. Load mode
-    /// (`GWT_TEST_SHRINK_BUDGETS=1`) fails every test that leans on the
-    /// production default instead.
-    fn pin_prefs_hang_guard() -> super::ScopedIssueMonitorPrefsTimeout {
-        super::ScopedIssueMonitorPrefsTimeout::set(gwt_core::deadline_budget::HANG_GUARD)
-    }
 
     /// SPEC #4778 AC-1: these cases exercise frame shape, not PM authority, so
     /// they decode with no registry reachable — the strictest of the two paths.
