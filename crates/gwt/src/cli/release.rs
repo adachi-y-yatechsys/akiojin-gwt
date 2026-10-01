@@ -6,6 +6,9 @@
 //! operation makes that gap readable every PM cycle, and — when the caller opts
 //! in with `ensure_release_pr` — opens the missing Release PR idempotently.
 
+use std::path::Path;
+
+use gwt_core::update::{self, UpdateApplyOutcome};
 use gwt_git::release_status::{
     self, ReleaseCheck, ReleaseCheckOptions, ReleaseCheckState, ReleasePrEnsure, RuntimeBuildStamp,
     RuntimeGeneration,
@@ -58,7 +61,7 @@ pub(super) fn run<E: CliEnv>(
         &options.release_branch,
         build_stamp(),
     );
-    render(&outcome, &generation, out)
+    render(&outcome, &generation, Some(&repo_path), out)
 }
 
 /// The build stamp `build.rs` compiled into this binary.
@@ -112,9 +115,13 @@ fn options_from(
 fn render(
     outcome: &ReleasePrEnsure,
     generation: &RuntimeGeneration,
+    repo_path: Option<&Path>,
     out: &mut String,
 ) -> Result<i32, SpecOpsError> {
-    let payload = status_json(outcome, generation);
+    let payload = match repo_path {
+        Some(path) => status_json_with_local(outcome, generation, path),
+        None => status_json(outcome, generation),
+    };
     out.push_str(&serde_json::to_string_pretty(&payload).map_err(super::serde_as_api_error)?);
     out.push('\n');
     Ok(0)
@@ -134,6 +141,11 @@ pub fn status_json(outcome: &ReleasePrEnsure, generation: &RuntimeGeneration) ->
         "stalled": check.is_stalled(),
         "version": check.version,
         "pending_version": check.pending_version,
+        "pending_update_version": null,
+        "update_stage": null,
+        "update_wait": null,
+        "last_apply_result": null,
+        "last_apply_failure": null,
         "version_source": "github_remote_tags",
         "release_pr": check.release_pr,
         "release_branch": check.release_branch,
@@ -148,6 +160,71 @@ pub fn status_json(outcome: &ReleasePrEnsure, generation: &RuntimeGeneration) ->
         "stale_runtime": generation.stale_runtime,
         "owner_action": generation.owner_action,
     })
+}
+
+/// Add read-only observations from this machine without changing the remote
+/// release bump's `pending_version` meaning. An apply result describes only
+/// the most recent marker; its attempt counter is never a cumulative count.
+fn status_json_with_local(
+    outcome: &ReleasePrEnsure,
+    generation: &RuntimeGeneration,
+    repo_path: &Path,
+) -> serde_json::Value {
+    let mut payload = status_json(outcome, generation);
+    // Keep the staged version and its failure observation visible even when
+    // the prepared payload has disappeared. Only the validated loader grants
+    // eligibility for the GUI apply guidance below.
+    let pending = std::fs::read(update::pending_update_manifest_path())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<update::PendingUpdateManifest>(&bytes).ok());
+    let can_apply = update::load_pending_update_manifest().is_some();
+    let payload_missing = pending.is_some() && !can_apply;
+    let wait = update::load_update_wait_observation(repo_path).filter(|wait| {
+        pending.as_ref().is_some_and(|manifest| {
+            manifest.version == wait.version
+                && match (
+                    chrono::DateTime::parse_from_rfc3339(&manifest.downloaded_at),
+                    chrono::DateTime::parse_from_rfc3339(&wait.observed_at),
+                ) {
+                    (Ok(downloaded), Ok(observed)) => observed >= downloaded,
+                    _ => false,
+                }
+        })
+    });
+    let result = update::load_update_apply_result();
+    let failure = result
+        .as_ref()
+        .filter(|result| result.outcome == UpdateApplyOutcome::Failure);
+    payload["pending_update_version"] = serde_json::json!(pending.as_ref().map(|m| &m.version));
+    payload["update_stage"] = serde_json::json!(if payload_missing {
+        Some("payload_missing")
+    } else {
+        wait.as_ref()
+            .map(|wait| wait.stage.as_str())
+            .or_else(|| pending.as_ref().map(|_| "staged"))
+    });
+    payload["update_wait"] = serde_json::json!(wait);
+    payload["last_apply_result"] = serde_json::json!(result);
+    payload["last_apply_failure"] = serde_json::json!(failure);
+
+    let current_failure = wait
+        .as_ref()
+        .is_some_and(|wait| wait.stage == "pending_failed")
+        || failure.is_some_and(|failure| {
+            pending
+                .as_ref()
+                .is_none_or(|manifest| manifest.version == failure.to_version)
+        });
+    if payload_missing || current_failure {
+        payload["owner_action"] = serde_json::json!(
+            "download the update again or reinstall GWT.app; inspect update_wait.reason and last_apply_failure before retrying"
+        );
+    } else if can_apply {
+        payload["owner_action"] = serde_json::json!(
+            "apply the pending update in the GUI after the active work has drained; inspect update_wait for the current blocker"
+        );
+    }
+    payload
 }
 
 /// The single next step for this state, so the PM classifies nothing itself.
@@ -199,6 +276,138 @@ mod tests {
     }
 
     #[test]
+    fn local_update_fields_are_explicit_when_no_observation_exists() {
+        let outcome = ensure(check(ReleaseCheckState::NoBump, None, None), false, None);
+        let payload = status_json(&outcome, &RuntimeGeneration::unknown("develop"));
+        for field in [
+            "pending_update_version",
+            "update_wait",
+            "last_apply_result",
+            "last_apply_failure",
+        ] {
+            assert_eq!(
+                payload.get(field),
+                Some(&serde_json::Value::Null),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_update_status_reads_valid_payload_and_the_last_attempt_without_applying() {
+        use gwt_core::update::{
+            self, PendingUpdateManifest, PreparedPayload, UpdateApplyOutcome, UpdateApplyResult,
+        };
+        let home = tempfile::tempdir().unwrap();
+        let _home = gwt_core::test_support::ScopedGwtHome::set(home.path());
+        let payload_path = home.path().join("prepared-binary");
+        std::fs::write(&payload_path, "not executable").unwrap();
+        let manifest = PendingUpdateManifest {
+            version: "9.200.0".into(),
+            asset_url: "https://example.invalid/update".into(),
+            payload: PreparedPayload::PortableBinary {
+                path: payload_path.clone(),
+            },
+            downloaded_at: "2026-10-01T00:00:00Z".into(),
+        };
+        update::persist_pending_update_manifest(&manifest).unwrap();
+        let outcome = ensure(
+            check(ReleaseCheckState::Stalled, Some("v9.201.0"), None),
+            false,
+            None,
+        );
+        let generation = RuntimeGeneration::unknown("develop");
+        let payload = status_json_with_local(&outcome, &generation, home.path());
+        assert_eq!(payload["pending_version"], "v9.201.0");
+        assert_eq!(payload["pending_update_version"], "9.200.0");
+        assert_eq!(payload["update_stage"], "staged");
+        assert!(payload["owner_action"].as_str().unwrap().contains("apply"));
+        assert_eq!(
+            std::fs::read_to_string(&payload_path).unwrap(),
+            "not executable"
+        );
+
+        update::log_update_event(
+            "pending_waiting",
+            &[
+                ("project_root", home.path().to_str().unwrap()),
+                ("version", "9.200.0"),
+                ("reason", "active_work"),
+                ("observed_at", "2026-10-01T00:10:00Z"),
+                ("next_evaluation_at", "2026-10-01T00:10:05Z"),
+            ],
+        );
+        let waiting = status_json_with_local(&outcome, &generation, home.path());
+        assert_eq!(waiting["update_stage"], "pending_waiting");
+        assert_eq!(waiting["update_wait"]["reason"], "active_work");
+        assert_eq!(
+            waiting["update_wait"]["next_evaluation_at"],
+            "2026-10-01T00:10:05Z"
+        );
+        update::log_update_event(
+            "pending_failed",
+            &[
+                ("project_root", home.path().to_str().unwrap()),
+                ("version", "9.200.0"),
+                ("reason", "apply_failed"),
+                ("observed_at", "2026-10-01T00:11:00Z"),
+            ],
+        );
+        let failed_wait = status_json_with_local(&outcome, &generation, home.path());
+        assert!(failed_wait["owner_action"]
+            .as_str()
+            .unwrap()
+            .contains("download"));
+
+        update::persist_update_apply_result(&UpdateApplyResult {
+            outcome: UpdateApplyOutcome::Failure,
+            from_version: "9.199.0".into(),
+            to_version: "9.200.0".into(),
+            observed_version: "9.199.0".into(),
+            attempt: 1,
+            recorded_at: "2026-10-01T01:00:00Z".into(),
+            message: Some("payload copy failed".into()),
+        })
+        .unwrap();
+        let failed = status_json_with_local(&outcome, &generation, home.path());
+        assert_eq!(
+            failed["last_apply_failure"]["message"],
+            "payload copy failed"
+        );
+        assert_eq!(failed["last_apply_result"]["attempt"], 1);
+        assert!(failed["owner_action"]
+            .as_str()
+            .unwrap()
+            .contains("download"));
+        assert!(!failed["owner_action"]
+            .as_str()
+            .unwrap()
+            .contains("apply the pending"));
+
+        std::fs::remove_file(payload_path).unwrap();
+        std::fs::remove_file(update::update_apply_result_path()).unwrap();
+        update::log_update_event(
+            "pending_failed",
+            &[
+                ("project_root", home.path().to_str().unwrap()),
+                ("version", "9.200.0"),
+                ("reason", "payload_missing"),
+                ("observed_at", "2026-10-01T01:10:00Z"),
+            ],
+        );
+        let missing = status_json_with_local(&outcome, &generation, home.path());
+        assert_eq!(missing["pending_update_version"], "9.200.0");
+        assert_eq!(missing["update_stage"], "payload_missing");
+        assert_eq!(missing["update_wait"]["stage"], "pending_failed");
+        assert_eq!(missing["update_wait"]["reason"], "payload_missing");
+        assert!(missing["last_apply_result"].is_null());
+        assert!(missing["owner_action"]
+            .as_str()
+            .unwrap()
+            .contains("reinstall"));
+    }
+
+    #[test]
     fn options_fall_back_to_the_project_release_topology() {
         let options = options_from(None, None, None);
         assert_eq!(options.release_branch, "develop");
@@ -227,7 +436,13 @@ mod tests {
             false,
             None,
         );
-        render(&outcome, &RuntimeGeneration::unknown("develop"), &mut out).expect("render");
+        render(
+            &outcome,
+            &RuntimeGeneration::unknown("develop"),
+            None,
+            &mut out,
+        )
+        .expect("render");
         assert!(out.contains("\"state\": \"stalled\""), "{out}");
         assert!(out.contains("\"stalled\": true"), "{out}");
         assert!(out.contains("\"version\": \"v9.91.0\""), "{out}");
@@ -257,7 +472,13 @@ mod tests {
             true,
             Some("https://github.com/akiojin/gwt/pull/3513"),
         );
-        render(&outcome, &RuntimeGeneration::unknown("develop"), &mut out).expect("render");
+        render(
+            &outcome,
+            &RuntimeGeneration::unknown("develop"),
+            None,
+            &mut out,
+        )
+        .expect("render");
         assert!(out.contains("\"created_release_pr\": true"), "{out}");
         assert!(out.contains("/pull/3513"), "{out}");
         assert!(out.contains("opened by this call"), "{out}");
