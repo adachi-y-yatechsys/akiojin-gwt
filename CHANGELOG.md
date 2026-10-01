@@ -1,6 +1,57 @@
 # Changelog
 
 All notable changes to this project will be documented in this file.
+## [9.107.0] - 2026-10-01
+
+### Bug Fixes
+
+- **startup:** 更新再開時の重複Gitと同期起動準備を削減
+- **pm:** 孤児エージェント窓の掃除を PM の定期 Hook に入れる (#4809)
+- **pm:** Idle は理由を読んでから対応し、孤児とは別扱いにする (#4809)
+- **process:** WindowsのPID生存確認で全プロセス走査を除去
+- **startup:** 壊れたGit参照のfallbackと回帰テストの環境隔離を修正
+- **update:** 自動ダウンロードとdrain診断を接続する
+- **update:** 自動ダウンロード失敗後も新しい検出を保持する
+- **gui:** 860px 以下でウィンドウ一覧のポップオーバーをレールの下に出す
+- **hub:** フォルダ選択を非同期化して結果を通知
+- **monitor:** Live pane を持つ Issue の失効再 launch を止め、孤児/停止 pane を閉じる (#4802)
+- **canvas:** タブ所属ウィンドウをIssue一覧へ戻せるよう修正
+- フォルダ選択の生存管理とOpen通知の要求相関を修正
+- **verify:** Windows の PowerShell 検証引数と文字コードを保持
+- **launch:** Windows の長文初期プロンプトをファイルで渡す
+- **test:** 長文プロンプトのテスト用ホームを隔離する
+
+### Features
+
+- **gui:** レールで Issues / Agents / Board / Settings の 4 面を選べるようにする
+- **gui:** PM をレール最上部に単独で置き、4 面から区切る
+
+### Miscellaneous Tasks
+
+- **work:** 起動性能修正の配送記録を確定する
+- **work:** Issue 4799のPR対応記録を保存
+- **work:** 自動更新修正の検証引き継ぎを記録
+- **work:** Work イベント記録を追加する
+- **work:** Work イベント記録を追加する
+- **work:** Work イベント記録を追加する
+- **work:** 一覧復帰修正の再開記録を保存
+- **work:** Issue一覧復帰修正のPR記録を保存
+- **work:** 長文プロンプト修正の引継ぎと検証を記録する
+- **work:** 検証済み PR 更新の記録を保存する
+
+### Testing
+
+- 起動性能測定でChromiumの遮蔽停止を防ぐ
+- Windows 並列テストの完了待ちとキュー前提を修正
+- Knowledge refresh の marker 待ちを queued worker の完了待ちに置き換える (#4793)
+- **update:** 共有worker失敗テストのHOMEを隔離
+- **hub:** Picker 検証の依存と smoke 実行先を修正
+
+### Ci
+
+- **test:** Windows CIから実機専用起動計測を除外する
+- **test:** PRのテスト経路を並列化して再ビルドを削減する
+
 ## [9.106.0] - 2026-09-30
 
 ### Bug Fixes

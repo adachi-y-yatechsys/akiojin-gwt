@@ -1399,7 +1399,8 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
       }
 
       function isHubNavigationResult(kind) {
-        return ["hub_state", "project_open_error",
+        return ["hub_state", "project_open_error", "project_opened",
+          "picker_started", "picker_selected", "picker_cancelled", "picker_error", "picker_busy",
           "clone_project_parent_selected", "github_repository_search_results",
           "github_repository_search_error", "clone_project_progress", "clone_project_done",
           "clone_project_error"].includes(kind);
@@ -1434,6 +1435,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
         });
         connection.addEventListener("close", () => {
           if (hubSocket !== connection) return;
+          clearPickerPending();
           if (socket === connection) handleSocketClose();
           if (hubReconnectTimer) clearTimeout(hubReconnectTimer);
           hubReconnectTimer = window.setTimeout(connectSocket, 1000);
@@ -3183,6 +3185,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
               modal,
               wizardModal,
               cloneProjectModal,
+              document.getElementById("open-project-path-modal"),
               branchCleanupModal,
               migrationModal,
             ],
@@ -5260,6 +5263,9 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
         renderProjectOnboarding,
         applyWindowListEvent,
         applyCloneProjectReceiveEvent,
+        applyPickerReceiveEvent,
+        applyProjectOpenReceiveEvent,
+        clearPickerPending,
         applyMigrationReceiveEvent,
         handleMigrationModalEscape,
         handleWindowListEscape,
@@ -6547,11 +6553,22 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
             applyKnowledgeReceiveEvent(event);
             break;
           case "project_open_error":
+            applyProjectOpenReceiveEvent(event);
             projectError = event.message;
             frontendUnits.projectWorkspaceShell.renderProjectPicker();
             frontendUnits.projectWorkspaceShell.renderProjectOnboarding(
               frontendUnits.projectWorkspaceShell.activeProjectTab(),
             );
+            break;
+          case "project_opened":
+            applyProjectOpenReceiveEvent(event);
+            break;
+          case "picker_started":
+          case "picker_selected":
+          case "picker_cancelled":
+          case "picker_error":
+          case "picker_busy":
+            applyPickerReceiveEvent(event);
             break;
           // SPEC-3064 Phase 3 (E7): clone-project modal state and rendering
           // live in the project shell surface.

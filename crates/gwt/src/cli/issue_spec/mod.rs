@@ -464,8 +464,18 @@ pub(super) fn run<E: CliEnv>(
                 },
                 cache,
             );
-            ops.read_section(IssueNumber(number), &SectionName("spec".to_string()))?;
-            out.push_str(&format!("repaired cache for #{number}\n"));
+            let repaired = ops.repair_sections(IssueNumber(number))?;
+            if repaired.is_empty() {
+                out.push_str(&format!(
+                    "refreshed cache for #{number}; no artifact needed repair\n"
+                ));
+            } else {
+                out.push_str(&format!(
+                    "repaired {} artifact(s) for #{number}: {}\n",
+                    repaired.len(),
+                    repaired.join(", ")
+                ));
+            }
             0
         }
         IssueCommand::SpecLint {
