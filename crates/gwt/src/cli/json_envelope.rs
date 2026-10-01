@@ -2574,6 +2574,7 @@ mod tests {
         ] {
             let fields = PrInventoryFields {
                 base_ref_name: "develop".to_string(),
+                created_at: None,
                 check_counts: None,
                 conflict: None,
                 unresolved_review_threads: None,
