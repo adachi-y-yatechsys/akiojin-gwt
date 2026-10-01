@@ -17,7 +17,6 @@ use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -4757,15 +4756,18 @@ fn with_pm_prefs_lock<T>(path: &Path, operation: impl FnOnce() -> io::Result<T>)
     // Lock a stable sibling inode: locking `path` itself would stop
     // protecting future writers as soon as the atomic rename replaces that
     // inode.
-    let lock = fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(path.with_extension("lock"))?;
-    gwt_core::operation_deadline::lock_exclusive(&lock)?;
+    //
+    // Issue #4686 AC-5: the resident PM's prompt dispatch takes this lock every
+    // tick and fails closed on it, so a bare deadline expiry here is one of the
+    // failures that leaves the PM without Board or runtime state. The named lock
+    // records the holder's pid, operation, and acquisition time, which is what
+    // distinguishes a busy peer from a lock file nobody released.
+    let lock = gwt_core::operation_deadline::NamedFileLock::acquire(
+        &path.with_extension("lock"),
+        "pm_prefs",
+    )?;
     let result = operation();
-    let unlock_result = FileExt::unlock(&lock);
+    let unlock_result = lock.unlock();
     match (result, unlock_result) {
         (Ok(value), Ok(())) => Ok(value),
         (Err(error), _) => Err(error),

@@ -722,6 +722,13 @@ impl RecoveryStore {
         let heads_dir = record_dir.join("heads");
         ensure_private_dir(&heads_dir)?;
         let lock = open_private_lock(&record_dir.join(".lock"))?;
+        // Issue #4686 AC-5 deliberately leaves this one site on the bare lock.
+        // `NamedFileLock` opens the lock file with default permissions and
+        // writes a sibling `.holder.json` carrying a pid and an operation name,
+        // while this store enforces private mode on every node it creates. The
+        // holder diagnostics are not worth widening the authority store's
+        // permissions or publishing which process is editing a record, so a
+        // contended deadline here stays anonymous on purpose.
         crate::operation_deadline::lock_exclusive(&lock).map_err(|_| RecoveryError::Storage)?;
         let revisions = load_revisions(&revisions_dir, &heads_dir, &record_dir, &self.authority)?;
         Ok(LockedRecord {
