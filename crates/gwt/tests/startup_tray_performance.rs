@@ -1,5 +1,10 @@
-//! Issue #4730: isolated Windows startup-load measurement, deliberately ignored.
-//! Run with --ignored --test-threads=1 --nocapture after building this checkout.
+//! Issues #4730 / #4803: isolated Windows dev-host startup-load measurements.
+//! The two ignored load fixtures are host measurements, not hosted-CI budgets.
+//! Keep their <= 5 s canvas / <= 500 ms response budgets on the Windows dev host.
+//! Run either fixture explicitly after building this checkout:
+//! cargo test -p gwt --test startup_tray_performance <fixture_name> -- --exact --ignored --test-threads=1 --nocapture
+//! Hosted CI selects only startup_metric_and_native_command_contract with --exact
+//! and without --ignored; the 1500-session Git-spawn budget runs as a unit test.
 //! This observes the native tray window and sends the real muda WM_COMMAND route;
 //! it does NOT prove Explorer icon painting or a physical notification-area click.
 //! Command IDs are pinned to muda 0.20.0 and main's initial menu creation order.
