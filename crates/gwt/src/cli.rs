@@ -42,6 +42,7 @@ pub mod permission_readiness;
 mod plan;
 mod pm;
 mod pr;
+mod provider_reset;
 pub(crate) mod register;
 mod release;
 pub(crate) mod search;
@@ -85,6 +86,7 @@ pub(crate) use title_summary_guard::validate_title_summary_work_name;
 /// variants and dispatch becomes a nested match.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliCommand {
+    ProviderReset(provider_reset::ProviderResetCommand),
     Issue(IssueCommand),
     Pr(PrCommand),
     Actions(ActionsCommand),
@@ -696,6 +698,7 @@ pub(crate) fn run_collect<E: CliEnv>(
         CliCommand::Workspace(inner) => workspace::run(env, inner, &mut out)?,
         CliCommand::Workflow(inner) => workflow::run(env, inner, &mut out)?,
         CliCommand::Pane(inner) => pane::run(env, inner, &mut out)?,
+        CliCommand::ProviderReset(inner) => provider_reset::run(env, inner, &mut out)?,
         CliCommand::Perf(inner) => perf::run(env, inner, &mut out)?,
         CliCommand::Pm(inner) => pm::run(env, inner, &mut out)?,
         CliCommand::Open(args) => open::run(env, args, &mut out)?,

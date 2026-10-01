@@ -1103,6 +1103,7 @@ pub struct LaunchConfig {
     /// Retained separately from argv so launch provenance still sees its skill.
     pub pending_initial_prompt: Option<String>,
     pub env_vars: HashMap<String, String>,
+    pub codex_auth_root: Option<crate::CodexAuthRoot>,
     pub remove_env: Vec<String>,
     pub working_dir: Option<PathBuf>,
     pub branch: Option<String>,
@@ -1176,6 +1177,16 @@ pub struct LaunchConfig {
 }
 
 impl LaunchConfig {
+    /// Revalidate captured provenance against the final child environment and cwd.
+    pub fn validated_codex_auth_root_for_cwd(
+        &self,
+        cwd: &std::path::Path,
+    ) -> Option<crate::CodexAuthRoot> {
+        let proof = self.codex_auth_root.as_ref()?;
+        let (path, _) = crate::environment::codex_auth_root_path(self, cwd)?;
+        (proof.path == path).then(|| proof.clone())
+    }
+
     /// Original task arguments for provenance, before file/shell transport.
     pub fn entrypoint_args(&self) -> &[String] {
         self.pending_initial_prompt
@@ -1725,6 +1736,7 @@ impl AgentLaunchBuilder {
             command: runner.executable,
             args,
             pending_initial_prompt: None,
+            codex_auth_root: None,
             env_vars,
             remove_env: Vec::new(),
             working_dir: self.working_dir,

@@ -160,7 +160,8 @@ fn legacy_holder_can_still_be_observed_and_released() {
 
     let arena = Arena::new();
     let coordinator = index_coordinator(arena.home.path());
-    let key = TargetKey::verification("repo", "legacy");
+    let project = gwt_core::paths::project_scope_hash(arena.worktree.path());
+    let key = TargetKey::verification(project.as_str(), "legacy");
     let JobAdmission::Owner(guard) = coordinator
         .request_job(&key, JobPriority::ManualRebuild, Duration::from_secs(5))
         .unwrap()
@@ -184,6 +185,11 @@ fn legacy_holder_can_still_be_observed_and_released() {
     let held = arena.run(STATUS);
     assert_eq!(headline(&held), "verification lease: held");
     assert_eq!(field(&held, "lease_id"), lease_id);
+    assert_eq!(field(&held, "holder_project_relation"), "same_project");
+    assert_eq!(
+        field(&held, "holder_intervention"),
+        "canonical_release_only"
+    );
     let (ok, refused) = gwtd(
         arena.home.path(),
         arena.worktree.path(),

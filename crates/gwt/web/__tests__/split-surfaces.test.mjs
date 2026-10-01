@@ -13,6 +13,7 @@ test("the title bar offers a reversible split and the split uses Operator tokens
   assert.ok(document.querySelector(".canvas-area #split-surfaces[hidden]"));
   const css = readFileSync(new URL("../styles/components.css", import.meta.url), "utf8");
   assert.match(css, /\.split-pane\[data-active="true"\][\s\S]*?var\(--color-focus-ring\)/);
+  assert.match(css, /\.split-pane \.resize-handle\s*\{\s*display: none !important;/);
 });
 
 async function fixture() {
