@@ -670,8 +670,7 @@ body::after {
   height: 360px !important;
   border-bottom: 1px solid var(--color-border-strong);
 }
-.split-pane .resize-handle,
-.split-pane .window-tab-strip { display: none !important; }
+.split-pane .resize-handle { display: none !important; }
 .split-pane .titlebar { cursor: default; }
 .split-pane__empty {
   padding: 16px;
