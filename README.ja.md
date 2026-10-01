@@ -1031,6 +1031,28 @@ Spotlight のインデックス処理そのものは Issue Monitor の snapshot 
 そうでなければ「ホストが重い」としか観測できません。Spotlight の無い
 プラットフォームでは、プロセスも警告も無い状態でこのブロックを返します。
 
+## アプリ更新の適用待ち
+
+ダウンロード済みの更新は、エージェントの作業が終わるまで適用待ちになることがあります。
+既存の drain は terminal convergence の15秒周期で安全条件を評価し、2回連続で静止を
+確認した後、60秒の猶予を置いて適用します。
+`autonomous_tuning.update_drain_notify_after_secs` は待機通知の繰り返し間隔です
+（既定1800秒）。強制再起動の期限ではなく、時間経過だけでエージェントを終了しません。
+
+`~/.gwt/logs/update-YYYY-MM-DD.log` に stage、待機・拒否理由、次の自動評価がある場合は
+`next_evaluation_at` を記録します。同じ理由を毎 tick ログへ繰り返さず、プロジェクト別の
+最新観測を評価ごとに更新します。観測時刻はアプリの生存保証ではありません。
+アプリが停止した場合、記録された次評価時刻どおりに評価されるとは限りません。
+
+JSON operation `release.status` の `pending_update_version` は保存済みローカルmanifestの版です。`pending_version`（remote release branchの未配信bump）とは
+別の値です。payloadが消失した場合、`update_stage` は `payload_missing` となり再ダウンロードを案内します。
+`update_wait` は対象版と一致する最新の待機観測、`last_apply_result` と
+`last_apply_failure` は直近の適用結果を返します。`attempt` はresume marker内の回数であり、
+通算試行回数ではありません。成功すると以前の失敗結果は置き換わります。
+インストール失敗時には旧版のまま再起動することがあるため、再起動だけで成功と判断せず、
+案内された回復操作と `observed_version` を確認してください。
+適用処理中の重複要求は1回にまとめ、失敗後は明示的に再試行できます。
+
 ## 開発
 
 ### ビルド

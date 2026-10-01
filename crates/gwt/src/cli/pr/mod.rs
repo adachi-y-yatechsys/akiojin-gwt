@@ -1555,6 +1555,8 @@ mod tests {
     fn seeded_inventory_item() -> gwt_git::PrInventoryItem {
         gwt_git::PrInventoryItem {
             base_ref_name: "develop".to_string(),
+            created_at: None,
+            age_hours: None,
             check_counts: None,
             conflict: None,
             unresolved_review_threads: None,
