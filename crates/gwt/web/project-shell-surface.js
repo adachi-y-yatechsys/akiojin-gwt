@@ -50,7 +50,7 @@
 //   migrationDialog: modal elements owned by app.js because the focus
 //   shortcut guard and clone-modal-focus-guard wiring also read them.
 import { renderMigrationModal as renderMigrationModalView } from "/migration-modal.js";
-import { renderProjectCloneModal as renderProjectCloneModalView } from "/project-clone-modal.js";
+import { renderProjectCloneModal as renderProjectCloneModalView, createFolderPickerController, createOpenProjectPathForm, createOpenProjectPathDialog } from "/project-clone-modal.js";
 import { windowRuntimeLabel } from "/window-runtime-state.js";
 import { groupProjectWindowList } from "/window-list-model.js";
 import {
@@ -286,8 +286,38 @@ export function createProjectShellSurface({
       };
 
       function sendOpenProjectDialog() {
-        send({ kind: "open_project_dialog" });
+        openPathDialog.open();
+        folderPicker.begin("open");
       }
+
+      const openPathDialog = createOpenProjectPathDialog(document, {
+        onChoose: () => folderPicker.begin("open"),
+        onOpen: (path) => send({ kind: "reopen_recent_project", path }),
+      });
+
+      const folderPicker = createFolderPickerController({
+        send,
+        onChange: (pending, message) => {
+          openPathDialog.update(pending, message);
+          for (const button of [pickerOpenProjectButton, onboardingOpenProjectButton]) {
+            button.textContent = pending ? "Choosing folder…" : "Open Folder…";
+            button.setAttribute("aria-busy", String(Boolean(pending)));
+          }
+          cloneProjectModalState = { ...cloneProjectModalState, pickerPending: Boolean(pending), pickerMessage: message };
+          renderProjectCloneModal();
+        },
+        onSelected: (event) => {
+          if (event.purpose === "open") openPathDialog.waitForOpen(event.path);
+          if (event.purpose === "clone_parent") {
+            cloneProjectModalState = { ...cloneProjectModalState, parentPath: event.path, error: "" };
+            renderProjectCloneModal();
+          }
+        },
+      });
+
+      function applyPickerReceiveEvent(event) { return folderPicker.receive(event); }
+      function applyProjectOpenReceiveEvent(event) { openPathDialog.receive(event); }
+      function clearPickerPending() { folderPicker.connectionLost(); }
 
       function openCloneProjectModal() {
         cloneProjectModalState = {
@@ -341,8 +371,9 @@ export function createProjectShellSurface({
             cloneProjectModalState = { ...cloneProjectModalState, url };
           },
           onParentSelect: () => {
-            send({ kind: "select_clone_project_parent" });
+            folderPicker.begin("clone_parent");
           },
+          onParentChange: (parentPath) => { cloneProjectModalState = { ...cloneProjectModalState, parentPath }; },
           onSearchQueryChange: (query) => {
             cloneProjectModalState = { ...cloneProjectModalState, query };
           },
@@ -846,6 +877,7 @@ export function createProjectShellSurface({
         return (
           Boolean(isModalOpen?.()) ||
           document.getElementById("close-project-modal")?.classList.contains("open") ||
+          openPathDialog.modal.classList.contains("open") ||
           cloneProjectModal?.classList.contains("open") ||
           migrationModal?.classList.contains("open") ||
           windowListOpen
@@ -879,6 +911,10 @@ export function createProjectShellSurface({
       // switcher (onOpenFolder / onCloneFromGithub above) and Open Folder is
       // also reachable via the Cmd+O / Ctrl+O hotkey (handleOpenFolderHotkey).
       function installProjectShellChrome() {
+        document.body.append(openPathDialog.modal);
+        for (const button of [pickerOpenProjectButton, onboardingOpenProjectButton]) {
+          button.parentElement.append(createOpenProjectPathForm(document, (path) => send({ kind: "reopen_recent_project", path })));
+        }
         pickerOpenProjectButton.addEventListener("click", sendOpenProjectDialog);
         pickerCloneProjectButton.addEventListener("click", openCloneProjectModal);
         onboardingOpenProjectButton.addEventListener("click", sendOpenProjectDialog);
@@ -920,6 +956,9 @@ export function createProjectShellSurface({
         renderProjectOnboarding,
         applyWindowListEvent,
         applyCloneProjectReceiveEvent,
+        applyPickerReceiveEvent,
+        applyProjectOpenReceiveEvent,
+        clearPickerPending,
         applyMigrationReceiveEvent,
         handleMigrationModalEscape,
         handleWindowListEscape,

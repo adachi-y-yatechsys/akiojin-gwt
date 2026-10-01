@@ -2011,6 +2011,11 @@ enum UserEvent {
     },
     IssueLaunchWizardPrepared(IssueLaunchWizardPrepared),
     ProjectNavigationPrepared(Box<ProjectNavigationPrepared>),
+    ProjectPickerFinished {
+        client_id: String,
+        request_id: u64,
+        result: Result<Option<PathBuf>, String>,
+    },
     /// Issue #4538: Recent path → ProjectKey resolution for `/p/<hash>`.
     RecentProjectKeysResolved(app_runtime::RecentProjectKeysResolved),
     /// Issue #4538 AC-4: authenticated `gwt open <path>` control request.
@@ -4052,6 +4057,7 @@ mod tests {
             next_project_incarnation,
             project_navigation_request: 0,
             pending_project_navigation: None,
+            project_picker: Default::default(),
             project_route: Default::default(),
             project_aggregates: Default::default(),
             next_project_aggregate_revision: 0,
@@ -10971,6 +10977,9 @@ fn main() -> std::io::Result<()> {
             Event::UserEvent(UserEvent::IssueLaunchWizardPrepared(prepared)) => {
                 let events = app.handle_issue_launch_wizard_prepared(prepared);
                 clients.dispatch(events);
+            }
+            Event::UserEvent(UserEvent::ProjectPickerFinished { client_id, request_id, result }) => {
+                clients.dispatch(app.handle_project_picker_finished(&client_id, request_id, result));
             }
             Event::UserEvent(UserEvent::ProjectNavigationPrepared(prepared)) => {
                 let may_open_project = matches!(

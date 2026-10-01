@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 import { parseHTML } from "linkedom";
 
-import { renderProjectCloneModal } from "../project-clone-modal.js";
+import { renderProjectCloneModal, createOpenProjectPathDialog } from "../project-clone-modal.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const indexHtml = readFileSync(resolve(here, "..", "index.html"), "utf8");
@@ -45,6 +45,31 @@ function state(overrides = {}) {
 }
 
 const noop = () => {};
+
+test("manual open retains its path on failure and closes only after open success", () => {
+  const { modalEl } = mount();
+  const document = modalEl.ownerDocument;
+  const sent = [];
+  const dialog = createOpenProjectPathDialog(document, { onChoose: noop, onOpen: (path) => sent.push(path) });
+  document.body.append(dialog.modal);
+  dialog.open();
+  const input = dialog.modal.querySelector('[data-open-project-path]');
+  input.value = '/missing/project';
+  input.dispatchEvent(new document.defaultView.Event('input'));
+  dialog.modal.querySelector('[data-open-project-submit]').click();
+  assert.deepEqual(sent, ['/missing/project']);
+  assert.equal(dialog.modal.classList.contains('open'), true, 'submission must keep feedback visible');
+  dialog.receive({ kind: 'project_open_error', message: 'Folder does not exist' });
+  assert.equal(input.value, '/missing/project');
+  assert.equal(dialog.modal.querySelector('[role="status"]').textContent, 'Folder does not exist');
+  input.value = '/valid/project';
+  input.dispatchEvent(new document.defaultView.Event('input'));
+  dialog.modal.querySelector('[data-open-project-submit]').click();
+  dialog.receive({ kind: 'project_opened', project_key: '0123456789abcdef', title: 'Project' });
+  assert.equal(dialog.modal.classList.contains('open'), false);
+  dialog.receive({ kind: 'project_open_error', message: 'Another client failed' });
+  assert.equal(dialog.modal.classList.contains('open'), false, 'unrelated results must not reopen the dialog');
+});
 
 test("url mode renders URL and destination controls", () => {
   const { modalEl, dialogEl, createNode } = mount();

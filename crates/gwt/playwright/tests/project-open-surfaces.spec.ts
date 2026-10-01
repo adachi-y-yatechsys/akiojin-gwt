@@ -63,6 +63,42 @@ test.describe("Project open entry surfaces", () => {
     await expect.poll(() => sentMessageKinds(page)).toContain("open_project_dialog");
   });
 
+  test("active Project Ctrl+O exposes pending, cancellation and manual path fallback", async ({ page }) => {
+    await bootProjectOpenFixture(page, [fixtureTab("git")]);
+    await page.keyboard.press('Control+o');
+    const modal = page.locator('#open-project-path-modal');
+    await expect(modal).toBeVisible();
+    await expect(modal).toHaveClass('modal-backdrop open');
+    await expect(modal.locator('.modal-shell > .modal-header')).toBeVisible();
+    await expect(modal.locator('.modal-shell > .modal-body')).toBeVisible();
+    await expect(modal.locator('.modal-shell > .modal-footer')).toBeVisible();
+    await expect(modal.getByRole('dialog')).toHaveAttribute('aria-modal', 'true');
+    await expect(modal.getByRole('status')).toContainText('Choose a folder');
+    await page.evaluate(() => (window as any).__gwtProjectOpenFixture.reply({ kind: 'picker_started', purpose: 'open', request_id: 1 }));
+    await modal.getByRole('button', { name: 'Choosing folder…' }).click();
+    expect((await sentMessageKinds(page)).filter((kind) => kind === 'open_project_dialog')).toHaveLength(1);
+    await page.evaluate(() => (window as any).__gwtProjectOpenFixture.reply({ kind: 'picker_cancelled', purpose: 'open', request_id: 1 }));
+    await expect(modal.getByRole('button', { name: 'Choose Folder…' })).toBeVisible();
+    await expect(modal.getByRole('status')).toBeHidden();
+    await modal.getByRole('button', { name: 'Choose Folder…' }).click();
+    await page.evaluate(() => {
+      (window as any).__gwtProjectOpenFixture.reply({ kind: 'picker_started', purpose: 'open', request_id: 2 });
+      (window as any).__gwtProjectOpenFixture.reply({ kind: 'picker_error', purpose: 'open', request_id: 2, message: 'Picker timed out' });
+    });
+    await expect(modal.getByRole('status')).toHaveText('Picker timed out');
+    await modal.locator('[data-open-project-path]').fill('E:\\repos\\manual');
+    await modal.locator('[data-open-project-submit]').click();
+    await expect.poll(() => sentMessageKinds(page)).toContain('reopen_recent_project');
+    await expect(modal).toBeVisible();
+    await page.evaluate(() => (window as any).__gwtProjectOpenFixture.reply({ kind: 'project_open_error', message: 'Folder does not exist' }));
+    await expect(modal.getByRole('status')).toHaveText('Folder does not exist');
+    await expect(modal.locator('[data-open-project-path]')).toHaveValue('E:\\repos\\manual');
+    await modal.locator('[data-open-project-path]').fill('E:\\repos\\valid');
+    await modal.locator('[data-open-project-submit]').click();
+    await page.evaluate(() => (window as any).__gwtProjectOpenFixture.reply({ kind: 'project_opened', project_key: '0123456789abcdef', title: 'Valid Project' }));
+    await expect(modal).toBeHidden();
+  });
+
   test("Clone from GitHub click opens the clone modal from the picker", async ({
     page,
   }) => {
@@ -138,6 +174,7 @@ async function installProjectOpenBackend(
 ): Promise<void> {
   await page.addInitScript((fixtureTabs: FixtureTab[]) => {
     const recordedSends: string[] = [];
+    let hubSocket: ProjectOpenFixtureWebSocket | undefined;
     const workspaceState = {
       kind: "workspace_state",
       workspace: {
@@ -158,6 +195,7 @@ async function installProjectOpenBackend(
 
       constructor(public readonly url: string) {
         super();
+        if (!new URL(url).searchParams.get('repo_hash')) hubSocket = this;
         setTimeout(() => {
           this.readyState = ProjectOpenFixtureWebSocket.OPEN;
           this.dispatchEvent(new Event("open"));
@@ -195,7 +233,7 @@ async function installProjectOpenBackend(
     });
     Object.defineProperty(window, "__gwtProjectOpenFixture", {
       configurable: true,
-      value: { recordedSends },
+      value: { recordedSends, reply: (event: unknown) => hubSocket?.emit(event) },
     });
   }, tabs);
 }
