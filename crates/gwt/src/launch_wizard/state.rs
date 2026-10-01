@@ -2570,12 +2570,12 @@ mod tests {
     }
 
     // SPEC-1921 US-20 / FR-123: before any explicit choice the reasoning stop
-    // follows the selected model's default (gpt-5.6-sol=Low, others=Medium).
+    // follows the selected model's default (gpt-6.1-sol/gpt-5.6-sol=Low).
     #[test]
     fn codex_initial_reasoning_follows_model_default() {
         let mut state = codex_manual_state();
-        assert_eq!(state.model, "gpt-6-astra");
-        assert_eq!(state.reasoning, "medium");
+        assert_eq!(state.model, "gpt-6.1-sol");
+        assert_eq!(state.reasoning, "low");
 
         state.set_model("gpt-5.6-sol");
         assert_eq!(state.reasoning, "low");
@@ -2587,21 +2587,21 @@ mod tests {
         assert_eq!(state.reasoning, "medium");
     }
 
-    // Issue #3962 AC-2: `gpt-6-astra` heads the 2026-09-05 Codex snapshot, so a
+    // Issue #4795 AC-1/2: `gpt-6.1-sol` heads the 2026-09-30 Codex snapshot, so a
     // wizard without a saved Codex profile selects it — and its effort default
     // — with no explicit choice, and reports no fallback.
     #[test]
-    fn codex_default_model_is_the_new_astra_row() {
+    fn codex_default_model_is_the_new_6_1_sol_row() {
         let state = codex_manual_state();
         let view = state.view();
 
-        assert_eq!(state.model, "gpt-6-astra");
-        assert_eq!(view.selected_model, "gpt-6-astra");
+        assert_eq!(state.model, "gpt-6.1-sol");
+        assert_eq!(view.selected_model, "gpt-6.1-sol");
         assert_eq!(
             view.model_options
                 .first()
                 .map(|option| option.value.as_str()),
-            Some("gpt-6-astra"),
+            Some("gpt-6.1-sol"),
             "the default row must lead the Codex picker"
         );
         assert!(
@@ -2641,11 +2641,11 @@ mod tests {
             let view = state.view();
             assert_eq!(view.selected_agent_id, "codex");
             assert_eq!(
-                view.selected_model, "gpt-6-astra",
+                view.selected_model, "gpt-6.1-sol",
                 "a retired saved model falls back to the current default"
             );
             assert_eq!(
-                view.selected_reasoning, "medium",
+                view.selected_reasoning, "low",
                 "the effort follows the fallback model's own default"
             );
             let notice = view
@@ -2653,13 +2653,13 @@ mod tests {
                 .as_deref()
                 .expect("the fallback must be visible to the user");
             assert!(
-                notice.contains(retired) && notice.contains("gpt-6-astra"),
+                notice.contains(retired) && notice.contains("gpt-6.1-sol"),
                 "the notice must name both the dropped and the replacement model: {notice}"
             );
 
             // The launch still proceeds, carrying the fallback model.
             let config = state.build_launch_config().expect("launch config");
-            assert_eq!(config.model.as_deref(), Some("gpt-6-astra"));
+            assert_eq!(config.model.as_deref(), Some("gpt-6.1-sol"));
 
             state.set_model("gpt-5.6-sol");
             assert!(
@@ -3060,7 +3060,7 @@ mod tests {
             Vec::new(),
             Some(LaunchWizardPreviousProfile {
                 agent_id: "codex".to_string(),
-                model: Some("gpt-5.5".to_string()),
+                model: Some("gpt-6-astra".to_string()),
                 reasoning: Some("high".to_string()),
                 version: Some("0.110.0".to_string()),
                 session_mode: gwt_agent::SessionMode::Continue,
@@ -3077,7 +3077,9 @@ mod tests {
         let view = state.view();
         assert_eq!(view.branch_name, "feature/current");
         assert_eq!(view.selected_agent_id, "codex");
-        assert_eq!(view.selected_model, "gpt-5.5");
+        // Issue #4795 AC-5: a new default must not replace a saved Astra choice.
+        assert_eq!(view.selected_model, "gpt-6-astra");
+        assert!(view.model_fallback_notice.is_none());
         assert_eq!(view.selected_reasoning, "high");
         assert_eq!(view.selected_version, "0.110.0");
         assert_eq!(view.selected_execution_mode, "continue");
@@ -3097,6 +3099,8 @@ mod tests {
 
         let config = state.build_launch_config().expect("launch config");
         assert_eq!(config.branch.as_deref(), Some("feature/current"));
+        assert_eq!(config.model.as_deref(), Some("gpt-6-astra"));
+        assert_eq!(config.reasoning_level.as_deref(), Some("high"));
         assert_eq!(config.session_mode, gwt_agent::SessionMode::Continue);
         assert!(
             config.skip_permissions,
