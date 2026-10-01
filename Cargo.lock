@@ -1336,6 +1336,7 @@ dependencies = [
  "objc2-foundation",
  "objc2-service-management",
  "pulldown-cmark",
+ "quick-xml",
  "regex",
  "reqwest",
  "rfd",
