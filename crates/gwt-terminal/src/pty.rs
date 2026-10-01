@@ -318,6 +318,8 @@ impl PtyHandle {
             normalize_spawn_config(config).map_err(|reason| TerminalError::PtyCreationFailed {
                 reason: reason.to_string(),
             })?;
+        #[cfg(windows)]
+        windows_spawn::check_command_line_length(&config, true)?;
         let nonce = nonce.into();
         if nonce.is_empty() {
             return Err(TerminalError::PtyCreationFailed {
@@ -457,6 +459,8 @@ impl PtyHandle {
             normalize_spawn_config(config).map_err(|reason| TerminalError::PtyCreationFailed {
                 reason: reason.to_string(),
             })?;
+        #[cfg(windows)]
+        windows_spawn::check_command_line_length(&config, false)?;
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(PtySize {

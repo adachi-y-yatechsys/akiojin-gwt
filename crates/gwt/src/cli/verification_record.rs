@@ -2959,6 +2959,93 @@ fn gwtd_artifact_restoration(worktree: &Path, commands: &[String]) -> Option<&'s
     Some("cargo build -p gwt --bin gwtd")
 }
 
+/// Assemble once for both local and daemon launches (Issue #4830).
+fn verification_command_arguments(
+    args: &[String],
+    capture: Option<&headed_e2e::Capture>,
+) -> Vec<String> {
+    let mut args = args.to_vec();
+    if let Some(capture) = capture {
+        args.extend(capture.arguments());
+    }
+    #[cfg(windows)]
+    {
+        use base64::Engine;
+        let executable = Path::new(&args[0])
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        if executable.eq_ignore_ascii_case("pwsh") || executable.eq_ignore_ascii_case("powershell")
+        {
+            if let Some(file) = args
+                .iter()
+                .take_while(|arg| {
+                    ![
+                        "-Command",
+                        "-c",
+                        "-EncodedCommand",
+                        "-e",
+                        "-ec",
+                        "-CommandWithArgs",
+                        "-cwa",
+                    ]
+                    .iter()
+                    .any(|mode| arg.eq_ignore_ascii_case(mode))
+                        && !arg.to_ascii_lowercase().ends_with(".ps1")
+                })
+                .position(|arg| arg.eq_ignore_ascii_case("-File"))
+            {
+                if let Some(script) = args.get(file + 1).filter(|script| script.as_str() != "-") {
+                    let quote = |value: &str| format!("'{}'", value.replace('\'', "''"));
+                    // -File parses unknown switches at ':' before the script sees them.
+                    // Invoke the script in PowerShell instead, quoting literal arguments.
+                    // Named script parameters retain their binding, while --reporter=...
+                    // remains a literal. No command text travels over an ASCII stdin pipe.
+                    let mut source = format!(
+                        "[Console]::InputEncoding = [Console]::OutputEncoding = $OutputEncoding = [Text.UTF8Encoding]::new($false); & {}",
+                        quote(script)
+                    );
+                    for arg in &args[file + 2..] {
+                        source.push(' ');
+                        let (name, value) = arg
+                            .split_once(':')
+                            .map_or((arg.as_str(), None), |(name, value)| (name, Some(value)));
+                        let named = name.strip_prefix('-').is_some_and(|name| {
+                            !name.is_empty()
+                                && name.chars().all(|ch| ch.is_alphanumeric() || ch == '_')
+                        });
+                        if named {
+                            source.push_str(name);
+                            if let Some(value) = value {
+                                source.push(':');
+                                // -File recognizes only boolean literals here, not arbitrary
+                                // PowerShell expressions such as $env:NAME.
+                                source.push_str(&if value.eq_ignore_ascii_case("$true")
+                                    || value.eq_ignore_ascii_case("$false")
+                                {
+                                    value.to_string()
+                                } else {
+                                    quote(value)
+                                });
+                            }
+                        } else {
+                            source.push_str(&quote(arg));
+                        }
+                    }
+                    source.push_str("; if ($?) { exit 0 } elseif ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE } else { exit 1 }");
+                    let bytes: Vec<u8> = source.encode_utf16().flat_map(u16::to_le_bytes).collect();
+                    args.truncate(file);
+                    args.extend([
+                        "-EncodedCommand".to_string(),
+                        base64::engine::general_purpose::STANDARD.encode(bytes),
+                    ]);
+                }
+            }
+        }
+    }
+    args
+}
+
 fn execute_command_with_isolation(
     worktree: &Path,
     command: &str,
@@ -2983,11 +3070,13 @@ fn execute_command_with_isolation(
             execute_command_on_daemon(command, &request, endpoint, progress)
         }
         VerificationHost::Inherit => {
+            let args = verification_command_arguments(&args, capture);
             let mut process = gwt_core::process::hidden_command(&args[0]);
             process.args(&args[1..]).current_dir(worktree);
             apply_child_environment_contract(&mut process);
             if let Some(capture) = capture {
-                capture.configure(&mut process);
+                let (key, value) = capture.environment();
+                process.env(key, value);
             }
             // After the contract, so a command that names one of its
             // variables still gets the value it asked for.
@@ -3079,10 +3168,10 @@ fn delegated_spawn_request(
     stdout_path: std::path::PathBuf,
     stderr_path: std::path::PathBuf,
 ) -> gwt_core::daemon::VerificationSpawnRequest {
-    let mut child_args = args[1..].to_vec();
+    let command_args = verification_command_arguments(args, capture);
+    let child_args = command_args[1..].to_vec();
     let mut env = resolved_child_environment(isolated_baseline);
     if let Some(capture) = capture {
-        child_args.extend(capture.arguments());
         let (key, value) = capture.environment();
         env.retain(|(existing, _)| existing != &key);
         env.push((key, value));
@@ -3542,9 +3631,20 @@ where
                 chromium_dark_passed: 0,
                 chromium_light_passed: 0,
                 failed: 0,
-                status: "missing".to_string(),
+                status: if exit_code != 0 && capture.reporter_argument_was_split(&tail) {
+                    "wrapper_defect"
+                } else {
+                    "missing"
+                }
+                .to_string(),
             })
         });
+        if headed_e2e
+            .as_ref()
+            .is_some_and(|evidence| evidence.status == "wrapper_defect")
+        {
+            tail.push_str("verification wrapper defect: the reporter drive path was split before Playwright started; repair argument forwarding and rerun canonical verification.\n");
+        }
         transcript.push_str(&tail);
         match terminated_by_signal {
             Some(signal) => transcript.push_str(&format!(
@@ -5541,6 +5641,110 @@ pub(crate) mod tests {
         assert!(
             transcript.contains("verify env probe <probe@example.com>"),
             "leading assignments must reach the child process: {transcript}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_powershell_script_preserves_headed_arguments_and_unicode() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("日本語 probe.ps1");
+        fs::write(&script, concat!(
+            "\u{feff}param([string]$Label, [string]$Data, [switch]$Enabled, [Parameter(ValueFromRemainingArguments=$true)][string[]]$Remaining)\n",
+            "@{label=$Label; data=$Data; enabled=$Enabled.IsPresent; args=$Remaining} | ConvertTo-Json -Compress | Set-Content -Encoding utf8 argv.json\n",
+            "'日本語' | node -e \"process.stdin.pipe(require('fs').createWriteStream('stdin.txt'))\"\n"
+        )).unwrap();
+        let capture = headed_e2e::Capture::new().unwrap();
+        for shell in ["pwsh", "powershell"] {
+            let reporter = r"--reporter=list,C:\日本語 path\reporter.cjs";
+            let command = format!(
+                "{shell} -NoProfile -File \"{}\" -Label \"日本語 label=1\" \"-Data:C:\\日本語 path\" -Enabled:$true \"{reporter}\"",
+                script.display()
+            );
+            let (code, _, output) = execute_command_with_isolation(
+                dir.path(),
+                &command,
+                false,
+                Some(&capture),
+                &VerificationHost::Inherit,
+                None,
+            )
+            .unwrap();
+            assert_eq!(code, 0, "{shell}: {output}");
+            let argv = fs::read_to_string(dir.path().join("argv.json")).unwrap();
+            let argv: serde_json::Value =
+                serde_json::from_str(argv.trim_start_matches('\u{feff}')).unwrap();
+            assert_eq!(argv["label"], "日本語 label=1", "{shell}");
+            assert_eq!(argv["data"], r"C:\日本語 path", "{shell}");
+            assert_eq!(argv["enabled"], true, "{shell}");
+            let expected: Vec<_> = std::iter::once(reporter.to_string())
+                .chain(capture.arguments())
+                .collect();
+            assert_eq!(argv["args"], serde_json::json!(expected), "{shell}");
+            assert_eq!(
+                fs::read_to_string(dir.path().join("stdin.txt"))
+                    .unwrap()
+                    .trim(),
+                "日本語",
+                "{shell}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_command_arguments_are_not_file_host_options() {
+        let args = [
+            "pwsh",
+            "-NoProfile",
+            "-Command",
+            "Write-Output $args",
+            "-File",
+            "literal.ps1",
+        ]
+        .map(str::to_string);
+        assert_eq!(verification_command_arguments(&args, None), args);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn split_reporter_launch_is_recorded_as_wrapper_defect() {
+        let dir = tempfile::tempdir().unwrap();
+        let drive = std::env::temp_dir()
+            .display()
+            .to_string()
+            .chars()
+            .next()
+            .unwrap();
+        let script = dir.path().join("broken-wrapper.ps1");
+        fs::write(
+            &script,
+            format!("[Console]::Error.WriteLine(\"Cannot find module '{drive}'`n    at resolveReporter (playwright/lib/program.js:326:18)\"); exit 1"),
+        )
+        .unwrap();
+        let commands = vec![format!("pwsh -NoProfile -File \"{}\"", script.display())];
+        let (record, transcript) = run_verification_inner(
+            dir.path(),
+            "wrapper-probe",
+            &commands,
+            None,
+            &[],
+            RunOptions {
+                headed_e2e_commands: &commands,
+                ..RunOptions::default()
+            },
+            || {},
+        )
+        .unwrap();
+        assert!(!record.all_passed);
+        assert_eq!(
+            record.commands[0].headed_e2e.as_ref().unwrap().status,
+            "wrapper_defect",
+            "{transcript}"
+        );
+        assert!(
+            record.commands[0].output_tail.contains("wrapper defect"),
+            "{transcript}"
         );
     }
 
