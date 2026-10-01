@@ -284,6 +284,9 @@ mod tests {
 
     #[tokio::test]
     async fn client_status_request_returns_daemon_snapshot() {
+        // The initial monitor load runs after spawn_server returns, on this
+        // current-thread runtime. Keep its fixture budget pinned through Status.
+        let _prefs_budget = server::pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let scope = sample_scope(&temp);
         let socket_path = temp.path().join("daemon.sock");
