@@ -2011,6 +2011,12 @@ enum UserEvent {
     },
     IssueLaunchWizardPrepared(IssueLaunchWizardPrepared),
     ProjectNavigationPrepared(Box<ProjectNavigationPrepared>),
+    ProjectPickerFinished {
+        client_id: String,
+        request_id: u64,
+        worker_finished: bool,
+        result: Result<Option<PathBuf>, String>,
+    },
     /// Issue #4538: Recent path → ProjectKey resolution for `/p/<hash>`.
     RecentProjectKeysResolved(app_runtime::RecentProjectKeysResolved),
     /// Issue #4538 AC-4: authenticated `gwt open <path>` control request.
@@ -3035,7 +3041,8 @@ mod tests {
         ));
         assert!(!super::frontend_event_may_change_project_tabs(
             &gwt::FrontendEvent::ReopenRecentProject {
-                path: "/tmp/repo".to_string()
+                path: "/tmp/repo".to_string(),
+                request_id: None,
             }
         ));
 
@@ -3710,6 +3717,7 @@ mod tests {
             build_frontend_sync_events("primary", workspace, Vec::new(), Vec::new(), None, None);
         events.push(transport_all(gwt::BackendEvent::ProjectOpenError {
             message: "shared".to_string(),
+            request_id: None,
         }));
 
         clients.dispatch(events);
@@ -4052,6 +4060,7 @@ mod tests {
             next_project_incarnation,
             project_navigation_request: 0,
             pending_project_navigation: None,
+            project_picker: Default::default(),
             project_route: Default::default(),
             project_aggregates: Default::default(),
             next_project_aggregate_revision: 0,
@@ -5953,6 +5962,7 @@ mod tests {
                 "client-1".to_string(),
                 gwt::FrontendEvent::ReopenRecentProject {
                     path: scratch.display().to_string(),
+                    request_id: None,
                 },
             )
             .is_empty());
@@ -7768,11 +7778,13 @@ mod tests {
         hub.dispatch(vec![
             transport_all(gwt::BackendEvent::ProjectOpenError {
                 message: "broadcast".to_string(),
+                request_id: None,
             }),
             super::OutboundEvent::reply(
                 "client-2",
                 gwt::BackendEvent::ProjectOpenError {
                     message: "targeted".to_string(),
+                    request_id: None,
                 },
             ),
         ]);
@@ -7789,6 +7801,7 @@ mod tests {
         hub.unregister("client-1");
         hub.dispatch(vec![transport_all(gwt::BackendEvent::ProjectOpenError {
             message: "after-unregister".to_string(),
+            request_id: None,
         })]);
         assert!(
             client_one.try_recv().is_none(),
@@ -10977,6 +10990,9 @@ fn main() -> std::io::Result<()> {
             Event::UserEvent(UserEvent::IssueLaunchWizardPrepared(prepared)) => {
                 let events = app.handle_issue_launch_wizard_prepared(prepared);
                 clients.dispatch(events);
+            }
+            Event::UserEvent(UserEvent::ProjectPickerFinished { client_id, request_id, worker_finished, result }) => {
+                clients.dispatch(app.handle_project_picker_finished(&client_id, request_id, worker_finished, result));
             }
             Event::UserEvent(UserEvent::ProjectNavigationPrepared(prepared)) => {
                 let may_open_project = matches!(
