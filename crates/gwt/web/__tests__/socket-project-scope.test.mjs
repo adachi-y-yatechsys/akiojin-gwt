@@ -40,7 +40,7 @@ function fixture({ routeProjectKey = null } = {}) {
       open: (...args) => { opened.push(args); return null; },
     },
     document: {},
-    clearTimeout() {}, setConnectionState() {}, syncRunningBranchCleanups() {},
+    clearTimeout() {}, clearPickerPending() {}, setConnectionState() {}, syncRunningBranchCleanups() {},
     createSocketReceiveDispatcher: ({ receive }) => ({ handle(event) { receive(JSON.parse(event.data)); } }),
     received: [], receive(event) { context.received.push(event); },
     uiTraceWiring: { isTracing: () => false }, traceUi() {},
