@@ -4297,6 +4297,7 @@ fn sample_runtime_with_events(
         next_project_incarnation,
         project_navigation_request: 0,
         pending_project_navigation: None,
+        project_picker: Default::default(),
         project_route: Default::default(),
         recent_projects: Vec::new(),
         profile_selections: HashMap::new(),
@@ -12696,13 +12697,169 @@ fn project_prepare_open_returns_before_repo_restore_and_preserves_cancel() {
     drain_queued_blocking_tasks(&queued_tasks);
     let prepared = take_project_navigation_completion(&recorded_events);
     assert!(
-        runtime
+        !runtime
             .handle_project_navigation_prepared(prepared)
             .is_empty(),
-        "cancel must invalidate a completion that was already queued"
+        "cancelling a later picker must preserve the project open already queued"
     );
-    assert_eq!(runtime.tabs.len(), before_tabs);
-    assert_eq!(runtime.active_tab_id, before_active);
+    assert_eq!(runtime.tabs.len(), before_tabs + 1);
+}
+
+#[test]
+fn project_picker_requests_queue_work_and_cancel_replies_once_to_the_client() {
+    let temp = tempdir().unwrap();
+    let _gwt_home = ScopedGwtHome::set(temp.path());
+    let mut runtime = sample_runtime(temp.path(), Vec::new(), None);
+    let (spawner, queued) = BlockingTaskSpawner::queued();
+    runtime.blocking_tasks = spawner;
+    let started = runtime.open_project_dialog_events("picker-client");
+    let BackendEvent::PickerStarted { request_id, .. } = started[0].event else {
+        panic!("picker must acknowledge pending without opening a native dialog inline");
+    };
+    assert_eq!(queued.lock().unwrap().len(), 1);
+    let duplicate = runtime.select_clone_project_parent_events("picker-client");
+    assert!(matches!(
+        duplicate[0].event,
+        BackendEvent::PickerBusy { .. }
+    ));
+    assert_eq!(
+        queued.lock().unwrap().len(),
+        1,
+        "repeat must not queue another dialog"
+    );
+    let result =
+        runtime.handle_project_picker_finished("picker-client", request_id, true, Ok(None));
+    assert_eq!(result.len(), 1);
+    assert_eq!(
+        result[0].target,
+        gwt::project_transport::DispatchTarget::Client("picker-client".into())
+    );
+    assert!(
+        matches!(result[0].event, BackendEvent::PickerCancelled { request_id: id, .. } if id == request_id)
+    );
+    assert!(runtime
+        .handle_project_picker_finished("picker-client", request_id, true, Ok(None))
+        .is_empty());
+    assert!(matches!(
+        runtime.select_clone_project_parent_events("picker-client")[0].event,
+        BackendEvent::PickerStarted { .. }
+    ));
+}
+
+#[test]
+fn project_picker_timeout_keeps_native_worker_busy_until_it_exits() {
+    let temp = tempdir().unwrap();
+    let _gwt_home = ScopedGwtHome::set(temp.path());
+    let mut runtime = sample_runtime(temp.path(), Vec::new(), None);
+    let (spawner, queued) = BlockingTaskSpawner::queued();
+    runtime.blocking_tasks = spawner;
+    let started = runtime.open_project_dialog_events("client");
+    let BackendEvent::PickerStarted { request_id, .. } = started[0].event else {
+        panic!("started")
+    };
+    let timeout = runtime.handle_project_picker_finished(
+        "client",
+        request_id,
+        false,
+        Err("Folder selection timed out".into()),
+    );
+    assert_eq!(timeout.len(), 1);
+    assert!(matches!(timeout[0].event, BackendEvent::PickerError { .. }));
+    assert!(
+        matches!(
+            runtime.open_project_dialog_events("client")[0].event,
+            BackendEvent::PickerBusy { .. }
+        ),
+        "timeout must not permit another native dialog while the first is alive"
+    );
+    assert_eq!(queued.lock().unwrap().len(), 1);
+    assert!(
+        runtime
+            .handle_project_picker_finished(
+                "client",
+                request_id,
+                true,
+                Ok(Some(temp.path().into())),
+            )
+            .is_empty(),
+        "late selection must not open a project or send a second terminal reply"
+    );
+    assert_eq!(queued.lock().unwrap().len(), 1);
+    assert!(matches!(
+        runtime.open_project_dialog_events("client")[0].event,
+        BackendEvent::PickerStarted { .. }
+    ));
+}
+
+#[test]
+fn project_picker_selected_error_and_stale_results_preserve_request_identity() {
+    let temp = tempdir().unwrap();
+    let _gwt_home = ScopedGwtHome::set(temp.path());
+    let mut runtime = sample_runtime(temp.path(), Vec::new(), None);
+    runtime.blocking_tasks = BlockingTaskSpawner::queued().0;
+    let started = runtime.select_clone_project_parent_events("client");
+    let BackendEvent::PickerStarted { request_id, .. } = started[0].event else {
+        panic!("started")
+    };
+    let selected = runtime.handle_project_picker_finished(
+        "client",
+        request_id,
+        true,
+        Ok(Some(temp.path().into())),
+    );
+    assert_eq!(selected.len(), 1);
+    assert!(
+        matches!(&selected[0].event, BackendEvent::PickerSelected { purpose, path, .. }
+        if purpose == "clone_parent" && path == &temp.path().display().to_string())
+    );
+    let next = runtime.open_project_dialog_events("client");
+    let BackendEvent::PickerStarted {
+        request_id: next_id,
+        ..
+    } = next[0].event
+    else {
+        panic!("started")
+    };
+    assert_ne!(request_id, next_id);
+    assert!(runtime
+        .handle_project_picker_finished("client", request_id, true, Ok(None))
+        .is_empty());
+    let timeout = runtime.handle_project_picker_finished(
+        "client",
+        next_id,
+        false,
+        Err("Folder selection timed out".into()),
+    );
+    assert_eq!(timeout.len(), 1);
+    assert!(
+        matches!(&timeout[0].event, BackendEvent::PickerError { request_id, message, .. }
+        if *request_id == next_id && message.contains("timed out"))
+    );
+    assert!(runtime
+        .handle_project_picker_finished("client", next_id, true, Ok(Some(temp.path().into())))
+        .is_empty());
+}
+
+#[test]
+fn project_picker_spawn_failure_clears_pending_and_search_runs_off_thread() {
+    let temp = tempdir().unwrap();
+    let _gwt_home = ScopedGwtHome::set(temp.path());
+    let mut runtime = sample_runtime(temp.path(), Vec::new(), None);
+    runtime.blocking_tasks = BlockingTaskSpawner::failing("worker unavailable");
+    let failed = runtime.open_project_dialog_events("client");
+    assert_eq!(failed.len(), 2);
+    assert!(
+        matches!(&failed[1].event, BackendEvent::PickerError { message, .. } if message == "worker unavailable")
+    );
+    let (spawner, queued) = BlockingTaskSpawner::queued();
+    runtime.blocking_tasks = spawner;
+    assert!(matches!(
+        runtime.open_project_dialog_events("client")[0].event,
+        BackendEvent::PickerStarted { .. }
+    ));
+    let search = runtime.github_repository_search_events("client", "gwt");
+    assert!(search.is_empty(), "gh must run on the queued worker");
+    assert_eq!(queued.lock().unwrap().len(), 2);
 }
 
 #[test]
@@ -12778,7 +12935,9 @@ fn project_prepare_open_commits_once_and_reuses_an_existing_project_key() {
     let (blocking_tasks, queued_tasks) = BlockingTaskSpawner::queued();
     runtime.blocking_tasks = blocking_tasks;
 
-    assert!(runtime.open_project_path_events(existing).is_empty());
+    assert!(runtime
+        .open_project_path_with_request_events(existing, Some("client-open-1".to_string()))
+        .is_empty());
     drain_queued_blocking_tasks(&queued_tasks);
     let prepared = take_project_navigation_completion(&recorded_events);
     let events = runtime.handle_project_navigation_prepared(prepared.clone());
@@ -12789,6 +12948,12 @@ fn project_prepare_open_commits_once_and_reuses_an_existing_project_key() {
         "existing ProjectKey must not duplicate a tab"
     );
     assert_eq!(runtime.active_tab_id.as_deref(), Some("tab-existing"));
+    assert!(events.iter().any(|event| matches!(
+        &event.event,
+        BackendEvent::ProjectOpened { project_key, request_id, .. }
+            if project_key == &runtime.project_tab_incarnations["tab-existing"].project_key.to_string()
+                && request_id.as_deref() == Some("client-open-1")
+    )), "opening an existing project must produce an explicit Hub completion");
     assert!(events
         .iter()
         .any(|event| matches!(event.event, BackendEvent::WindowCanvasState { .. })));
@@ -12877,10 +13042,11 @@ fn project_prepare_spawn_failure_is_visible_for_open_and_switch() {
     let mut runtime = sample_runtime(temp.path(), tabs, Some("tab-first"));
     runtime.blocking_tasks = BlockingTaskSpawner::failing("worker unavailable");
 
-    let open_events = runtime.open_project_path_events(pending);
+    let open_events =
+        runtime.open_project_path_with_request_events(pending, Some("client-open-2".to_string()));
     assert!(open_events.iter().any(|event| matches!(
         &event.event,
-        BackendEvent::ProjectOpenError { message } if message == "worker unavailable"
+        BackendEvent::ProjectOpenError { message, request_id } if message == "worker unavailable" && request_id.as_deref() == Some("client-open-2")
     )));
     assert_eq!(runtime.active_tab_id.as_deref(), Some("tab-first"));
 
@@ -12888,7 +13054,7 @@ fn project_prepare_spawn_failure_is_visible_for_open_and_switch() {
     assert_eq!(runtime.active_tab_id.as_deref(), Some("tab-second"));
     assert!(switch_events.iter().any(|event| matches!(
         &event.event,
-        BackendEvent::ProjectOpenError { message } if message == "worker unavailable"
+        BackendEvent::ProjectOpenError { message, .. } if message == "worker unavailable"
     )));
 }
 

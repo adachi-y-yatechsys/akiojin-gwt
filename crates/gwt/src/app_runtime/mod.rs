@@ -237,6 +237,7 @@ mod launch_errors;
 mod launch_output_mirror;
 mod loaders;
 mod migration;
+mod native_project_picker;
 pub(crate) mod persist_dispatcher;
 pub(crate) mod pm;
 mod profile;
@@ -1048,7 +1049,9 @@ pub(crate) struct ProjectIncarnation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProjectNavigationSource {
-    Open,
+    Open {
+        request_id: Option<String>,
+    },
     Clone {
         workspace_home: PathBuf,
     },
@@ -1257,6 +1260,7 @@ pub struct AppRuntime {
     pub(crate) next_project_incarnation: u64,
     pub(crate) project_navigation_request: u64,
     pub(crate) pending_project_navigation: Option<ProjectNavigationRequest>,
+    pub(crate) project_picker: project_tabs::ProjectPickerState,
     /// Issue #4538: `/p/<hash>` resolution cache and `gwt open` waiters.
     pub(crate) project_route: project_route::ProjectRouteState,
     pub(crate) recent_projects: Vec<gwt::RecentProjectEntry>,
@@ -3219,6 +3223,7 @@ impl AppRuntime {
             next_project_incarnation,
             project_navigation_request: 0,
             pending_project_navigation: None,
+            project_picker: Default::default(),
             project_route: Default::default(),
             recent_projects: prune_missing_recent_projects(dedupe_recent_projects(
                 normalize_recent_projects(persisted.recent_projects),
@@ -8245,7 +8250,7 @@ impl AppRuntime {
                 gwt::perf::startup::mark(gwt::perf::startup::StartupPhase::ShellInteractive);
                 Vec::new()
             }
-            FrontendEvent::OpenProjectDialog => self.open_project_dialog_events(),
+            FrontendEvent::OpenProjectDialog => self.open_project_dialog_events(&client_id),
             FrontendEvent::SelectCloneProjectParent => {
                 self.select_clone_project_parent_events(&client_id)
             }
@@ -8255,8 +8260,8 @@ impl AppRuntime {
             FrontendEvent::CloneProjectStart { url, parent_path } => {
                 self.clone_project_start_events(&client_id, &url, &parent_path)
             }
-            FrontendEvent::ReopenRecentProject { path } => {
-                self.open_project_path_events(PathBuf::from(path))
+            FrontendEvent::ReopenRecentProject { path, request_id } => {
+                self.open_project_path_with_request_events(PathBuf::from(path), request_id)
             }
             FrontendEvent::ApplyUpdate => self.apply_pending_update_events(&client_id),
             FrontendEvent::ApplyUpdateStart => self.apply_update_start_events(&client_id),
@@ -8572,7 +8577,7 @@ impl AppRuntime {
                 reasoning,
             } => self.set_pm_launch_profile_events(context, &agent_id, model, reasoning),
             FrontendEvent::RestartPmAgent => self.restart_pm_agent_events(context),
-            FrontendEvent::OpenProjectDialog => self.open_project_dialog_events(),
+            FrontendEvent::OpenProjectDialog => self.open_project_dialog_events(&client_id),
             FrontendEvent::SelectCloneProjectParent => {
                 self.select_clone_project_parent_events(&client_id)
             }
@@ -8582,8 +8587,8 @@ impl AppRuntime {
             FrontendEvent::CloneProjectStart { url, parent_path } => {
                 self.clone_project_start_events(&client_id, &url, &parent_path)
             }
-            FrontendEvent::ReopenRecentProject { path } => {
-                self.open_project_path_events(PathBuf::from(path))
+            FrontendEvent::ReopenRecentProject { path, request_id } => {
+                self.open_project_path_with_request_events(PathBuf::from(path), request_id)
             }
             FrontendEvent::PreviewCloseProject { .. }
             | FrontendEvent::ConfirmCloseProject { .. }
