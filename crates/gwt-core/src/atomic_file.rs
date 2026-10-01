@@ -68,49 +68,24 @@ fn temp_path_for(path: &Path, parent: Option<&Path>) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicBool;
-    use std::sync::Arc;
 
     #[test]
-    fn a_reader_never_observes_the_destination_partially_written() {
+    fn publication_preserves_the_previous_file_contents() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("descriptor.json");
-        let read_something = Arc::new(AtomicBool::new(false));
-        let done = Arc::new(AtomicBool::new(false));
+        let previous = dir.path().join("previous.json");
+        let old = br#"{"turn":0}"#;
+        let new = br#"{"turn":100,"complete":true}"#;
+        write_atomic(&path, old).expect("publish initial descriptor");
 
-        let observer = {
-            let path = path.clone();
-            let read_something = Arc::clone(&read_something);
-            let done = Arc::clone(&done);
-            std::thread::spawn(move || {
-                let mut torn = 0_u64;
-                while !done.load(Ordering::Relaxed) {
-                    if let Ok(content) = fs::read_to_string(&path) {
-                        read_something.store(true, Ordering::Relaxed);
-                        if !content.starts_with('{') || !content.ends_with('}') {
-                            torn += 1;
-                        }
-                    }
-                }
-                torn
-            })
-        };
+        // Keep the old file observable without an open reader racing Windows
+        // replacement. An in-place truncate/write would also change this link,
+        // so the assertion catches that regression without scheduler timing.
+        fs::hard_link(&path, &previous).expect("retain the previous file");
+        write_atomic(&path, new).expect("publish replacement descriptor");
 
-        for turn in 0..2_000 {
-            write_atomic(&path, format!("{{\"turn\":{turn}}}").as_bytes())
-                .expect("publish descriptor");
-        }
-        done.store(true, Ordering::Relaxed);
-        let torn = observer.join().expect("observer thread");
-
-        assert!(
-            read_something.load(Ordering::Relaxed),
-            "the observer never read the file, so this run proves nothing"
-        );
-        assert_eq!(
-            torn, 0,
-            "a published file must never be readable as empty or partial"
-        );
+        assert_eq!(fs::read(&previous).expect("read previous descriptor"), old);
+        assert_eq!(fs::read(&path).expect("read published descriptor"), new);
     }
 
     #[test]
