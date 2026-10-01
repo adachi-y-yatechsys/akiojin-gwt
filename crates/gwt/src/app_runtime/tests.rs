@@ -80741,3 +80741,31 @@ fn termination_class_requires_exact_exit_and_readable_bridge_evidence() {
         assert_eq!(after.issue_tiers[&4774].unknown_failures, 0);
     }
 }
+
+/// Issue #4868: the Rust 1.99 rewrite replaced `fetch_update` + `checked_add`
+/// with `fetch_add`, which wraps where the old form refused to. These pin the
+/// two properties callers depend on: the value returned is the one claimed
+/// (not its successor), and a counter that can no longer promise a successor
+/// panics instead of wrapping around to a value already in use.
+mod incarnation_claiming {
+    use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn claiming_returns_the_current_value_and_advances_by_one() {
+        let counter = AtomicU64::new(1);
+        assert_eq!(super::super::claim_incarnation(&counter), 1);
+        assert_eq!(super::super::claim_incarnation(&counter), 2);
+        assert_eq!(super::super::claim_incarnation(&counter), 3);
+    }
+
+    #[test]
+    fn claiming_panics_instead_of_wrapping_when_the_space_is_exhausted() {
+        let counter = AtomicU64::new(u64::MAX);
+        let exhausted =
+            std::panic::catch_unwind(|| super::super::claim_incarnation(&counter)).is_err();
+        assert!(
+            exhausted,
+            "a counter that cannot promise a successor must panic, not hand out a reused value"
+        );
+    }
+}
