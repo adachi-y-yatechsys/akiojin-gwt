@@ -514,7 +514,7 @@ impl WindowsNpmRegistryFixture {
 
         let connect_timeout = remaining_timeout()?;
         let mut stream = TcpStream::connect_timeout(&self.address, connect_timeout)
-            .map_err(&normalize_timeout_error)?;
+            .map_err(normalize_timeout_error)?;
         let request = format!(
             "GET /-/gwt-health HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
             self.address
@@ -525,7 +525,7 @@ impl WindowsNpmRegistryFixture {
             stream.set_write_timeout(Some(write_timeout))?;
             let count = stream
                 .write(&request.as_bytes()[written..])
-                .map_err(&normalize_timeout_error)?;
+                .map_err(normalize_timeout_error)?;
             if count == 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::WriteZero,
@@ -540,7 +540,7 @@ impl WindowsNpmRegistryFixture {
         loop {
             let read_timeout = remaining_timeout()?;
             stream.set_read_timeout(Some(read_timeout))?;
-            let count = stream.read(&mut buffer).map_err(&normalize_timeout_error)?;
+            let count = stream.read(&mut buffer).map_err(normalize_timeout_error)?;
             if count == 0 {
                 break;
             }
