@@ -5049,6 +5049,7 @@ mod tests {
         crate::session_inventory::SessionObservation {
             session_id: format!("session-{}", issue_number.unwrap_or(0)),
             issue_number,
+            execution_binding_missing: false,
             agent_id: "codex".to_string(),
             worktree_path: std::path::PathBuf::from(format!(
                 "/tmp/work/issue-{}",

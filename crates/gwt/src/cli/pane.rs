@@ -1872,6 +1872,7 @@ mod tests {
             SessionObservation {
                 session_id: id.to_string(),
                 issue_number: Some(4305),
+                execution_binding_missing: false,
                 agent_id: "codex".to_string(),
                 worktree_path: "/repo/work/issue-4305".into(),
                 worktree_exists: exists,
