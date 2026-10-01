@@ -713,6 +713,8 @@ fn format_provider_help() -> String {
         "The native decision is mandatory even in autonomous mode. JSON approval flags",
         "and saved approvals are not accepted. Cancel is the default. Only Host windows",
         "using a directly installed Codex and its default provider are supported.",
+        "The target Session must contain launch-time authentication root/source proof.",
+        "The prompt shows that root; the helper uses it. Relaunch legacy windows.",
         "Claude extra usage is paid and is never executed by gwt; switch providers instead.",
         "Audit: ~/.gwt/provider-resets/<request_id>.jsonl (not an approval token).",
         "",

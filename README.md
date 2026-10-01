@@ -486,13 +486,19 @@ for that account; Cancel is the default. Confirmation is mandatory even in
 autonomous mode. JSON approval flags and past approvals cannot replace it.
 Only canvas windows using a directly installed Host Codex and its default
 provider are supported; Docker, package-runner launches and custom backends
-are refused.
+are refused. The dialog identifies the authentication root recorded when the
+target window launched and its source (host, profile or caller environment).
+The helper uses that same root. Relaunch older windows that lack this proof;
+unresolved authentication environments are refused. On Windows, set an explicit
+`CODEX_HOME` before launching the target window.
 
 After a confirmed reset, gwt rereads account availability and releases the
 provider hold automatically. Failure or an unconfirmed outcome retains the
 hold. Approval, execution and results are recorded under
 `~/.gwt/provider-resets/<request_id>.jsonl`; the operation returns that path
-and any failure reason. No credits are purchased, and no paid-usage fallback
+and any failure reason. If only the final audit write fails after a successful
+reset and hold release, the result remains successful with an `audit_warning`.
+No credits are purchased, and no paid-usage fallback
 exists. See `gwtd --help provider` for parameters.
 
 ### Autonomous mode (opt-in)

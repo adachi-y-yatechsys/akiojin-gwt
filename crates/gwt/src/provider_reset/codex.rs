@@ -134,11 +134,12 @@ async fn request(
     }
 }
 
-/// Use only the default Host account, never credentials/config from the calling agent.
+/// Use the proven target authentication root, never the calling agent's credentials.
 fn app_server_request(
     executable: &Path,
     cwd: &Path,
     home: &Path,
+    auth_root: &Path,
 ) -> gwt_core::process::ProcessPlanRequest {
     let mut request = gwt_core::process::ProcessPlanRequest::new(executable).inherit_env(false);
     // These contain process/runtime setup only; provider/API variables are excluded.
@@ -161,7 +162,7 @@ fn app_server_request(
     request
         .env("HOME", home)
         .env("USERPROFILE", home)
-        .env("CODEX_HOME", home.join(".codex"))
+        .env("CODEX_HOME", auth_root)
         .args(["app-server", "--stdio"])
         .current_dir(cwd)
 }
@@ -177,14 +178,19 @@ pub struct CodexResetClient {
 }
 
 impl CodexResetClient {
-    pub fn start(executable: &Path, cwd: &Path, home: &Path) -> Result<Self, String> {
+    pub fn start(
+        executable: &Path,
+        cwd: &Path,
+        home: &Path,
+        auth_root: &Path,
+    ) -> Result<Self, String> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|_| "Could not initialize Codex API runtime")?;
         let (child, reader, writer) = runtime.block_on(async {
             let mut command = gwt_core::process::resolved_tokio_command(app_server_request(
-                executable, cwd, home,
+                executable, cwd, home, auth_root,
             ))
             .map_err(|_| "Could not resolve the installed Codex executable")?;
             let mut child = command
@@ -344,9 +350,9 @@ mod tests {
     }
 
     #[test]
-    fn reset_helper_uses_default_home_and_does_not_inherit_provider_credentials() {
+    fn reset_helper_uses_proven_target_root_and_does_not_inherit_provider_credentials() {
         let home = std::env::temp_dir().join("gwt-reset-test-home");
-        let request = app_server_request(Path::new("/installed/codex"), &home, &home);
+        let request = app_server_request(Path::new("/installed/codex"), &home, &home, &home);
         assert!(!request.inherit_env);
         let environment = request
             .env
@@ -355,7 +361,7 @@ mod tests {
             .collect::<std::collections::BTreeMap<_, _>>();
         assert_eq!(
             environment.get(std::ffi::OsStr::new("CODEX_HOME")).copied(),
-            Some(home.join(".codex").as_os_str())
+            Some(home.as_os_str())
         );
         for key in [
             "OPENAI_API_KEY",

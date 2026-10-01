@@ -52,6 +52,13 @@ impl ResetBackend for FakeProvider {
     }
 }
 
+fn auth_root() -> gwt_agent::CodexAuthRoot {
+    gwt_agent::CodexAuthRoot {
+        path: "/proven/codex-home".into(),
+        origin: gwt_agent::CodexAuthRootOrigin::Profile,
+    }
+}
+
 fn request(provider: &str) -> ResetRequest {
     ResetRequest {
         id: "attempt-1".into(),
@@ -67,6 +74,7 @@ fn unsupported_provider_and_no_free_credit_never_prompt_or_consume() {
         backend.reads = VecDeque::from([snapshot(false, Some(false))]);
         let result = execute(
             &request(provider),
+            &auth_root(),
             &mut backend,
             |_| panic!("must not prompt"),
             || Ok(()),
@@ -84,10 +92,13 @@ fn cancel_preserves_hold_even_when_the_caller_is_autonomous() {
     let mut events = vec![];
     let result = execute(
         &request("codex"),
+        &auth_root(),
         &mut backend,
         |prompt| {
             assert!(prompt.contains("tab-1::agent-2"));
             assert!(prompt.contains("無料"));
+            assert!(prompt.contains("/proven/codex-home"));
+            assert!(prompt.contains("PROFILE"));
             assert!(prompt.contains(CLAUDE_NOTICE));
             Ok(false)
         },
@@ -110,6 +121,7 @@ fn explicit_approval_consumes_once_and_only_verified_recovery_releases_hold() {
     let mut events = vec![];
     execute(
         &request("codex"),
+        &auth_root(),
         &mut backend,
         |_| Ok(true),
         || Ok(()),
@@ -140,6 +152,7 @@ fn explicit_approval_consumes_once_and_only_verified_recovery_releases_hold() {
     let mut next = FakeProvider::ready();
     assert!(execute(
         &request("codex"),
+        &auth_root(),
         &mut next,
         |_| Ok(false),
         || Ok(()),
@@ -164,6 +177,7 @@ fn provider_failure_or_unconfirmed_recovery_never_clears_hold() {
         let mut events = vec![];
         assert!(execute(
             &request("codex"),
+            &auth_root(),
             &mut backend,
             |_| Ok(true),
             || Ok(()),
@@ -187,6 +201,7 @@ fn stale_target_account_or_audit_failure_prevents_consume() {
         }
         assert!(execute(
             &request("codex"),
+            &auth_root(),
             &mut backend,
             |_| Ok(true),
             || if failure == "target" {
@@ -204,6 +219,40 @@ fn stale_target_account_or_audit_failure_prevents_consume() {
         .is_err());
         assert_eq!(backend.calls, 0);
     }
+}
+
+#[test]
+fn final_audit_failure_does_not_reverse_a_completed_reset() {
+    let mut backend = FakeProvider::ready();
+    let released = Cell::new(false);
+    let mut events = vec![];
+    let result = execute(
+        &request("codex"),
+        &auth_root(),
+        &mut backend,
+        |_| Ok(true),
+        || Ok(()),
+        || {
+            released.set(true);
+            Ok(())
+        },
+        &mut |phase, _| {
+            events.push(phase.to_owned());
+            if phase == "completed" {
+                Err("disk full".into())
+            } else {
+                Ok(())
+            }
+        },
+    );
+    assert!(
+        result.is_ok(),
+        "reset and release already succeeded: {result:?}"
+    );
+    assert_eq!(result.unwrap().audit_warning.as_deref(), Some("disk full"));
+    assert!(released.get());
+    assert_eq!(backend.calls, 1);
+    assert!(!events.iter().any(|phase| phase == "failed"));
 }
 
 #[test]

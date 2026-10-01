@@ -61,7 +61,8 @@ pub(super) fn run<E: CliEnv>(
                     "provider": request.provider,
                     "window_id": request.window_id,
                     "status": if result.is_ok() { "completed" } else { "failed" },
-                    "reason": result.err(),
+                    "reason": result.as_ref().err(),
+                    "audit_warning": result.as_ref().ok().and_then(|completed| completed.audit_warning.as_ref()),
                     "audit_path": audit_dir.join(format!("{}.jsonl", request.id)),
                 })
                 .to_string(),
@@ -77,7 +78,7 @@ fn perform<E: CliEnv>(
     prefs_path: &Path,
     audit_dir: &Path,
     request: &ResetRequest,
-) -> Result<(), String> {
+) -> Result<provider_reset::ResetCompleted, String> {
     let mut audit = Audit::open(audit_dir, request, env.repo_path())?;
     audit.record(
         "requested",
@@ -94,9 +95,24 @@ fn perform<E: CliEnv>(
         let home = gwt_home
             .parent()
             .ok_or("default Host home is unavailable")?;
-        let mut client = CodexResetClient::start(&target.executable, &target.cwd, home)?;
+        audit.record(
+            "authentication",
+            &json!({
+                "session_id": target.session_id,
+                "target_auth_root": target.auth_root,
+                "helper_auth_root": target.auth_root.path,
+            })
+            .to_string(),
+        )?;
+        let mut client = CodexResetClient::start(
+            &target.executable,
+            &target.cwd,
+            home,
+            &target.auth_root.path,
+        )?;
         provider_reset::execute(
             request,
+            &target.auth_root,
             &mut client,
             native::confirm,
             || {
@@ -150,6 +166,7 @@ struct Target {
     session_id: String,
     executable: PathBuf,
     cwd: PathBuf,
+    auth_root: gwt_agent::CodexAuthRoot,
 }
 
 fn live_target(project: &Path, id: &str) -> Result<Target, String> {
@@ -182,6 +199,18 @@ fn validate_target(window: &PersistedWindowState, session: &Session) -> Result<T
     if session.runtime_target != LaunchRuntimeTarget::Host || session.backend_id.is_some() {
         return Err("free reset requires a Host Codex window using its default provider".into());
     }
+    let auth_root = session.codex_auth_root.as_ref().ok_or(
+        "target authentication root/source is missing; relaunch this window to record its launch-time authentication proof",
+    )?;
+    if !auth_root.path.is_absolute()
+        || !auth_root.path.is_dir()
+        || dunce::canonicalize(&auth_root.path).ok().as_ref() != Some(&auth_root.path)
+    {
+        return Err(
+            "target authentication root no longer matches its launch proof; relaunch this window"
+                .into(),
+        );
+    }
     // Bind the helper to the same installed executable, never resolve a new
     // caller-provided PATH command or execute the session's shell arguments.
     let executable = PathBuf::from(&session.launch_command);
@@ -201,6 +230,7 @@ fn validate_target(window: &PersistedWindowState, session: &Session) -> Result<T
         session_id: session.id.clone(),
         executable,
         cwd: session.worktree_path.clone(),
+        auth_root: auth_root.clone(),
     })
 }
 
@@ -268,8 +298,20 @@ mod tests {
     }
 
     #[test]
+    fn reset_target_without_launch_authentication_proof_is_refused() {
+        let (window, session) = target_fixture();
+        assert!(validate_target(&window, &session)
+            .unwrap_err()
+            .contains("authentication"));
+    }
+
+    #[test]
     fn reset_target_allows_a_rate_limited_pane_but_rejects_other_runtimes() {
         let (mut window, mut session) = target_fixture();
+        session.codex_auth_root = Some(gwt_agent::CodexAuthRoot {
+            path: dunce::canonicalize(std::env::temp_dir()).unwrap(),
+            origin: gwt_agent::CodexAuthRootOrigin::Host,
+        });
         assert!(validate_target(&window, &session).is_ok());
         session.runtime_target = LaunchRuntimeTarget::Docker;
         assert!(validate_target(&window, &session).is_err());

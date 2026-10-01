@@ -19,6 +19,11 @@ pub(crate) struct ResetRequest {
     pub window_id: String,
 }
 
+#[derive(Debug)]
+pub(crate) struct ResetCompleted {
+    pub audit_warning: Option<String>,
+}
+
 pub(crate) trait ResetBackend {
     fn read(&mut self) -> Result<ResetSnapshot, String>;
     fn consume(&mut self, key: &str, credit: &str) -> Result<ResetOutcome, String>;
@@ -38,12 +43,13 @@ impl ResetBackend for CodexResetClient {
 /// approval flag/token parameter and no autonomous-mode shortcut.
 pub(crate) fn execute(
     request: &ResetRequest,
+    auth_root: &gwt_agent::CodexAuthRoot,
     backend: &mut impl ResetBackend,
     confirm: impl FnOnce(&str) -> Result<bool, String>,
     revalidate_target: impl FnOnce() -> Result<(), String>,
     release_hold: impl FnOnce() -> Result<(), String>,
     audit: &mut impl FnMut(&str, &str) -> Result<(), String>,
-) -> Result<(), String> {
+) -> Result<ResetCompleted, String> {
     let result = (|| {
         if request.provider != "codex" {
             return Err(format!("unsupported free reset provider. {CLAUDE_NOTICE}"));
@@ -51,11 +57,12 @@ pub(crate) fn execute(
         let before = backend.read()?;
         let credit = free_credit(&before)?;
         let prompt = format!(
-            "Codex の無料リセットを1回使用します。\n対象 window: {}\nアカウント: {}\n\
+            "Codex の無料リセットを1回使用します。\n対象 window: {}\nアカウント: {}\n認証ルート: {}\n由来: {}\n\
              このアカウントを共有する Codex の対象使用量枠がリセットされます。\n\
              無料リセット枠を1つ消費します。購入や有料追加利用は行いません。\n\
              成功と利用再開を確認した場合のみ gwt の hold を解除します。\n\n{CLAUDE_NOTICE}",
-            request.window_id, before.account_id,
+            request.window_id, before.account_id, auth_root.path.display(),
+            serde_json::to_value(auth_root.origin).map_err(|_| "authentication origin encoding failed")?,
         );
         audit("proposed", &prompt)?;
         if !confirm(&prompt)? {
@@ -92,11 +99,12 @@ pub(crate) fn execute(
             return Err("reset returned success but account recovery is unconfirmed; provider hold retained".into());
         }
         release_hold()?;
-        audit(
+        let audit_warning = audit(
             "completed",
             "Free reset and authoritative hold release confirmed",
-        )?;
-        Ok(())
+        )
+        .err();
+        Ok(ResetCompleted { audit_warning })
     })();
     if let Err(reason) = &result {
         if let Err(audit_error) = audit("failed", reason) {
