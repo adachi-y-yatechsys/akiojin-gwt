@@ -236,6 +236,7 @@ root_js_modules! {
     // presses the surface of the focused window. app.js imports it at module
     // top level, so a missing entry would hang the splash.
     "surface-rail.js" => "installSurfaceRail",
+    "split-surfaces.js" => "createSplitSurfaces",
     // SPEC-3038 (2026-06-20) — Command Rail Windows popover model: groups the
     // cross-tab open-window set by owning project tab so the list matches the
     // badge and supports cross-tab focus.
