@@ -29,6 +29,36 @@ const PR_WORKFLOWS: [&str; 3] = [
 const RUST_CACHE_ACTION: &str = "Swatinem/rust-cache";
 const TOOLCHAIN_ACTION: &str = "dtolnay/rust-toolchain@stable";
 
+#[test]
+fn every_pull_request_rust_cache_disables_pr_cache_saves() {
+    for entry in fs::read_dir(repo_root().join(".github/workflows")).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|s| s.to_str()) != Some("yml") {
+            continue;
+        }
+        let workflow: Value = serde_yaml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        if triggers(&workflow).get("pull_request").is_none() {
+            continue;
+        }
+        for (name, job) in workflow["jobs"].as_mapping().unwrap() {
+            for step in job["steps"].as_sequence().into_iter().flatten() {
+                if step["uses"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .starts_with(RUST_CACHE_ACTION)
+                {
+                    assert_eq!(
+                        step["with"]["save-if"].as_str(),
+                        Some("${{ github.ref == 'refs/heads/develop' }}"),
+                        "{} / {name:?} must not save a PR cache",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// AC-3: the repository cache ceiling is 10 GB and one warmed scope measured
 /// ~540 MB. Each shared key is stored once per warmed branch scope (develop and
 /// main), so the shared keys alone cost `count * 2 * 540 MB`. Three keys leave

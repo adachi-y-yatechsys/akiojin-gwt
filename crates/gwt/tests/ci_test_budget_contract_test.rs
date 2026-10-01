@@ -145,6 +145,117 @@ fn job_body<'a>(workflow: &'a str, header: &str) -> &'a str {
     &body[..end]
 }
 
+/// Issue #4839: hosted runners use deterministic contracts, not host measurements.
+#[test]
+fn hosted_windows_startup_selects_only_the_native_command_contract() {
+    let workflow = read(TEST_WORKFLOW);
+    let job = job_body(&workflow, "  test-windows-rust:");
+    let (_, step) = named_steps(job)
+        .into_iter()
+        .find(|(name, _)| name == "Check Windows startup tray readiness contract")
+        .expect("Windows startup contract step");
+    assert!(step.contains("run: node scripts/ci-windows-tests.mjs run gwt test startup_tray_performance startup_metric_and_native_command_contract -- --exact --test-threads=1 --nocapture"));
+    assert_eq!(timeout_minutes(&step), Some(1));
+    assert!(
+        !step.contains("--ignored"),
+        "the selected test is not ignored"
+    );
+    for host_only in [
+        "startup_tray_under_large_stopped_session_load",
+        "startup_update_resume_under_large_session_load",
+    ] {
+        assert!(
+            !job.contains(host_only),
+            "{host_only} is a dev-host measurement"
+        );
+    }
+}
+
+#[test]
+fn startup_git_budget_is_required_on_linux_and_windows() {
+    let workflow = read(TEST_WORKFLOW);
+    assert!(rust_job(&workflow)
+        .contains("run: cargo nextest run --workspace --all-features --test-threads=1"));
+    let job = job_body(&workflow, "  test-windows-rust:");
+    let (_, step) = named_steps(job)
+        .into_iter()
+        .find(|(name, _)| name == "Check startup update Git-spawn budget")
+        .expect("Windows must run the existing 1500-session Git budget test");
+    assert!(step.contains("run: node scripts/ci-windows-tests.mjs run gwt bin gwt app_runtime::tests::startup_restore_update_marker_1500_sessions_bounds_git_spawns -- --exact --test-threads=1"));
+    assert!(!step.contains("continue-on-error:"));
+    assert!(!step.contains("if:"));
+}
+
+#[test]
+fn native_tray_measurement_runs_only_on_nightly_by_exact_name() {
+    let nightly = read(NIGHTLY_WORKFLOW);
+    let job = job_body(&nightly, "  test-windows-startup-tray:");
+    assert!(job.contains("cargo test -p gwt --test startup_tray_performance startup_tray_under_large_stopped_session_load -- --exact --ignored --test-threads=1 --nocapture"));
+    assert!(!job.contains("startup_update_resume_under_large_session_load"));
+    assert!(job.contains("actions/upload-artifact@"));
+    assert!(job.contains("if: always()"));
+    let reporter = job_body(&nightly, "  report-nightly-failure:");
+    assert!(reporter.contains("test-windows-startup-tray"));
+}
+
+#[test]
+fn linux_infrastructure_regressions_run_beside_the_workspace_suite() {
+    let workflow = read(TEST_WORKFLOW);
+    let job = job_body(&workflow, "  test-linux-infrastructure:");
+    assert!(job.contains("runs-on: ubuntu-latest"));
+    assert!(job.contains("shared-key: linux-workspace"));
+    assert!(job.contains("cargo-nextest@"));
+    assert!(job.contains("scripts/ci-apt.sh gtk-deps"));
+    assert!(!job.contains("needs:"));
+    let prepare = job
+        .find("cargo test -p gwt --all-features --lib --test gwtd_cli_test --no-run")
+        .expect("a fresh job must build the guarded gwtd and stress harness");
+    assert!(
+        prepare
+            < job
+                .find("scripts/test-gwtd-verification-artifact.py")
+                .unwrap()
+    );
+    for script in [
+        "scripts/test-nextest-timeout.mjs",
+        "scripts/test-gwtd-verification-artifact.py",
+        "scripts/test-managed-assets-lock-stress.py",
+    ] {
+        assert!(job.contains(script), "parallel job must retain {script}");
+        assert!(
+            !rust_job(&workflow).contains(script),
+            "main job still runs {script}"
+        );
+    }
+    let required = job_body(&workflow, "  test-rust-required:");
+    assert!(required.contains("name: Test (Rust)\n"));
+    assert!(required.contains("needs: [test, test-linux-infrastructure]"));
+    assert!(required.contains("if: always()"));
+    assert!(required.contains("RUST_RESULT: ${{ needs.test.result }}"));
+    assert!(required.contains("INFRA_RESULT: ${{ needs.test-linux-infrastructure.result }}"));
+    assert!(required.contains("test \"$RUST_RESULT\" = success"));
+    assert!(required.contains("test \"$INFRA_RESULT\" = success"));
+}
+
+#[test]
+fn windows_filters_use_prebuilt_targets_with_one_build_per_feature_set() {
+    let workflow = read(TEST_WORKFLOW);
+    let job = job_body(&workflow, "  test-windows-rust:");
+    assert_eq!(job.matches("ci-windows-tests.mjs build default").count(), 1);
+    assert_eq!(job.matches("ci-windows-tests.mjs build warm").count(), 1);
+    assert!(
+        !job.contains("cargo test"),
+        "filters must execute built binaries"
+    );
+    let warm = job.find("ci-windows-tests.mjs build warm").unwrap();
+    assert!(job.rfind("ci-windows-tests.mjs run ").unwrap() < warm);
+    assert!(
+        job.find("ci-windows-tests.mjs build default").unwrap()
+            < job.find("ci-windows-tests.mjs run ").unwrap()
+    );
+    assert!(job.contains("ci-windows-tests.mjs run-warm gwt lib gwt cli::hook::event_dispatcher::tests::warm_four_megabyte_history_user_prompt_submit_p95_stays_within_budget"));
+}
+
 /// Issue #4134 AC-1: the three-pass determinism loop is the single most
 /// expensive thing PR CI used to do, and it re-ran a suite Linux had already
 /// proven. It keeps its purpose on a nightly schedule; PR CI must not pay for

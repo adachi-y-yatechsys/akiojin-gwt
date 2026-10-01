@@ -69,6 +69,8 @@ pub(crate) struct MonitorTerminalFacts {
     /// The Issue holds a failure record (launch / agent failure, or an
     /// operator stop hold).
     pub(crate) failure_hold: bool,
+    /// Issue #4802 AC-3: the hold is an operator stop through the Monitor.
+    pub(crate) monitor_stopped: bool,
 }
 
 impl MonitorTerminalFacts {
@@ -84,6 +86,7 @@ impl MonitorTerminalFacts {
             issue_closed: facts.issue_closed,
             needs_human: facts.needs_human,
             failure_hold: facts.failure_hold,
+            monitor_stopped: facts.monitor_stopped,
         }
     }
 }
@@ -110,6 +113,13 @@ pub(crate) enum TerminalCloseReason {
     /// FR-044 (c): the Monitor durably replaced this launch with another
     /// window and this one is no longer running.
     RevokedLaunch,
+    /// Issue #4802 AC-3: an idle pane whose Issue the Monitor bound to another
+    /// window, and whose Session is not the Issue's execution writer — the
+    /// duplicate a relaunch left behind.
+    LostOwnership,
+    /// Issue #4802 AC-3: an idle pane of an Issue the operator stopped
+    /// through the Monitor.
+    MonitorStopped,
 }
 
 impl TerminalCloseReason {
@@ -118,6 +128,8 @@ impl TerminalCloseReason {
             Self::SettledExecution => "settled_execution",
             Self::ClosedIssue => "closed_issue",
             Self::RevokedLaunch => "revoked_launch",
+            Self::LostOwnership => "lost_ownership",
+            Self::MonitorStopped => "monitor_stopped",
         }
     }
 }
@@ -155,6 +167,12 @@ pub(crate) fn classify_terminal_window(facts: &TerminalWindowFacts) -> TerminalC
     let Some(monitor) = facts.monitor.as_ref() else {
         return Ineligible("monitor_unreadable");
     };
+    // Issue #4802 AC-3: ahead of the hold checks, because a Monitor stop is
+    // itself a hold, and ahead of the obligation checks, because a pane that
+    // lost ownership is not the writer those obligations belong to.
+    if let Some(reason) = orphaned_idle_pane_reason(facts, monitor, session_status) {
+        return Eligible(reason);
+    }
     if monitor.needs_human {
         return Ineligible("needs_human");
     }
@@ -199,6 +217,56 @@ pub(crate) fn classify_terminal_window(facts: &TerminalWindowFacts) -> TerminalC
         return Ineligible("monitor_tracking_unsettled");
     }
     Ineligible("not_terminal")
+}
+
+/// Issue #4802 AC-3: an idle pane nothing owns any more.
+///
+/// The close predicate used to reach only a fully Stopped revoked launch, so
+/// the prompt-ready duplicates a relaunch left behind and the panes of Issues
+/// the operator stopped stayed on the canvas indefinitely. Both are closed
+/// here, and only while idle: a pane in a turn (Running / Starting / Waiting)
+/// or held for recovery (Interrupted) is never a candidate, which keeps the
+/// #3482 rule that a working pane is not killed. A pane the Monitor still
+/// binds is never orphaned, and an unreadable or corrupt execution record
+/// fails closed.
+fn orphaned_idle_pane_reason(
+    facts: &TerminalWindowFacts,
+    monitor: &MonitorTerminalFacts,
+    session_status: gwt_agent::AgentStatus,
+) -> Option<TerminalCloseReason> {
+    use gwt::cli::execution_state::{ExecutionBindingState, ExecutionDiagnosisState};
+
+    if monitor.binds_this_window {
+        return None;
+    }
+    let idle = matches!(
+        facts.window_status,
+        WindowProcessStatus::Idle | WindowProcessStatus::Stopped
+    ) && matches!(
+        session_status,
+        gwt_agent::AgentStatus::Idle | gwt_agent::AgentStatus::Stopped
+    );
+    if !idle {
+        return None;
+    }
+    let execution = facts.execution.as_ref()?;
+    if execution.status == ExecutionDiagnosisState::Corrupt
+        || execution.binding == ExecutionBindingState::Corrupt
+    {
+        return None;
+    }
+    if monitor.monitor_stopped {
+        return Some(TerminalCloseReason::MonitorStopped);
+    }
+    // The Session that still holds the execution generation is the writer:
+    // closing it would strand the Work, whichever window the Monitor binds.
+    if monitor.binds_other_window
+        && !monitor.needs_human
+        && execution.binding != ExecutionBindingState::Bound
+    {
+        return Some(TerminalCloseReason::LostOwnership);
+    }
+    None
 }
 
 /// Issue #4441: translate one close-side ineligibility cause into a
@@ -267,12 +335,63 @@ pub(crate) enum RestoreAdmission {
     RefuseTerminal(TerminalCloseReason),
     /// The owner is closed, but cleanup must retain its diagnostic window.
     RefuseRetainedTerminal,
+    /// Issue #4802 (AC-4): the execution reached Completed, so the Work is
+    /// finished even while a settlement obligation is open. Do not spawn;
+    /// keep the placeholder as the diagnostic.
+    RefuseCompletedWork,
     /// Issue #4441 (AC-3): the Issue Monitor is holding this row. Do not
     /// spawn, but keep the placeholder — the hold is reversible.
     RefuseHeld(&'static str),
     /// The canonical facts could not be read. Do not spawn, but keep the
     /// placeholder: the next generation may be able to prove the answer.
     RefuseUnprovable(&'static str),
+}
+
+/// FR-047 / Issue #4143 (AC-2) / Issue #4802 (AC-4): the restore decision for
+/// one Issue-linked Session, from the canonical facts. `has_window` is whether
+/// a persisted placeholder names the exact window; an orphan Session has no
+/// identity to compare against the Monitor binding.
+pub(crate) fn restore_admission_for_facts(
+    facts: &TerminalWindowFacts,
+    has_window: bool,
+) -> RestoreAdmission {
+    match classify_terminal_window(facts) {
+        TerminalCloseEligibility::Eligible(
+            TerminalCloseReason::RevokedLaunch | TerminalCloseReason::LostOwnership,
+        ) if !has_window => RestoreAdmission::Admit,
+        // Issue #4441 AC-3 / #4802 AC-4: a stop is a reversible hold, so
+        // nothing spawns but the placeholder stays for the release.
+        TerminalCloseEligibility::Eligible(TerminalCloseReason::MonitorStopped) => {
+            RestoreAdmission::RefuseHeld("monitor_stopped")
+        }
+        TerminalCloseEligibility::Eligible(reason) => RestoreAdmission::RefuseTerminal(reason),
+        // Reopened #4143: diagnostic retention is not permission to
+        // restart a closed owner's process. Keep its placeholder, but
+        // refuse automatic spawn even for Blocked/open-obligation ECRs.
+        // This outranks the per-cause mapping below, which answers "could
+        // this cause be established", not "is this owner finished".
+        TerminalCloseEligibility::Ineligible(_)
+            if facts
+                .monitor
+                .as_ref()
+                .is_some_and(|monitor| monitor.issue_closed) =>
+        {
+            RestoreAdmission::RefuseRetainedTerminal
+        }
+        // Issue #4802 AC-4: an execution that reached Completed is
+        // finished Work even while a settlement obligation is still open.
+        // Restarting its agent is what brought finished Issues' windows
+        // back after a restart; the placeholder is retained as the
+        // diagnostic, but nothing spawns.
+        TerminalCloseEligibility::Ineligible(_)
+            if facts.execution.as_ref().is_some_and(|execution| {
+                execution.status == gwt::cli::execution_state::ExecutionDiagnosisState::Completed
+            }) =>
+        {
+            RestoreAdmission::RefuseCompletedWork
+        }
+        TerminalCloseEligibility::Ineligible(cause) => restore_admission_for_ineligible(cause),
+    }
 }
 
 /// Immutable facts about one Issue-linked Agent window captured on the Tao
@@ -745,28 +864,7 @@ impl AppRuntime {
             WindowProcessStatus::Stopped,
             project_root,
         );
-        match classify_terminal_window(&facts) {
-            TerminalCloseEligibility::Eligible(TerminalCloseReason::RevokedLaunch)
-                if window_id.is_none() =>
-            {
-                RestoreAdmission::Admit
-            }
-            TerminalCloseEligibility::Eligible(reason) => RestoreAdmission::RefuseTerminal(reason),
-            // Reopened #4143: diagnostic retention is not permission to
-            // restart a closed owner's process. Keep its placeholder, but
-            // refuse automatic spawn even for Blocked/open-obligation ECRs.
-            // This outranks the per-cause mapping below, which answers "could
-            // this cause be established", not "is this owner finished".
-            TerminalCloseEligibility::Ineligible(_)
-                if facts
-                    .monitor
-                    .as_ref()
-                    .is_some_and(|monitor| monitor.issue_closed) =>
-            {
-                RestoreAdmission::RefuseRetainedTerminal
-            }
-            TerminalCloseEligibility::Ineligible(cause) => restore_admission_for_ineligible(cause),
-        }
+        restore_admission_for_facts(&facts, window_id.is_some())
     }
 
     /// Persist a terminal/empty restore refusal and remove its placeholder.
@@ -945,6 +1043,208 @@ mod tests {
         assert_eq!(
             classify_terminal_window(&live),
             TerminalCloseEligibility::Eligible(TerminalCloseReason::RevokedLaunch)
+        );
+    }
+
+    fn idle_pane(
+        execution: ExecutionTerminalFacts,
+        monitor: MonitorTerminalFacts,
+    ) -> TerminalWindowFacts {
+        TerminalWindowFacts {
+            window_status: WindowProcessStatus::Idle,
+            ..facts(Some(execution), Some(monitor))
+        }
+    }
+
+    fn duplicate_monitor() -> MonitorTerminalFacts {
+        MonitorTerminalFacts {
+            binds_other_window: true,
+            ..MonitorTerminalFacts::default()
+        }
+    }
+
+    fn stopped_monitor() -> MonitorTerminalFacts {
+        // What `IssueMonitorState::stop_only` leaves: the binding revoked,
+        // the row parked for a human, and a failure record naming the stop.
+        MonitorTerminalFacts {
+            needs_human: true,
+            failure_hold: true,
+            monitor_stopped: true,
+            ..MonitorTerminalFacts::default()
+        }
+    }
+
+    fn non_writer(execution: ExecutionTerminalFacts) -> ExecutionTerminalFacts {
+        ExecutionTerminalFacts {
+            binding: ExecutionBindingState::Stale,
+            ..execution
+        }
+    }
+
+    /// Issue #4802 AC-3: an idle duplicate whose Issue the Monitor bound to
+    /// another window is closed, even though the execution still has open
+    /// obligations; they belong to the writer, not to this pane.
+    #[test]
+    fn idle_pane_that_lost_ownership_is_eligible() {
+        assert_eq!(
+            classify_terminal_window(&idle_pane(
+                non_writer(active_execution(42)),
+                duplicate_monitor()
+            )),
+            TerminalCloseEligibility::Eligible(TerminalCloseReason::LostOwnership)
+        );
+    }
+
+    /// Issue #4802 AC-3 / #3482: a duplicate that is working, is held for
+    /// recovery, or still holds the execution generation is never closed.
+    #[test]
+    fn lost_ownership_never_closes_a_working_or_writing_pane() {
+        for status in [
+            WindowProcessStatus::Running,
+            WindowProcessStatus::Starting,
+            WindowProcessStatus::Waiting,
+        ] {
+            let mut working = idle_pane(non_writer(active_execution(42)), duplicate_monitor());
+            working.window_status = status;
+            assert!(
+                !matches!(
+                    classify_terminal_window(&working),
+                    TerminalCloseEligibility::Eligible(_)
+                ),
+                "{status:?} pane must be retained"
+            );
+        }
+        let mut in_turn = idle_pane(non_writer(active_execution(42)), duplicate_monitor());
+        in_turn.session_status = Some(gwt_agent::AgentStatus::Running);
+        assert!(!matches!(
+            classify_terminal_window(&in_turn),
+            TerminalCloseEligibility::Eligible(_)
+        ));
+        let mut interrupted = idle_pane(non_writer(active_execution(42)), duplicate_monitor());
+        interrupted.session_status = Some(gwt_agent::AgentStatus::Interrupted);
+        assert_eq!(
+            classify_terminal_window(&interrupted),
+            TerminalCloseEligibility::Ineligible("session_interrupted")
+        );
+        assert_eq!(
+            classify_terminal_window(&idle_pane(active_execution(42), duplicate_monitor())),
+            TerminalCloseEligibility::Ineligible("obligation_open"),
+            "the execution writer keeps its pane"
+        );
+        let mut corrupt = non_writer(active_execution(42));
+        corrupt.binding = ExecutionBindingState::Corrupt;
+        assert_eq!(
+            classify_terminal_window(&idle_pane(corrupt, duplicate_monitor())),
+            TerminalCloseEligibility::Ineligible("execution_blocked_or_corrupt")
+        );
+        let still_bound = MonitorTerminalFacts {
+            binds_this_window: true,
+            ..MonitorTerminalFacts::default()
+        };
+        assert_eq!(
+            classify_terminal_window(&idle_pane(non_writer(active_execution(42)), still_bound)),
+            TerminalCloseEligibility::Ineligible("obligation_open")
+        );
+    }
+
+    /// Issue #4802 AC-3: the idle pane of an Issue stopped through the
+    /// Monitor is closed; a pane still in a turn is not.
+    #[test]
+    fn idle_pane_of_a_monitor_stopped_issue_is_eligible() {
+        assert_eq!(
+            classify_terminal_window(&idle_pane(active_execution(42), stopped_monitor())),
+            TerminalCloseEligibility::Eligible(TerminalCloseReason::MonitorStopped)
+        );
+        let mut running = idle_pane(active_execution(42), stopped_monitor());
+        running.window_status = WindowProcessStatus::Running;
+        running.session_status = Some(gwt_agent::AgentStatus::Running);
+        assert_eq!(
+            classify_terminal_window(&running),
+            TerminalCloseEligibility::Ineligible("needs_human")
+        );
+        // A failure hold that is not an operator stop keeps its pane.
+        let failed = MonitorTerminalFacts {
+            failure_hold: true,
+            ..MonitorTerminalFacts::default()
+        };
+        assert_eq!(
+            classify_terminal_window(&idle_pane(active_execution(42), failed)),
+            TerminalCloseEligibility::Ineligible("failure_hold")
+        );
+    }
+
+    /// Issue #4802 AC-4: a restart restores no window for a stopped, held or
+    /// completed Issue, and still restores live Work.
+    #[test]
+    fn restore_refuses_stopped_held_and_completed_issues() {
+        let placeholder = |execution: ExecutionTerminalFacts, monitor: MonitorTerminalFacts| {
+            TerminalWindowFacts {
+                window_status: WindowProcessStatus::Stopped,
+                session_status: Some(gwt_agent::AgentStatus::Stopped),
+                ..facts(Some(execution), Some(monitor))
+            }
+        };
+        let restore = |facts: TerminalWindowFacts| restore_admission_for_facts(&facts, true);
+
+        assert_eq!(
+            restore(placeholder(active_execution(42), stopped_monitor())),
+            RestoreAdmission::RefuseHeld("monitor_stopped")
+        );
+        assert_eq!(
+            restore(placeholder(
+                active_execution(42),
+                MonitorTerminalFacts {
+                    failure_hold: true,
+                    ..MonitorTerminalFacts::default()
+                }
+            )),
+            RestoreAdmission::RefuseHeld("failure_hold")
+        );
+        assert_eq!(
+            restore(placeholder(
+                active_execution(42),
+                MonitorTerminalFacts {
+                    needs_human: true,
+                    ..MonitorTerminalFacts::default()
+                }
+            )),
+            RestoreAdmission::RefuseHeld("needs_human")
+        );
+        let mut completed_unsettled = settled_execution(42);
+        completed_unsettled.settlement_clear = false;
+        completed_unsettled.settlement_obligation_open = true;
+        assert_eq!(
+            restore(placeholder(
+                completed_unsettled,
+                MonitorTerminalFacts::default()
+            )),
+            RestoreAdmission::RefuseCompletedWork,
+            "a Completed execution is finished Work even with an open obligation"
+        );
+        assert_eq!(
+            restore(placeholder(settled_execution(42), tracked_monitor())),
+            RestoreAdmission::RefuseTerminal(TerminalCloseReason::SettledExecution)
+        );
+        assert_eq!(
+            restore(placeholder(
+                non_writer(active_execution(42)),
+                duplicate_monitor()
+            )),
+            RestoreAdmission::RefuseTerminal(TerminalCloseReason::LostOwnership),
+            "a duplicate placeholder does not come back"
+        );
+        assert_eq!(
+            restore_admission_for_facts(
+                &placeholder(non_writer(active_execution(42)), duplicate_monitor()),
+                false
+            ),
+            RestoreAdmission::Admit,
+            "an orphan Session has no window identity to judge"
+        );
+        assert_eq!(
+            restore(placeholder(active_execution(42), tracked_monitor())),
+            RestoreAdmission::Admit,
+            "live Work still restores"
         );
     }
 
