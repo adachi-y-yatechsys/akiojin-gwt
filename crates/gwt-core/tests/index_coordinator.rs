@@ -11,7 +11,7 @@ use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Child;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -566,47 +566,26 @@ fn wait_for_file(path: &Path, deadline: Duration) {
 // Issue #4360: cross-process marker publication must be all-or-nothing
 // ---------------------------------------------------------------------------
 
-/// AC-1 (writer side): a reader that observes the destination must never find
-/// it existing yet empty. `fs::write` truncates first and fills afterwards, so
-/// the gap between those two steps is exactly the window a loaded host widens.
+/// AC-1 (writer side): publication replaces the file instead of truncating it.
 #[test]
-fn publish_marker_never_exposes_an_empty_destination() {
+fn publish_marker_preserves_the_previous_file_contents() {
     let arena = TestArena::new();
     let path = arena.path("published-marker");
-    let observed = Arc::new(AtomicBool::new(false));
-    let done = Arc::new(AtomicBool::new(false));
+    let previous = arena.path("previous-marker");
+    publish_marker(&path, b"queued").expect("publish initial marker");
 
-    let observer = {
-        let path = path.clone();
-        let observed = Arc::clone(&observed);
-        let done = Arc::clone(&done);
-        std::thread::spawn(move || {
-            let mut empty_reads = 0_u64;
-            while !done.load(Ordering::Relaxed) {
-                if let Ok(content) = fs::read_to_string(&path) {
-                    observed.store(true, Ordering::Relaxed);
-                    if content.is_empty() {
-                        empty_reads += 1;
-                    }
-                }
-            }
-            empty_reads
-        })
-    };
+    // A hard link observes the old file without an open reader competing with
+    // Windows rename. Direct writes mutate both paths and fail deterministically.
+    fs::hard_link(&path, &previous).expect("retain the previous marker");
+    publish_marker(&path, b"completed-with-result").expect("publish replacement marker");
 
-    for turn in 0..2_000 {
-        publish_marker(&path, format!("turn-{turn}").as_bytes()).expect("publish marker");
-    }
-    done.store(true, Ordering::Relaxed);
-    let empty_reads = observer.join().expect("observer thread");
-
-    assert!(
-        observed.load(Ordering::Relaxed),
-        "the observer never managed to read the marker, so the run proves nothing"
+    assert_eq!(
+        fs::read(&previous).expect("read previous marker"),
+        b"queued"
     );
     assert_eq!(
-        empty_reads, 0,
-        "a published marker must never be observable as an existing empty file"
+        fs::read(&path).expect("read published marker"),
+        b"completed-with-result"
     );
 }
 
