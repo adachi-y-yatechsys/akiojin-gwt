@@ -51637,6 +51637,130 @@ fn durable_issue_monitor_delivery_materializes_one_window_and_replay_only_acks()
     );
 }
 
+/// Issue #4802 AC-2: a launch into a worktree that already has a live agent
+/// pane is refused. The Monitor delivery is acknowledged onto the running pane
+/// instead, so the Issue ends up bound to one pane rather than accumulating a
+/// fresh one per relaunch (#4758 collected sixteen). A finished pane does not
+/// block a launch.
+#[test]
+fn issue_monitor_delivery_into_a_worktree_with_a_live_agent_pane_adopts_it() {
+    let _env_lock = env_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (label, pane_status, expect_adoption) in [
+        ("running pane", WindowProcessStatus::Running, true),
+        ("idle pane", WindowProcessStatus::Idle, true),
+        ("stopped pane", WindowProcessStatus::Stopped, false),
+    ] {
+        let temp = tempdir().expect("tempdir");
+        let _home = ScopedEnvVar::set("HOME", temp.path());
+        let _userprofile = ScopedEnvVar::set("USERPROFILE", temp.path());
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("create repo");
+        init_repo_with_initial_commit(&repo);
+        let sessions_dir = temp.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("create sessions dir");
+        gwt_agent::Session::new(&repo, "develop", gwt_agent::AgentId::Codex)
+            .save(&sessions_dir)
+            .expect("save previous session");
+        let mut monitor = gwt::IssueMonitorState::new(gwt::IssueMonitorConfig {
+            enabled: true,
+            ..gwt::IssueMonitorConfig::default()
+        });
+        monitor.terminal_queue_push(&[3165], "operator", "2026-07-28T00:00:00Z");
+        monitor.record_candidate(gwt::IssueMonitorIssue {
+            number: 3165,
+            title: "SPEC: duplicate launch".to_string(),
+            labels: vec!["gwt-spec".to_string()],
+            state: gwt::IssueMonitorIssueState::Open,
+            body: None,
+            url: None,
+            readiness: gwt::IssueMonitorReadiness::Ready,
+            updated_at: None,
+        });
+        assert!(monitor.apply_confirmed_claim(
+            3165,
+            "claim-3165",
+            "host/session",
+            "effect-3165",
+            "2026-07-28T00:00:00Z",
+        ));
+        let prefs_path = gwt::issue_monitor_prefs_path_for_repo_path(&repo);
+        gwt::save_issue_monitor_prefs(&prefs_path, &monitor.prefs()).expect("seed delivery");
+        let mut tab = sample_project_tab(
+            "tab-1",
+            "Repo",
+            repo.clone(),
+            ProjectKind::Git,
+            &[WindowPreset::Agent],
+        );
+        let raw_window_id = tab.workspace.persisted().windows[0].id.clone();
+        assert!(tab
+            .workspace
+            .set_linked_issue_number(&raw_window_id, Some(3165)));
+        tab.workspace.set_status(&raw_window_id, pane_status);
+        let (mut runtime, _recorded_events) =
+            sample_runtime_with_events(temp.path(), vec![tab], Some("tab-1"));
+        let live_window_id = combined_window_id("tab-1", &raw_window_id);
+        if pane_status == WindowProcessStatus::Stopped {
+            runtime
+                .window_pty_statuses
+                .insert(live_window_id.clone(), pane_status);
+        } else {
+            runtime
+                .window_pty_statuses
+                .insert(live_window_id.clone(), WindowProcessStatus::Running);
+            runtime
+                .window_hook_states
+                .insert(live_window_id.clone(), pane_status);
+        }
+        assert_eq!(runtime.window_status(&live_window_id), Some(pane_status));
+
+        let events = runtime.auto_launch_issue_monitor_delivery_events(
+            &runtime.test_context(),
+            3165,
+            LinkedIssueKind::Spec,
+            Some("launch:effect-3165".to_string()),
+            gwt::IssueMonitorLaunchSessionStrategy::ResumeIfSafe,
+        );
+        let agent_windows = runtime.tabs[0]
+            .workspace
+            .persisted()
+            .windows
+            .iter()
+            .filter(|window| window.preset == WindowPreset::Agent)
+            .count();
+        let prefs = gwt::load_issue_monitor_prefs(&prefs_path).expect("reload prefs");
+        let reloaded =
+            gwt::IssueMonitorState::with_prefs(gwt::IssueMonitorConfig::default(), prefs.clone());
+        if expect_adoption {
+            assert_eq!(agent_windows, 1, "{label}: no second pane is opened");
+            assert!(
+                events.iter().any(|event| matches!(
+                    &event.event,
+                    BackendEvent::IssueMonitorToast { message, .. }
+                        if message.contains("did not open a second pane")
+                )),
+                "{label}: the refusal is reported"
+            );
+            assert!(
+                prefs.pending_launch_deliveries.is_empty(),
+                "{label}: the delivery is acknowledged onto the live pane"
+            );
+            assert_eq!(
+                reloaded.launched_window_issue(&live_window_id),
+                Some(3165),
+                "{label}: the Issue is bound to the pane already working it"
+            );
+        } else {
+            assert_eq!(
+                agent_windows, 2,
+                "{label}: a finished pane does not block a launch"
+            );
+        }
+    }
+}
+
 #[test]
 fn durable_delivery_fallback_commit_budget_is_an_explicit_runtime_dependency() {
     // Issue #3878: the local fallback commit that claims, marks and ACKs a
@@ -53318,6 +53442,12 @@ fn app_runtime_monitor_resume_if_safe_resumes_only_present_provider_conversation
 
 /// SPEC #3165 T-226 / FR-102: writer exclusion keys on the exact native
 /// conversation, not branch equality, and preserves a known holder window id.
+///
+/// Issue #4802 AC-2 narrows the live-holder rows: a holder that is a live
+/// agent pane in the Issue's worktree is no longer answered with a second
+/// pane (fresh successor or exact resume). The launch is refused and
+/// acknowledged onto that pane, still naming the holder window id. Only the
+/// materializing holder, which has no live pane yet, still gets a successor.
 #[test]
 fn app_runtime_monitor_resume_if_safe_uses_exact_native_writer_identity() {
     let _env_lock = env_test_lock()
@@ -53334,14 +53464,21 @@ fn app_runtime_monitor_resume_if_safe_uses_exact_native_writer_identity() {
     let _forward_token = ScopedEnvVar::unset(gwt_agent::GWT_HOOK_FORWARD_TOKEN_ENV);
     let _pane_url = ScopedEnvVar::unset(gwt_agent::GWT_PANE_WS_URL_ENV);
 
-    for (case_name, holder) in [
+    for (case_name, holder, live_pane_refuses) in [
         (
             "active-same-native",
             MonitorNativeHolderFixture::ActiveSameConversation,
+            true,
         ),
         (
             "materializing-same-native",
             MonitorNativeHolderFixture::MaterializingSameConversation,
+            false,
+        ),
+        (
+            "active-other-native",
+            MonitorNativeHolderFixture::ActiveOtherConversation,
+            true,
         ),
     ] {
         let mut fixture = monitor_relaunch_fixture(
@@ -53368,6 +53505,13 @@ fn app_runtime_monitor_resume_if_safe_uses_exact_native_writer_identity() {
                 Some(WindowProcessStatus::Running),
                 "the active holder case must represent a live Running window",
             ),
+            // No hook state: the other-conversation holder sits at its
+            // prompt, which is still a live pane for Issue #4802 AC-2.
+            MonitorNativeHolderFixture::ActiveOtherConversation => assert_eq!(
+                fixture.runtime.window_status(holder_window_id),
+                Some(WindowProcessStatus::Idle),
+                "the other-conversation holder must represent a live Idle window",
+            ),
             MonitorNativeHolderFixture::MaterializingSameConversation => {
                 assert!(fixture.runtime.window_lookup.contains_key(holder_window_id));
                 assert!(fixture
@@ -53386,29 +53530,45 @@ fn app_runtime_monitor_resume_if_safe_uses_exact_native_writer_identity() {
             )),
             "known holder diagnostic must include {holder_window_id}",
         );
+        if live_pane_refuses {
+            // Issue #4802 AC-2: the live pane in the Issue worktree is the
+            // launch; no successor window is opened and nothing is spawned.
+            assert!(
+                events.iter().any(|event| matches!(
+                    &event.event,
+                    BackendEvent::IssueMonitorToast { message, .. }
+                        if message.contains("did not open a second pane")
+                )),
+                "{case_name}: the refusal is reported",
+            );
+            assert_eq!(
+                fixture.runtime.tabs[0]
+                    .workspace
+                    .persisted()
+                    .windows
+                    .iter()
+                    .filter(|window| window.preset == WindowPreset::Agent)
+                    .count(),
+                1,
+                "{case_name}: the live holder stays the only agent pane",
+            );
+            assert!(
+                !fixture
+                    .recorded_events
+                    .lock()
+                    .expect("event log")
+                    .iter()
+                    .any(|event| matches!(
+                        recorded_project_payload(event),
+                        UserEvent::LaunchComplete { .. }
+                    )),
+                "{case_name}: a refused launch completes nothing",
+            );
+            continue;
+        }
         let result = take_monitor_launch_complete(case_name, &fixture.recorded_events);
         assert_monitor_fresh_successor(result, &fixture);
     }
-
-    let mut different = monitor_relaunch_fixture(
-        temp.path(),
-        "active-other-native",
-        MonitorProviderConversationFixture::Present,
-        MonitorNativeHolderFixture::ActiveOtherConversation,
-        false,
-    );
-    different.runtime.auto_launch_issue_monitor_delivery_events(
-        &different.runtime.test_context(),
-        3165,
-        LinkedIssueKind::Spec,
-        None,
-        gwt::IssueMonitorLaunchSessionStrategy::ResumeIfSafe,
-    );
-    let result = take_monitor_launch_complete(
-        "same branch different native conversation",
-        &different.recorded_events,
-    );
-    assert_monitor_exact_resume(result, &different);
 }
 
 /// Issue #3716 AC-2: when the exact native conversation is still held by its
