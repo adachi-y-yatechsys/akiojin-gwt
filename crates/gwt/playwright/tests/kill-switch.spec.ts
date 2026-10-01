@@ -300,7 +300,16 @@ test.describe("Anshin Phase 1 kill-switch + attention", () => {
       .click();
     await expect(monitor.win).toBeVisible();
     await expect(manual.win).toBeHidden();
-    await emitStatePair("agent-3", "waiting");
+    // Issue #4887: start the next state in the same browser task after the
+    // focus helper returns, so a queued running snapshot cannot hide behind
+    // another Playwright round trip before the waiting episode begins.
+    await page.evaluate(async () => {
+      await (window as any).__killSwitchFixture.focusAndWait("agent-3");
+      await (window as any).__killSwitchFixture.emitBatchAndWait([
+        { kind: "window_state", window_id: "agent-3", state: "waiting" },
+        { kind: "terminal_status", id: "agent-3", status: "waiting" },
+      ]);
+    });
     // A focus response also carries the backend workspace model. Deliver that
     // snapshot explicitly so stale fixture status cannot hide behind timing.
     await page.evaluate(() => (window as any).__killSwitchFixture.focusAndWait("agent-3"));
@@ -483,6 +492,11 @@ async function installKillSwitchBackend(page) {
       async focusAndWait(id) {
         if (!socketRef) throw new Error("fixture socket is not connected");
         await socketRef.send(JSON.stringify({ kind: "focus_window", id }));
+        // Match emitBatchAndWait: emit completion only means the WebSocket
+        // frame was queued; its dispatcher and render work still need to run.
+        await new Promise((resolve) =>
+          requestAnimationFrame(() => requestAnimationFrame(resolve)),
+        );
       },
       async emitBatchAndWait(payloads) {
         if (!socketRef) throw new Error("fixture socket is not connected");
