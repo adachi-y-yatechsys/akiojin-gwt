@@ -229,12 +229,43 @@ fn linux_infrastructure_regressions_run_beside_the_workspace_suite() {
     }
     let required = job_body(&workflow, "  test-rust-required:");
     assert!(required.contains("name: Test (Rust)\n"));
-    assert!(required.contains("needs: [test, test-linux-infrastructure]"));
+    assert!(
+        required.contains("needs: [test, test-linux-infrastructure, test-windows-verify-timings]")
+    );
     assert!(required.contains("if: always()"));
     assert!(required.contains("RUST_RESULT: ${{ needs.test.result }}"));
     assert!(required.contains("INFRA_RESULT: ${{ needs.test-linux-infrastructure.result }}"));
     assert!(required.contains("test \"$RUST_RESULT\" = success"));
     assert!(required.contains("test \"$INFRA_RESULT\" = success"));
+}
+
+#[test]
+fn paired_windows_timings_preserve_both_artifacts_and_gate_delivery() {
+    let workflow = read(TEST_WORKFLOW);
+    let job = job_body(&workflow, "  test-windows-verify-timings:");
+    assert!(job.contains("runs-on: windows-latest"));
+    assert!(job.contains("needs: changes"));
+    // Unknown/failed classification must measure, not silently skip.
+    assert!(job.contains("!cancelled() && needs.changes.outputs.verify_timings != 'false'"));
+    assert!(job.contains("cargo-nextest@0.9.146"));
+    let (_, measure) = named_steps(job)
+        .into_iter()
+        .find(|(name, _)| name == "Measure serial and grouped derived gwt-lib schedules")
+        .expect("both schedules run in one step on the same host");
+    assert!(measure.contains("python scripts/ci_verify_timings.py --output target/verify-timings"));
+    assert!(!measure.contains("continue-on-error"));
+    let (_, upload) = named_steps(job)
+        .into_iter()
+        .find(|(name, _)| name == "Upload both measurements even on failure")
+        .expect("preserve raw evidence when a measurement fails");
+    assert!(upload.contains("if: always()"));
+    assert!(upload.contains("path: target/verify-timings/"));
+    assert!(upload.contains("if-no-files-found: error"));
+    let required = job_body(&workflow, "  test-rust-required:");
+    assert!(required.contains("TIMINGS_RESULT: ${{ needs.test-windows-verify-timings.result }}"));
+    assert!(required.contains("WORKFLOW_CANCELLED: ${{ cancelled() }}"));
+    assert!(required.contains("test \"$WORKFLOW_CANCELLED\" = false"));
+    assert!(required.contains("case \"$TIMINGS_RESULT\" in success|skipped) ;; *) exit 1 ;; esac"));
 }
 
 #[test]
