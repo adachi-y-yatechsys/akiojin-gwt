@@ -650,17 +650,25 @@ impl WindowCanvasState {
     /// so folding it back into the list needs no arguments. Refused when the window has
     /// no Issue behind it (FR-013) or no Issue window is left to host it — either way the
     /// window stays on the canvas rather than vanishing into a placement nothing renders.
-    pub fn dock_agent_window_to_issue(&mut self, id: &str) -> bool {
-        let Some(index) = self.window_index(id) else {
-            return false;
-        };
-        let Some(issue_number) = self.persisted.windows[index].linked_issue_number else {
-            return false;
-        };
-        let Some(issue_window_id) = self.issue_preview_host_window_id() else {
-            return false;
-        };
-        self.place_agent_window_in_issue_preview(id, &issue_window_id, issue_number)
+    pub fn dock_agent_window_to_issue(&mut self, id: &str) -> Result<(), &'static str> {
+        let index = self.window_index(id).ok_or("window no longer exists")?;
+        let window = &self.persisted.windows[index];
+        let issue_number = window.linked_issue_number.ok_or("no linked Issue")?;
+        if !window.preset.is_agent_terminal() || !window.placement.is_canvas() {
+            return Err("window is not an agent on the canvas");
+        }
+        let issue_window_id = self
+            .issue_preview_host_window_id()
+            .ok_or("no Issue or Issue Monitor window is open")?;
+
+        // Validate first so refused requests preserve both placement and group state.
+        // Reuse tab detachment to promote the remaining active tab/dissolve singletons.
+        if self.persisted.windows[index].tab_group_id.is_some() {
+            let geometry = self.persisted.windows[index].geometry.clone();
+            self.detach_window_tab(id, geometry);
+        }
+        self.place_agent_window_in_issue_preview(id, &issue_window_id, issue_number);
+        Ok(())
     }
 
     pub fn move_agent_kanban_card(
@@ -1372,7 +1380,7 @@ mod tests {
         assert!(workspace.place_agent_window_in_issue_preview(&agent.id, &issue.id, 3885));
         assert!(workspace.undock_agent_window(&agent.id, None));
 
-        assert!(workspace.dock_agent_window_to_issue(&agent.id));
+        assert!(workspace.dock_agent_window_to_issue(&agent.id).is_ok());
 
         assert_eq!(
             workspace.window(&agent.id).expect("agent").placement,
@@ -1391,7 +1399,7 @@ mod tests {
         let _issue = workspace.add_window(WindowPreset::Issue, arrange_bounds());
         let agent = workspace.add_window(WindowPreset::Agent, arrange_bounds());
 
-        assert!(!workspace.dock_agent_window_to_issue(&agent.id));
+        assert!(workspace.dock_agent_window_to_issue(&agent.id).is_err());
         assert_eq!(
             workspace.window(&agent.id).expect("agent").placement,
             WindowPlacement::Canvas
@@ -1405,6 +1413,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn docking_tabbed_agent_to_issue_normalizes_remaining_group() {
+        let mut workspace = WindowCanvasState::from_persisted(empty_workspace_state());
+        let issue = workspace.add_window(WindowPreset::Issue, arrange_bounds());
+        let first = workspace.add_window(WindowPreset::Agent, arrange_bounds());
+        let second = workspace.add_window(WindowPreset::Agent, arrange_bounds());
+        let returning = workspace.add_window(WindowPreset::Agent, arrange_bounds());
+        workspace.set_linked_issue_number(&returning.id, Some(4812));
+        workspace.set_linked_issue_number(&second.id, Some(4812));
+        assert!(workspace.dock_window_tab(&second.id, &first.id));
+        assert!(workspace.dock_window_tab(&returning.id, &first.id));
+        let group = workspace.window(&first.id).unwrap().tab_group_id.clone();
+        let geometry = workspace.window(&first.id).unwrap().geometry.clone();
+
+        assert!(workspace.dock_agent_window_to_issue(&returning.id).is_ok());
+
+        let docked = workspace.window(&returning.id).unwrap();
+        assert_eq!(
+            docked.placement,
+            WindowPlacement::IssuePreview {
+                issue_window_id: issue.id,
+                issue_number: 4812,
+            }
+        );
+        assert!(docked.tab_group_id.is_none());
+        assert!(!docked.tab_group_active);
+        for id in [&first.id, &second.id] {
+            let remaining = workspace.window(id).unwrap();
+            assert_eq!(remaining.tab_group_id, group);
+            assert_eq!(remaining.geometry, geometry);
+            assert_eq!(remaining.placement, WindowPlacement::Canvas);
+        }
+        assert!(workspace.window(&first.id).unwrap().tab_group_active);
+        assert!(!workspace.window(&second.id).unwrap().tab_group_active);
+
+        assert!(workspace.dock_agent_window_to_issue(&second.id).is_ok());
+        let last = workspace.window(&first.id).unwrap();
+        assert!(last.tab_group_id.is_none());
+        assert!(!last.tab_group_active);
+        assert_eq!(last.geometry, geometry);
+    }
+
     // SPEC-3885 FR-012: with no Issue window left to host it the window stays on the
     // canvas rather than disappearing into a placement nothing renders.
     #[test]
@@ -1416,7 +1466,7 @@ mod tests {
         assert!(workspace.undock_agent_window(&agent.id, None));
         assert!(workspace.close_window(&issue.id));
 
-        assert!(!workspace.dock_agent_window_to_issue(&agent.id));
+        assert!(workspace.dock_agent_window_to_issue(&agent.id).is_err());
         assert_eq!(
             workspace.window(&agent.id).expect("agent").placement,
             WindowPlacement::Canvas
