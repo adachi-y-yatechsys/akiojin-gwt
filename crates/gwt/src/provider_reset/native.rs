@@ -1,5 +1,10 @@
 //! Human consent from an OS dialog, never from agent-supplied JSON or stdin.
 
+#[cfg(any(
+    target_os = "macos",
+    target_os = "windows",
+    all(target_os = "linux", not(test))
+))]
 pub(crate) const APPROVE_LABEL: &str = "Redeem free reset";
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
