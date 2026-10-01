@@ -6179,7 +6179,7 @@ impl AppRuntime {
                 session_binding_id: uuid::Uuid::new_v4().to_string(),
                 initial_session_id: continuation_session_id.clone(),
                 entrypoint: gwt::cli::execution_state::entrypoint_from_launch(
-                    &config.args,
+                    config.entrypoint_args(),
                     config.session_mode == gwt_agent::SessionMode::Resume,
                 ),
                 requested_at,
