@@ -145,6 +145,46 @@ fn job_body<'a>(workflow: &'a str, header: &str) -> &'a str {
     &body[..end]
 }
 
+/// Issue #4839: hosted runners use deterministic contracts, not host measurements.
+#[test]
+fn hosted_windows_startup_selects_only_the_native_command_contract() {
+    let workflow = read(TEST_WORKFLOW);
+    let job = job_body(&workflow, "  test-windows-rust:");
+    let (_, step) = named_steps(job)
+        .into_iter()
+        .find(|(name, _)| name == "Measure Windows startup tray performance")
+        .expect("Windows startup contract step");
+    assert!(step.contains("run: cargo test -p gwt --test startup_tray_performance startup_metric_and_native_command_contract -- --exact --test-threads=1 --nocapture"));
+    assert!(
+        !step.contains("--ignored"),
+        "the selected test is not ignored"
+    );
+    for host_only in [
+        "startup_tray_under_large_stopped_session_load",
+        "startup_update_resume_under_large_session_load",
+    ] {
+        assert!(
+            !job.contains(host_only),
+            "{host_only} is a dev-host measurement"
+        );
+    }
+}
+
+#[test]
+fn startup_git_budget_is_required_on_linux_and_windows() {
+    let workflow = read(TEST_WORKFLOW);
+    assert!(rust_job(&workflow)
+        .contains("run: cargo nextest run --workspace --all-features --test-threads=1"));
+    let job = job_body(&workflow, "  test-windows-rust:");
+    let (_, step) = named_steps(job)
+        .into_iter()
+        .find(|(name, _)| name == "Check startup update Git-spawn budget")
+        .expect("Windows must run the existing 1500-session Git budget test");
+    assert!(step.contains("run: cargo test -p gwt --bin gwt app_runtime::tests::startup_restore_update_marker_1500_sessions_bounds_git_spawns -- --exact --test-threads=1"));
+    assert!(!step.contains("continue-on-error:"));
+    assert!(!step.contains("if:"));
+}
+
 /// Issue #4134 AC-1: the three-pass determinism loop is the single most
 /// expensive thing PR CI used to do, and it re-ran a suite Linux had already
 /// proven. It keeps its purpose on a nightly schedule; PR CI must not pay for
