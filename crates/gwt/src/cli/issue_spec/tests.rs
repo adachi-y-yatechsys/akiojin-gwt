@@ -492,7 +492,10 @@ fn run_supports_read_create_pull_repair_and_rename_workflows() {
         run(&mut env, IssueCommand::SpecRepair { number: 42 }, &mut out).unwrap(),
         0
     );
-    assert_eq!(out, "repaired cache for #42\n");
+    // #4838: the old wording claimed a repair the operation never performed —
+    // it only re-read the section. A fixture with well-formed markers now says
+    // so explicitly, and a genuine repair names the artifacts it rewrote.
+    assert_eq!(out, "refreshed cache for #42; no artifact needed repair\n");
 
     out.clear();
     assert_eq!(
