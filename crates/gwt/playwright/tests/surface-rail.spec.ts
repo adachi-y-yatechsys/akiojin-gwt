@@ -9,6 +9,13 @@
 import { expect, test, type Page } from "@playwright/test";
 import { APP_URL, installEmbeddedRoutes } from "./_helpers/embedded-frontend";
 
+// browser-check supplies an isolated checkout server; fixture mode remains
+// useful for fast development while both modes exercise the same UI code.
+const surfaceAppUrl = process.env.GWT_PLAYWRIGHT_BASE_URL || APP_URL;
+async function installSurfaceAssets(page: Page) {
+  if (!process.env.GWT_PLAYWRIGHT_BASE_URL) await installEmbeddedRoutes(page);
+}
+
 type SentMessage = {
   kind?: string;
   id?: string;
@@ -21,6 +28,93 @@ test.describe("Surface rail", () => {
     viewport: { width: 1440, height: 900 },
   });
 
+  test("splits two independent surfaces, keeps agents live, and restores the canvas", async ({ page }, testInfo) => {
+    const errors: string[] = [];
+    page.on("console", (message) => { if (message.type() === "error") errors.push(message.text()); });
+    page.on("pageerror", (error) => errors.push(String(error)));
+    await installSurfaceAssets(page);
+    await installSurfaceRailBackend(page);
+    await page.goto(surfaceAppUrl);
+    await expect(windowById(page, "board-window")).toBeVisible();
+    const geometry = () => page.locator(".workspace-window").evaluateAll((elements) =>
+      Object.fromEntries(elements.map((element) => {
+        const node = element as HTMLElement;
+        return [node.dataset.id, [node.style.left, node.style.top, node.style.width, node.style.height]];
+      })),
+    );
+    const original = await geometry();
+    await page.getByRole("button", { name: "Split view", exact: true }).click();
+    const left = page.getByRole("region", { name: "Left pane", exact: true });
+    const right = page.getByRole("region", { name: "Right pane", exact: true });
+    await expect(left).toHaveAttribute("data-surface", "board");
+    await expect(right).toHaveAttribute("data-surface", "issues");
+    const leftBox = await left.boundingBox();
+    const rightBox = await right.boundingBox();
+    expect(leftBox!.x + leftBox!.width).toBeLessThanOrEqual(rightBox!.x);
+    expect(Math.abs(leftBox!.width - rightBox!.width)).toBeLessThan(2);
+    await right.getByRole("combobox", { name: "Right pane surface" }).selectOption("agents");
+    await expect(right).toHaveAttribute("data-active", "true");
+    await expect(left).toHaveAttribute("data-surface", "board");
+    await expect(right.locator(".workspace-window")).toHaveCount(2);
+    await expect(right.locator("[data-id='agent-one']")).toBeVisible();
+    await expect(right.locator("[data-id='agent-two']")).toBeVisible();
+    await expect(right.locator("[data-id='pm-window']")).toHaveCount(0);
+    // Focus selects which pane the fixed rail controls.
+    await left.getByRole("combobox", { name: "Left pane surface" }).focus();
+    await page.locator(".op-rail__surface[data-surface='settings']").click();
+    await expect(left).toHaveAttribute("data-surface", "settings");
+    await expect(left.locator(".workspace-window[data-preset='settings']")).toBeVisible();
+    await expect(right).toHaveAttribute("data-surface", "agents");
+    await expect(left.getByRole("option", { name: "Agents (open in other pane)" })).toHaveJSProperty("disabled", true);
+    await page.setViewportSize({ width: 1000, height: 800 });
+    await expect(right.locator(".workspace-window").first()).toBeVisible();
+    await expect(left).toHaveAttribute("data-surface", "settings");
+    const splitGeometry = await geometry();
+    for (const [id, value] of Object.entries(original)) expect(splitGeometry[id]).toEqual(value);
+    await page.screenshot({ path: testInfo.outputPath("split-surfaces.png") });
+    await clearMessages(page);
+    await page.getByRole("button", { name: "Close split", exact: true }).click();
+    await expect(page.locator("#split-surfaces")).toBeHidden();
+    await expect(page.locator("#canvas-stage > .workspace-window")).toHaveCount(6);
+    expect((await sentMessages(page)).filter((message) => message.kind === "close_window")).toEqual([]);
+    expect(errors).toEqual([]);
+  });
+
+  test("opening an inactive grouped surface keeps the split open", async ({ page }) => {
+    const errors: string[] = [];
+    page.on("pageerror", (error) => errors.push(String(error)));
+    page.on("console", (message) => { if (message.type() === "error") errors.push(message.text()); });
+    await installSurfaceAssets(page);
+    await installSurfaceRailBackend(page, true);
+    await page.goto(surfaceAppUrl);
+    await expect(windowById(page, "board-window")).toBeVisible();
+    await page.getByRole("button", { name: "Split view", exact: true }).click();
+    await page.getByRole("combobox", { name: "Left pane surface" }).selectOption("settings");
+    await expect(page.locator("#split-surfaces")).toBeVisible();
+    await expect(page.locator(".split-pane[data-surface='settings'] [data-id='settings-grouped']")).toBeVisible();
+    expect(errors).toEqual([]);
+  });
+
+  test("two surfaces in one tab group stay visible without changing the active tab", async ({ page }) => {
+    const errors: string[] = [];
+    page.on("pageerror", (error) => errors.push(String(error)));
+    page.on("console", (message) => { if (message.type() === "error") errors.push(message.text()); });
+    await installSurfaceAssets(page);
+    await installSurfaceRailBackend(page, true);
+    await page.goto(surfaceAppUrl);
+    await expect(windowById(page, "board-window")).toBeVisible();
+    await clearMessages(page);
+    await page.getByRole("button", { name: "Split view", exact: true }).click();
+    await page.getByRole("combobox", { name: "Right pane surface" }).selectOption("settings");
+    await expect(page.locator(".split-pane[data-surface='board'] [data-id='board-window']")).toBeVisible();
+    await expect(page.locator(".split-pane[data-surface='settings'] [data-id='settings-grouped']")).toBeVisible();
+    expect((await sentMessages(page)).filter((message) => message.kind === "activate_window_tab")).toEqual([]);
+    await page.getByRole("button", { name: "Close split", exact: true }).click();
+    await expect(windowById(page, "settings-grouped")).toBeHidden();
+    await expect(windowById(page, "board-window")).toBeVisible();
+    expect(errors).toEqual([]);
+  });
+
   test("selects Issues / Agents / Board / Settings and folds to a top strip when narrow", async ({
     page,
   }) => {
@@ -31,9 +125,9 @@ test.describe("Surface rail", () => {
     });
     page.on("pageerror", (error) => pageErrors.push(String(error)));
 
-    await installEmbeddedRoutes(page);
+    await installSurfaceAssets(page);
     await installSurfaceRailBackend(page);
-    await page.goto(APP_URL);
+    await page.goto(surfaceAppUrl);
 
     const rail = page.locator("#op-rail");
     const surfaces = rail.locator(".op-rail__surface");
@@ -190,8 +284,8 @@ async function clearMessages(page: Page): Promise<void> {
   });
 }
 
-async function installSurfaceRailBackend(page: Page): Promise<void> {
-  await page.addInitScript(() => {
+async function installSurfaceRailBackend(page: Page, groupedSettings = false): Promise<void> {
+  await page.addInitScript((groupedSettings) => {
     const canvasWindow = (id: string, overrides: Record<string, unknown>) => ({
       id,
       title: id,
@@ -256,6 +350,10 @@ async function installSurfaceRailBackend(page: Page): Promise<void> {
         z_index: 6,
       }),
     ];
+    if (groupedSettings) {
+      Object.assign(windows.find((data) => data.id === "board-window")!, { tab_group_id: "group", tab_group_active: true });
+      windows.push(canvasWindow("settings-grouped", { preset: "settings", tab_group_id: "group", tab_group_active: false }));
+    }
 
     let zCounter = 20;
     let socket: FixtureWebSocket | null = null;
@@ -319,6 +417,20 @@ async function installSurfaceRailBackend(page: Page): Promise<void> {
             this.emit(workspaceState());
           }
         }
+        if (message.kind === "create_window" && message.preset) {
+          zCounter += 1;
+          windows.push(canvasWindow(`${message.preset}-new`, { preset: message.preset, z_index: zCounter }));
+          this.emit(workspaceState());
+        }
+        if (message.kind === "activate_window_tab") {
+          const target = windows.find((data) => data.id === message.id);
+          if (target?.tab_group_id) {
+            for (const data of windows) {
+              if (data.tab_group_id === target.tab_group_id) data.tab_group_active = data.id === target.id;
+            }
+            this.emit(workspaceState());
+          }
+        }
       }
 
       close(): void {
@@ -338,5 +450,5 @@ async function installSurfaceRailBackend(page: Page): Promise<void> {
       value: FixtureWebSocket,
     });
     (window as any).__surfaceRailSocket = () => socket;
-  });
+  }, groupedSettings);
 }
