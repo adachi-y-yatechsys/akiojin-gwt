@@ -61,6 +61,7 @@ const ROOT_MODULES = new Set([
   "fleet-minimap.js",
   // Issue #4777 T-1 — rail surface selection (Issues / Agents / Board / Settings).
   "surface-rail.js",
+  "split-surfaces.js",
   "focus-trap.js",
   "startup-metrics.js",
   "hotkey.js",

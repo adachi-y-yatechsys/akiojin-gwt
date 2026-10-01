@@ -52,6 +52,7 @@
           ><span aria-hidden="true">⌂</span> Hub</a>
 
           <div class="project-actions">
+            <button class="arrange-button" id="split-view-button" type="button" aria-pressed="false" title="Show two surfaces side by side">Split view</button>
             <button class="arrange-button" id="close-project-button" type="button">Close Project</button>
             <span class="app-version" id="app-version" role="button" tabindex="0" hidden></span>
             <!-- SPEC-2013 Phase 8: the standalone Open Project split-button was
@@ -289,6 +290,7 @@
           </div>
         </aside>
         <div class="canvas-area">
+          <div class="split-surfaces" id="split-surfaces" hidden></div>
           <!-- SPEC-3038 US-4: the permanent hint bar is retired. Canvas
                guidance lives in the ⌘? hotkey overlay; connection state has
                one home — the Status Strip ONLINE cell. -->
