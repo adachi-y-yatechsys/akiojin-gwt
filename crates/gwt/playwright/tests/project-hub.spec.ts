@@ -3,9 +3,47 @@
  */
 import { expect, test, type Page } from "@playwright/test";
 import { HUB_URL, ORIGIN_URL, installEmbeddedRoutes } from "./_helpers/embedded-frontend";
+import { withLiveGwtBackendLock } from "./_helpers/live-gwt";
 
 const projectA = { id: "tab-a", project_key: "0123456789abcdef", title: "Alpha", kind: "git" };
 const projectB = { id: "tab-b", project_key: "fedcba9876543210", title: "Beta", kind: "git" };
+
+test("live isolated Hub opens a manual path and acknowledges an already-open Project", async ({ page }, testInfo) => {
+  const base = process.env.GWT_PLAYWRIGHT_BASE_URL;
+  const projectRoot = process.env.GWT_PLAYWRIGHT_PROJECT_ROOT;
+  test.skip(!base || !projectRoot, "Requires an isolated checkout server and project path");
+  await withLiveGwtBackendLock(base!, testInfo, async () => {
+    const errors = collectBrowserErrors(page);
+    let openedEvents = 0;
+    page.on("websocket", (socket) => socket.on("framereceived", ({ payload }) => {
+      try {
+        if (JSON.parse(String(payload)).kind === "project_opened") openedEvents += 1;
+      } catch { /* Ignore non-JSON frames. */ }
+    }));
+    await page.goto(new URL("/", base!).href);
+    await expect(page.locator("[data-hub]")).toBeVisible();
+    await page.getByText("Enter folder path…", { exact: true }).click();
+    await page.locator("[data-open-project-path]").fill(projectRoot!);
+    const notice = page.locator(".gwt-hub__notice");
+    const previousOpened = openedEvents;
+    await page.locator("[data-open-project-submit]").click();
+    await expect.poll(() => openedEvents).toBe(previousOpened + 1);
+    await expect(notice).toContainText("Opened ");
+    await expect(notice.getByRole("link", { name: "Open in a new tab" })).toHaveAttribute("href", /^\/p\/[a-f0-9]+$/);
+    const projectUrl = await notice.locator("a").getAttribute("href");
+    const projects = page.locator('[data-hub-list="open"] a');
+    await expect(page.locator(`[data-hub-list="open"] a[href="${projectUrl}"]`)).toHaveCount(1);
+    const openCount = await projects.count();
+    await page.locator("[data-open-project-submit]").click();
+    await expect.poll(() => openedEvents).toBe(previousOpened + 2);
+    await expect(notice).toContainText("Opened ");
+    await expect(notice.locator("a")).toHaveAttribute("href", projectUrl!);
+    await expect(projects).toHaveCount(openCount);
+    await expect(page.locator(".gwt-hub__error")).toBeHidden();
+    await page.screenshot({ path: testInfo.outputPath("live-hub-reopened.png") });
+    expect(errors).toEqual([]);
+  });
+});
 
 function collectBrowserErrors(page: Page): string[] {
   const errors: string[] = [];
@@ -31,6 +69,8 @@ async function installRouteBackend(page: Page) {
         super();
         this.url = url;
         this.projectKey = new URL(url).searchParams.get("repo_hash");
+        if (!this.projectKey) (window as any).__gwtHubReply = (event: unknown) =>
+          this.dispatchEvent(new MessageEvent("message", { data: JSON.stringify(event) }));
         setTimeout(() => {
           this.readyState = 1;
           this.dispatchEvent(new Event("open"));
@@ -65,6 +105,40 @@ async function installRouteBackend(page: Page) {
 }
 
 test.describe("Project Hub and routes", () => {
+  test("folder picker is pending once, cancels neutrally, and supports manual paths", async ({ page }) => {
+    const errors = collectBrowserErrors(page);
+    await installEmbeddedRoutes(page);
+    await installRouteBackend(page);
+    await page.goto(HUB_URL);
+    const open = page.locator('[data-hub-action="open-folder"]');
+    await open.click();
+    await expect(open).toHaveText("Choosing folder…");
+    await page.evaluate(() => (window as any).__gwtHubReply({ kind: 'picker_started', purpose: 'open', request_id: 1 }));
+    await open.click();
+    expect(await page.evaluate(() => (window as any).__gwtSent.filter((entry: any) => entry.message.kind === 'open_project_dialog').length)).toBe(1);
+    await expect(page.locator('.gwt-hub__error')).toContainText('already open');
+    await page.evaluate(() => (window as any).__gwtHubReply({ kind: 'picker_cancelled', purpose: 'open', request_id: 1 }));
+    await expect(open).toHaveText('Open Folder…');
+    await expect(page.locator('.gwt-hub__error')).toBeHidden();
+    await page.getByText('Enter folder path…', { exact: true }).click();
+    await page.locator('[data-open-project-path]').fill('E:\\repos\\alpha');
+    await page.locator('[data-open-project-submit]').click();
+    await page.evaluate(() => (window as any).__gwtHubReply({ kind: 'project_opened', project_key: '0123456789abcdef', title: 'Alpha' }));
+    await expect(page.locator('.gwt-hub__notice')).toContainText('Opened Alpha');
+    await expect(page.locator('.gwt-hub__notice a')).toHaveAttribute('href', '/p/0123456789abcdef');
+    await page.locator('[data-hub-action="clone"]').click();
+    await page.locator('#clone-project-parent-input').fill('E:\\repos');
+    await page.locator('#clone-project-url-input').fill('https://github.com/o/r.git');
+    await expect(page.locator('#clone-project-start')).toBeEnabled();
+    await page.locator('#clone-project-parent-button').click();
+    await page.evaluate(() => (window as any).__gwtHubReply({ kind: 'picker_started', purpose: 'clone_parent', request_id: 2 }));
+    await expect(page.locator('#clone-project-parent-button')).toHaveText('Choosing folder…');
+    await page.evaluate(() => (window as any).__gwtHubReply({ kind: 'picker_cancelled', purpose: 'clone_parent', request_id: 2 }));
+    await expect(page.locator('#clone-project-parent-button')).toHaveText('Choose Folder...');
+    await expect(page.locator('#clone-project-parent-input')).toHaveValue('E:\\repos');
+    expect(errors).toEqual([]);
+  });
+
   test("root is a picker with path-free new-tab Project links", async ({ page }, testInfo) => {
     const errors = collectBrowserErrors(page);
     await installEmbeddedRoutes(page);
