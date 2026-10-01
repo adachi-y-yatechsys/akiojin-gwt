@@ -161,7 +161,7 @@ pub(super) fn frontend_user_action_log(event: &FrontendEvent) -> Option<Frontend
                 .count(url.len())
                 .mode(parent_path)
         }
-        FrontendEvent::ReopenRecentProject { path } => {
+        FrontendEvent::ReopenRecentProject { path, .. } => {
             FrontendUserActionLog::new("reopen_recent_project", "project").target(path)
         }
         FrontendEvent::PreviewCloseProject { project_key } => {

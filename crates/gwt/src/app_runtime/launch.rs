@@ -89,6 +89,7 @@ fn bound_pty_gate_program() -> Result<PathBuf, String> {
 
 #[derive(Clone)]
 pub struct ProcessLaunch {
+    pub(crate) initial_prompt_file: Option<Arc<tempfile::TempPath>>,
     pub(crate) command: String,
     pub(crate) args: Vec<String>,
     pub(crate) env: HashMap<String, String>,
@@ -2263,8 +2264,8 @@ pub struct LaunchWizardMemoryCache {
     // Issue #4377: the ledger holds every Session ever launched, stopped ones
     // included (1,124 files on one host), so it is parsed on a background
     // thread and joined on first read instead of inside `AppRuntime::new`.
-    sessions: OnceLock<Vec<gwt_agent::Session>>,
-    pending_sessions: Mutex<Option<thread::JoinHandle<Vec<gwt_agent::Session>>>>,
+    sessions: Arc<OnceLock<Vec<gwt_agent::Session>>>,
+    pending_sessions: Arc<Mutex<Option<thread::JoinHandle<Vec<gwt_agent::Session>>>>>,
     agent_options: Arc<Mutex<AgentOptionsSlot>>,
     // SPEC-3170 FR-001: Claude capability detection may read settings and run
     // `claude --version` once per process. The wizard stores the booleans at
@@ -2277,8 +2278,8 @@ impl Clone for LaunchWizardMemoryCache {
     fn clone(&self) -> Self {
         Self {
             sessions_dir: self.sessions_dir.clone(),
-            sessions: OnceLock::from(self.sessions().clone()),
-            pending_sessions: Mutex::new(None),
+            sessions: self.sessions.clone(),
+            pending_sessions: self.pending_sessions.clone(),
             agent_options: self.agent_options.clone(),
             claude_ultracode_supported: self.claude_ultracode_supported,
             claude_workflows_enabled: self.claude_workflows_enabled,
@@ -2291,8 +2292,8 @@ impl LaunchWizardMemoryCache {
         let claude_capabilities = gwt_agent::claude_capability_snapshot();
         Self {
             sessions_dir: sessions_dir.to_path_buf(),
-            sessions: OnceLock::new(),
-            pending_sessions: Self::spawn_session_load(sessions_dir),
+            sessions: Arc::new(OnceLock::new()),
+            pending_sessions: Arc::new(Self::spawn_session_load(sessions_dir)),
             agent_options: Self::spawn_agent_options_detection(),
             claude_ultracode_supported: claude_capabilities.ultracode_supported,
             claude_workflows_enabled: claude_capabilities.workflows_enabled,
@@ -2316,8 +2317,8 @@ impl LaunchWizardMemoryCache {
     ) -> Self {
         Self {
             sessions_dir: sessions_dir.to_path_buf(),
-            sessions: OnceLock::new(),
-            pending_sessions: Self::spawn_session_load(sessions_dir),
+            sessions: Arc::new(OnceLock::new()),
+            pending_sessions: Arc::new(Self::spawn_session_load(sessions_dir)),
             agent_options: Arc::new(Mutex::new(AgentOptionsSlot::Ready(agent_options))),
             claude_ultracode_supported,
             claude_workflows_enabled,
@@ -2370,7 +2371,7 @@ impl LaunchWizardMemoryCache {
 
     fn sessions_mut(&mut self) -> &mut Vec<gwt_agent::Session> {
         self.sessions();
-        self.sessions
+        Arc::make_mut(&mut self.sessions)
             .get_mut()
             .expect("session ledger resolved above")
     }
@@ -2450,7 +2451,7 @@ impl LaunchWizardMemoryCache {
         self.sessions().clone()
     }
 
-    fn latest_resumable_branch_session(
+    pub(super) fn latest_resumable_branch_session(
         &self,
         repo_path: &Path,
         branch_name: &str,
@@ -2475,11 +2476,8 @@ impl LaunchWizardMemoryCache {
             .filter(|session| !durable_launch_recovery_exists(&self.sessions_dir, &session.id))
             .collect();
         // A still-running startup load is superseded; dropping it detaches.
-        *self
-            .pending_sessions
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        self.sessions = OnceLock::from(sessions);
+        self.pending_sessions = Arc::new(Mutex::new(None));
+        self.sessions = Arc::new(OnceLock::from(sessions));
     }
 
     pub(super) fn session_by_id(&self, session_id: &str) -> Option<&gwt_agent::Session> {
@@ -2499,7 +2497,7 @@ impl LaunchWizardMemoryCache {
         )
     }
 
-    fn record_session(&mut self, session: gwt_agent::Session) {
+    pub(super) fn record_session(&mut self, session: gwt_agent::Session) {
         if durable_launch_recovery_exists(&self.sessions_dir, &session.id) {
             self.forget_session(&session.id);
             return;
@@ -4626,6 +4624,7 @@ impl AppRuntime {
             &window_id,
             geometry,
             ProcessLaunch {
+                initial_prompt_file: None,
                 command: launch.command,
                 args: launch.args,
                 env,
@@ -4692,7 +4691,13 @@ impl AppRuntime {
             incarnation,
             observation,
         )?;
-        self.install_process_window(id, incarnation, pane, console_kind);
+        self.install_process_window(
+            id,
+            incarnation,
+            pane,
+            console_kind,
+            launch.initial_prompt_file,
+        );
         Ok(())
     }
 
@@ -4726,7 +4731,13 @@ impl AppRuntime {
             expected,
             handshake_cleanup,
         )?;
-        self.install_process_window(id, incarnation, pane, console_kind);
+        self.install_process_window(
+            id,
+            incarnation,
+            pane,
+            console_kind,
+            launch.initial_prompt_file,
+        );
         Ok(())
     }
 
@@ -4736,9 +4747,11 @@ impl AppRuntime {
         incarnation: u64,
         pane: Pane,
         console_kind: Option<gwt_core::process_console::ProcessKind>,
+        initial_prompt_file: Option<Arc<tempfile::TempPath>>,
     ) {
         let pane = Arc::new(Mutex::new(pane));
         let mut runtime = WindowRuntime::new(incarnation, pane.clone());
+        runtime._initial_prompt_file = initial_prompt_file;
         let output_thread =
             self.spawn_output_thread(id.to_string(), incarnation, pane.clone(), console_kind);
         let status_thread = self.spawn_status_thread(id.to_string(), incarnation, pane.clone());
@@ -5360,6 +5373,8 @@ impl AppRuntime {
             if config.working_dir.is_some() {
                 config.working_dir = Some(worktree_path.clone());
             }
+            let initial_prompt_file =
+                crate::launch_runtime::prepare_initial_prompt(&mut config, &worktree_path)?;
             gwt_agent::LaunchEnvironment::from_active_profile(
                 &profile_config_path,
                 config.runtime_target,
@@ -5485,7 +5500,7 @@ impl AppRuntime {
             // (the `$gwt-*` prompt token moves into an env var / embedded
             // script on wrapped launches).
             let execution_entrypoint = gwt::cli::execution_state::entrypoint_from_launch(
-                &config.args,
+                config.entrypoint_args(),
                 config.session_mode == gwt_agent::SessionMode::Resume,
             );
             let durable_tool_runtime_command = config
@@ -5808,6 +5823,7 @@ impl AppRuntime {
                 gwt_agent::SessionExecutionIdentity::from_session(&session)?;
 
             let process_launch = ProcessLaunch {
+                initial_prompt_file,
                 command: config.command.clone(),
                 args: config.args.clone(),
                 env: config.env_vars.clone(),
@@ -6544,6 +6560,7 @@ mod docker_session_persistence_tests {
         .expect("persist finalized production launch");
 
         let process_launch = ProcessLaunch {
+            initial_prompt_file: None,
             command: config.command,
             args: config.args,
             env: config.env_vars,

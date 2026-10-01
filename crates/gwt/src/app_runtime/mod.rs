@@ -169,6 +169,8 @@ pub(crate) fn next_window_runtime_incarnation() -> u64 {
 }
 
 pub struct WindowRuntime {
+    /// Removed when this session ends or its launch is torn down.
+    _initial_prompt_file: Option<Arc<tempfile::TempPath>>,
     /// Process-local identity of this exact PTY runtime. A window id may be
     /// reused by a successor, so background events must carry this value and
     /// prove they still belong to the runtime currently stored for the id.
@@ -200,6 +202,7 @@ impl WindowRuntime {
             .shared_pty();
         Self {
             incarnation,
+            _initial_prompt_file: None,
             started_at_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|since| since.as_millis() as u64)
@@ -234,6 +237,7 @@ mod launch_errors;
 mod launch_output_mirror;
 mod loaders;
 mod migration;
+mod native_project_picker;
 pub(crate) mod persist_dispatcher;
 pub(crate) mod pm;
 mod profile;
@@ -249,6 +253,7 @@ mod title_sync;
 mod ui_trace;
 mod window;
 mod wizard;
+pub(crate) use wizard::IssueMonitorLaunchPrepared;
 mod workspace;
 mod workspace_views;
 use attachments::UploadedImagePasteOperation;
@@ -1044,7 +1049,9 @@ pub(crate) struct ProjectIncarnation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProjectNavigationSource {
-    Open,
+    Open {
+        request_id: Option<String>,
+    },
     Clone {
         workspace_home: PathBuf,
     },
@@ -1253,6 +1260,7 @@ pub struct AppRuntime {
     pub(crate) next_project_incarnation: u64,
     pub(crate) project_navigation_request: u64,
     pub(crate) pending_project_navigation: Option<ProjectNavigationRequest>,
+    pub(crate) project_picker: project_tabs::ProjectPickerState,
     /// Issue #4538: `/p/<hash>` resolution cache and `gwt open` waiters.
     pub(crate) project_route: project_route::ProjectRouteState,
     pub(crate) recent_projects: Vec<gwt::RecentProjectEntry>,
@@ -1284,6 +1292,7 @@ pub struct AppRuntime {
     /// replay never creates a second agent window and can re-ACK after a
     /// transient daemon disconnect.
     pub(crate) issue_monitor_launch_deliveries: HashMap<String, IssueMonitorLaunchDeliveryState>,
+    pub(crate) issue_monitor_launch_preparations: HashSet<wizard::IssueMonitorLaunchPreparationKey>,
     pub(crate) issue_monitor_materializer_id: String,
     /// Issue #3878: budget for one local fallback commit of the Issue Monitor
     /// prefs. Injected at construction so a test runtime owns its budget
@@ -1535,6 +1544,10 @@ pub struct AppRuntime {
     pub(crate) issue_client_factory: RuntimeIssueClientFactory,
     /// Cached update state so late-connecting WebView clients get the toast.
     pub(crate) pending_update: Option<gwt_core::update::UpdateState>,
+    /// Initiator of the shared download, or None when its worker is idle.
+    pub(crate) update_download_in_flight: Option<ClientId>,
+    /// Newest discovery to retry if the active download fails.
+    pub(crate) deferred_update_discovery: Option<gwt_core::update::UpdateState>,
     /// Shared PTY writer registry published to the WebSocket fast-path.
     pub(crate) pty_writers: PtyWriterRegistry,
     /// Browser-uploaded attachment temp files waiting to be staged under the
@@ -3210,6 +3223,7 @@ impl AppRuntime {
             next_project_incarnation,
             project_navigation_request: 0,
             pending_project_navigation: None,
+            project_picker: Default::default(),
             project_route: Default::default(),
             recent_projects: prune_missing_recent_projects(dedupe_recent_projects(
                 normalize_recent_projects(persisted.recent_projects),
@@ -3241,6 +3255,7 @@ impl AppRuntime {
             pending_update_resume_notice: None,
             pending_launch_feedback_contexts: HashMap::new(),
             issue_monitor_launch_deliveries: HashMap::new(),
+            issue_monitor_launch_preparations: HashSet::new(),
             issue_monitor_materializer_id: uuid::Uuid::new_v4().to_string(),
             issue_monitor_fallback_commit_timeout: ISSUE_MONITOR_FALLBACK_COMMIT_TIMEOUT,
             issue_monitor_provider_auth_probe: gwt::issue_monitor::provider_auth_state_from_env,
@@ -3301,6 +3316,8 @@ impl AppRuntime {
             knowledge_monitor_snapshot: Default::default(),
             issue_client_factory: default_issue_client_factory(),
             pending_update: None,
+            update_download_in_flight: None,
+            deferred_update_discovery: None,
             pty_writers,
             attachment_uploads,
             persist_dispatcher,
@@ -7651,6 +7668,17 @@ impl AppRuntime {
                 )
             }
         };
+        let monitor = gwt::IssueMonitorState::with_prefs(gwt::IssueMonitorConfig::default(), prefs);
+        if let Ok(blockers) = serde_json::to_string(&self.update_drain_blockers(&monitor)) {
+            gwt_core::update::log_update_event(
+                "drain_started",
+                &[
+                    ("version", &version),
+                    ("project_root", &project_root.to_string_lossy()),
+                    ("blockers", &blockers),
+                ],
+            );
+        }
         // AC-12: drain start is a notification-center record.
         events.push(update_notice(
             "info",
@@ -7732,10 +7760,39 @@ impl AppRuntime {
                 grace_secs: gwt::update_drain::DEFAULT_AUTO_APPLY_GRACE_SECS,
             });
         let version = drain.version.clone();
+        // Record identities when the bounded warning fires or a scheduled
+        // apply is postponed, rather than writing the same blockers each tick.
+        if let gwt::update_drain::UpdateAutoApplyStep::StillDraining(blockers)
+        | gwt::update_drain::UpdateAutoApplyStep::Postponed(blockers) = &step
+        {
+            if let Ok(blockers) = serde_json::to_string(blockers) {
+                gwt_core::update::log_update_event(
+                    "drain_blocked",
+                    &[
+                        ("version", &version),
+                        ("project_root", &context.project_root.to_string_lossy()),
+                        ("blockers", &blockers),
+                    ],
+                );
+            }
+        }
         let blocker_list = |blockers: &[gwt::update_drain::UpdateBlocker]| {
             blockers
                 .iter()
-                .map(ToString::to_string)
+                .map(|blocker| match blocker {
+                    gwt::update_drain::UpdateBlocker::ActivePane { window_id, .. } => format!(
+                        "{blocker} [{window_id}] — let the agent finish; inspect its pane if stalled"
+                    ),
+                    gwt::update_drain::UpdateBlocker::PendingAcquireClaim { .. } => format!(
+                        "{blocker} — wait for the claim to settle; inspect Issue Monitor status if stalled"
+                    ),
+                    gwt::update_drain::UpdateBlocker::ActiveExecution { .. } => format!(
+                        "{blocker} — have the owning agent verify and settle its execution"
+                    ),
+                    gwt::update_drain::UpdateBlocker::HeldVerificationLease { .. } => format!(
+                        "{blocker} — wait for the owning verification to finish"
+                    ),
+                })
                 .collect::<Vec<_>>()
                 .join(", ")
         };
@@ -7745,7 +7802,7 @@ impl AppRuntime {
                 vec![update_notice(
                     "warn",
                     format!(
-                        "Update v{version} still pending after {} min — waiting for: {}. Agents are never stopped automatically.",
+                        "Update v{version} still pending after {} min; new launches are held — waiting for: {}. Agents are never stopped automatically.",
                         drained_for_secs / 60,
                         blocker_list(&blockers)
                     ),
@@ -7771,7 +7828,7 @@ impl AppRuntime {
                 update_notice(
                     "info",
                     format!(
-                        "Update v{version} automatic apply postponed — waiting for: {}.",
+                        "Update v{version} automatic apply postponed; new launches are held — waiting for: {}.",
                         blocker_list(&blockers)
                     ),
                 ),
@@ -8193,7 +8250,7 @@ impl AppRuntime {
                 gwt::perf::startup::mark(gwt::perf::startup::StartupPhase::ShellInteractive);
                 Vec::new()
             }
-            FrontendEvent::OpenProjectDialog => self.open_project_dialog_events(),
+            FrontendEvent::OpenProjectDialog => self.open_project_dialog_events(&client_id),
             FrontendEvent::SelectCloneProjectParent => {
                 self.select_clone_project_parent_events(&client_id)
             }
@@ -8203,8 +8260,8 @@ impl AppRuntime {
             FrontendEvent::CloneProjectStart { url, parent_path } => {
                 self.clone_project_start_events(&client_id, &url, &parent_path)
             }
-            FrontendEvent::ReopenRecentProject { path } => {
-                self.open_project_path_events(PathBuf::from(path))
+            FrontendEvent::ReopenRecentProject { path, request_id } => {
+                self.open_project_path_with_request_events(PathBuf::from(path), request_id)
             }
             FrontendEvent::ApplyUpdate => self.apply_pending_update_events(&client_id),
             FrontendEvent::ApplyUpdateStart => self.apply_update_start_events(&client_id),
@@ -8520,7 +8577,7 @@ impl AppRuntime {
                 reasoning,
             } => self.set_pm_launch_profile_events(context, &agent_id, model, reasoning),
             FrontendEvent::RestartPmAgent => self.restart_pm_agent_events(context),
-            FrontendEvent::OpenProjectDialog => self.open_project_dialog_events(),
+            FrontendEvent::OpenProjectDialog => self.open_project_dialog_events(&client_id),
             FrontendEvent::SelectCloneProjectParent => {
                 self.select_clone_project_parent_events(&client_id)
             }
@@ -8530,8 +8587,8 @@ impl AppRuntime {
             FrontendEvent::CloneProjectStart { url, parent_path } => {
                 self.clone_project_start_events(&client_id, &url, &parent_path)
             }
-            FrontendEvent::ReopenRecentProject { path } => {
-                self.open_project_path_events(PathBuf::from(path))
+            FrontendEvent::ReopenRecentProject { path, request_id } => {
+                self.open_project_path_with_request_events(PathBuf::from(path), request_id)
             }
             FrontendEvent::PreviewCloseProject { .. }
             | FrontendEvent::ConfirmCloseProject { .. }

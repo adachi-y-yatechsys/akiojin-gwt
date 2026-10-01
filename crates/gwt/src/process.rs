@@ -58,14 +58,9 @@ pub fn current_username() -> String {
     resolve_username(whoami_value.as_deref(), env_value.as_deref())
 }
 
-/// Return `true` when `pid` refers to a live process visible to the
-/// current user on a Unix host.
-///
-/// On non-Unix targets (Windows today), the daemon's `serve_blocking`
-/// is a stub, so reporting any persisted endpoint as "alive" would
-/// surface permanent stale entries in `gwtd daemon status`. Returning
-/// `false` lets `resolve_bootstrap_action` treat such endpoints as
-/// dead and clean them up on the next bootstrap call.
+/// Return whether `pid` is alive, using a signal-zero probe on Unix and
+/// a direct process-handle probe on Windows. Permission failures do not
+/// establish that an owner is dead.
 pub fn is_process_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
@@ -94,9 +89,9 @@ pub fn is_process_alive(pid: u32) -> bool {
     }
 }
 
-/// Return whether a process is alive on every supported host using the
-/// `sysinfo` process table. [`is_process_alive`] delegates here on Windows;
-/// Unix keeps the cheaper `kill(pid, 0)` probe.
+/// Probe only the requested PID. Windows daemon event publishing calls this
+/// for every output chunk; a full process snapshot here consumes a core even
+/// when `sysinfo` is asked to refresh just one PID (Issue #4799).
 pub fn is_host_process_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
@@ -107,16 +102,29 @@ pub fn is_host_process_alive(pid: u32) -> bool {
     }
     #[cfg(not(unix))]
     {
-        use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+        use windows::{
+            core::HRESULT,
+            Win32::{
+                Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, WAIT_OBJECT_0},
+                System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE},
+            },
+        };
 
-        let mut system = System::new();
-        let pid = sysinfo::Pid::from_u32(pid);
-        system.refresh_processes_specifics(
-            ProcessesToUpdate::Some(&[pid]),
-            true,
-            ProcessRefreshKind::nothing(),
-        );
-        system.process(pid).is_some()
+        // SAFETY: request only wait access to this PID, without inheritance.
+        let handle = match unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) } {
+            Ok(handle) => handle,
+            // Access denied or another uncertain failure must not authorize
+            // replacing a live owner. An invalid PID is definitively absent.
+            Err(error) => return error.code() != HRESULT::from_win32(ERROR_INVALID_PARAMETER.0),
+        };
+        // SAFETY: the owned process handle stays valid through the zero-timeout
+        // wait and is then closed exactly once. A signaled process has exited,
+        // including one whose actual exit code happens to be STILL_ACTIVE.
+        unsafe {
+            let alive = WaitForSingleObject(handle, 0) != WAIT_OBJECT_0;
+            let _ = CloseHandle(handle);
+            alive
+        }
     }
 }
 
@@ -270,6 +278,77 @@ mod tests {
     #[test]
     fn current_process_is_alive() {
         assert!(is_process_alive(std::process::id()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_liveness_rejects_missing_and_exited_processes() {
+        assert!(!is_host_process_alive(u32::MAX));
+        let request =
+            gwt_core::process::ProcessPlanRequest::new("cmd").args(["/D", "/C", "exit 259"]);
+        let mut child = gwt_core::process::resolved_command(request)
+            .expect("resolve cmd")
+            .spawn()
+            .expect("spawn child");
+        assert_eq!(child.wait().expect("wait for child").code(), Some(259));
+        // Keep its handle alive: the terminated process object still exists,
+        // and its exit code equals STILL_ACTIVE, but it is no longer running.
+        assert!(!is_host_process_alive(child.id()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_exact_process_identity_rejects_a_reused_pid() {
+        let pid = std::process::id();
+        let started_at = host_process_start_time(pid).expect("current process start time");
+        assert!(exact_pty_process_tree_is_alive(pid, started_at));
+        assert!(!exact_pty_process_tree_is_alive(pid, started_at - 1));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_liveness_probe_stays_within_cpu_budget() {
+        use windows::Win32::{
+            Foundation::FILETIME,
+            System::Threading::{GetCurrentThread, GetThreadTimes},
+        };
+
+        fn thread_cpu() -> std::time::Duration {
+            let (mut created, mut exited, mut kernel, mut user) = (
+                FILETIME::default(),
+                FILETIME::default(),
+                FILETIME::default(),
+                FILETIME::default(),
+            );
+            // SAFETY: all output pointers are valid; the pseudo handle denotes
+            // this calling thread and must not be closed.
+            unsafe {
+                GetThreadTimes(
+                    GetCurrentThread(),
+                    &mut created,
+                    &mut exited,
+                    &mut kernel,
+                    &mut user,
+                )
+                .expect("read thread CPU time");
+            }
+            let ticks = |time: FILETIME| {
+                (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime)
+            };
+            // test-hygiene: allow-short-duration converts measured CPU ticks; no wall-clock wait
+            std::time::Duration::from_micros((ticks(kernel) + ticks(user)) / 10)
+        }
+
+        let before = thread_cpu();
+        for _ in 0..1000 {
+            assert!(is_host_process_alive(std::process::id()));
+        }
+        let cpu = thread_cpu() - before;
+        eprintln!("1000 Windows PID probes consumed {cpu:?} of thread CPU");
+        assert!(
+            cpu < std::time::Duration::from_millis(500),
+            "PID probe CPU budget exceeded: {cpu:?}"
+        );
     }
 
     #[cfg(unix)]

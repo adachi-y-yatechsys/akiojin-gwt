@@ -83,7 +83,7 @@ test.describe("Project tabs", () => {
       const terminal = shell.locator(".terminal-root");
       await terminal.click();
       await expect(terminal.locator(".xterm-helper-textarea")).toBeFocused();
-      const command = "printf 'GWT_%s\\n' 'SCOPED_4536'\r";
+      const command = "node -p \"'GWT_' + 'SCOPED_4536'\"\r";
       await page.keyboard.type(command);
       // Windows shells can elicit cursor-position and focus replies before
       // typing; those protocol frames share the terminal_input transport.

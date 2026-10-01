@@ -90,7 +90,7 @@ jobs:
           echo "flake_targets=$flake_targets" >>"$GITHUB_OUTPUT"
 
   test:
-    name: Test (Rust)
+    name: Test (Rust workspace)
     runs-on: ubuntu-latest
     # Issue #4055 / #4191: the step budgets below are the operative limits;
     # this cap only bounds the job as a whole and must cover their sum
@@ -149,6 +149,7 @@ jobs:
       # job rebuilt 377 crates.
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/develop' }}
           shared-key: linux-workspace
         continue-on-error: true
       # Issue #4055: 21 green runs measured this step at 500–725s (p95 ~660s)
@@ -174,22 +175,6 @@ jobs:
       - name: Run doctests
         run: cargo test --workspace --all-features --doc
         timeout-minutes: 5
-      - name: Verify per-test timeout and suite continuation
-        run: node scripts/test-nextest-timeout.mjs
-        timeout-minutes: 5
-      # Issue #4317: the workspace test step enables the self dev-dependency's
-      # `test-gh-guard` feature, so the target/debug/gwtd it leaves behind
-      # refuses every real `gh` spawn. This drives the real artifact through
-      # refusal -> `cargo build -p gwt --bin gwtd` -> successful GitHub read,
-      # which is the recovery verify.run now appends to its own matrix.
-      - name: Run gwtd verification artifact regression
-        run: python3 scripts/test-gwtd-verification-artifact.py
-        timeout-minutes: 10
-      # Issue #4346: repeat the exact lock check with three concurrent cargo
-      # workers held until completion; reject zero tests and worker failures.
-      - name: Run managed asset lock concurrency regression
-        run: python3 scripts/test-managed-assets-lock-stress.py
-        timeout-minutes: 10
       # Issue #4134 AC-4: four tests cost 226s here and 3.9s on macOS for the
       # same nine spawn/stop cycles, so the wait is inside one `gwt` lifetime
       # under Xvfb rather than in the serialization. The instrumented run showed
@@ -213,6 +198,73 @@ jobs:
             echo "Skipping voice accuracy regression: tests/voice_eval/manifest.json not found."
           fi
         timeout-minutes: 10
+
+  # Issue #4821: infrastructure regressions run beside the workspace suite.
+  test-linux-infrastructure:
+    name: Test (Linux infrastructure)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: Cache Linux GTK dependency packages
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/gwt-apt-archives
+          key: gwt-apt-gtk-${{ runner.os }}-${{ hashFiles('scripts/ci-apt.sh') }}
+          restore-keys: |
+            gwt-apt-gtk-${{ runner.os }}-
+        timeout-minutes: 5
+      - name: Install tray + GTK dependencies (Linux)
+        run: sudo GWT_APT_CACHE_DIR="$HOME/.cache/gwt-apt-archives" bash scripts/ci-apt.sh gtk-deps
+        timeout-minutes: 18
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.146
+        timeout-minutes: 5
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/develop' }}
+          shared-key: linux-workspace
+        continue-on-error: true
+      - name: Build infrastructure regression artifacts
+        run: cargo test -p gwt --all-features --lib --test gwtd_cli_test --no-run
+        timeout-minutes: 25
+      - name: Verify per-test timeout and suite continuation
+        run: node scripts/test-nextest-timeout.mjs
+        timeout-minutes: 5
+      # Issue #4317: the script arms the guarded artifact itself and drives
+      # refusal -> `cargo build -p gwt --bin gwtd` -> successful GitHub read,
+      # which is the recovery verify.run now appends to its own matrix.
+      - name: Run gwtd verification artifact regression
+        run: python3 scripts/test-gwtd-verification-artifact.py
+        timeout-minutes: 10
+      # Issue #4346: repeat the exact lock check with three concurrent cargo
+      # workers held until completion; reject zero tests and worker failures.
+      - name: Run managed asset lock concurrency regression
+        run: python3 scripts/test-managed-assets-lock-stress.py
+        timeout-minutes: 10
+
+  # Keep the existing protected check while both workloads run in parallel.
+  # always() makes failure, cancellation and skipped dependencies fail closed.
+  test-rust-required:
+    name: Test (Rust)
+    runs-on: ubuntu-latest
+    needs: [test, test-linux-infrastructure]
+    if: always()
+    steps:
+      - name: Require both Rust verification jobs
+        env:
+          RUST_RESULT: ${{ needs.test.result }}
+          INFRA_RESULT: ${{ needs.test-linux-infrastructure.result }}
+        run: |
+          echo "Rust workspace: $RUST_RESULT; Linux infrastructure: $INFRA_RESULT"
+          test "$RUST_RESULT" = success
+          test "$INFRA_RESULT" = success
 
   # SPEC #4551 T-055 / AC-6: one green run says nothing about a test whose
   # result is not a function of its source. All 16 issues this SPEC bundles
@@ -246,6 +298,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/develop' }}
           shared-key: linux-workspace
         continue-on-error: true
       # N lives in the script, not here, so the number the gate actually runs
@@ -284,6 +337,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/develop' }}
           shared-key: linux-workspace
         continue-on-error: true
       - uses: actions/setup-python@v7
@@ -317,31 +371,40 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/develop' }}
           shared-key: windows-workspace
         continue-on-error: true
+      - name: Check Windows test runner
+        run: node --test scripts/ci-windows-tests.test.mjs
+      - name: Build Windows regression targets once
+        run: node scripts/ci-windows-tests.mjs build default
+        timeout-minutes: 30
       - name: Run managed hook self-heal regressions
         shell: bash
         run: |
-          cargo test -p gwt --bin gwt app_runtime::tests::startup_self_heal_converges_legacy_config_without_a_runtime_guard -- --exact --test-threads=1
-          cargo test -p gwt --test hook_health_test codex_hook_audit_and_repair_cover_worktree_local_and_workspace_home_copies -- --exact --test-threads=1
+          node scripts/ci-windows-tests.mjs run gwt bin gwt app_runtime::tests::startup_self_heal_converges_legacy_config_without_a_runtime_guard -- --exact --test-threads=1
+          node scripts/ci-windows-tests.mjs run gwt test hook_health_test codex_hook_audit_and_repair_cover_worktree_local_and_workspace_home_copies -- --exact --test-threads=1
         timeout-minutes: 15
       - name: Run priority roundtrip from Normal and BelowNormal launchers
-        run: cargo test -p gwt-core --test process_priority_roundtrip -- --nocapture
+        run: node scripts/ci-windows-tests.mjs run gwt-core test process_priority_roundtrip -- --nocapture
         timeout-minutes: 15
       - name: Run shared Windows process resolver tests
-        run: cargo test -p gwt-core --test windows_process_resolver --test process_adapter_parity
+        shell: bash
+        run: |
+          node scripts/ci-windows-tests.mjs run gwt-core test windows_process_resolver
+          node scripts/ci-windows-tests.mjs run gwt-core test process_adapter_parity
         timeout-minutes: 15
       - name: Run real Claude probe caller regressions
         shell: bash
         run: |
-          cargo test -p gwt-core --test windows_claude_user_agent
-          cargo test -p gwt-agent --lib real_bun_global_placeholder_fixture
-          cargo test -p gwt-agent --lib package_runner_resolution_failure_still_emits_an_end_summary
-          cargo test -p gwt --bin gwt real_bun_global_placeholder_fixture
-          cargo test -p gwt --bin gwt command_prompt_agent_wrapper
+          node scripts/ci-windows-tests.mjs run gwt-core test windows_claude_user_agent
+          node scripts/ci-windows-tests.mjs run gwt-agent lib gwt_agent real_bun_global_placeholder_fixture
+          node scripts/ci-windows-tests.mjs run gwt-agent lib gwt_agent package_runner_resolution_failure_still_emits_an_end_summary
+          node scripts/ci-windows-tests.mjs run gwt bin gwt real_bun_global_placeholder_fixture
+          node scripts/ci-windows-tests.mjs run gwt bin gwt command_prompt_agent_wrapper
         timeout-minutes: 15
       - name: Run Windows PTY resolver adapter tests
-        run: cargo test -p gwt-terminal --lib pty::windows_spawn::tests -- --test-threads=1
+        run: node scripts/ci-windows-tests.mjs run gwt-terminal lib gwt_terminal pty::windows_spawn::tests -- --test-threads=1
         timeout-minutes: 15
       # Issue #3631: a GUI-subsystem PTY start gate is never attached to the
       # pane's pseudoconsole, so the released agent renders in an external
@@ -350,52 +413,52 @@ jobs:
       - name: Run Windows PTY start-gate console contracts
         shell: bash
         run: |
-          cargo test -p gwt --test windows_binary_subsystem_test -- --test-threads=1
-          cargo test -p gwt --test pty_start_gate_console_test -- --test-threads=1
+          node scripts/ci-windows-tests.mjs run gwt test windows_binary_subsystem_test -- --test-threads=1
+          node scripts/ci-windows-tests.mjs run gwt test pty_start_gate_console_test -- --test-threads=1
         timeout-minutes: 15
       - name: Run Issue Monitor scheduled driver contracts
         shell: bash
         run: |
-          cargo test -p gwt --bin gwt scheduled_tick_is_single_flight_per_canonical_project_scope -- --test-threads=1
-          cargo test -p gwt --bin gwt scheduled_tick_drives_disabled_claim_cleanup_without_scanning -- --test-threads=1
-          cargo test -p gwt --bin gwt scheduled_tick_advances_autonomous_launch_without_an_external_daemon -- --test-threads=1
-          cargo test -p gwt --bin gwt app_runtime_local_driver_ -- --test-threads=1
-          cargo test -p gwt --lib local_fallback_lease -- --test-threads=1
+          node scripts/ci-windows-tests.mjs run gwt bin gwt scheduled_tick_is_single_flight_per_canonical_project_scope -- --test-threads=1
+          node scripts/ci-windows-tests.mjs run gwt bin gwt scheduled_tick_drives_disabled_claim_cleanup_without_scanning -- --test-threads=1
+          node scripts/ci-windows-tests.mjs run gwt bin gwt scheduled_tick_advances_autonomous_launch_without_an_external_daemon -- --test-threads=1
+          node scripts/ci-windows-tests.mjs run gwt bin gwt app_runtime_local_driver_ -- --test-threads=1
+          node scripts/ci-windows-tests.mjs run gwt lib gwt local_fallback_lease -- --test-threads=1
         timeout-minutes: 15
       - name: Run Issue Monitor launch_now control-path contracts
         shell: bash
         run: |
-          cargo test -p gwt --lib cli::issue::tests::windows_launch_now_ -- --test-threads=1
-          cargo test -p gwt --lib cli::issue::tests::immediate_scan_delivery_never_claims_an_unacknowledged_schedule -- --exact --test-threads=1
-          cargo test -p gwt --lib cli::pane::tests::pane_websocket_request_carries_the_agent_capability_in_authorization -- --exact --test-threads=1
-          cargo test -p gwt --lib cli::pane::tests::issue_monitor_scan_client_ -- --test-threads=1
-          cargo test -p gwt --bin gwt embedded_server::tests::authenticated_monitor_scan_routes_scope_guard_and_result_only_to_origin_socket -- --exact --test-threads=1
-          cargo test -p gwt --bin gwt authenticated_pm_scan_now_ -- --test-threads=1
-          cargo test -p gwt --bin gwt authenticated_scan_now_ -- --test-threads=1
-          cargo test -p gwt --test issue_monitor_protocol_test frontend_issue_monitor_events_use_snake_case_wire_shape -- --exact --test-threads=1
-          cargo test -p gwt --test issue_monitor_protocol_test agent_issue_monitor_scan_ -- --test-threads=1
+          node scripts/ci-windows-tests.mjs run gwt lib gwt cli::issue::tests::windows_launch_now_ -- --test-threads=1
+          node scripts/ci-windows-tests.mjs run gwt lib gwt cli::issue::tests::immediate_scan_delivery_never_claims_an_unacknowledged_schedule -- --exact --test-threads=1
+          node scripts/ci-windows-tests.mjs run gwt lib gwt cli::pane::tests::pane_websocket_request_carries_the_agent_capability_in_authorization -- --exact --test-threads=1
+          node scripts/ci-windows-tests.mjs run gwt lib gwt cli::pane::tests::issue_monitor_scan_client_ -- --test-threads=1
+          node scripts/ci-windows-tests.mjs run gwt bin gwt embedded_server::tests::authenticated_monitor_scan_routes_scope_guard_and_result_only_to_origin_socket -- --exact --test-threads=1
+          node scripts/ci-windows-tests.mjs run gwt bin gwt authenticated_pm_scan_now_ -- --test-threads=1
+          node scripts/ci-windows-tests.mjs run gwt bin gwt authenticated_scan_now_ -- --test-threads=1
+          node scripts/ci-windows-tests.mjs run gwt test issue_monitor_protocol_test frontend_issue_monitor_events_use_snake_case_wire_shape -- --exact --test-threads=1
+          node scripts/ci-windows-tests.mjs run gwt test issue_monitor_protocol_test agent_issue_monitor_scan_ -- --test-threads=1
         timeout-minutes: 15
       - name: Run agent process resolver caller contracts
-        run: cargo test -p gwt --test agent_process_resolution_contract_test
+        run: node scripts/ci-windows-tests.mjs run gwt test agent_process_resolution_contract_test
         timeout-minutes: 15
       - name: Run Windows runtime daemon named-pipe transport contracts
         shell: bash
         run: |
-          cargo test -p gwt --lib cli::daemon::transport -- --test-threads=1
-          cargo test -p gwt --lib cli::daemon::client -- --test-threads=1
-          cargo test -p gwt --lib cli::daemon::tests -- --test-threads=1
-          cargo test -p gwt --lib daemon_subscriber -- --test-threads=1
-          cargo test -p gwt --lib daemon_supervisor -- --test-threads=1
-          cargo test -p gwt --lib process::tests -- --test-threads=1
-          cargo test -p gwt-core --lib daemon_pipe_name -- --test-threads=1
+          node scripts/ci-windows-tests.mjs run gwt lib gwt cli::daemon::transport -- --test-threads=1
+          node scripts/ci-windows-tests.mjs run gwt lib gwt cli::daemon::client -- --test-threads=1
+          node scripts/ci-windows-tests.mjs run gwt lib gwt cli::daemon::tests -- --test-threads=1
+          node scripts/ci-windows-tests.mjs run gwt lib gwt daemon_subscriber -- --test-threads=1
+          node scripts/ci-windows-tests.mjs run gwt lib gwt daemon_supervisor -- --test-threads=1
+          node scripts/ci-windows-tests.mjs run gwt lib gwt process::tests -- --test-threads=1
+          node scripts/ci-windows-tests.mjs run gwt-core lib gwt_core daemon_pipe_name -- --test-threads=1
         timeout-minutes: 20
       # Issue #4746: Windows uses the in-process verification runner, and
       # reclaiming an exited workload's stalled driver needs native taskkill.
       - name: Run Windows verification completion and reclaim regressions
         shell: bash
         run: |
-          cargo test -p gwt --lib cli::verification_record::tests::verification_records_exit_while_grandchild_holds_output -- --exact --test-threads=1
-          cargo test -p gwt --lib cli::verification_lease:: -- --test-threads=1
+          node scripts/ci-windows-tests.mjs run gwt lib gwt cli::verification_record::tests::verification_records_exit_while_grandchild_holds_output -- --exact --test-threads=1
+          node scripts/ci-windows-tests.mjs run gwt lib gwt cli::verification_lease:: -- --test-threads=1
         timeout-minutes: 15
       # Issue #4078 AC-4: the wait declaration is the only way a Windows agent
       # can tell the Issue Monitor its silence is a wait rather than a stall.
@@ -405,31 +468,33 @@ jobs:
       - name: Run Issue Monitor wait declaration contracts
         shell: bash
         run: |
-          cargo test -p gwt --lib cli::issue::tests::monitor_wait_ -- --test-threads=1
-          cargo test -p gwt --lib issue_monitor::tests::wait_declaration_ -- --test-threads=1
-          cargo test -p gwt --lib issue_monitor::tests::agent_status_projects_the_wait_declaration -- --exact --test-threads=1
+          node scripts/ci-windows-tests.mjs run gwt lib gwt cli::issue::tests::monitor_wait_ -- --test-threads=1
+          node scripts/ci-windows-tests.mjs run gwt lib gwt issue_monitor::tests::wait_declaration_ -- --test-threads=1
+          node scripts/ci-windows-tests.mjs run gwt lib gwt issue_monitor::tests::agent_status_projects_the_wait_declaration -- --exact --test-threads=1
         timeout-minutes: 15
       - name: Run release asset contract tests
         run: node scripts/test_release_assets.cjs
         timeout-minutes: 15
+      # Issue #4821: keep the readiness contract within 60 seconds.
+      # Native timing measurements run on the nightly path.
+      - name: Check Windows startup tray readiness contract
+        run: node scripts/ci-windows-tests.mjs run gwt test startup_tray_performance startup_metric_and_native_command_contract -- --exact --test-threads=1 --nocapture
+        timeout-minutes: 1
+      # Issue #4803 AC-4: Linux runs this in the workspace suite; pin it here
+      # too so exceeding the deterministic 1500-session Git budget fails CI.
+      - name: Check startup update Git-spawn budget
+        run: node scripts/ci-windows-tests.mjs run gwt bin gwt app_runtime::tests::startup_restore_update_marker_1500_sessions_bounds_git_spawns -- --exact --test-threads=1
+        timeout-minutes: 15
+      # Build the second feature set only after default artifacts finish.
+      - name: Build warm latency target once
+        run: node scripts/ci-windows-tests.mjs build warm
+        timeout-minutes: 30
       # Issue #3777: measure the warm 250ms acceptance contract without other
       # tests competing for CPU and file I/O. The full default-parallel proof
       # remains in nightly.yml alongside the other deadline-sensitive tests.
       - name: Measure warm prompt latency in isolation
-        run: cargo test -p gwt --lib --all-features cli::hook::event_dispatcher::tests::warm_four_megabyte_history_user_prompt_submit_p95_stays_within_budget -- --exact --test-threads=1
+        run: node scripts/ci-windows-tests.mjs run-warm gwt lib gwt cli::hook::event_dispatcher::tests::warm_four_megabyte_history_user_prompt_submit_p95_stays_within_budget -- --exact --test-threads=1
         timeout-minutes: 15
-      # Issue #4730: native tray dispatch under real startup load, including
-      # the first ten minutes of frontend dispatch timing. Uses an isolated HOME.
-      - name: Measure Windows startup tray performance
-        run: cargo test -p gwt --test startup_tray_performance -- --ignored --test-threads=1 --nocapture
-        timeout-minutes: 25
-      - name: Upload Windows startup tray measurements
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: windows-startup-tray-performance
-          path: target/startup-tray-performance.json
-          if-no-files-found: warn
 
   # The default-parallel determinism proof lives in nightly.yml (Issue #4134
   # AC-1). It re-ran on Windows a suite Linux had already run, cost 2806s, and
@@ -448,6 +513,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
+          save-if: ${{ github.ref == 'refs/heads/develop' }}
           shared-key: windows-workspace
         continue-on-error: true
       # Issue #4134 AC-2: the four provider/selector combinations used to be a

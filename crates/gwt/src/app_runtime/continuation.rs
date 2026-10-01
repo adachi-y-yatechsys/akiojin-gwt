@@ -1770,19 +1770,73 @@ fn durable_launch_recovery_records(
                 tracing::warn!(path = %path.display(), "launch recovery receipt filename does not match its Session identity");
                 return None;
             }
+            match durable_launch_recovery_repo_identity_matches(&record) {
+                Some(true) => {}
+                Some(false) => {
+                    match archive_mismatched_launch_recovery(sessions_dir, &path, &record, &bytes) {
+                        Ok(()) => tracing::info!(session_id = %record.session_id, "archived launch recovery receipt after repository identity mismatch"),
+                        Err(error) => tracing::warn!(session_id = %record.session_id, error = %error, "launch recovery receipt archive remains pending"),
+                    }
+                    return None;
+                }
+                None => {
+                    tracing::warn!(session_id = %record.session_id, "retained launch recovery receipt while repository identity is unavailable");
+                    return None;
+                }
+            }
             Some((path, record))
         })
         .collect()
 }
 
-fn durable_launch_recovery_repo_matches(record: &DurableLaunchRecoveryRecord) -> bool {
-    if gwt_core::repo_hash::detect_repo_hash(&record.worktree_path)
-        .is_none_or(|repo_hash| repo_hash.to_string() != record.repo_hash)
+fn archive_mismatched_launch_recovery(
+    sessions_dir: &Path,
+    path: &Path,
+    record: &DurableLaunchRecoveryRecord,
+    expected_bytes: &[u8],
+) -> Result<(), String> {
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(durable_launch_recovery_lock_path(
+            sessions_dir,
+            &record.session_id,
+        )?)
+        .map_err(|error| error.to_string())?;
+    lock.lock_exclusive().map_err(|error| error.to_string())?;
+    // A concurrent launch may have strengthened or replaced this receipt.
+    // Never archive evidence other than the exact mismatch we inspected.
+    if std::fs::read(path).map_err(|error| error.to_string())? != expected_bytes
+        || durable_launch_recovery_repo_identity_matches(record) != Some(false)
     {
-        return false;
+        return Err("launch recovery evidence changed before archival".to_string());
+    }
+    let parent = durable_launch_recovery_dir(sessions_dir);
+    let archive = parent.join("archive");
+    create_durable_launch_recovery_directory(&archive).map_err(|error| error.to_string())?;
+    let destination = archive.join(format!(
+        "{}-{}.json",
+        record.session_id,
+        uuid::Uuid::new_v4()
+    ));
+    std::fs::rename(path, destination).map_err(|error| error.to_string())?;
+    sync_durable_launch_recovery_directory(&archive).map_err(|error| error.to_string())?;
+    sync_durable_launch_recovery_directory(&parent).map_err(|error| error.to_string())
+}
+
+// None means unavailable evidence, not proof that this repository changed.
+fn durable_launch_recovery_repo_identity_matches(
+    record: &DurableLaunchRecoveryRecord,
+) -> Option<bool> {
+    let repo_hash = gwt_core::repo_hash::detect_repo_hash(&record.worktree_path)?;
+    if repo_hash.to_string() != record.repo_hash {
+        return Some(false);
     }
     gwt_git::worktree::main_worktree_root(&record.worktree_path)
-        .is_ok_and(|anchor| path_matches(&anchor, &record.project_root))
+        .ok()
+        .map(|anchor| path_matches(&anchor, &record.project_root))
 }
 
 #[derive(Clone, Copy)]
@@ -2726,6 +2780,79 @@ fn repaired_binding_probe_receipt_matches(
 mod repaired_binding_probe_tests {
     use super::*;
 
+    fn recovery_fixture(root: &Path) -> (PathBuf, PathBuf, Vec<u8>) {
+        let repo = root.join("repo");
+        init_repo(&repo);
+        let sessions = root.join("sessions");
+        let record = DurableLaunchRecoveryRecord {
+            schema_version: DURABLE_LAUNCH_RECOVERY_SCHEMA_VERSION,
+            kind: DurableLaunchRecoveryKind::Genesis,
+            session_id: "archive-test".to_string(),
+            project_root: repo.clone(),
+            worktree_path: repo,
+            repo_hash: "different-repository".to_string(),
+            owner_kind: "issue".to_string(),
+            owner_number: 4803,
+            expected_binding: None,
+            expected_agent_id: None,
+            expected_session_identity: None,
+        };
+        let path = durable_launch_recovery_path(&sessions, &record.session_id).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let bytes = serde_json::to_vec_pretty(&record).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        (sessions, path, bytes)
+    }
+
+    #[test]
+    fn recovery_repository_mismatch_archives_original_receipt_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let _gwt_home = gwt_core::test_support::ScopedGwtHome::set(temp.path());
+        let (sessions, path, bytes) = recovery_fixture(temp.path());
+        assert!(durable_launch_recovery_records(&sessions).is_empty());
+        assert!(!path.exists());
+        let archive = durable_launch_recovery_dir(&sessions).join("archive");
+        let files: Vec<_> = std::fs::read_dir(&archive)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(files.len(), 1);
+        assert_eq!(std::fs::read(files[0].path()).unwrap(), bytes);
+        assert!(durable_launch_recovery_records(&sessions).is_empty());
+        assert_eq!(std::fs::read_dir(archive).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn recovery_repository_unavailable_retains_receipt() {
+        let temp = tempfile::tempdir().unwrap();
+        let _gwt_home = gwt_core::test_support::ScopedGwtHome::set(temp.path());
+        let (sessions, path, _) = recovery_fixture(temp.path());
+        let mut record: DurableLaunchRecoveryRecord =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        record.worktree_path = temp.path().join("unavailable");
+        let bytes = serde_json::to_vec_pretty(&record).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(durable_launch_recovery_records(&sessions).is_empty());
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        assert!(!durable_launch_recovery_dir(&sessions)
+            .join("archive")
+            .exists());
+    }
+
+    #[test]
+    fn recovery_repository_archive_failure_retains_receipt() {
+        let temp = tempfile::tempdir().unwrap();
+        let _gwt_home = gwt_core::test_support::ScopedGwtHome::set(temp.path());
+        let (sessions, path, bytes) = recovery_fixture(temp.path());
+        std::fs::write(
+            durable_launch_recovery_dir(&sessions).join("archive"),
+            b"blocked",
+        )
+        .unwrap();
+        assert!(durable_launch_recovery_records(&sessions).is_empty());
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+    }
+
     fn init_repo(path: &Path) {
         std::fs::create_dir_all(path).expect("create repository directory");
         let status = gwt_core::process::hidden_command("git")
@@ -2937,10 +3064,6 @@ impl AppRuntime {
                     continue;
                 }
             };
-            if !durable_launch_recovery_repo_matches(&receipt) {
-                tracing::warn!(session_id = %receipt.session_id, "retained launch recovery receipt after repository identity mismatch");
-                continue;
-            }
             let operation_id = match &receipt.kind {
                 DurableLaunchRecoveryKind::Genesis => {
                     self.reconcile_durable_genesis_launch(&receipt, owner);
@@ -6056,7 +6179,7 @@ impl AppRuntime {
                 session_binding_id: uuid::Uuid::new_v4().to_string(),
                 initial_session_id: continuation_session_id.clone(),
                 entrypoint: gwt::cli::execution_state::entrypoint_from_launch(
-                    &config.args,
+                    config.entrypoint_args(),
                     config.session_mode == gwt_agent::SessionMode::Resume,
                 ),
                 requested_at,

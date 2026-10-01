@@ -210,6 +210,49 @@ test.describe("Issue preview placement", () => {
     expect(pageErrors).toEqual([]);
   });
 
+  // Issue #4812 AC-3: both return controls work from an active grouped tab.
+  for (const control of ["header", "titlebar"] as const) {
+    test(`Issue #4812: ${control} returns a grouped agent to the list`, async ({ page }) => {
+      if (!liveUrl) await installEmbeddedRoutes(page);
+      await installIssuePreviewBackend(page);
+      await page.goto(liveUrl || APP_URL);
+      await page.getByRole("button", { name: "Output", exact: true }).click();
+      await expect(page.locator(".surface-knowledge .issue-preview")).toBeVisible();
+
+      await page.evaluate(() => {
+        window.__patchWindow("tab-issue::agent-preview-2", {
+          placement: { kind: "canvas" }, tab_group_id: "return-group", tab_group_active: false,
+        });
+        window.__patchWindow("tab-issue::agent-preview", {
+          placement: { kind: "canvas" }, tab_group_id: "return-group", tab_group_active: true,
+        });
+      });
+      const agent = page.locator(".workspace-window[data-id='tab-issue::agent-preview']");
+      const sibling = page.locator(".workspace-window[data-id='tab-issue::agent-preview-2']");
+      await expect(agent).toBeVisible();
+      await expect(agent).toHaveClass(/tabbed/);
+      await expect(agent.locator(".window-tab-strip .window-tab")).toHaveCount(2);
+      await expect(sibling).not.toBeVisible();
+      const button = control === "header"
+        ? agent.locator(".issue-window-header [data-action='return-to-list']")
+        : agent.locator(".titlebar [data-action='minimize-to-issue']");
+      await expect(button).toBeVisible();
+      // The Issue window can overlap canvas chrome, as in the standalone tests.
+      await button.dispatchEvent("click");
+      await expect.poll(() => page.evaluate(() => window.__knowledgeLoadMessages
+        .filter(message => message.kind === "dock_agent_window_to_issue")
+        .map(message => message.id))).toEqual(["tab-issue::agent-preview"]);
+      await expect(agent).not.toBeVisible();
+      await expect(page.locator(".surface-knowledge .issue-preview"))
+        .toHaveAttribute("data-window-id", "tab-issue::agent-preview");
+      await expect(sibling).toBeVisible();
+      await expect(sibling).not.toHaveClass(/tabbed/);
+      expect(await page.evaluate(() => window.__knowledgeLoadMessages
+        .filter(message => ["close_window", "stop_window", "restart_window"].includes(message.kind))))
+        .toEqual([]);
+    });
+  }
+
   // 受け入れシナリオ 5 / FR-011.
   test("an errored agent is badged in the Issue row, not opened on the canvas", async ({
     page,
@@ -908,10 +951,13 @@ async function installIssuePreviewBackend(page, { agentStatus = "running" } = {}
           if (message.kind === "dock_agent_window_to_issue") {
             // SPEC #3885 FR-012: the inverse transition. The window already knows
             // its Issue, so the backend resolves the host Issue window itself.
+            const groupId = windows.find(entry => entry.id === message.id)?.tab_group_id;
             windows = windows.map((entry) =>
               entry.id === message.id
                 ? {
                     ...entry,
+                    tab_group_id: null,
+                    tab_group_active: false,
                     placement: {
                       kind: "issue_preview",
                       issue_window_id: "tab-issue::issue-1",
@@ -920,6 +966,15 @@ async function installIssuePreviewBackend(page, { agentStatus = "running" } = {}
                   }
                 : entry,
             );
+            // Model the backend's detach/normalize response; Rust tests exercise
+            // the real transition rather than this deterministic WebSocket fixture.
+            if (groupId) {
+              const remaining = windows.filter(entry => entry.tab_group_id === groupId);
+              remaining.forEach((entry, index) => {
+                entry.tab_group_id = remaining.length > 1 ? groupId : null;
+                entry.tab_group_active = remaining.length > 1 && index === 0;
+              });
+            }
             this.emit(workspaceState());
           }
         }

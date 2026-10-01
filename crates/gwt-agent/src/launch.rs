@@ -81,28 +81,11 @@ fn materialize_claude_settings_file(
     Ok(path)
 }
 
-/// Resolve the gwt repo hash for the directory by shelling out to
-/// `git remote get-url origin`. Returns `None` when no origin is configured.
+/// Resolve the gwt repo hash without spawning Git on the launch path.
+/// Returns `None` when no origin is configured.
 fn detect_repo_hash_for_dir(dir: &Path) -> Option<String> {
-    let output = gwt_core::process::hidden_command("git")
-        .arg("remote")
-        .arg("get-url")
-        .arg("origin")
-        .current_dir(dir)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if url.is_empty() {
-        return None;
-    }
-    Some(
-        gwt_core::repo_hash::compute_repo_hash(&url)
-            .as_str()
-            .to_string(),
-    )
+    let repo = gwt_git::Repository::discover(dir).ok()?;
+    gwt_core::repo_hash::detect_repo_hash(repo.path()).map(|hash| hash.as_str().to_owned())
 }
 
 /// Resolve the gwt worktree hash for the directory.
@@ -1116,6 +1099,9 @@ pub struct LaunchConfig {
     pub agent_id: AgentId,
     pub command: String,
     pub args: Vec<String>,
+    /// Long initial task materialized as a file after worktree resolution.
+    /// Retained separately from argv so launch provenance still sees its skill.
+    pub pending_initial_prompt: Option<String>,
     pub env_vars: HashMap<String, String>,
     pub remove_env: Vec<String>,
     pub working_dir: Option<PathBuf>,
@@ -1187,6 +1173,16 @@ pub struct LaunchConfig {
     /// the forced-skip contract is decided and the one place the per-provider
     /// mapping is verified to have survived materialization.
     pub permission_decision: PermissionModeDecision,
+}
+
+impl LaunchConfig {
+    /// Original task arguments for provenance, before file/shell transport.
+    pub fn entrypoint_args(&self) -> &[String] {
+        self.pending_initial_prompt
+            .as_ref()
+            .map(std::slice::from_ref)
+            .unwrap_or(&self.args)
+    }
 }
 
 /// Permission mode for agent launch.
@@ -1728,6 +1724,7 @@ impl AgentLaunchBuilder {
             agent_id,
             command: runner.executable,
             args,
+            pending_initial_prompt: None,
             env_vars,
             remove_env: Vec::new(),
             working_dir: self.working_dir,
@@ -2233,6 +2230,61 @@ mod tests {
     use crate::custom::{CustomAgentType, CustomCodingAgent, ModeArgs};
 
     use super::*;
+
+    #[test]
+    fn repo_hash_from_subdirectory_does_not_require_git_on_path() {
+        const CHILD_REPO: &str = "GWT_TEST_REPO_HASH_NO_GIT_DIR";
+        let origin = "https://github.com/example/monitor-launch.git";
+        if let Some(nested) = std::env::var_os(CHILD_REPO) {
+            assert!(
+                gwt_core::process::hidden_command("git")
+                    .arg("--version")
+                    .output()
+                    .is_err(),
+                "the isolated child must not be able to execute Git"
+            );
+            assert_eq!(
+                detect_repo_hash_for_dir(std::path::Path::new(&nested)),
+                Some(
+                    gwt_core::repo_hash::compute_repo_hash(origin)
+                        .as_str()
+                        .to_owned()
+                )
+            );
+            return;
+        }
+        let repo = tempfile::tempdir().unwrap();
+        let output = gwt_core::process::hidden_command("git")
+            .arg("init")
+            .arg(repo.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git init failed: {output:?}");
+        std::fs::write(
+            repo.path().join(".git/config"),
+            format!("[remote \"origin\"]\n\turl = {origin}\n"),
+        )
+        .unwrap();
+        let nested = repo.path().join("src/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        // Isolate PATH in a child so parallel agent tests retain their runners.
+        let output = gwt_core::process::hidden_command(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "launch::tests::repo_hash_from_subdirectory_does_not_require_git_on_path",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("PATH", repo.path().join("missing-bin"))
+            .env(CHILD_REPO, &nested)
+            .current_dir(&nested)
+            .output()
+            .expect("run isolated repository hash check");
+        assert!(
+            output.status.success(),
+            "isolated repository hash check failed: {output:?}"
+        );
+    }
 
     // SPEC-1921 Phase 53 / Issue #2091: canonical_launch_args is the single
     // source of truth for entrypoint-independent default args across all launch entry
