@@ -59,6 +59,7 @@ pub mod project_open_control;
 pub mod project_runtime;
 pub mod project_transport;
 pub mod protocol;
+pub mod provider_reset;
 pub mod pty_start_gate;
 pub mod recovery_delivery;
 pub mod runtime_daemon_events;

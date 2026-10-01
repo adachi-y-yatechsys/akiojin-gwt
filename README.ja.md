@@ -111,7 +111,7 @@ curl -fsSL https://raw.githubusercontent.com/akiojin/gwt/main/installers/macos/u
   - `GOOGLE_API_KEY` または `GEMINI_API_KEY`
   - `XAI_API_KEY`
 - shared project index runtime の bootstrap / repair が必要な場合は
-  Python 3.9+ が使えること
+  Python 3.10+ が使えること
 
 Linux デスクトップ版のビルドには WebKitGTK 系の依存が必要です。CI と同じ依存は
 [docs/docker-usage.md](docs/docker-usage.md) を参照してください。
@@ -430,6 +430,31 @@ Workspace パネルの `Clean Up Ready` 件数も、worktree 単位で同じ考�
 （`.gwt/` namespace、materialize された `gwt-*` skill / command、手書きの内容を含まない
 `.codex/hooks.json` / `.claude/settings.local.json`）だけであれば cleanup-ready のまま
 数えられます。それ以外の未コミット変更があれば、その Workspace は件数から外れます。
+
+### プロバイダの無料リセット
+
+`provider.reset.proposals` は provider hold を読み、残り待機時間が
+`min_reset_wait_secs`（既定: 86400 秒）以上なら Codex の無料リセット枠の確認を
+提案します。Claude の上限時は別プロバイダへの切替を提案します。
+**Claude の追加利用は課金を伴うため gwt からは実行しない**方針です。
+
+`provider.reset` に `provider: "codex"` と `pane.list` の正確な `window_id` を
+指定すると、無料枠を確認した後に OS の確認ダイアログを表示します。
+**Redeem free reset** を選ぶと、そのアカウントの無料リセットを1回消費します。
+既定は Cancel で、autonomous モードでも確認を省略しません。
+JSON の承認フラグや過去の承認は利用できません。canvas 上にある、直接インストールした
+Host Codex と既定プロバイダの window に対応し、Docker・package runner・独自 backend は拒否します。
+確認画面には対象窓の起動時に記録した認証ルートと由来（host・profile・caller environment）を
+表示し、ヘルパーも同じルートを使用します。証跡のない古い窓は再起動してください。
+認証環境を解決できない場合は実行を拒否します。
+Windows では対象窓を起動する前に `CODEX_HOME` を明示してください。
+
+成功後はアカウントの利用再開を再確認し、provider hold を自動解除します。
+失敗や結果不明の場合は hold を保持します。承認・実行・結果は
+`~/.gwt/provider-resets/<request_id>.jsonl` に保存し、operation はそのパスと失敗理由を
+返します。リセットと hold 解除の成功後に最終監査の書き込みだけが失敗した場合は、
+成功結果を維持し、`audit_warning` を別に返します。クレジット購入や有料追加利用への切替は行いません。
+引数の詳細は `gwtd --help provider` を参照してください。
 
 ### Autonomous モード（opt-in）
 
@@ -1080,6 +1105,20 @@ lint、coverage、直接の headed browser 確認、pre-push 確認は verificat
 lease なしでそのまま実行します。完了判定には引き続き canonical な検証証跡が
 必要です。
 
+`verify.lease.status` は `holder_project_relation`（`same_project` /
+`other_project` / `unknown`）、`holder_reclaim_candidate`、
+`holder_intervention` を判定として返します。他プロジェクトの holder、所有者を
+特定できない holder、活動を判定できない holder は
+`holder_intervention: forbidden` として保護されます。観測回数を増やしても
+`unknown` の holder を停止する根拠にはなりません。同一プロジェクトの回収候補または
+旧 control channel だけが `canonical_release_only` になり、canonical release が状態を確認します。
+他プロジェクトからの release は拒否されます。拒否を `kill` / `pkill` で迂回しないでください。
+
+ETA には `estimated_remaining_ms_uncertain: true` が併記されます。これはバッチの
+推定時間または lease TTL で、現在の進捗を測るカウンターではありません。値が不変でも
+固着の証拠にはなりません。`waiter_action: wait` は canonical admission を待つのが
+正しい挙動だと示します。待機列に並んでいることは holder を停止する権限になりません。
+
 `verify.run` はコマンド開始前に未完了の記録を保存します。本体が外部終了すると、
 監視プロセスが中断理由、最後に実行中だったコマンド、完了したコマンドの結果を
 記録します。`execution.status` は `running`・`interrupted`・`missing_record`
@@ -1100,7 +1139,7 @@ Git hook は `gwtd` ではなく `git push` の配下で動くため verificatio
 `verify.lease.extend` は holder や予約を作らずエラーを返すようになりました。
 canonical 検証を囲む手動取得は `verify.run` に置き換え、通常の Cargo 操作を
 囲む手動取得は削除してください。既存の旧 holder はプロセスを kill せず、
-明示的に解放できます。
+所有プロジェクトから明示的に解放できます。
 
 ```bash
 gwtd <<'JSON'

@@ -61554,7 +61554,21 @@ fn assert_every_codex_hook_is_trusted(config: &toml::Value, hooks_path: &Path) {
     ];
     // Issue #4071: Codex keys hooks by the plain absolute path, never the
     // Windows `\\?\` verbatim form `std::fs::canonicalize` returns.
-    let canonical = dunce::canonicalize(hooks_path).expect("canonicalize hooks path");
+    //
+    // Issue #4879: ask the registration side for that form instead of
+    // restating it. `dunce::canonicalize` stood here, which on macOS resolves a
+    // `/var/...` launch path to `/private/var/...` — a key the product never
+    // writes and Codex never reads.
+    //
+    // The caller must hand over a path that came from
+    // `codex_hooks_paths_for_codex_discovery` rather than one joined by hand.
+    // The two registered copies do not share a canonical form: the
+    // worktree-local copy keeps the launch path as given, while the
+    // workspace-home copy is reached through git's `gitdir`, which git wrote
+    // canonically. No single rule applied to a hand-built path can match both,
+    // which is why this helper derives nothing of its own.
+    let canonical =
+        gwt_skills::codex_hook_trust_key_path(hooks_path).expect("derive Codex hook trust key");
     let hooks: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(hooks_path).expect("read hooks.json"))
             .expect("parse hooks.json");
@@ -61631,8 +61645,33 @@ fn codex_hook_trust_launch_trusts_every_discovered_worktree_hook_file() {
     let config: toml::Value =
         toml::from_str(&fs::read_to_string(&report.config_path).expect("read codex config"))
             .expect("parse codex config");
-    assert_every_codex_hook_is_trusted(&config, &worktree.join(".codex/hooks.json"));
-    assert_every_codex_hook_is_trusted(&config, &repo.join(".codex/hooks.json"));
+    // Issue #4879: take both paths from the product's own discovery derivation.
+    // Joining `.codex/hooks.json` onto the fixture roots by hand produced a
+    // workspace-home path that only looked right: the registration side reaches
+    // that copy through git's `gitdir`, so the hand-built form differed from the
+    // key it had written, and the assertion failed on a correct product.
+    let worktree_local = gwt_skills::codex_hooks_paths_for_codex_discovery(
+        &worktree,
+        gwt_skills::CodexHookDiscoveryMode::WorktreeLocal,
+    );
+    let workspace_home = gwt_skills::codex_hooks_paths_for_codex_discovery(
+        &worktree,
+        gwt_skills::CodexHookDiscoveryMode::WorkspaceHome,
+    );
+    assert_ne!(
+        worktree_local, workspace_home,
+        "fixture must be a linked worktree whose two hook copies are distinct"
+    );
+    assert!(
+        workspace_home
+            .iter()
+            .all(|path| path.starts_with(dunce::canonicalize(&repo).expect("canonical repo"))),
+        "the workspace-home copy must live under the repository checkout: \
+         {workspace_home:?} vs {repo:?}"
+    );
+    for path in worktree_local.iter().chain(workspace_home.iter()) {
+        assert_every_codex_hook_is_trusted(&config, path);
+    }
 }
 
 /// Issue #3967 AC-4: a pre-registration that cannot vouch for the gwt hooks

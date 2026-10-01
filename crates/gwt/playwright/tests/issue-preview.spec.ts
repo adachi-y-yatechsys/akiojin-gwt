@@ -230,8 +230,7 @@ test.describe("Issue preview placement", () => {
       const agent = page.locator(".workspace-window[data-id='tab-issue::agent-preview']");
       const sibling = page.locator(".workspace-window[data-id='tab-issue::agent-preview-2']");
       await expect(agent).toBeVisible();
-      await expect(agent).toHaveClass(/tabbed/);
-      await expect(agent.locator(".window-tab-strip .window-tab")).toHaveCount(2);
+      await expect(page.locator(".window-tab-strip, .window-tab")).toHaveCount(0);
       await expect(sibling).not.toBeVisible();
       const button = control === "header"
         ? agent.locator(".issue-window-header [data-action='return-to-list']")
@@ -246,7 +245,7 @@ test.describe("Issue preview placement", () => {
       await expect(page.locator(".surface-knowledge .issue-preview"))
         .toHaveAttribute("data-window-id", "tab-issue::agent-preview");
       await expect(sibling).toBeVisible();
-      await expect(sibling).not.toHaveClass(/tabbed/);
+      await expect(sibling.locator(".titlebar")).toBeVisible();
       expect(await page.evaluate(() => window.__knowledgeLoadMessages
         .filter(message => ["close_window", "stop_window", "restart_window"].includes(message.kind))))
         .toEqual([]);

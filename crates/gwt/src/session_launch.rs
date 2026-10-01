@@ -28,6 +28,7 @@ pub fn initialize_launch_session(
     session.launch_route = config.launch_route;
     session.launch_command = durable_command.unwrap_or_else(|| config.command.clone());
     session.launch_args = config.args.clone();
+    session.codex_auth_root = config.validated_codex_auth_root_for_cwd(worktree);
     session.windows_shell = config.windows_shell;
     session.tool_runtime_provenance = config.tool_runtime_provenance.clone();
     apply_resume_identity_to_session(&mut session, config);

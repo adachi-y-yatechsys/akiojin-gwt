@@ -128,6 +128,7 @@ fn print_help() {
     println!("  register    gwt-register-spec exit CLI (SPEC-2784)");
     println!("  pane        Inspect and control live agent panes");
     println!("  pm          PM agent diagnostics (SPEC-3431)");
+    println!("  provider    Free quota reset proposals and native user consent");
     println!("  workspace   Update Work current projection and summary journal");
     println!("  update      Check / apply gwt updates");
     println!("  daemon      Long-running runtime daemon (SPEC-2077)");
@@ -156,6 +157,7 @@ fn family_help(family: &str) -> Option<String> {
         "register" => Some(format_register_help()),
         "pane" => Some(format_pane_help()),
         "pm" => Some(format_pm_help()),
+        "provider" => Some(format_provider_help()),
         "workspace" => Some(format_workspace_help()),
         "update" => Some(format_update_help()),
         "daemon" => Some(format_daemon_help()),
@@ -707,6 +709,30 @@ fn format_register_help() -> String {
         "",
         "Key params:",
         "  spec, label, reason",
+        "",
+    ]
+    .join("\n")
+}
+
+fn format_provider_help() -> String {
+    [
+        "provider.* — Free provider resets; never purchase credits or enable paid usage.",
+        "",
+        "Operations:",
+        "  provider.reset.proposals  Read holds and propose checking a free Codex reset",
+        "                            or switching away from a held Claude provider.",
+        "    min_reset_wait_secs     Optional wait threshold (default: 86400 seconds).",
+        "  provider.reset            Verify a free Codex credit, ask through an OS dialog,",
+        "                            redeem once and release the hold only after recovery.",
+        "    provider, window_id     Required. Use the exact id returned by pane.list.",
+        "",
+        "The native decision is mandatory even in autonomous mode. JSON approval flags",
+        "and saved approvals are not accepted. Cancel is the default. Only Host windows",
+        "using a directly installed Codex and its default provider are supported.",
+        "The target Session must contain launch-time authentication root/source proof.",
+        "The prompt shows that root; the helper uses it. Relaunch legacy windows.",
+        "Claude extra usage is paid and is never executed by gwt; switch providers instead.",
+        "Audit: ~/.gwt/provider-resets/<request_id>.jsonl (not an approval token).",
         "",
     ]
     .join("\n")
