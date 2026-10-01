@@ -3023,6 +3023,7 @@ export function createKnowledgeKanbanSurface({
 
         const header = createNode("div", "issue-preview-header");
         const titleWrap = createNode("div", "issue-preview-title-wrap");
+        header.appendChild(createNode("span", "issue-preview-mode", "Read-only preview"));
         titleWrap.appendChild(
           createNode(
             "div",
