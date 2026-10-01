@@ -1180,6 +1180,21 @@ lint, coverage, direct headed browser checks, and pre-push checks run
 directly without a verification lease. Completion still requires canonical
 verification evidence.
 
+`verify.lease.status` returns `holder_project_relation` (`same_project`,
+`other_project`, or `unknown`), `holder_reclaim_candidate`, and
+`holder_intervention`. Another project's holder, an unidentified owner, or an
+inconclusive activity reading is protected: `holder_intervention: forbidden`.
+Additional sampling does not authorize stopping an `unknown` holder. Only a
+same-project reclaim candidate or legacy control channel reports
+`canonical_release_only`; canonical
+release rechecks its state and refuses requests from another project. A refusal
+must not be bypassed with `kill` or `pkill`.
+
+`estimated_remaining_ms_uncertain: true` accompanies the ETA: it is a batch
+estimate or lease TTL, not a live progress counter. An unchanged value does not
+prove a stall. `waiter_action: wait` means waiting for canonical admission is
+expected; a pending queue position grants no permission to stop the holder.
+
 The `pre-push` hook deliberately runs only checks that do not compile the
 workspace: `cargo fmt --all -- --check`, Markdownlint, and the SKILL.md
 frontmatter validation. A Git hook runs under `git push` rather than under
@@ -1192,7 +1207,8 @@ pull request by the Lint, Test, and Coverage workflows instead.
 `verify.lease.extend` now return an error without creating a holder or
 reservation. Replace manual acquisition around canonical verification with
 `verify.run`; remove acquisition around ordinary Cargo commands. Existing
-legacy holders can be drained explicitly without killing their processes:
+legacy holders can be drained explicitly from their owning project without
+killing their processes:
 
 ```bash
 gwtd <<'JSON'
