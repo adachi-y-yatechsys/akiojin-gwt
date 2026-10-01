@@ -55,9 +55,9 @@ test.describe("Surface rail", () => {
     await right.getByRole("combobox", { name: "Right pane surface" }).selectOption("agents");
     await expect(right).toHaveAttribute("data-active", "true");
     await expect(left).toHaveAttribute("data-surface", "board");
-    await expect(right.locator(".workspace-window")).toHaveCount(2);
-    await expect(right.locator("[data-id='agent-one']")).toBeVisible();
-    await expect(right.locator("[data-id='agent-two']")).toBeVisible();
+    await expect(right.locator(".agent-tile")).toHaveCount(2);
+    await expect(right.locator("[data-agent-id='agent-one']")).toBeVisible();
+    await expect(right.locator("[data-agent-id='agent-two']")).toBeVisible();
     await expect(right.locator("[data-id='pm-window']")).toHaveCount(0);
     // Focus selects which pane the fixed rail controls.
     await left.getByRole("combobox", { name: "Left pane surface" }).focus();
@@ -67,7 +67,7 @@ test.describe("Surface rail", () => {
     await expect(right).toHaveAttribute("data-surface", "agents");
     await expect(left.getByRole("option", { name: "Agents (open in other pane)" })).toHaveJSProperty("disabled", true);
     await page.setViewportSize({ width: 1000, height: 800 });
-    await expect(right.locator(".workspace-window").first()).toBeVisible();
+    await expect(right.locator(".agent-tile").first()).toBeVisible();
     await expect(left).toHaveAttribute("data-surface", "settings");
     const splitGeometry = await geometry();
     for (const [id, value] of Object.entries(original)) expect(splitGeometry[id]).toEqual(value);
@@ -77,6 +77,43 @@ test.describe("Surface rail", () => {
     await expect(page.locator("#split-surfaces")).toBeHidden();
     await expect(page.locator("#canvas-stage > .workspace-window")).toHaveCount(6);
     expect((await sentMessages(page)).filter((message) => message.kind === "close_window")).toEqual([]);
+    expect(errors).toEqual([]);
+  });
+
+  test("Agents uses equal columns, keyboard spin control, live output and per-session input", async ({ page }, testInfo) => {
+    const errors: string[] = [];
+    page.on("pageerror", error => errors.push(String(error)));
+    page.on("console", message => { if (message.type() === "error") errors.push(message.text()); });
+    await installSurfaceAssets(page);
+    await installSurfaceRailBackend(page);
+    await page.goto(surfaceAppUrl);
+    await page.locator('.op-rail__surface[data-surface="agents"]').click();
+    await expect(page.locator("html")).toHaveAttribute("data-theme", testInfo.project.name.includes("light") ? "light" : "dark");
+    const tiles = page.locator(".agent-tile");
+    await expect(tiles).toHaveCount(2);
+    const columns = page.getByRole("spinbutton", { name: "Agent columns" });
+    await columns.fill("1");
+    const first = await tiles.nth(0).boundingBox();
+    const second = await tiles.nth(1).boundingBox();
+    expect(second!.y).toBeGreaterThan(first!.y);
+    await columns.press("ArrowUp");
+    await expect(columns).toHaveValue("2");
+    const boxes = await tiles.evaluateAll(nodes => nodes.map(node => { const r = node.getBoundingClientRect(); return { y: r.y, width: r.width }; }));
+    expect(boxes[0].y).toBe(boxes[1].y);
+    expect(Math.abs(boxes[0].width - boxes[1].width)).toBeLessThan(1);
+    await columns.fill("4");
+    await columns.press("ArrowUp");
+    await expect(columns).toHaveValue("4");
+    await columns.press("ArrowDown");
+    await expect(columns).toHaveValue("3");
+    await columns.fill("2");
+    await page.evaluate(() => (window as any).__surfaceRailSocket().emit({ kind: "terminal_output", id: "agent-one", data_base64: btoa("LIVE AGENT OUTPUT\r\n") }));
+    await expect(tiles.first().locator(".xterm-rows")).toContainText("LIVE AGENT OUTPUT");
+    await tiles.first().getByRole("textbox", { name: "Message to agent" }).fill("Continue");
+    await expect(windowById(page, "agent-one")).toHaveClass(/\bfocused\b/);
+    await tiles.first().getByRole("button", { name: "Send", exact: true }).click();
+    await expect.poll(async () => (await sentMessages(page)).filter(message => message.kind === "pane_send_input")).toEqual([{ kind: "pane_send_input", session_id: "session-one", text: "Continue" }]);
+    await page.screenshot({ path: testInfo.outputPath("agents-grid.png") });
     expect(errors).toEqual([]);
   });
 
@@ -164,24 +201,22 @@ test.describe("Surface rail", () => {
     );
     expect(accent).not.toBe(idleEdge);
 
-    // Agents frames every agent window, but not the PM, and presses the
-    // Agents entry without creating or focusing any window.
+    // Agents tiles every agent, excludes the PM and leaves the camera unchanged.
     await clearMessages(page);
     const stage = page.locator("#canvas-stage");
     const before = await stage.evaluate((element) => (element as HTMLElement).style.transform);
     await entry("agents").click();
     await expect.poll(() => pressedSurfaces(page)).toEqual(["agents"]);
-    await expect
-      .poll(() => stage.evaluate((element) => (element as HTMLElement).style.transform))
-      .not.toBe(before);
+    expect(await stage.evaluate((element) => (element as HTMLElement).style.transform)).toBe(before);
     expect(
       (await sentMessages(page)).filter(
         (message) => message.kind === "create_window" || message.kind === "focus_window",
       ),
     ).toEqual([]);
-    await expect.poll(() => inCanvasView(page, "agent-one")).toBe(true);
-    await expect.poll(() => inCanvasView(page, "agent-two")).toBe(true);
-    expect(await inCanvasView(page, "pm-window")).toBe(false);
+    await expect(page.locator("[data-agent-id=agent-one]")).toBeVisible();
+    await expect(page.locator("[data-agent-id=agent-two]")).toBeVisible();
+    await expect(windowById(page, "pm-window")).toBeHidden();
+    await expect(page.locator(".agent-tile[data-agent-id=pm-window]")).toHaveCount(0);
 
     // The PM entry lands on the PM and presses itself, not Agents: the role
     // marker (is_pm), not the claude preset, decides where it belongs.
@@ -338,6 +373,7 @@ async function installSurfaceRailBackend(page: Page, groupedSettings = false): P
       canvasWindow("agent-one", {
         status: "running",
         agent_id: "agent-one",
+        session_id: "session-one",
         agent_color: "cyan",
         geometry: { x: 2400, y: 1400, width: 560, height: 340 },
         z_index: 5,
@@ -345,6 +381,7 @@ async function installSurfaceRailBackend(page: Page, groupedSettings = false): P
       canvasWindow("agent-two", {
         status: "waiting",
         agent_id: "agent-two",
+        session_id: "session-two",
         agent_color: "green",
         geometry: { x: 3000, y: 1400, width: 560, height: 340 },
         z_index: 6,
