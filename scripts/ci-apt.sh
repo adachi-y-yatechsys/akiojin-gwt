@@ -86,6 +86,8 @@
 #   GWT_APT_CONF_DIR         apt drop-in directory (default: /etc/apt/apt.conf.d)
 #   GWT_APT_CACHE_DIR        .deb archive dir reused across CI runs
 #   GWT_APT_GET              apt-get binary (default: apt-get)
+#   GWT_APT_DPKG             dpkg binary (default: dpkg)
+#   GWT_APT_DPKG_QUERY       dpkg-query binary (default: dpkg-query)
 #   GWT_APT_LOCK_PROBE       test-only command; exit 0 means the lock is held
 
 set -euo pipefail
@@ -101,6 +103,8 @@ ACQUIRE_RETRIES="${GWT_APT_ACQUIRE_RETRIES:-3}"
 APT_CONF_DIR="${GWT_APT_CONF_DIR:-/etc/apt/apt.conf.d}"
 CACHE_DIR="${GWT_APT_CACHE_DIR:-}"
 APT_GET="${GWT_APT_GET:-apt-get}"
+DPKG="${GWT_APT_DPKG:-dpkg}"
+DPKG_QUERY="${GWT_APT_DPKG_QUERY:-dpkg-query}"
 
 # The tray + WebView build dependencies every Linux job installs. This is the
 # one home for the set: the workflows key their actions/cache entry on a hash
@@ -354,7 +358,13 @@ summarize_attempt() {
 
 run_apt_get() {
   LAST_STEP="$1"
+  LAST_ELAPSED=0
   wait_for_apt_lock || return "${LOCK_CONTENTION}"
+  # Preserve apt's resumable partial downloads, but recreate the directory
+  # before every call (including recovery), not only before attempt one.
+  if [[ -n "${CACHE_DIR}" ]]; then
+    mkdir -p "${CACHE_DIR}/partial" || return $?
+  fi
   # The last attempt before the total deadline is truncated to whatever is
   # left, so the reason line has to quote the budget actually applied rather
   # than the configured one.
@@ -371,6 +381,49 @@ run_apt_get() {
   run_with_timeout "${LAST_ATTEMPT_BUDGET}" "${APT_GET}" "${APT_OPTIONS[@]}" "$@" 2>&1 |
     tee "${ATTEMPT_LOG}" || status=$?
   LAST_ELAPSED=$((SECONDS - started))
+  return "${status}"
+}
+
+# #4883: timeout can interrupt dpkg after downloading, while unpacking. The
+# kernel releases its locks when the process exits; deleting lock files or
+# partial downloads cannot repair the package database journal.
+recover_interrupted_install() {
+  LAST_STEP="dpkg-recovery"
+  LAST_ELAPSED=0
+  wait_for_apt_lock || return "${LOCK_CONTENTION}"
+  LAST_ATTEMPT_BUDGET="$(smaller "${ATTEMPT_TIMEOUT}" "$(remaining_seconds)")"
+  log "recovery=configure cmd=${DPKG} --configure -a timeout=${LAST_ATTEMPT_BUDGET}s"
+  local started="${SECONDS}" status=0
+  run_with_timeout "${LAST_ATTEMPT_BUDGET}" "${DPKG}" --configure -a 2>&1 |
+    tee "${ATTEMPT_LOG}" || status=$?
+  LAST_ELAPSED=$((SECONDS - started))
+  ((status == 0)) && return 0
+  # A timeout or fatal dpkg error must not turn into a fresh apt transaction.
+  ((status == 1)) || return "${status}"
+
+  # configure cannot finish dependencies whose unpack was interrupted. Ask
+  # dpkg which packages require reinstallation; never guess from stderr or
+  # reinstall every cached archive. Pin the recorded version and prohibit
+  # removals. With no unambiguous target, leave the error visible and stop.
+  local snapshot state package version
+  local reinstall=()
+  LAST_STEP="dpkg-query"
+  LAST_ATTEMPT_BUDGET="$(smaller "${ATTEMPT_TIMEOUT}" "$(remaining_seconds)")"
+  snapshot="$(run_with_timeout "${LAST_ATTEMPT_BUDGET}" "${DPKG_QUERY}" -W \
+    '--showformat=${db:Status-Abbrev}\t${binary:Package}\t${Version}\n')" || return $?
+  while IFS=$'\t' read -r state package version; do
+    if [[ "${state}" == i?R && -n "${package}" && -n "${version}" ]]; then
+      reinstall+=("${package}=${version}")
+    fi
+  done <<<"${snapshot}"
+  if ((${#reinstall[@]} == 0)); then
+    log "recovery=failed reason=no install-selected reinstreq packages; refusing an untargeted repair"
+    return 1
+  fi
+  log "recovery=reinstall packages=${reinstall[*]} removals=forbidden"
+  status=0
+  run_apt_get install --fix-broken --no-remove --reinstall -y "${reinstall[@]}" || status=$?
+  LAST_STEP="dpkg-reinstall"
   return "${status}"
 }
 
@@ -404,14 +457,21 @@ describe_failure() {
 run_with_retries() {
   local attempt=1
   local status=0
+  local immediate_failures=0 started=0
   while ((attempt <= ATTEMPTS)); do
     log "phase=${MODE} attempt=${attempt}/${ATTEMPTS} elapsed=${SECONDS}s deadline=${TOTAL_DEADLINE}s"
+    started="${SECONDS}"
     status=0
     run_once || status=$?
     ATTEMPTS_USED="${attempt}"
     if ((status == 0)); then
       log "phase=${MODE} attempt=${attempt}/${ATTEMPTS} status=ok"
+      summarize_attempt
+      log "diagnosis attempt=${attempt}/${ATTEMPTS} ${LAST_DIAGNOSIS}"
       return 0
+    fi
+    if ((SECONDS == started && status != DEADLINE_EXHAUSTED && status != LOCK_CONTENTION)); then
+      immediate_failures=$((immediate_failures + 1))
     fi
 
     LAST_REASON="$(describe_failure "${status}")"
@@ -430,8 +490,20 @@ run_with_retries() {
       fi
       log "phase=${MODE} status=retrying in ${RETRY_DELAY}s"
       sleep "${RETRY_DELAY}"
+      if ((status == 124 || status == 137)) && [[ "${LAST_STEP}" == "install" ]]; then
+        local recovery_status=0
+        recover_interrupted_install || recovery_status=$?
+        if ((recovery_status != 0)); then
+          LAST_REASON="interrupted dpkg recovery failed at ${LAST_STEP} (exit ${recovery_status})"
+          summarize_attempt
+          break
+        fi
+      fi
     fi
   done
+  if ((immediate_failures == ATTEMPTS_USED)); then
+    LAST_REASON="state inconsistency: all attempts failed immediately; inspect apt stderr (${LAST_REASON})"
+  fi
   return 1
 }
 
