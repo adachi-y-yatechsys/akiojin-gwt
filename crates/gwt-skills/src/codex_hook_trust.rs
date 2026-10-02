@@ -2745,7 +2745,8 @@ mod tests {
         )
         .unwrap();
         generate_codex_hooks(&worktree).unwrap();
-        let root_hooks_path = codex_hook_trust_key_path(&root_checkout.join(".codex/hooks.json")).unwrap();
+        let root_hooks_path =
+            codex_hook_trust_key_path(&root_checkout.join(".codex/hooks.json")).unwrap();
         let worktree_hooks_prefix = codex_hook_trust_key_path(&worktree.join(".codex/hooks.json"))
             .unwrap()
             .display()
@@ -2787,7 +2788,8 @@ mod tests {
         )
         .unwrap();
         generate_codex_hooks_for_mode(&worktree, CodexHookDiscoveryMode::WorktreeLocal).unwrap();
-        let worktree_hooks_path = codex_hook_trust_key_path(&worktree.join(".codex/hooks.json")).unwrap();
+        let worktree_hooks_path =
+            codex_hook_trust_key_path(&worktree.join(".codex/hooks.json")).unwrap();
 
         let entries = collect_codex_managed_hook_trust_entries_for_mode(
             &worktree,
@@ -2821,8 +2823,10 @@ mod tests {
         )
         .unwrap();
         generate_codex_hooks_for_mode(&worktree, CodexHookDiscoveryMode::Both).unwrap();
-        let root_hooks_path = codex_hook_trust_key_path(&root_checkout.join(".codex/hooks.json")).unwrap();
-        let worktree_hooks_path = codex_hook_trust_key_path(&worktree.join(".codex/hooks.json")).unwrap();
+        let root_hooks_path =
+            codex_hook_trust_key_path(&root_checkout.join(".codex/hooks.json")).unwrap();
+        let worktree_hooks_path =
+            codex_hook_trust_key_path(&worktree.join(".codex/hooks.json")).unwrap();
 
         let entries = collect_codex_managed_hook_trust_entries_for_mode(
             &worktree,
@@ -3726,7 +3730,8 @@ enabled = false
             report.untrusted_gwt_hooks.is_empty(),
             "a fresh worktree's tracked canonical hooks must be trusted: {report:?}"
         );
-        let worktree_hooks_path = codex_hook_trust_key_path(&worktree.join(".codex/hooks.json")).unwrap();
+        let worktree_hooks_path =
+            codex_hook_trust_key_path(&worktree.join(".codex/hooks.json")).unwrap();
         let parsed: toml::Value =
             toml::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
         for event_name in [
@@ -3912,7 +3917,8 @@ trusted_hash = "sha256:08adeab2"
 
         let state = trust_state(&config_path);
         for worktree in &worktrees {
-            let hooks_path = codex_hook_trust_key_path(&worktree.path().join(".codex/hooks.json")).unwrap();
+            let hooks_path =
+                codex_hook_trust_key_path(&worktree.path().join(".codex/hooks.json")).unwrap();
             for event_name in [
                 "session_start",
                 "user_prompt_submit",
