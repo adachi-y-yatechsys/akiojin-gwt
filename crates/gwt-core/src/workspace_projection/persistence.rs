@@ -4248,6 +4248,10 @@ pub fn save_workspace_work_items_projection_to_path(
     write_atomic(path, &bytes)
 }
 
+/// Issue #4850: the operation label every Work items transaction records as
+/// the observed holder of `works.lock`.
+pub const WORKSPACE_WORK_ITEMS_LOCK_OPERATION: &str = "workspace work items";
+
 pub(crate) fn with_workspace_work_items_lock<T>(
     work_items_path: &Path,
     operation: impl FnOnce() -> Result<T>,
@@ -4284,14 +4288,15 @@ fn with_workspace_work_items_locks_profiled<T>(
         if let Some(parent) = lock_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let lock = fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(&lock_path)?;
         let lock_started = Instant::now();
-        crate::operation_deadline::lock_exclusive(&lock)?;
+        // Issue #4850 / #4686 AC-5: a named lock, so a contender that runs
+        // out of its deadline is told who holds the Work items (pid /
+        // operation / since) instead of only that the deadline expired.
+        // Ordinary contention is routine here and is not logged.
+        let lock = crate::operation_deadline::NamedFileLock::acquire_quiet(
+            &lock_path,
+            WORKSPACE_WORK_ITEMS_LOCK_OPERATION,
+        )?;
         lock_wait_micros =
             lock_wait_micros.saturating_add(lock_started.elapsed().as_micros() as u64);
         locks.push(lock);
