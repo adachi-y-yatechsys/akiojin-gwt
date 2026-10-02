@@ -146,10 +146,13 @@ or replace it whole. With two or more candidates the Monitor skips held
 providers, ranks the rest by `prefer_for` match (soft-avoiding the
 implementer's provider for an independent review), and launches the first
 one, so one rate-limited provider does not stop the queue. A provider is held
-the moment it refuses a launch while another candidate is free; no usage
+on its first rate-limit refusal, even when no alternative is free; no usage
 reading or threshold switches launches ahead of a refusal
 (`usage_threshold_percent` is still accepted and stored, but it no longer
-affects selection). `agent_id` is the
+affects selection). An all-held pool waits for its earliest known reset;
+only when every reset is unknown does `needs_human_fleet` report
+`launch_candidates_exhausted`. Holds never reopen on a timer before reset.
+`agent_id` is the
 only required field per candidate; providers must be unique and known, and
 `prefer_for` tags use `type:<cc-type>` / `kind:spec|issue` / `label:<name>`:
 

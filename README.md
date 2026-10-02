@@ -430,7 +430,11 @@ leaves the pool when it refuses a launch, not when a usage reading predicts it
 will; the exact rules are specified in SPEC
 [#3914](https://github.com/akiojin/gwt/issues/3914)), so one rate-limited
 provider no longer stops the queue. `issue.monitor.status` reports each
-provider's latest usage reading under `provider_usage`, or why there is none. Saving Agent settings for a second provider
+provider's latest usage reading under `provider_usage`, or why there is none.
+Every rate-limit refusal immediately holds its provider. If all candidates
+are held, the queue resumes at the earliest known reset; if every reset is
+unknown, `needs_human_fleet` reports `launch_candidates_exhausted` instead
+of periodically retrying. Saving Agent settings for a second provider
 in the GUI appends it to the same pool. All operations accept an optional
 `project_root` and otherwise target the current worktree. Priority and
 daemon-absent configuration changes become visible to running instances on the

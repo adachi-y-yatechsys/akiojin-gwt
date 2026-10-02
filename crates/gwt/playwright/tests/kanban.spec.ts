@@ -226,14 +226,14 @@ test.describe("Issue Bridge load recovery", () => {
         agent_id: "claude",
         summary: "claude / opus / high",
         reason:
-          "codex held until 2026-09-21T08:41:00Z; re-verification launch at 2026-09-15T10:00:00Z",
+          "codex refused: usage limit reached; held until 2026-09-21T08:41:00Z",
       },
     });
     await expect(gear).toHaveAttribute(
       "title",
       [
         "Agent settings Saved: codex / gpt-5 / high",
-        "Launching with claude / opus / high (codex held until 2026-09-21T08:41:00Z; re-verification launch at 2026-09-15T10:00:00Z)",
+        "Launching with claude / opus / high (codex refused: usage limit reached; held until 2026-09-21T08:41:00Z)",
       ].join("\n"),
     );
 

@@ -256,21 +256,22 @@ body cannot hold `plan` / `tasks` sections.
   Prefer adding a candidate over stopping the Monitor when one provider hits
   its limit.
   What switches launches is a refusal, never a reading: a provider is held
-  the moment it refuses a launch while another candidate is free, and the
+  on its first rate-limit refusal, including the last candidate, and the
   refused Issue relaunches on the next candidate at once. No usage reading or
   threshold moves launches ahead of a refusal — an account shown at 100% can
   still be serving — and `usage_threshold_percent` is accepted and stored
   but no longer affects selection. `effective_launch_profile` says a switch is
   in force and why: `refused_provider`, `refused_at`, the `refusal` wording,
-  and the candidate launches use instead. A provider with nothing to switch
-  to is retried a few times before it is held.
+  and the candidate launches use instead. Holds never admit timed probes or
+  use usage readings to infer recovery. When all candidates are held and at
+  least one reset is known, wait for the earliest reset and resume automatically.
   `provider_usage` is where you confirm it: one row per provider with
   `state`, `windows[*].used_percent`, and `fetched_at`. A row whose `state`
   is `not_observed`, `stale`, `disabled`, `no_data`, or `unavailable` carries
   no fresh numbers and its `detail` says why — the poller runs only while a
   gwt window is open — so never read a missing reading as a healthy account.
   `needs_human_fleet` with kind `launch_candidates_exhausted` means every
-  candidate refused and nothing can launch: report it immediately, like
+  candidate refused and every reset is unknown: report it immediately, like
   `agent_blackout`, with the providers and resets its `reason` lists.
   An element that names only `agent_id` keeps the settings already saved for
   that provider (model / reasoning / version / permissions / Docker / shell),
@@ -484,11 +485,11 @@ same profile to try again.
 - `issue.monitor.quota_hold.list` and `issue.monitor.quota_hold.clear`
   are how you handle a **provider-wide quota hold**. A hold stops every
   launch on that provider until the reset the provider printed, which
-  can be days out, and it is formed from a notice on a pane screen plus
-  the usage poller's reading. A hold whose refusal printed no reset reads
-  `reset_at: "unknown"`: it does not expire on a timer, and ends only by a
-  re-verification launch that works, a poller reading that contradicts it,
-  or your clear. The list shows each hold with its
+  can be days out. The first observed rate-limit refusal forms the hold;
+  usage readings are telemetry, never a prerequisite or a release signal.
+  A refusal with no usable future reset reads `reset_at: "unknown"`: it
+  never expires on a timer. Explicit clear or a confirmed account replacement
+  can release it. The list shows each hold with its
   evidence (`screen_text`, `poller_state`, `poller_windows` with
   `used_percent`), which is also what `issue.monitor.status` reports
   under `provider_quota_holds`. The hold is false only when the poller's
