@@ -189,7 +189,7 @@ test.describe("Issue Bridge load recovery", () => {
   // and disappear when the hold clears.
   test("keeps the saved agent settings and shows the held fallback on its own line", async ({
     page,
-  }) => {
+  }, testInfo) => {
     const consoleErrors: string[] = [];
     const pageErrors: string[] = [];
     page.on("console", (message) => {
@@ -197,8 +197,9 @@ test.describe("Issue Bridge load recovery", () => {
     });
     page.on("pageerror", (error) => pageErrors.push(String(error)));
 
+    const theme = testInfo.project.name.includes("light") ? "light" : "dark";
     await installEmbeddedRoutes(page);
-    await installIssueBridgeBackend(page);
+    await installIssueBridgeBackend(page, { theme });
     await page.goto(APP_URL);
 
     const issueSurface = page.locator(".workspace-window.surface-knowledge");
@@ -236,6 +237,26 @@ test.describe("Issue Bridge load recovery", () => {
         "Launching with claude / opus / high (codex refused: usage limit reached; held until 2026-09-21T08:41:00Z)",
       ].join("\n"),
     );
+
+    // #4908: unknown resets expose no candidate, without a probe timer.
+    await page.evaluate((status) => {
+      window.__issueBridgeFixtureSocket.emit({ kind: "issue_monitor_status", status });
+    }, {
+      ...saved,
+      effective_launch_profile: {
+        reason: "codex refused: usage limit reached; reset unknown",
+      },
+      needs_human_fleet: {
+        kind: "launch_candidates_exhausted",
+        reason: "Every launch candidate provider refused; every reset is unknown",
+      },
+    });
+    await expect(gear).toHaveAttribute("title", /No launch candidate.*reset unknown/);
+    await expect(gear).not.toHaveAttribute("title", /9999|re-verification/);
+    await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
+    await testInfo.attach(`quota-${theme}`, {
+      body: await issueSurface.screenshot(), contentType: "image/png",
+    });
 
     await page.evaluate((status) => {
       window.__issueBridgeFixtureSocket.emit({ kind: "issue_monitor_status", status });
