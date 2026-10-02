@@ -13,6 +13,10 @@ pub enum UpdateApplyAdmission {
 }
 
 impl UpdateApplyAdmission {
+    pub fn accepts_discovery(&self) -> bool {
+        !matches!(self, Self::Committing)
+    }
+
     pub fn begin_resolution(&mut self) -> bool {
         if !matches!(self, Self::Idle) {
             return false;
@@ -1046,10 +1050,13 @@ mod apply_admission_tests {
     #[test]
     fn update_apply_admission_coalesces_requests_and_commits_once() {
         let mut admission = UpdateApplyAdmission::default();
+        assert!(admission.accepts_discovery());
         assert!(admission.begin_resolution());
+        assert!(admission.accepts_discovery());
         // Restart now, legacy toast, and automatic drain share this admission.
         assert!(!admission.begin_resolution());
         assert!(admission.begin_commit());
+        assert!(!admission.accepts_discovery());
         assert!(!admission.begin_commit());
         assert!(!admission.begin_resolution());
     }

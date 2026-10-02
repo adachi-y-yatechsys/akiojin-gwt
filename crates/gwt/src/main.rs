@@ -784,6 +784,9 @@ fn admit_prepared_update(
     manifest: &gwt_core::update::PendingUpdateManifest,
     admission: &mut update_front_door::UpdateApplyAdmission,
 ) -> (bool, Vec<OutboundEvent>) {
+    if !admission.begin_commit() {
+        return (false, Vec::new());
+    }
     if let Some(gwt_core::update::UpdateState::Available { latest, .. }) = &app.pending_update {
         if gwt_core::update::pending_version_is_newer(latest, &manifest.version) {
             admission.failed();
@@ -803,7 +806,7 @@ fn admit_prepared_update(
             );
         }
     }
-    (admission.begin_commit(), Vec::new())
+    (true, Vec::new())
 }
 
 fn spawn_gui_exit_backstop(reason: GuiShutdownReason, grace: Duration) {
@@ -4898,9 +4901,19 @@ mod tests {
             admission.begin_resolution(),
             "the current release can be retried"
         );
-        let mut current_manifest = manifest;
+        let mut current_manifest = manifest.clone();
         current_manifest.version = "9.108.0".into();
         assert!(super::admit_prepared_update(&runtime, &current_manifest, &mut admission).0);
+        // Duplicate results after commitment must not reopen admission or
+        // delete files which an already-started helper may still be using.
+        fs::create_dir_all(&old_dir).unwrap();
+        fs::write(old_dir.join("gwt"), "helper-owned payload").unwrap();
+        gwt_core::update::persist_pending_update_manifest(&manifest).unwrap();
+        let (admitted, events) = super::admit_prepared_update(&runtime, &manifest, &mut admission);
+        assert!(!admitted && events.is_empty());
+        assert!(gwt_core::update::load_pending_update_manifest().is_some());
+        assert!(old_dir.exists());
+        assert!(!admission.begin_resolution());
     }
 
     #[test]
@@ -11372,7 +11385,9 @@ fn main() -> std::io::Result<()> {
                 clients.dispatch(app.apply_launch_wizard_branch_candidates(wizard_id, candidates));
             }
             Event::UserEvent(UserEvent::UpdateAvailable(state)) => {
-                clients.dispatch(record_update_available(app, state));
+                if update_apply_admission.accepts_discovery() {
+                    clients.dispatch(record_update_available(app, state));
+                }
             }
             Event::UserEvent(UserEvent::ApplyUpdate { state, client_id }) => {
                 if !update_apply_admission.begin_resolution() {
@@ -11517,7 +11532,9 @@ fn main() -> std::io::Result<()> {
                 });
             }
             Event::UserEvent(UserEvent::UpdateDownloadFinished(failure)) => {
-                clients.dispatch(finish_update_download(app, failure));
+                if update_apply_admission.accepts_discovery() {
+                    clients.dispatch(finish_update_download(app, failure));
+                }
             }
             Event::UserEvent(UserEvent::UpdatePrepared {
                 version,
