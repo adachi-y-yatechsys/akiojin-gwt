@@ -116,6 +116,10 @@ serve the current recovery and session-specific Stop contracts. The obsolete age
 identity reset is retired; startup preserves saved purpose and focus values and
 leaves `agent_identity.migration.json` unchanged (or absent).
 
+The embedded frontend uses the current Fast mode fields and requires an operation
+ID for cleanup requests. Reload older open tabs after upgrading; saved Fast mode
+preferences are retained.
+
 ## Requirements
 
 - `git` available in `PATH`

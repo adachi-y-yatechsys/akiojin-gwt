@@ -9176,7 +9176,7 @@ impl AppRuntime {
                 &branches,
                 delete_remote,
                 force_filesystem_delete,
-                operation_id.as_deref(),
+                &operation_id,
             ),
             FrontendEvent::RunWorkspaceCleanup {
                 branch,
@@ -9189,7 +9189,7 @@ impl AppRuntime {
                 &branch,
                 delete_remote,
                 force_filesystem_delete,
-                operation_id.as_deref(),
+                &operation_id,
             ),
             FrontendEvent::SyncBranchCleanup { id, operation_id } => {
                 self.sync_branch_cleanup_events(context, &client_id, &id, &operation_id)

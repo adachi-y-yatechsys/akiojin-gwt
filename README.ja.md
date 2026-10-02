@@ -112,6 +112,10 @@ Stop 契約が利用するため保持します。旧 agent identity reset は�
 目的・進捗を保持します。`agent_identity.migration.json` は既存の内容を変更せず、
 未作成なら新たに作成しません。
 
+組み込みフロントエンドは現行の Fast mode フィールドを使用し、cleanup リクエストには
+operation ID を必須とします。更新前から開いているタブは再読み込みしてください。
+保存済みの Fast mode 設定は保持します。
+
 ## 前提
 
 - `PATH` 上で `git` が使えること
