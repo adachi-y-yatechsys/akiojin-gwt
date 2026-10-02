@@ -180,7 +180,7 @@ fn assert_launch_preserves_foreign_authority(recovering: bool) {
         .unwrap();
     for id in ["live", "discarded"] {
         let item = saved.work_items.iter().find(|item| item.id == id).unwrap();
-        assert_eq!(item.execution_containers, [container.clone()]);
+        assert_eq!(item.execution_containers, std::slice::from_ref(&container));
     }
     assert!(!container_detachments_path(&works_path).exists());
     assert!(
