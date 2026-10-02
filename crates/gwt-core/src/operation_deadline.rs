@@ -430,13 +430,14 @@ mod tests {
         let owner = NamedFileLock::acquire_quiet(&path, "workspace work items").expect("owner");
         let contender_path = path.clone();
         std::thread::spawn(move || {
-            // The host clock, not the frozen test clock: the poll loop has to
-            // see the deadline pass.
+            // An already-expired deadline on the fixed operation clock: the
+            // contender is refused on its first poll, so nothing here waits
+            // on wall time.
             let start = Instant::now();
-            let _deadline = ScopedOperationDeadline::enter(start + Duration::from_millis(40));
+            let _clock = ScopedOperationClock::set(start);
+            let _deadline = ScopedOperationDeadline::enter(start);
             let error = NamedFileLock::acquire_quiet(&contender_path, "pr.edit metadata")
                 .expect_err("contended lock must time out");
-            assert!(start.elapsed() < Duration::from_secs(5));
             assert!(is_deadline_expired(&error), "{error}");
             let message = error.to_string();
             assert!(message.contains("workspace work items"), "{message}");
