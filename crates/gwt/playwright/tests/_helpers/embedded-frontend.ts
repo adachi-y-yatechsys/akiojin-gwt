@@ -62,6 +62,8 @@ const ROOT_MODULES = new Set([
   // Issue #4777 T-1 — rail surface selection (Issues / Agents / Board / Settings).
   "surface-rail.js",
   "split-surfaces.js",
+  "agents-surface.js",
+  "terminal-text-preview.js",
   "focus-trap.js",
   "startup-metrics.js",
   "hotkey.js",

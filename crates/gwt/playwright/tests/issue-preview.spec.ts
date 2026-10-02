@@ -41,6 +41,43 @@ test.describe("Issue preview placement", () => {
     viewport: { width: 1600, height: 1000 },
   });
 
+  test("Agents shows all inline agents while Issue preview stays read-only", async ({ page }, testInfo) => {
+    if (!liveUrl) await installEmbeddedRoutes(page);
+    await installIssuePreviewBackend(page);
+    await page.goto(liveUrl || APP_URL);
+    await page.getByRole("button", { name: "Output", exact: true }).click();
+    await page.getByRole("button", { name: "Split view", exact: true }).click();
+    await page.getByRole("combobox", { name: "Right pane surface" }).selectOption("agents");
+    const tiles = page.locator(".agent-tile");
+    await expect(tiles).toHaveCount(3);
+    const preview = page.locator(".issue-preview .terminal-text-preview");
+    await expect(preview).toBeVisible();
+    await expect(page.locator(".issue-preview-mode")).toHaveText("Read-only preview");
+    await page.evaluate(() => window.__emitAgentOutput("SIMULTANEOUS LIVE OUTPUT"));
+    await expect(preview).toContainText("SIMULTANEOUS LIVE OUTPUT");
+    await expect(tiles.first().locator(".xterm-rows")).toContainText("SIMULTANEOUS LIVE OUTPUT");
+    await preview.click();
+    await page.keyboard.type("preview cannot send");
+    expect(await page.evaluate(() => window.__knowledgeLoadMessages.filter(message => message.kind === "terminal_input"))).toEqual([]);
+    await expect.poll(() => page.evaluate(() => window.__gwtTerminalTestApi.metrics("tab-issue::agent-preview").isReady)).toBe(true);
+    await expect.poll(() => page.evaluate(() => window.__gwtTerminalTestApi.metrics("tab-issue::agent-preview").readOnly)).toBe(false);
+    await tiles.first().locator(".terminal-root").click();
+    await tiles.first().locator(".xterm-helper-textarea").focus();
+    await page.keyboard.type("x");
+    await expect.poll(() => page.evaluate(() => window.__knowledgeLoadMessages.filter(message => message.kind === "terminal_input").length)).toBeGreaterThan(0);
+    await page.screenshot({ path: testInfo.outputPath("agents-with-preview.png") });
+    await page.locator(".surface-knowledge [data-issue-view='split']").click();
+    await expect(tiles.locator(".xterm")).toHaveCount(3);
+    await expect(page.locator(".issue-split-pair .terminal-text-preview")).toHaveCount(3);
+    await page.locator(".surface-knowledge [data-issue-view='list']").click();
+    await page.getByRole("button", { name: "Output", exact: true }).click();
+    await page.getByRole("button", { name: "Close split", exact: true }).click();
+    await expect(page.locator(".issue-preview .xterm")).toBeVisible();
+    await expect.poll(() => page.evaluate(() => window.__gwtTerminalTestApi.metrics("tab-issue::agent-preview").readOnly)).toBe(true);
+    await page.evaluate(() => window.__emitAgentOutput("RESTORED READ ONLY"));
+    await expect(page.locator(".issue-preview")).toContainText("RESTORED READ ONLY");
+  });
+
   // 受け入れシナリオ 1 / FR-004.
   test("an auto-launched agent does not add a window to the canvas", async ({ page }) => {
     const consoleErrors: string[] = [];
@@ -304,6 +341,10 @@ test.describe("Issue preview placement", () => {
     const menu = row.locator(".knowledge-row-menu");
     await expect(menu).toHaveCount(1);
     await menu.locator("summary").click();
+    await expect(menu).toHaveAttribute("open", "");
+    // Issue #4886: a background workspace refresh must not close the menu.
+    await page.evaluate(() => window.__patchWindow("tab-issue::agent-preview", { title: "Background refresh" }));
+    await expect(page.locator(".issue-preview-title")).toHaveText("Background refresh");
     await expect(menu).toHaveAttribute("open", "");
     await expect(menu.locator('[data-action="continue-work"]')).toBeVisible();
     await expect(menu.locator('[data-action="continue-work"]')).toBeEnabled();
@@ -760,6 +801,7 @@ async function installIssuePreviewBackend(page, { agentStatus = "running" } = {}
 
       const agentWindow = (id, issueNumber, title) => ({
         id,
+        session_id: `${id}-session`,
         title,
         preset: "agent",
         geometry: { x: 120, y: 120, width: 1280, height: 800 },

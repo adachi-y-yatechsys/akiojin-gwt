@@ -38,16 +38,18 @@ async function fixture() {
     return [data.id, element];
   }));
   const opened = [];
+  const agents = document.createElement("section");
   const controller = createSplitSurfaces({
     document,
     stage,
+    onAgentsHost: (host) => { if (host) host.appendChild(agents); else agents.remove(); },
     getWindows: () => windows,
     getElement: (id) => elements.get(id),
     openSurface: (surface) => opened.push(surface),
     onChange: () => {},
     onLayout: () => {},
   });
-  return { controller, document, window, stage, windows, elements, opened };
+  return { controller, document, window, stage, windows, elements, opened, agents };
 }
 
 test("two panes select independently, preserve live nodes and restore canvas geometry", async () => {
@@ -76,16 +78,14 @@ test("two panes select independently, preserve live nodes and restore canvas geo
   }
 });
 
-test("Agents keeps every existing agent visible, excluding the PM, and reconciles removals", async () => {
-  const { controller, elements, windows } = await fixture();
+test("Agents hosts its dedicated grid and releases it when switching surfaces", async () => {
+  const { controller, elements, agents, stage } = await fixture();
   controller.open("agents");
-  assert.equal(controller.containsWindow("a"), true);
-  assert.equal(controller.containsWindow("b"), true);
-  assert.equal(controller.containsWindow("pm"), false);
-  assert.equal(elements.get("a").closest(".split-pane"), elements.get("b").closest(".split-pane"));
-  windows.splice(windows.findIndex((w) => w.id === "b"), 1);
-  controller.sync();
-  assert.equal(controller.containsWindow("b"), false);
+  assert.equal(agents.closest(".split-pane").dataset.surface, "agents");
+  assert.equal(elements.get("a").parentElement, stage);
+  assert.equal(elements.get("pm").parentElement, stage);
+  controller.select("settings");
+  assert.equal(agents.parentElement, null);
 });
 
 test("a missing surface requests the existing launcher once and mounts the arriving window", async () => {
