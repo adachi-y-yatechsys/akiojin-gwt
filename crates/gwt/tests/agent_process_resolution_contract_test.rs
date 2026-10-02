@@ -18,7 +18,9 @@ const AGENT_PROBE_SITES: &[ProbeSite] = &[
     },
     ProbeSite {
         relative_path: "crates/gwt-agent/src/detect.rs",
-        function_name: "fetch_version",
+        // `fetch_version` delegates here so profile overrides and removals
+        // use the same resolved adapter as the default environment.
+        function_name: "fetch_version_with_environment",
     },
     ProbeSite {
         relative_path: "crates/gwt-agent/src/prepare.rs",

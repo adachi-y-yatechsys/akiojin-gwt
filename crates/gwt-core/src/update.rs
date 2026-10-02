@@ -259,11 +259,6 @@ pub fn update_resume_dir() -> PathBuf {
     crate::paths::gwt_home().join("update-resume")
 }
 
-/// `~/.gwt/update-resume/marker.json`.
-pub fn update_resume_marker_path() -> PathBuf {
-    update_resume_dir().join("marker.json")
-}
-
 /// Atomically write the resume marker.
 pub fn persist_update_resume_marker(marker: &UpdateResumeMarker) -> Result<(), String> {
     persist_update_resume_marker_in(&update_resume_dir(), marker)
