@@ -11384,10 +11384,10 @@ fn main() -> std::io::Result<()> {
             }) => {
                 clients.dispatch(app.apply_launch_wizard_branch_candidates(wizard_id, candidates));
             }
-            Event::UserEvent(UserEvent::UpdateAvailable(state)) => {
-                if update_apply_admission.accepts_discovery() {
-                    clients.dispatch(record_update_available(app, state));
-                }
+            Event::UserEvent(UserEvent::UpdateAvailable(state))
+                if update_apply_admission.accepts_discovery() =>
+            {
+                clients.dispatch(record_update_available(app, state));
             }
             Event::UserEvent(UserEvent::ApplyUpdate { state, client_id }) => {
                 if !update_apply_admission.begin_resolution() {
@@ -11531,10 +11531,10 @@ fn main() -> std::io::Result<()> {
                     let _ = apply_proxy.send_event(UserEvent::UpdateDownloadFinished(None));
                 });
             }
-            Event::UserEvent(UserEvent::UpdateDownloadFinished(failure)) => {
-                if update_apply_admission.accepts_discovery() {
-                    clients.dispatch(finish_update_download(app, failure));
-                }
+            Event::UserEvent(UserEvent::UpdateDownloadFinished(failure))
+                if update_apply_admission.accepts_discovery() =>
+            {
+                clients.dispatch(finish_update_download(app, failure));
             }
             Event::UserEvent(UserEvent::UpdatePrepared {
                 version,
