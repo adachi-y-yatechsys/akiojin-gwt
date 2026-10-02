@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use crate::{
     coordination::{BoardEntry, BoardEntryKind},
-    error::{GwtError, JsonDecodeKind, Result},
+    error::{GwtError, JsonDecodeKind, Result, WorkspaceStateLoadError},
     paths::{
         gwt_project_dir_for_repo_path, gwt_repo_local_work_events_dir,
         gwt_repo_local_work_events_path, gwt_work_event_shard_path,
@@ -97,6 +97,33 @@ fn legacy_workspace_work_items_path_for_repo_path(repo_path: &Path) -> PathBuf {
 
 fn legacy_workspace_work_events_path_for_repo_path(repo_path: &Path) -> PathBuf {
     gwt_project_dir_for_repo_path(repo_path).join("workspace/work_events.jsonl")
+}
+
+/// Return the first legacy state file that the next load would import.
+/// Existence errors remain load errors, never evidence of a fresh project.
+pub fn pending_legacy_workspace_state_import(repo_path: &Path) -> Result<Option<PathBuf>> {
+    for (canonical, legacy) in [
+        (
+            gwt_workspace_projection_path_for_repo_path(repo_path),
+            legacy_workspace_projection_path_for_repo_path(repo_path),
+        ),
+        (
+            gwt_workspace_work_items_path_for_repo_path(repo_path),
+            legacy_workspace_work_items_path_for_repo_path(repo_path),
+        ),
+    ] {
+        if canonical != legacy
+            && !canonical
+                .try_exists()
+                .map_err(|error| WorkspaceStateLoadError::io(&canonical, error))?
+            && legacy
+                .try_exists()
+                .map_err(|error| WorkspaceStateLoadError::io(&legacy, error))?
+        {
+            return Ok(Some(legacy));
+        }
+    }
+    Ok(None)
 }
 
 fn copy_legacy_workspace_file_if_needed(legacy_path: &Path, canonical_path: &Path) -> Result<()> {
@@ -3707,12 +3734,12 @@ pub fn load_workspace_projection_from_path(path: &Path) -> Result<Option<Workspa
     match fs::read(path) {
         Ok(bytes) => {
             let mut projection: WorkspaceProjection = serde_json::from_slice(&bytes)
-                .map_err(|error| GwtError::Other(format!("workspace projection json: {error}")))?;
+                .map_err(|error| WorkspaceStateLoadError::json(path, error))?;
             migrate_workspace_to_work_terminology(&mut projection);
             Ok(Some(projection))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
+        Err(error) => Err(WorkspaceStateLoadError::io(path, error).into()),
     }
 }
 
@@ -3761,7 +3788,7 @@ pub fn load_workspace_work_items_from_path(path: &Path) -> Result<Option<WorkIte
             #[cfg(debug_assertions)]
             mark_playwright_work_items_decode_started(path);
             let mut items: WorkItemsProjection = serde_json::from_slice(&bytes)
-                .map_err(|error| classify_json_decode_error("workspace work items json", error))?;
+                .map_err(|error| WorkspaceStateLoadError::json(path, error))?;
             for item in &mut items.work_items {
                 if item.title == "Workspace" {
                     item.title = "Work".to_string();
@@ -3783,7 +3810,7 @@ pub fn load_workspace_work_items_from_path(path: &Path) -> Result<Option<WorkIte
             Ok(Some(items))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
+        Err(error) => Err(WorkspaceStateLoadError::io(path, error).into()),
     }
 }
 
@@ -4113,6 +4140,18 @@ impl WorkItemsCache {
 }
 
 pub fn save_workspace_work_items_projection_to_path(
+    path: &Path,
+    projection: &WorkItemsProjection,
+) -> Result<()> {
+    // Callers already hold the non-reentrant Workspace transaction lock.
+    // Validate before every ordinary write, including a GUI default snapshot.
+    validate_existing_workspace_state::<WorkItemsProjection>(path)?;
+    save_workspace_work_items_projection_after_rebuild(path, projection)
+}
+
+/// Only the complete-source rebuild may replace a syntactically corrupt file.
+/// Its caller must hold the Workspace lock and validate the entire source first.
+pub(crate) fn save_workspace_work_items_projection_after_rebuild(
     path: &Path,
     projection: &WorkItemsProjection,
 ) -> Result<()> {
@@ -6918,9 +6957,22 @@ fn save_workspace_projection_to_path_unlocked(
     path: &Path,
     projection: &WorkspaceProjection,
 ) -> Result<()> {
+    validate_existing_workspace_state::<WorkspaceProjection>(path)?;
     let bytes = serde_json::to_vec_pretty(projection)
         .map_err(|error| GwtError::Other(format!("workspace projection json: {error}")))?;
     write_atomic(path, &bytes)
+}
+
+fn validate_existing_workspace_state<T: serde::de::DeserializeOwned>(path: &Path) -> Result<()> {
+    match fs::read(path) {
+        Ok(bytes) => {
+            serde_json::from_slice::<T>(&bytes)
+                .map_err(|error| WorkspaceStateLoadError::json(path, error))?;
+            Ok(())
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(WorkspaceStateLoadError::io(path, error).into()),
+    }
 }
 
 pub fn update_workspace_projection_with_journal_paths(

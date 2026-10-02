@@ -5,6 +5,49 @@ use crate::paths::{gwt_repo_local_work_event_shard_path, gwt_repo_local_work_eve
 
 use super::*;
 
+#[test]
+fn ordinary_workspace_saves_preserve_invalid_existing_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let current = tmp.path().join("current.json");
+    let works = tmp.path().join("works.json");
+    for original in [
+        b"{\"updated_at\":".as_slice(),
+        b"{\"future_schema\":true}".as_slice(),
+    ] {
+        fs::write(&current, original).unwrap();
+        fs::write(&works, original).unwrap();
+        assert!(save_workspace_projection_to_path(
+            &current,
+            &WorkspaceProjection::default_for_project(tmp.path()),
+        )
+        .is_err());
+        assert!(save_workspace_work_items_projection_to_path(
+            &works,
+            &WorkItemsProjection::empty(Utc::now()),
+        )
+        .is_err());
+        assert_eq!(fs::read(&current).unwrap(), original);
+        assert_eq!(fs::read(&works).unwrap(), original);
+    }
+}
+
+#[test]
+fn workspace_load_failures_report_the_affected_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let current = tmp.path().join("current.json");
+    let works = tmp.path().join("works.json");
+    fs::write(&current, b"{").unwrap();
+    fs::create_dir(&works).unwrap();
+    let current_error = load_workspace_projection_from_path(&current).unwrap_err();
+    let works_error = load_workspace_work_items_from_path(&works).unwrap_err();
+    assert!(current_error
+        .to_string()
+        .contains(&current.display().to_string()));
+    assert!(works_error
+        .to_string()
+        .contains(&works.display().to_string()));
+}
+
 /// Issue #4703: repairing the projection must survive replay of its source.
 #[test]
 fn detached_foreign_container_stays_detached_after_intake_and_rebuild() {
@@ -615,10 +658,10 @@ fn work_items_loader_classifies_malformed_and_incompatible_json() {
     std::fs::write(&malformed_path, b"{\"work_items\":").expect("write malformed json");
     assert!(matches!(
         load_workspace_work_items_from_path(&malformed_path),
-        Err(GwtError::JsonDecode {
-            kind: JsonDecodeKind::Malformed,
+        Err(GwtError::WorkspaceStateLoad(WorkspaceStateLoadError {
+            kind: crate::WorkspaceStateLoadErrorKind::Malformed,
             ..
-        })
+        }))
     ));
 
     let incompatible_path = temp.path().join("incompatible.json");
@@ -662,10 +705,10 @@ fn work_items_loader_classifies_malformed_and_incompatible_json() {
     .expect("write incompatible json");
     assert!(matches!(
         load_workspace_work_items_from_path(&incompatible_path),
-        Err(GwtError::JsonDecode {
-            kind: JsonDecodeKind::IncompatibleSchema,
+        Err(GwtError::WorkspaceStateLoad(WorkspaceStateLoadError {
+            kind: crate::WorkspaceStateLoadErrorKind::IncompatibleSchema,
             ..
-        })
+        }))
     ));
 
     let unknown_cases = [
@@ -729,10 +772,10 @@ fn work_items_loader_classifies_malformed_and_incompatible_json() {
 
         assert!(matches!(
             load_workspace_work_items_from_path(&path),
-            Err(GwtError::JsonDecode {
-                kind: JsonDecodeKind::IncompatibleSchema,
+            Err(GwtError::WorkspaceStateLoad(WorkspaceStateLoadError {
+                kind: crate::WorkspaceStateLoadErrorKind::IncompatibleSchema,
                 ..
-            })
+            }))
         ));
         assert_eq!(std::fs::read(&path).unwrap(), original);
     }
@@ -2058,7 +2101,7 @@ fn split_root_transaction_rejects_incompatible_legacy_current_without_materializ
     )
     .expect_err("incompatible legacy current must fail closed");
 
-    assert!(error.to_string().contains("workspace projection json"));
+    assert!(matches!(error, GwtError::WorkspaceStateLoad(_)));
     assert_eq!(
         std::fs::read(&legacy_current).expect("legacy current after refusal"),
         incompatible
@@ -2093,7 +2136,7 @@ fn split_root_transaction_rejects_incompatible_legacy_work_items_without_materia
     )
     .expect_err("incompatible legacy WorkItems must fail closed");
 
-    assert!(error.to_string().contains("workspace work items json"));
+    assert!(matches!(error, GwtError::WorkspaceStateLoad(_)));
     assert_eq!(
         std::fs::read(&legacy_works).expect("legacy WorkItems after refusal"),
         incompatible
