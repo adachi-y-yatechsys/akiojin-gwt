@@ -5999,17 +5999,7 @@ fn issue_monitor_owner_launch_profile_choice(
             issue_number,
             linked_issue_kind == gwt::LinkedIssueKind::Spec,
             Some(&available),
-            |pool| {
-                gwt::select_launch_profile(
-                    pool,
-                    &holds,
-                    provider_usage_accounts,
-                    prefs.launch_usage_threshold_percent,
-                    &work_tags,
-                    None,
-                    &now,
-                )
-            },
+            |pool| gwt::select_launch_profile(pool, &holds, &work_tags, None, &now),
         )
         .ok_or_else(|| "No eligible Issue Monitor automatic tier candidate".to_string())?;
     Ok(IssueMonitorLaunchProfileChoice {
@@ -6045,8 +6035,6 @@ fn issue_monitor_launch_profile_choice(
                         provider_usage_accounts,
                     )
                 }),
-                &[],
-                prefs.launch_usage_threshold_percent,
                 &[],
                 avoid_provider,
                 &now,

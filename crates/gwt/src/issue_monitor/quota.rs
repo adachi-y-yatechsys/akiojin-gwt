@@ -6,6 +6,13 @@
 //! had recovered stayed held for days while the pool fell back to another
 //! agent. Formation now needs repeated launch failures, and a held provider is
 //! periodically given one launch to prove it has recovered.
+//!
+//! Issue #4908: the repeated failures are for a provider there is nothing to
+//! switch from. While another candidate is free, the first refusal holds the
+//! provider and the next candidate takes the launch — retrying the one that
+//! just refused only burns launches. Usage readings never form a hold or pick
+//! a candidate; a refusal does. A refusal that states no reset is held with
+//! its reset unknown and is not released by a timer.
 
 /// Consecutive rate-limited launch attempts required before a hold forms.
 pub(crate) const PROVIDER_QUOTA_HOLD_REQUIRED_FAILURES: usize = 3;
@@ -25,6 +32,24 @@ pub(crate) const PROVIDER_QUOTA_REVERIFY_INTERVAL_SECS: i64 = 30 * 60;
 /// its last rate-limited attempt — longer than the 120 s screen settle window,
 /// so a launch that is about to be refused cannot vouch for itself.
 pub(crate) const PROVIDER_QUOTA_RECOVERY_CONFIRM_SECS: i64 = 5 * 60;
+
+/// Issue #4908 AC-3: the `provider_quota_holds` deadline of a hold whose
+/// refusal stated no reset. A far-future instant rather than a new field, so
+/// a gwt that predates it still reads the provider as held; every projection
+/// reports it as [`PROVIDER_QUOTA_UNKNOWN_RESET_LABEL`] instead.
+pub(crate) const PROVIDER_QUOTA_UNKNOWN_RESET_AT: &str = "9999-12-31T23:59:59Z";
+
+/// How a hold with no stated reset reads in `issue.monitor.status`.
+pub(crate) const PROVIDER_QUOTA_UNKNOWN_RESET_LABEL: &str = "unknown";
+
+/// A hold's reset as readers see it: the instant, or `unknown`.
+pub(crate) fn provider_quota_reset_label(reset_at: &str) -> &str {
+    if reset_at == PROVIDER_QUOTA_UNKNOWN_RESET_AT {
+        PROVIDER_QUOTA_UNKNOWN_RESET_LABEL
+    } else {
+        reset_at
+    }
+}
 
 /// Consecutive refusals a hold needs: the constant, or one while a test holds
 /// the `hold_provider_quota_on_first_failure_in_this_test` guard.
@@ -136,13 +161,25 @@ mod tests {
         window_id: &str,
         at: &str,
     ) -> IssueMonitorProviderUsageLimitOutcome {
+        refused_launch(monitor, "codex", window_id, at, Some(RESET_AT))
+    }
+
+    /// Launch Issue 42 on `window_id` and have `provider` refuse it, stating
+    /// `resets_at` (or no reset at all).
+    fn refused_launch(
+        monitor: &mut IssueMonitorState,
+        provider: &str,
+        window_id: &str,
+        at: &str,
+        resets_at: Option<&str>,
+    ) -> IssueMonitorProviderUsageLimitOutcome {
         monitor.complete_active_launch_at(42, window_id, at);
         monitor.try_hold_provider_usage_limit(
             42,
             window_id,
-            "codex",
-            "Codex usage limit reached",
-            Some(RESET_AT),
+            provider,
+            format!("{provider} usage limit reached"),
+            resets_at,
             Some(IssueMonitorProviderQuotaHoldEvidence::screen_notice(
                 at, window_id, SCREEN,
             )),
@@ -162,6 +199,32 @@ mod tests {
             if attempt < PROVIDER_QUOTA_HOLD_REQUIRED_FAILURES {
                 at = after(&at, provider_quota_retry_backoff_secs(attempt));
             }
+        }
+        at
+    }
+
+    /// Have `provider` refuse launches from `first_at` until it is held — one
+    /// refusal while another candidate is free, the #4366 streak otherwise —
+    /// and return the instant of the refusal that formed the hold.
+    fn refuse_until_held(
+        monitor: &mut IssueMonitorState,
+        provider: &str,
+        first_at: &str,
+        resets_at: Option<&str>,
+    ) -> String {
+        let mut at = first_at.to_string();
+        for attempt in 1..=PROVIDER_QUOTA_HOLD_REQUIRED_FAILURES {
+            refused_launch(
+                monitor,
+                provider,
+                &format!("tab-1::agent-{provider}-{attempt}"),
+                &at,
+                resets_at,
+            );
+            if monitor.prefs().provider_quota_holds.contains_key(provider) {
+                break;
+            }
+            at = after(&at, provider_quota_retry_backoff_secs(attempt));
         }
         at
     }
@@ -436,8 +499,6 @@ mod tests {
             &pool,
             &prefs.launch_admission_provider_quota_holds(now, |_| reported_healthy),
             &[],
-            prefs.launch_usage_threshold_percent,
-            &[],
             None,
             now,
         );
@@ -574,6 +635,349 @@ mod tests {
                 .and_then(|record| record.retry_not_before.clone())
                 .as_deref(),
             Some(claude_reset)
+        );
+    }
+
+    /// Issue #4908 AC-1 / AC-3 / AC-7: with another candidate free, the first
+    /// refusal switches launches to it — no retry on the refused provider, no
+    /// backoff on the Issue — and the refused provider stays out until the
+    /// reset the refusal stated.
+    #[test]
+    fn the_first_refusal_switches_launches_to_the_next_free_candidate() {
+        let mut monitor = monitor_with_pool(&["codex", "claude"]);
+        assert_eq!(
+            launch_choice(&monitor.prefs(), FIRST_FAILURE_AT, false),
+            "codex"
+        );
+
+        assert_eq!(
+            rate_limited_launch(&mut monitor, "tab-1::agent-1", FIRST_FAILURE_AT),
+            IssueMonitorProviderUsageLimitOutcome::Held
+        );
+
+        let prefs = monitor.prefs();
+        assert_eq!(
+            prefs.provider_quota_holds.get("codex").map(String::as_str),
+            Some(RESET_AT),
+            "one observed refusal takes the provider out of the pool"
+        );
+        assert_eq!(launch_choice(&prefs, FIRST_FAILURE_AT, false), "claude");
+        assert!(
+            monitor.retry_ready(42, FIRST_FAILURE_AT),
+            "the refused Issue relaunches on the next candidate at once"
+        );
+        assert_eq!(monitor.queued_issue_numbers(), vec![42]);
+        assert_eq!(launch_choice(&prefs, &after(RESET_AT, -1), false), "claude");
+        assert_eq!(launch_choice(&prefs, RESET_AT, false), "codex");
+    }
+
+    /// Issue #4908 AC-1: nothing but a refusal switches launches. A poller
+    /// reading that shows the account at its limit forms no hold and leaves
+    /// the pool head the launch choice — the account may still be serving.
+    #[test]
+    fn a_usage_reading_at_the_limit_never_switches_the_launch_candidate() {
+        let mut monitor = monitor_with_pool(&["codex", "claude"]);
+        let fetched_at = parse_rfc3339_utc(FIRST_FAILURE_AT).expect("fixture instant");
+        let exhausted = gwt_core::usage::ProviderUsage {
+            provider: gwt_core::usage::UsageProvider::Codex,
+            account_id: Some("acct".to_string()),
+            account_label: None,
+            plan: None,
+            windows: vec![gwt_core::usage::UsageWindow::new(
+                gwt_core::usage::WindowKind::Weekly,
+                100.0,
+                None,
+            )],
+            limit_reached: true,
+            state: gwt_core::usage::UsageState::Ok,
+            fetched_at: Some(fetched_at),
+        };
+
+        monitor.reconcile_provider_usage(&exhausted, FIRST_FAILURE_AT);
+
+        let prefs = monitor.prefs();
+        assert!(
+            prefs.provider_quota_holds.is_empty(),
+            "a reading is not a refusal: {:?}",
+            prefs.provider_quota_holds
+        );
+        assert_eq!(launch_choice(&prefs, FIRST_FAILURE_AT, false), "codex");
+        let status = monitor.agent_status_at(FIRST_FAILURE_AT);
+        assert!(status.effective_launch_profile.is_none());
+        assert!(status.needs_human_fleet.is_none());
+    }
+
+    /// Issue #4908 AC-2: the status says launches were switched, and names
+    /// the provider that refused, when, and with what wording.
+    #[test]
+    fn status_names_the_provider_and_the_refusal_behind_a_switch() {
+        let mut monitor = monitor_with_pool(&["codex", "claude"]);
+        rate_limited_launch(&mut monitor, "tab-1::agent-1", FIRST_FAILURE_AT);
+        let now = after(FIRST_FAILURE_AT, 30);
+
+        for status in [
+            serde_json::to_value(monitor.agent_status_at(&now)).expect("agent status"),
+            serde_json::to_value(monitor.status_view_at(&now)).expect("gui status"),
+        ] {
+            assert_eq!(
+                status.pointer("/effective_launch_profile/agent_id"),
+                Some(&serde_json::json!("claude")),
+                "{status}"
+            );
+            assert_eq!(
+                status.pointer("/effective_launch_profile/refused_provider"),
+                Some(&serde_json::json!("codex")),
+                "{status}"
+            );
+            assert_eq!(
+                status.pointer("/effective_launch_profile/refused_at"),
+                Some(&serde_json::json!(FIRST_FAILURE_AT)),
+                "{status}"
+            );
+            let text = |pointer: &str| {
+                status
+                    .pointer(pointer)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            assert!(
+                text("/effective_launch_profile/refusal").contains("hit your usage limit"),
+                "{status}"
+            );
+            let reason = text("/effective_launch_profile/reason");
+            assert!(
+                reason.contains("codex")
+                    && reason.contains("hit your usage limit")
+                    && reason.contains(RESET_AT),
+                "the reason names the provider, its refusal and its reset: {reason}"
+            );
+        }
+    }
+
+    /// Issue #4908 AC-3: a refusal that states no reset is recorded as
+    /// unknown, and the provider does not come back on a timer.
+    #[test]
+    fn a_refusal_without_a_reset_is_recorded_as_unknown_and_never_returns_on_a_timer() {
+        let mut monitor = monitor_with_pool(&["codex", "claude"]);
+
+        refused_launch(
+            &mut monitor,
+            "codex",
+            "tab-1::agent-1",
+            FIRST_FAILURE_AT,
+            None,
+        );
+
+        let prefs = monitor.prefs();
+        for secs in [61, 60 * 60 + 1, 7 * 24 * 60 * 60, 365 * 24 * 60 * 60] {
+            assert_eq!(
+                launch_choice(&prefs, &after(FIRST_FAILURE_AT, secs), false),
+                "claude",
+                "{secs}s after a refusal with no stated reset"
+            );
+        }
+        let status = serde_json::to_value(monitor.agent_status_at(&after(FIRST_FAILURE_AT, 120)))
+            .expect("agent status");
+        assert_eq!(
+            status.pointer("/provider_quota_holds/0/reset_at"),
+            Some(&serde_json::json!("unknown")),
+            "{status}"
+        );
+        assert_eq!(
+            status.pointer("/launch_profile_candidates/0/held_until"),
+            Some(&serde_json::json!("unknown")),
+            "{status}"
+        );
+        let reason = status
+            .pointer("/effective_launch_profile/reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            reason.contains("reset unknown") && !reason.contains("9999"),
+            "{reason}"
+        );
+    }
+
+    /// Issue #4908 AC-3: a reset read from a later refusal replaces the
+    /// unknown one.
+    #[test]
+    fn a_later_refusal_that_states_its_reset_replaces_the_unknown_one() {
+        let mut monitor = monitor_with_pool(&["codex", "claude"]);
+        refused_launch(
+            &mut monitor,
+            "codex",
+            "tab-1::agent-1",
+            FIRST_FAILURE_AT,
+            None,
+        );
+
+        rate_limited_launch(
+            &mut monitor,
+            "tab-1::agent-2",
+            &after(FIRST_FAILURE_AT, 600),
+        );
+
+        assert_eq!(
+            monitor
+                .prefs()
+                .provider_quota_holds
+                .get("codex")
+                .map(String::as_str),
+            Some(RESET_AT)
+        );
+        assert_eq!(codex_evidence(&monitor).attempts.len(), 2);
+    }
+
+    /// Issue #4908 AC-4: once every candidate has refused, nothing launches
+    /// and the status says a human is needed — the stop is never silent.
+    #[test]
+    fn every_candidate_refused_is_reported_as_needing_a_human() {
+        let mut monitor = monitor_with_pool(&["codex", "claude"]);
+        rate_limited_launch(&mut monitor, "tab-1::agent-1", FIRST_FAILURE_AT);
+        assert!(
+            monitor
+                .agent_status_at(FIRST_FAILURE_AT)
+                .needs_human_fleet
+                .is_none(),
+            "claude is still free"
+        );
+
+        // The last free candidate has nowhere to switch to, so its refusals
+        // are retried before they hold it (Issue #4366).
+        let first_claude_refusal = after(FIRST_FAILURE_AT, 60);
+        refused_launch(
+            &mut monitor,
+            "claude",
+            "tab-1::agent-claude-0",
+            &first_claude_refusal,
+            None,
+        );
+        assert!(
+            monitor
+                .agent_status_at(&first_claude_refusal)
+                .needs_human_fleet
+                .is_none(),
+            "claude is retried, not yet held"
+        );
+        let at = refuse_until_held(
+            &mut monitor,
+            "claude",
+            &after(&first_claude_refusal, provider_quota_retry_backoff_secs(1)),
+            None,
+        );
+
+        let now = after(&at, 30);
+        assert!(monitor.next_launch_request(&now).is_none());
+        let status = monitor.agent_status_at(&now);
+        let needs_human = status
+            .needs_human_fleet
+            .expect("an exhausted pool needs a human");
+        assert_eq!(needs_human.kind, "launch_candidates_exhausted");
+        assert!(
+            needs_human.reason.contains("codex")
+                && needs_human.reason.contains(RESET_AT)
+                && needs_human.reason.contains("claude")
+                && needs_human.reason.contains("reset unknown"),
+            "the reason names every refused provider and its reset: {}",
+            needs_human.reason
+        );
+        assert!(status.agent_blackout.is_some());
+        assert_eq!(
+            status.stall_reason,
+            Some(IssueMonitorStallReason::QuotaHold)
+        );
+    }
+
+    /// Issue #4908 AC-3 / AC-4: an Issue parked behind an exhausted pool
+    /// whose resets are unknown is admitted again as soon as one provider is
+    /// released — its own floor never passes, so the pool decides.
+    #[test]
+    fn releasing_one_provider_of_an_exhausted_pool_readmits_the_parked_issue() {
+        let mut monitor = monitor_with_pool(&["codex", "claude"]);
+        refused_launch(
+            &mut monitor,
+            "codex",
+            "tab-1::agent-1",
+            FIRST_FAILURE_AT,
+            None,
+        );
+        let at = refuse_until_held(&mut monitor, "claude", &after(FIRST_FAILURE_AT, 60), None);
+        let now = after(&at, 30);
+        assert_eq!(
+            monitor
+                .autonomous_record(42)
+                .and_then(|record| record.retry_not_before.as_deref()),
+            Some(PROVIDER_QUOTA_UNKNOWN_RESET_AT)
+        );
+        assert!(!monitor.retry_ready_for_saved_profile(42, &now));
+        assert_eq!(monitor.runnable_backlog_len(&now), 0);
+        assert!(monitor.next_launch_request(&now).is_none());
+
+        monitor.clear_provider_quota_hold("codex", "test", &now);
+
+        assert!(
+            monitor.retry_ready_for_saved_profile(42, &now),
+            "a free candidate outranks a floor that mirrors another provider's hold"
+        );
+        assert_eq!(
+            monitor.runnable_backlog_len(&now),
+            1,
+            "the parked Issue counts as runnable again"
+        );
+        let status = monitor.agent_status_at(&now);
+        assert!(status.needs_human_fleet.is_none());
+        assert!(
+            status.quota_hold.is_none(),
+            "launch admission is open again"
+        );
+    }
+
+    /// Issue #4908 AC-3: between two processes, the newer refusal decides
+    /// whether a hold carries a stated reset or an unknown one — the unknown
+    /// deadline is not "later" than a real reset.
+    #[test]
+    fn the_newer_refusal_decides_between_an_unknown_and_a_stated_reset_across_processes() {
+        let mut stale = monitor_with_pool(&["codex", "claude"]);
+        refused_launch(
+            &mut stale,
+            "codex",
+            "tab-1::agent-1",
+            FIRST_FAILURE_AT,
+            None,
+        );
+        let mut newer = monitor_with_pool(&["codex", "claude"]);
+        refused_launch(
+            &mut newer,
+            "codex",
+            "tab-1::agent-1",
+            FIRST_FAILURE_AT,
+            None,
+        );
+        rate_limited_launch(&mut newer, "tab-1::agent-2", &after(FIRST_FAILURE_AT, 600));
+        let hold = |monitor: &IssueMonitorState| {
+            monitor.prefs().provider_quota_holds.get("codex").cloned()
+        };
+        assert_eq!(
+            hold(&stale).as_deref(),
+            Some(PROVIDER_QUOTA_UNKNOWN_RESET_AT)
+        );
+        assert_eq!(hold(&newer).as_deref(), Some(RESET_AT));
+
+        let stale_prefs = stale.prefs();
+        newer.merge_provider_quota_holds_from_prefs(&stale_prefs);
+        assert_eq!(
+            hold(&newer).as_deref(),
+            Some(RESET_AT),
+            "an older unknown hold on disk must not erase the stated reset"
+        );
+
+        let newer_prefs = newer.prefs();
+        stale.merge_provider_quota_holds_from_prefs(&newer_prefs);
+        assert_eq!(
+            hold(&stale).as_deref(),
+            Some(RESET_AT),
+            "the newer refusal's stated reset replaces the unknown one"
         );
     }
 }
