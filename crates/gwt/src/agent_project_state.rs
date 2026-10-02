@@ -70,6 +70,10 @@ pub fn adopt_authenticated_execution(
         .reason
         .trim()
         .starts_with(crate::cli::execution_state::RECOVERY_ENVELOPE_PREFIX)
+        || request
+            .reason
+            .trim()
+            .starts_with(crate::cli::execution_state::BLOCKED_CONTINUATION_TRANSFER_PREFIX)
     {
         return Err(AgentWorkspaceUpdateError::new(
             AgentWorkspaceUpdateErrorCode::InvalidRequest,
@@ -507,7 +511,15 @@ pub fn prepare_resume_producing_authority(
         schema_version: AGENT_EXECUTION_CONTINUATION_SCHEMA_VERSION,
         operation_id: format!("resume-producing-{}", uuid::Uuid::new_v4()),
     };
-    match continue_authenticated_execution(project_root, predecessor_session_id, request) {
+    // Launch consumes success as Active producing authority. A Blocked Resume
+    // must instead recover through an explicit execution.continue invocation
+    // and verify/reopen; preparation must leave its durable state untouched.
+    match continue_authenticated_execution_inner(
+        project_root,
+        predecessor_session_id,
+        request,
+        false,
+    ) {
         Ok(result) => {
             tracing::info!(
                 session_id = predecessor_session_id,
@@ -752,7 +764,15 @@ fn evaluate_authenticated_execution_continuation(
     };
     let repo_hash = repo_hash_for_mutation(&worktree, "repo hash")
         .map_err(|_| execution_binding_error("execution_continuation_repo_hash_unavailable"))?;
-    let exact_unbound = is_exact_unbound_host_session(&session);
+    // A Resume may retain its owner but lose producing authority. Only a
+    // Blocked predecessor can recover that shape through the audited takeover;
+    // Active owner-only Sessions still cannot manufacture a binding.
+    let exact_unbound = is_exact_unbound_host_session(&session)
+        || (record.status == crate::cli::execution_state::ExecutionControlStatus::Blocked
+            && session.linked_issue_number == Some(owner.number)
+            && session.execution_binding.is_none()
+            && session.runtime_target == LaunchRuntimeTarget::Host
+            && session.docker_runtime_binding.is_none());
     let activated_publication_repair = (!crate::cli::execution_state::integrity_ok(&record)
         && exact_unbound)
         .then(|| {
@@ -877,6 +897,15 @@ pub(crate) fn probe_authenticated_execution_continuation(
             if authority.record.status
                 == crate::cli::execution_state::ExecutionControlStatus::Blocked
             {
+                if authority.exact_unbound {
+                    let mut probe =
+                        crate::cli::execution_state::probe_blocked_continuation_takeover(
+                            &authority.worktree,
+                            &authority.session.id,
+                        );
+                    probe.governance.repository_target = governance.repository_target;
+                    return probe;
+                }
                 return RecoveryProbe::unavailable(
                     "execution.continue",
                     GovernanceMetadata {
@@ -922,6 +951,23 @@ pub fn continue_authenticated_execution(
     (AgentExecutionContinuationReceipt, SessionExecutionBinding),
     AgentWorkspaceUpdateError,
 > {
+    continue_authenticated_execution_inner(
+        authenticated_project_root,
+        authenticated_session_id,
+        request,
+        true,
+    )
+}
+
+fn continue_authenticated_execution_inner(
+    authenticated_project_root: &Path,
+    authenticated_session_id: &str,
+    request: AgentExecutionContinuationRequest,
+    recover_blocked: bool,
+) -> std::result::Result<
+    (AgentExecutionContinuationReceipt, SessionExecutionBinding),
+    AgentWorkspaceUpdateError,
+> {
     request.validate()?;
     let authority = evaluate_authenticated_execution_continuation(
         authenticated_project_root,
@@ -936,6 +982,101 @@ pub fn continue_authenticated_execution(
         exact_unbound,
         current_binding,
     } = authority;
+    if record.status == crate::cli::execution_state::ExecutionControlStatus::Blocked {
+        if !recover_blocked {
+            return Err(AgentWorkspaceUpdateError::new(
+                AgentWorkspaceUpdateErrorCode::RelaunchRequired,
+                "Blocked recovery requires explicit execution.continue, then verification and execution.reopen",
+            ));
+        }
+        let existing = crate::cli::execution_state::continuation_validation_for_operation(
+            &worktree,
+            owner,
+            &request.operation_id,
+        )
+        .map_err(|_| execution_binding_error("execution_continuation_validation_unreadable"))?;
+        let replay = existing.as_ref().is_some_and(|audit| {
+            audit.session_id == session.id
+                && audit.execution_binding == current_binding
+                && session.execution_binding.as_ref().is_some_and(|binding| {
+                    binding.identity == current_binding
+                        && audit.capability_generation == binding.capability_generation
+                })
+        });
+        if existing.is_some() && !replay {
+            return Err(execution_binding_error(
+                "execution_continuation_replay_binding_mismatch",
+            ));
+        }
+        // The takeover is durable before validation publication. Its reserved
+        // reason (unavailable to public adoption) proves the exact operation
+        // may finish publication after a write failure without another transfer.
+        let pending_validation = record.transfers.last().is_some_and(|transfer| {
+            transfer.to_session_id == session.id
+                && transfer.reason
+                    == format!(
+                        "{}{}",
+                        crate::cli::execution_state::BLOCKED_CONTINUATION_TRANSFER_PREFIX,
+                        request.operation_id,
+                    )
+        });
+        if !exact_unbound && !replay && !pending_validation {
+            return Err(AgentWorkspaceUpdateError::new(
+                AgentWorkspaceUpdateErrorCode::RelaunchRequired,
+                "Blocked execution must be recovered with execution.reopen before continuing",
+            ));
+        }
+        let binding = crate::cli::execution_state::continue_blocked_takeover(
+            &worktree,
+            &session,
+            &current_binding,
+            &request.operation_id,
+        )
+        .map_err(|error| {
+            AgentWorkspaceUpdateError::new(
+                AgentWorkspaceUpdateErrorCode::TransactionConflict,
+                format!("Blocked continuation could not recover authority: {error}"),
+            )
+        })?;
+        let verified = crate::cli::verification_record::snapshot_current_generation_caller_binding(
+            &worktree,
+            Some(&session.id),
+        )
+        .map_err(|_| execution_binding_error("execution_continuation_readback_mismatch"))?;
+        if verified.as_ref() != Some(&binding) {
+            return Err(execution_binding_error(
+                "execution_continuation_readback_mismatch",
+            ));
+        }
+        crate::cli::execution_state::record_rebound_continuation_validation(
+            &worktree,
+            owner,
+            &request.operation_id,
+            &session.id,
+            &binding,
+        )
+        .map_err(|_| {
+            AgentWorkspaceUpdateError::new(
+                AgentWorkspaceUpdateErrorCode::TransactionConflict,
+                "Blocked continuation transferred authority but could not record validation; retry execution.continue with the same params.operation_id before verification",
+            )
+        })?;
+        return Ok((
+            AgentExecutionContinuationReceipt {
+                schema_version: AGENT_EXECUTION_CONTINUATION_SCHEMA_VERSION,
+                operation_id: request.operation_id,
+                outcome: AgentExecutionContinuationOutcome::ReboundCurrent,
+                predecessor_generation_id: None,
+                generation_id: binding.identity.generation_id.clone(),
+                execution_binding: binding.identity.clone(),
+                capability_generation: binding.capability_generation,
+                superseded_execution_binding: None,
+                takeover_audit_id: None,
+                validated: true,
+            },
+            binding,
+        ));
+    }
     if let Some(audit) = crate::cli::execution_state::continuation_validation_for_operation(
         &worktree,
         owner,
@@ -1098,13 +1239,6 @@ pub fn continue_authenticated_execution(
             binding,
         ));
     }
-    if record.status == crate::cli::execution_state::ExecutionControlStatus::Blocked {
-        return Err(AgentWorkspaceUpdateError::new(
-            AgentWorkspaceUpdateErrorCode::RelaunchRequired,
-            "Blocked execution must be recovered with execution.reopen before continuing",
-        ));
-    }
-
     let existing = crate::cli::execution_state::continuation_attempt_for_operation(
         &worktree,
         owner,
@@ -6248,6 +6382,184 @@ mod tests {
                     agent.session_id == session.id
                         && agent.workspace_id.as_deref() == Some(ensured_work_id)
                 }));
+            },
+        );
+    }
+
+    #[test]
+    fn resumed_unbound_blocked_session_advertises_and_executes_continuation() {
+        with_split_root_exact_unbound_fixture(
+            |project_state_root, worktree, nested, _sibling, session| {
+                use crate::cli::execution_state as execution;
+                execution::settle(
+                    worktree,
+                    "split-root-foreign-predecessor",
+                    execution::ExecutionSettlement::Blocked {
+                        reason: "predecessor stopped before verification".to_string(),
+                        missing_verification: Some("derived matrix".to_string()),
+                    },
+                )
+                .expect("settle predecessor");
+                let mut resumed = session.clone();
+                resumed.linked_issue_number = Some(3393);
+                save_session_fixture(&resumed);
+                let before_launch = ExecutionBindingAuthoritySnapshot::capture(
+                    project_state_root,
+                    worktree,
+                    &resumed.id,
+                );
+                assert!(
+                    prepare_resume_producing_authority(project_state_root, &resumed.id).is_none(),
+                    "launch preparation must not present Blocked recovery as Active producing authority"
+                );
+                assert_eq!(
+                    ExecutionBindingAuthoritySnapshot::capture(
+                        project_state_root,
+                        worktree,
+                        &resumed.id,
+                    ),
+                    before_launch
+                );
+                let registry = crate::agent_capability::AgentCapabilityRegistry::default();
+                let token = registry.issue(project_state_root, &resumed.id).unwrap();
+                let grant = crate::agent_capability::AgentCapabilityGrant::new(
+                    token.clone(),
+                    registry.authenticate(&token).unwrap(),
+                );
+                assert!(grant.principal().active_execution_binding().is_none());
+                let diagnosis = execution::diagnose(nested, Some(&resumed.id));
+                assert!(
+                    diagnosis
+                        .available_recoveries
+                        .contains(&"execution.continue".to_string()),
+                    "unbound Resume needs an executable recovery: {diagnosis:?}"
+                );
+                assert!(!diagnosis
+                    .available_recoveries
+                    .contains(&"execution.adopt".to_string()));
+
+                let request = AgentExecutionContinuationRequest {
+                    schema_version: AGENT_EXECUTION_CONTINUATION_SCHEMA_VERSION,
+                    operation_id: "resume-blocked-continuation".to_string(),
+                    readiness_nonce: None,
+                };
+                execution::set_continuation_validation_write_failure();
+                continue_authenticated_execution(project_state_root, &resumed.id, request.clone())
+                    .expect_err("injected validation write failure after the durable takeover");
+                let (_, binding) = continue_authenticated_execution(
+                    project_state_root,
+                    &resumed.id,
+                    request.clone(),
+                )
+                .expect("execute advertised recovery");
+                registry.promote_continuation(&grant, &binding).unwrap();
+                assert_eq!(
+                    registry
+                        .refresh_grant(&grant)
+                        .unwrap()
+                        .principal()
+                        .active_execution_binding(),
+                    Some(&binding),
+                    "the existing Host promotion publishes recovery authority"
+                );
+                let error = registry
+                    .adopt_execution(
+                        &registry.refresh_grant(&grant).unwrap(),
+                        AgentExecutionAdoptionRequest {
+                            schema_version: 1,
+                            claimed_session_id: resumed.id.clone(),
+                            reason: format!(
+                                "{}forged",
+                                execution::BLOCKED_CONTINUATION_TRANSFER_PREFIX
+                            ),
+                        },
+                    )
+                    .expect_err("public Host adoption cannot forge a continuation retry");
+                assert_eq!(error.code, AgentWorkspaceUpdateErrorCode::InvalidRequest);
+                let recovered = execution::load(worktree).unwrap().unwrap();
+                assert_eq!(recovered.status, execution::ExecutionControlStatus::Blocked);
+                assert_eq!(recovered.primary_session_id, resumed.id);
+                assert_eq!(recovered.transfers.len(), 1);
+                crate::cli::verification_record::authenticate_current_generation_caller(
+                    worktree,
+                    Some(&resumed.id),
+                )
+                .expect("recovered Session can run canonical verification");
+                let after = execution::diagnose(nested, Some(&resumed.id));
+                assert!(after
+                    .available_recoveries
+                    .contains(&"verify.plan".to_string()));
+                assert!(after
+                    .available_recoveries
+                    .contains(&"verify.run".to_string()));
+                assert!(
+                    continue_authenticated_execution(
+                        project_state_root,
+                        &resumed.id,
+                        AgentExecutionContinuationRequest {
+                            operation_id: "unrelated-bound-blocked-continuation".to_string(),
+                            ..request.clone()
+                        },
+                    )
+                    .is_err(),
+                    "a bound Blocked Session must still use verification/reopen"
+                );
+                let (_, replay) =
+                    continue_authenticated_execution(project_state_root, &resumed.id, request)
+                        .expect("replay existing recovery");
+                assert_eq!(replay, binding);
+                assert_eq!(execution::load(worktree).unwrap().unwrap(), recovered);
+            },
+        );
+    }
+
+    #[test]
+    fn resumed_unbound_blocked_session_rejects_foreign_owner_without_mutation() {
+        with_split_root_exact_unbound_fixture(
+            |project_state_root, worktree, nested, _sibling, session| {
+                use crate::cli::execution_state as execution;
+                execution::settle(
+                    worktree,
+                    "split-root-foreign-predecessor",
+                    execution::ExecutionSettlement::Blocked {
+                        reason: "predecessor stopped".to_string(),
+                        missing_verification: None,
+                    },
+                )
+                .unwrap();
+                let mut resumed = session.clone();
+                resumed.linked_issue_number = Some(4788);
+                save_session_fixture(&resumed);
+                let before = ExecutionBindingAuthoritySnapshot::capture(
+                    project_state_root,
+                    worktree,
+                    &resumed.id,
+                );
+                let diagnosis = execution::diagnose(nested, Some(&resumed.id));
+                assert!(!diagnosis
+                    .available_recoveries
+                    .contains(&"execution.continue".to_string()));
+                assert!(!diagnosis
+                    .available_recoveries
+                    .contains(&"execution.adopt".to_string()));
+                assert!(continue_authenticated_execution(
+                    project_state_root,
+                    &resumed.id,
+                    AgentExecutionContinuationRequest {
+                        schema_version: AGENT_EXECUTION_CONTINUATION_SCHEMA_VERSION,
+                        operation_id: "wrong-owner-blocked-resume".to_string(),
+                        readiness_nonce: None,
+                    },
+                )
+                .is_err());
+                assert_eq!(
+                    ExecutionBindingAuthoritySnapshot::capture(
+                        project_state_root,
+                        worktree,
+                        &resumed.id,
+                    ),
+                    before
+                );
             },
         );
     }

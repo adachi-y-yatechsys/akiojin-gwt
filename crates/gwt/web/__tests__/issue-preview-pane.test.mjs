@@ -343,7 +343,7 @@ test("no preview pane is rendered when the Issue has no auto-launched agent", as
 test("app.js wires the read-only mirror and the Windowize handoff", () => {
   assert.match(
     appSource,
-    /createTerminalRuntime:\s*\(id,\s*terminalRoot,\s*options\)\s*=>\s*\n?\s*createTerminalRuntime\(id,\s*terminalRoot,\s*options\)/,
+    /createTerminalRuntime:\s*\(id,\s*terminalRoot,\s*options\)\s*=>\s*\n?\s*createTerminalRuntime\(id,\s*terminalRoot,\s*\{ \.\.\.options, readOnly: Boolean\(agentsHost\) \|\| options\?\.readOnly \}\)/,
     "the Issue surface receives the shared terminal runtime factory",
   );
   assert.match(

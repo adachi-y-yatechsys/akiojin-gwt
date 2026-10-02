@@ -62,6 +62,8 @@ const ROOT_MODULES = new Set([
   // Issue #4777 T-1 — rail surface selection (Issues / Agents / Board / Settings).
   "surface-rail.js",
   "split-surfaces.js",
+  "agents-surface.js",
+  "terminal-text-preview.js",
   "focus-trap.js",
   "startup-metrics.js",
   "hotkey.js",
@@ -91,7 +93,6 @@ const ROOT_MODULES = new Set([
   // SPEC-2013 2026-06-16 amendment — internal Project Switcher popover.
   // SPEC-3064 Phase 3 (E1) — provider usage & rate limits surface.
   "provider-usage-surface.js",
-  "window-tabs-renderer.js",
   // SPEC-3015 — generated protocol enum contract + extracted window runtime
   // state helpers.
   "protocol-enums.js",

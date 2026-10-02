@@ -682,12 +682,66 @@ fn run_monitor_status<E: CliEnv>(
         "uncertainties": inventory.uncertainties,
     });
     output["active_sessions"] = serde_json::json!(inventory.sessions);
+    output["session_row_mismatch"] =
+        serde_json::json!(session_row_mismatch(&status.inbox, &inventory.sessions));
     out.push_str(
         &serde_json::to_string(&output)
             .map_err(|error| io_as_api_error(io::Error::other(error)))?,
     );
     out.push('\n');
     Ok(0)
+}
+
+/// Issue #4862: where the inbox row and the live sessions disagree.
+///
+/// The Kanban column follows the row's `monitor_state`, so a row that stops
+/// saying `launched` moves its card out of Active — even when an agent is still
+/// working in that Issue's worktree. The PM has had to join three separate
+/// reads (the row, `pane.list`, and `worktree_sessions`) to notice, and once
+/// came close to orphaning a window that was mid-task. Report the disagreement
+/// where both sides are already in scope.
+///
+/// Both directions matter and they fail differently:
+/// `working_without_active_row` hides progress and invites a duplicate launch;
+/// `active_row_without_session` holds a slot for a window that is gone.
+fn session_row_mismatch(
+    inbox: &[crate::issue_monitor::IssueMonitorInboxSummary],
+    sessions: &[crate::session_inventory::SessionObservation],
+) -> serde_json::Value {
+    use crate::issue_monitor::MonitorInboxState;
+    let live: std::collections::BTreeSet<u64> = sessions
+        .iter()
+        .filter_map(|session| session.issue_number)
+        .collect();
+    let mut working_without_active_row = Vec::new();
+    let mut active_row_without_session = Vec::new();
+    for row in inbox {
+        let row_claims_a_window = matches!(
+            row.state,
+            MonitorInboxState::Launched | MonitorInboxState::Launching
+        );
+        let has_live_session = live.contains(&row.issue_number);
+        if has_live_session && !row_claims_a_window {
+            working_without_active_row.push(serde_json::json!({
+                "issue_number": row.issue_number,
+                "state": row.state,
+            }));
+        }
+        // A `launching` row legitimately has no session yet, so only a row that
+        // already claims a bound window counts as a phantom.
+        if !has_live_session && matches!(row.state, MonitorInboxState::Launched) {
+            active_row_without_session.push(serde_json::json!({
+                "issue_number": row.issue_number,
+                "launched_window_id": row.launched_window_id,
+            }));
+        }
+    }
+    serde_json::json!({
+        "consistent": working_without_active_row.is_empty()
+            && active_row_without_session.is_empty(),
+        "working_without_active_row": working_without_active_row,
+        "active_row_without_session": active_row_without_session,
+    })
 }
 
 /// The Issue Monitor projection `issue.monitor.status` reports: the daemon's
@@ -1047,6 +1101,25 @@ fn run_monitor_queue_list<E: CliEnv>(
     Ok(0)
 }
 
+/// Push Issues onto this host's terminal queue, naming every number it would
+/// not add.
+///
+/// Issue #4819: this operation used to answer `ok: true` with the whole queue
+/// whatever happened, so a caller could not tell "queued" from "declined".
+/// It now reports one result per number and refuses the call as a whole when
+/// any of them is declined:
+///
+/// - `claimed_by_other_owner` — another owner holds a live `Active` / `Queued`
+///   claim on the Issue. `force: true` takes it over.
+/// - `not_in_queue_after_write` — the number was accepted but is absent from
+///   the queue that was written. Nothing is known to produce this; it exists so
+///   a future silent drop is named rather than swallowed.
+///
+/// `launch_now` deliberately does not apply the claim guard: it is the explicit
+/// "do this now" override, and the Issue it is pointed at is named by a person.
+/// That asymmetry is why a stale claim could make `queue.push` look broken while
+/// `launch_now` kept working on the same Issue. An expired claim lease is not a
+/// refusal on either path.
 fn run_monitor_queue_push<E: CliEnv>(
     env: &E,
     project_root: Option<&std::path::Path>,
@@ -1060,6 +1133,7 @@ fn run_monitor_queue_push<E: CliEnv>(
     let now = chrono::Utc::now().to_rfc3339();
     let queued_expires_at = (chrono::Utc::now() + chrono::Duration::minutes(15)).to_rfc3339();
     let mut accepted_numbers = Vec::new();
+    let mut outcomes: Vec<QueuePushOutcome> = Vec::new();
     // Queue claims are advisory: a GitHub outage must not make the local
     // queue unusable. Active claims remain authoritative and are left alone.
     for number in numbers {
@@ -1074,8 +1148,21 @@ fn run_monitor_queue_push<E: CliEnv>(
                 } else {
                     Vec::new()
                 };
-            if !force
-                && claims.iter().any(|claim| {
+            // Issue #4819: a live claim from another owner is a real refusal,
+            // so it is named instead of skipped. A bare `continue` here dropped
+            // the number from `accepted_numbers` while the operation still
+            // answered `ok: true` with the whole queue, so three retries looked
+            // exactly like three successes.
+            //
+            // An *expired* claim is not a refusal. The queue claim carries the
+            // 15-minute lease written as `queued_expires_at` below, and a lease
+            // nobody renewed used to block `queue.push` forever while
+            // `launch_now` kept admitting the same Issue — the asymmetry that
+            // made this look like a defect in the queue store.
+            let blocking = if force {
+                None
+            } else {
+                claims.iter().find(|claim| {
                     claim.issue_number == *number
                         && matches!(
                             claim.status,
@@ -1083,8 +1170,22 @@ fn run_monitor_queue_push<E: CliEnv>(
                                 | gwt_github::issue_auto_claim::ClaimStatus::Queued
                         )
                         && claim.owner != crate::process::current_claim_owner()
+                        && !queue_claim_lease_expired(&claim.expires_at, &now)
                 })
-            {
+            };
+            if let Some(blocking) = blocking {
+                outcomes.push(QueuePushOutcome {
+                    number: *number,
+                    accepted: false,
+                    refusal_code: Some(QUEUE_PUSH_REFUSAL_CLAIMED_BY_OTHER_OWNER),
+                    refusal_detail: Some(format!(
+                        "issue #{number} is claimed by {} ({} claim, lease expires {}); \
+                         pass force: true to take it over",
+                        blocking.owner,
+                        claim_status_word(&blocking.status),
+                        blocking.expires_at
+                    )),
+                });
                 continue;
             }
             let claim = gwt_github::issue_auto_claim::ClaimComment {
@@ -1116,8 +1217,10 @@ fn run_monitor_queue_push<E: CliEnv>(
                 );
             }
             accepted_numbers.push(*number);
+            outcomes.push(QueuePushOutcome::accepted(*number));
         } else {
             accepted_numbers.push(*number);
+            outcomes.push(QueuePushOutcome::accepted(*number));
         }
     }
     let (prefs, _) = crate::try_mutate_issue_monitor_prefs(&path, |prefs| {
@@ -1151,9 +1254,108 @@ fn run_monitor_queue_push<E: CliEnv>(
         Ok(())
     })
     .map_err(io_as_api_error)?;
-    out.push_str(&serde_json::to_string(&prefs.terminal_queues).expect("queue serializes"));
+    // Issue #4819 AC-1: the written queue is the only proof that a number was
+    // added, so every accepted number is read back out of it. This keeps the
+    // invariant a property of the operation rather than a patch over the one
+    // guard that was known to drop silently.
+    let written = prefs
+        .terminal_queues
+        .get(&crate::process::current_hostname())
+        .map(|queue| {
+            queue
+                .entries
+                .iter()
+                .map(|entry| entry.number)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for outcome in outcomes.iter_mut().filter(|outcome| outcome.accepted) {
+        if !written.contains(&outcome.number) {
+            outcome.accepted = false;
+            outcome.refusal_code = Some(QUEUE_PUSH_REFUSAL_NOT_IN_QUEUE_AFTER_WRITE);
+            outcome.refusal_detail = Some(format!(
+                "issue #{} was accepted but is absent from the {} queue after the write",
+                outcome.number,
+                crate::process::current_hostname()
+            ));
+        }
+    }
+    let refused = outcomes
+        .iter()
+        .filter(|outcome| !outcome.accepted)
+        .map(|outcome| outcome.number)
+        .collect::<Vec<_>>();
+    let payload = serde_json::json!({
+        "terminal_queues": prefs.terminal_queues,
+        "results": outcomes,
+        "accepted": outcomes
+            .iter()
+            .filter(|outcome| outcome.accepted)
+            .map(|outcome| outcome.number)
+            .collect::<Vec<_>>(),
+        "refused": refused,
+    });
+    out.push_str(&serde_json::to_string(&payload).expect("queue push result serializes"));
     out.push('\n');
-    Ok(0)
+    // Issue #4819 AC-3: one refused number means the call did not do what it
+    // was asked, so the envelope must not report `ok: true`.
+    if refused.is_empty() {
+        Ok(0)
+    } else {
+        Ok(1)
+    }
+}
+
+/// Per-number outcome of `issue.monitor.queue.push` (Issue #4819).
+#[derive(serde::Serialize)]
+struct QueuePushOutcome {
+    number: u64,
+    accepted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refusal_code: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refusal_detail: Option<String>,
+}
+
+impl QueuePushOutcome {
+    fn accepted(number: u64) -> Self {
+        QueuePushOutcome {
+            number,
+            accepted: true,
+            refusal_code: None,
+            refusal_detail: None,
+        }
+    }
+}
+
+/// Refusal codes `issue.monitor.queue.push` can return, one per branch that
+/// declines a number (Issue #4819 AC-2).
+const QUEUE_PUSH_REFUSAL_CLAIMED_BY_OTHER_OWNER: &str = "claimed_by_other_owner";
+const QUEUE_PUSH_REFUSAL_NOT_IN_QUEUE_AFTER_WRITE: &str = "not_in_queue_after_write";
+
+/// Render a claim status as the word the refusal detail names it by.
+fn claim_status_word(status: &gwt_github::issue_auto_claim::ClaimStatus) -> &'static str {
+    match status {
+        gwt_github::issue_auto_claim::ClaimStatus::Active => "active",
+        gwt_github::issue_auto_claim::ClaimStatus::Queued => "queued",
+        gwt_github::issue_auto_claim::ClaimStatus::Released => "released",
+        gwt_github::issue_auto_claim::ClaimStatus::Completed => "completed",
+        gwt_github::issue_auto_claim::ClaimStatus::Lost => "lost",
+    }
+}
+
+/// Whether a queue claim's lease has run out by `now`.
+///
+/// Issue #4819: an unparseable deadline counts as live, so a malformed claim
+/// refuses loudly rather than being waved through.
+fn queue_claim_lease_expired(expires_at: &str, now: &str) -> bool {
+    match (
+        chrono::DateTime::parse_from_rfc3339(expires_at),
+        chrono::DateTime::parse_from_rfc3339(now),
+    ) {
+        (Ok(expires), Ok(now)) => expires <= now,
+        _ => false,
+    }
 }
 
 fn run_monitor_queue_remove<E: CliEnv>(
@@ -1546,6 +1748,43 @@ fn run_monitor_quota_hold_clear<E: CliEnv>(
     reason: &str,
     out: &mut String,
 ) -> Result<i32, SpecOpsError> {
+    run_monitor_quota_hold_clear_inner(env, project_root, provider, reason, None, out)
+}
+
+pub(super) fn run_monitor_quota_hold_clear_if_matches<E: CliEnv>(
+    env: &E,
+    project_root: Option<&std::path::Path>,
+    provider: &str,
+    reason: &str,
+    expected_reset_at: &str,
+    out: &mut String,
+) -> Result<i32, SpecOpsError> {
+    if expected_reset_at.trim().is_empty() {
+        return refuse_quota_hold_clear(
+            out,
+            provider,
+            "missing_expected_hold",
+            "expected reset time is required",
+        );
+    }
+    run_monitor_quota_hold_clear_inner(
+        env,
+        project_root,
+        provider,
+        reason,
+        Some(expected_reset_at),
+        out,
+    )
+}
+
+fn run_monitor_quota_hold_clear_inner<E: CliEnv>(
+    env: &E,
+    project_root: Option<&std::path::Path>,
+    provider: &str,
+    reason: &str,
+    expected_reset_at: Option<&str>,
+    out: &mut String,
+) -> Result<i32, SpecOpsError> {
     let project_root = issue_monitor_project_root(env, project_root)?;
     let prefs_path = crate::issue_monitor_prefs_path_for_repo_path(&project_root);
     // Refuse before publishing so the daemon never has to reject a control it
@@ -1564,15 +1803,20 @@ fn run_monitor_quota_hold_clear<E: CliEnv>(
     let before = crate::load_issue_monitor_prefs(&prefs_path).map_err(io_as_api_error)?;
     let held_before = issues_held_by_provider(&before, &provider);
 
+    let mut clear = serde_json::json!({
+        "provider": provider,
+        "reason": reason,
+        "released_at": released_at,
+    });
+    let key = if let Some(expected) = expected_reset_at {
+        clear["expected_reset_at"] = serde_json::json!(expected);
+        "quota_hold_clear_if_matches"
+    } else {
+        "quota_hold_clear"
+    };
     let payload = crate::runtime_daemon_events::issue_monitor_payload(
         "control",
-        serde_json::json!({
-            "quota_hold_clear": {
-                "provider": provider,
-                "reason": reason,
-                "released_at": released_at,
-            }
-        }),
+        serde_json::json!({key: clear}),
         std::process::id(),
     );
     let delivery = match publish_monitor_config_set(&project_root, payload) {
@@ -1584,6 +1828,17 @@ fn run_monitor_quota_hold_clear<E: CliEnv>(
             let written = crate::try_mutate_issue_monitor_prefs_without_authority_fence(
                 &prefs_path,
                 |prefs| {
+                    if expected_reset_at.is_some_and(|expected| {
+                        prefs
+                            .provider_quota_holds
+                            .get(&provider)
+                            .map(String::as_str)
+                            != Some(expected)
+                    }) {
+                        return Err(std::io::Error::other(
+                            "provider quota hold changed; release refused",
+                        ));
+                    }
                     let mut monitor = crate::IssueMonitorState::with_prefs(
                         crate::IssueMonitorConfig::default(),
                         prefs.clone(),
@@ -4944,6 +5199,181 @@ pub(crate) fn body_closes_issue(body: &str, issue_number: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
+    // ---- Issue #4862: inbox row vs live sessions ----
+
+    /// Build one inbox row with only the fields this mismatch check reads.
+    fn mismatch_row(
+        issue_number: u64,
+        state: crate::MonitorInboxState,
+        launched_window_id: Option<&str>,
+    ) -> crate::issue_monitor::IssueMonitorInboxSummary {
+        crate::issue_monitor::IssueMonitorInboxSummary {
+            launch_tier: None,
+            landing_tier: None,
+            non_agent_attempts: 0,
+            tier_input: 0,
+            issue_number,
+            state,
+            github_state: crate::IssueMonitorIssueState::Open,
+            issue_updated_at: None,
+            readiness: crate::IssueMonitorReadiness::NotApplicable,
+            recoverable_merged: false,
+            completion_reason: None,
+            blocked_by_owner: None,
+            claim_expires_at: None,
+            blocked_by_claim_id: None,
+            exclusion_reason: None,
+            launched_window_id: launched_window_id.map(str::to_string),
+            error_message: None,
+            last_activity_at: None,
+            retry_not_before: None,
+            retry_hold_reason: None,
+            claim_id: None,
+            delivery_id: None,
+            waiting: None,
+            steering: None,
+            idle_kind: None,
+            idle_since: None,
+            duplicate_launch_refusal: None,
+            attempts: 0,
+            last_failure_message: None,
+            failure_kind: None,
+            pane_state: None,
+            pane_hold_reason: None,
+            runtime_consistency: None,
+        }
+    }
+
+    /// A live session in some Issue's worktree. No window is created: the check
+    /// reads observations, which is what Issue #4862 AC-6 requires.
+    fn mismatch_session(issue_number: Option<u64>) -> crate::session_inventory::SessionObservation {
+        crate::session_inventory::SessionObservation {
+            session_id: format!("session-{}", issue_number.unwrap_or(0)),
+            issue_number,
+            execution_binding_missing: false,
+            agent_id: "codex".to_string(),
+            worktree_path: std::path::PathBuf::from(format!(
+                "/tmp/work/issue-{}",
+                issue_number.unwrap_or(0)
+            )),
+            worktree_exists: true,
+            host_pid: 1,
+            child_pid: 2,
+            child_started_at: 0,
+            started_at: "2026-10-01T00:00:00Z".to_string(),
+            launch_origin: gwt_agent::SessionLaunchOrigin::Launch,
+            restore_source_session_id: None,
+        }
+    }
+
+    /// The symptom a user reported: the card leaves Active while the agent is
+    /// still working, because the row stopped saying `launched`.
+    #[test]
+    fn a_queued_row_with_a_live_session_is_reported_as_working_without_an_active_row() {
+        let inbox = vec![mismatch_row(4777, crate::MonitorInboxState::Queued, None)];
+        let sessions = vec![mismatch_session(Some(4777))];
+
+        let report = session_row_mismatch(&inbox, &sessions);
+
+        assert_eq!(report["consistent"], false);
+        assert_eq!(
+            report["working_without_active_row"][0]["issue_number"],
+            4777
+        );
+        assert!(report["active_row_without_session"]
+            .as_array()
+            .expect("array")
+            .is_empty());
+    }
+
+    /// The other direction: the row holds a slot for a window that is gone.
+    #[test]
+    fn a_launched_row_without_a_live_session_is_reported_as_a_phantom() {
+        let inbox = vec![mismatch_row(
+            4777,
+            crate::MonitorInboxState::Launched,
+            Some("project-x::agent-1307"),
+        )];
+
+        let report = session_row_mismatch(&inbox, &[]);
+
+        assert_eq!(report["consistent"], false);
+        assert_eq!(
+            report["active_row_without_session"][0]["issue_number"],
+            4777
+        );
+        assert_eq!(
+            report["active_row_without_session"][0]["launched_window_id"],
+            "project-x::agent-1307"
+        );
+    }
+
+    /// `launching` has no window yet by design, so it must not be a phantom.
+    #[test]
+    fn a_launching_row_without_a_session_yet_is_not_a_phantom() {
+        let inbox = vec![mismatch_row(
+            4777,
+            crate::MonitorInboxState::Launching,
+            None,
+        )];
+
+        let report = session_row_mismatch(&inbox, &[]);
+
+        assert_eq!(report["consistent"], true);
+    }
+
+    /// A hold keeps the row out of Active deliberately, but the agent inside the
+    /// worktree is still working — the PM must still see that.
+    #[test]
+    fn a_held_row_with_a_live_session_still_reports_the_disagreement() {
+        let inbox = vec![mismatch_row(
+            4777,
+            crate::MonitorInboxState::HoldExcluded,
+            None,
+        )];
+        let sessions = vec![mismatch_session(Some(4777))];
+
+        let report = session_row_mismatch(&inbox, &sessions);
+
+        assert_eq!(report["consistent"], false);
+        assert_eq!(
+            report["working_without_active_row"][0]["issue_number"],
+            4777
+        );
+    }
+
+    #[test]
+    fn a_launched_row_with_its_live_session_is_consistent() {
+        let inbox = vec![mismatch_row(
+            4777,
+            crate::MonitorInboxState::Launched,
+            Some("project-x::agent-1343"),
+        )];
+        let sessions = vec![mismatch_session(Some(4777))];
+
+        let report = session_row_mismatch(&inbox, &sessions);
+
+        assert_eq!(report["consistent"], true);
+    }
+
+    /// The PM's own session carries no Issue number and must not be joined to
+    /// any row.
+    #[test]
+    fn a_session_without_an_issue_number_is_ignored() {
+        let inbox = vec![mismatch_row(
+            4777,
+            crate::MonitorInboxState::Launched,
+            Some("project-x::agent-1343"),
+        )];
+
+        let report = session_row_mismatch(&inbox, &[mismatch_session(None)]);
+
+        assert_eq!(
+            report["active_row_without_session"][0]["issue_number"], 4777,
+            "a PM session must not count as the Issue's window"
+        );
+    }
+
     use std::{
         fs::File,
         path::Path,
@@ -6633,6 +7063,168 @@ mod tests {
         assert!(prefs.enabled);
     }
 
+    // ---- Issue #4819: `queue.push` must never refuse silently ----
+
+    /// Seed one open Issue carrying the queue label and, optionally, a claim
+    /// comment owned by somebody other than this process.
+    fn queue_push_issue(
+        env: &mut crate::cli::TestEnv,
+        number: u64,
+        foreign_claim_expires_at: Option<&str>,
+    ) {
+        let updated_at = UpdatedAt::new("2026-09-30T09:00:00Z");
+        let comments = foreign_claim_expires_at
+            .map(|expires_at| {
+                let claim = gwt_github::issue_auto_claim::ClaimComment {
+                    comment_id: None,
+                    claim_id: format!("gwt-queue:{number}:seeded"),
+                    // current_claim_owner() embeds this process id, so any
+                    // literal owner here is a different owner.
+                    owner: "other-host:other-user:1".to_string(),
+                    issue_number: number,
+                    status: gwt_github::issue_auto_claim::ClaimStatus::Queued,
+                    heartbeat_at: "2026-09-30T09:00:00Z".to_string(),
+                    expires_at: expires_at.to_string(),
+                    launched_work_id: None,
+                };
+                vec![CommentSnapshot {
+                    id: CommentId(9100 + number),
+                    body: gwt_github::issue_auto_claim::render_claim_comment(&claim),
+                    updated_at: updated_at.clone(),
+                }]
+            })
+            .unwrap_or_default();
+        env.client.seed(gwt_github::IssueSnapshot {
+            number: IssueNumber(number),
+            title: format!("issue {number}"),
+            body: String::new(),
+            labels: vec![gwt_github::issue_auto_claim::QUEUED_LABEL.to_string()],
+            state: IssueState::Open,
+            updated_at,
+            comments,
+        });
+    }
+
+    fn run_queue_push(
+        env: &mut crate::cli::TestEnv,
+        numbers: Vec<u64>,
+        force: bool,
+    ) -> (i32, serde_json::Value) {
+        let mut out = String::new();
+        let code = run(
+            env,
+            IssueCommand::MonitorQueuePush {
+                project_root: None,
+                issue_numbers: numbers,
+                position: None,
+                force,
+            },
+            &mut out,
+        )
+        .expect("queue push answers");
+        let payload =
+            serde_json::from_str::<serde_json::Value>(out.trim()).expect("queue push payload");
+        (code, payload)
+    }
+
+    fn queued_numbers(repo: &std::path::Path) -> Vec<u64> {
+        let path = crate::issue_monitor_prefs_path_for_repo_path(repo);
+        let prefs = crate::load_issue_monitor_prefs(&path).expect("prefs");
+        prefs
+            .terminal_queues
+            .get(&crate::process::current_hostname())
+            .map(|queue| {
+                queue
+                    .entries
+                    .iter()
+                    .map(|entry| entry.number)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Issue #4819 AC-4 / AC-1 / AC-3: the 2026-09-30 observation. #4803 and
+    /// #4812 were pushed in one call; #4803 landed in the queue and #4812 did
+    /// not, and the operation answered `ok: true` with no reason either time.
+    /// Before the fix this test sees exit code 0 and no mention of #4812.
+    #[test]
+    fn queue_push_names_the_issue_a_live_foreign_claim_refused() {
+        let tmp = TempDir::new().expect("tempdir");
+        let _home = ScopedGwtHome::set(tmp.path().join("home"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        let mut env = crate::cli::TestEnv::new(repo.clone());
+        queue_push_issue(&mut env, 4803, None);
+        queue_push_issue(&mut env, 4812, Some("2999-01-01T00:00:00Z"));
+
+        let (code, payload) = run_queue_push(&mut env, vec![4812, 4803], false);
+
+        assert_eq!(code, 1, "a refused number must not answer ok: true");
+        assert_eq!(payload["refused"], serde_json::json!([4812]));
+        assert_eq!(payload["accepted"], serde_json::json!([4803]));
+        let refusal = payload["results"]
+            .as_array()
+            .expect("results array")
+            .iter()
+            .find(|result| result["number"] == 4812)
+            .expect("the refused number is named in results")
+            .clone();
+        assert_eq!(refusal["accepted"], serde_json::json!(false));
+        assert_eq!(
+            refusal["refusal_code"],
+            serde_json::json!("claimed_by_other_owner")
+        );
+        let detail = refusal["refusal_detail"]
+            .as_str()
+            .expect("a refusal carries its reason");
+        assert!(
+            detail.contains("other-host:other-user:1") && detail.contains("force: true"),
+            "the reason names the holder and the override: {detail}"
+        );
+        assert_eq!(
+            queued_numbers(&repo),
+            vec![4803],
+            "the accepted number is queued and the refused one is not"
+        );
+    }
+
+    /// Issue #4819 AC-5: the queue claim carries a 15-minute lease, so an
+    /// expired one is not a refusal. This is the asymmetry that made
+    /// `launch_now` admit an Issue `queue.push` kept declining.
+    #[test]
+    fn queue_push_admits_an_issue_whose_foreign_claim_lease_ran_out() {
+        let tmp = TempDir::new().expect("tempdir");
+        let _home = ScopedGwtHome::set(tmp.path().join("home"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        let mut env = crate::cli::TestEnv::new(repo.clone());
+        queue_push_issue(&mut env, 4812, Some("2020-01-01T00:00:00Z"));
+
+        let (code, payload) = run_queue_push(&mut env, vec![4812], false);
+
+        assert_eq!(code, 0, "an expired lease blocks nothing");
+        assert_eq!(payload["refused"], serde_json::json!([]));
+        assert_eq!(queued_numbers(&repo), vec![4812]);
+    }
+
+    /// Issue #4819 AC-2: `force` is the documented override, and taking the
+    /// Issue over is an acceptance, not a refusal.
+    #[test]
+    fn queue_push_with_force_takes_over_a_live_foreign_claim() {
+        let tmp = TempDir::new().expect("tempdir");
+        let _home = ScopedGwtHome::set(tmp.path().join("home"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        let mut env = crate::cli::TestEnv::new(repo.clone());
+        queue_push_issue(&mut env, 4812, Some("2999-01-01T00:00:00Z"));
+
+        let (code, payload) = run_queue_push(&mut env, vec![4812], true);
+
+        assert_eq!(code, 0);
+        assert_eq!(payload["refused"], serde_json::json!([]));
+        assert_eq!(queued_numbers(&repo), vec![4812]);
+    }
+
     /// SPEC #4093 AC-8 (Issue #3737 AC-4): `launch_now` inside a GitHub
     /// refusal window names the window and its resume time instead of
     /// answering as if the scan will read GitHub right now.
@@ -7538,6 +8130,15 @@ mod tests {
                 "session_observation": {
                     "complete": true,
                     "uncertainties": [],
+                },
+                // Issue #4862 AC-5: the row-versus-session disagreement is part
+                // of every status snapshot, including the rebuilt fallback —
+                // a `launching` row legitimately has no session yet, so this
+                // shape is the consistent one.
+                "session_row_mismatch": {
+                    "consistent": true,
+                    "working_without_active_row": [],
+                    "active_row_without_session": [],
                 },
                 "max_active": 3,
                 "enabled": true,
@@ -11066,6 +11667,50 @@ mod tests {
             profile.skip_permissions,
             "the wizard's permission choice is kept"
         );
+    }
+
+    #[test]
+    fn quota_hold_clear_if_matches_local_fallback_preserves_new_hold() {
+        let tmp = TempDir::new().unwrap();
+        let _home = ScopedGwtHome::set(tmp.path().join("home"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let prefs_path = crate::issue_monitor_prefs_path_for_repo_path(&repo);
+        let current = (chrono::Utc::now() + chrono::Duration::days(3)).to_rfc3339();
+        let seed = crate::IssueMonitorPrefs {
+            provider_quota_holds: std::collections::BTreeMap::from([(
+                "codex".into(),
+                current.clone(),
+            )]),
+            ..Default::default()
+        };
+        crate::save_issue_monitor_prefs(&prefs_path, &seed).unwrap();
+        let env = crate::cli::TestEnv::new(repo);
+        for (expected, code) in [("stale", 1), (current.as_str(), 0)] {
+            let mut out = String::new();
+            assert_eq!(
+                run_monitor_quota_hold_clear_if_matches(
+                    &env,
+                    None,
+                    "codex",
+                    "verified reset",
+                    expected,
+                    &mut out
+                )
+                .unwrap(),
+                code,
+                "{out}"
+            );
+            let persisted = crate::load_issue_monitor_prefs(&prefs_path).unwrap();
+            assert_eq!(
+                persisted.provider_quota_holds.contains_key("codex"),
+                code != 0
+            );
+            assert_eq!(
+                persisted.provider_quota_hold_releases.contains_key("codex"),
+                code == 0
+            );
+        }
     }
 
     /// Issue #3923 AC-1 / AC-4: the PM lists a provider hold with its evidence

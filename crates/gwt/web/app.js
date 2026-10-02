@@ -20,10 +20,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
       import { createStartupMetrics } from "/startup-metrics.js";
       import {
         TITLEBAR_DOCK_HIT_HEIGHT,
-        clientPointFromDragEvent,
-        detachGeometryFromClientPoint,
         findTitlebarDockTarget,
-        resolveDragReleasePoint,
       } from "/window-docking.js";
       import {
         attentionForWorkspace,
@@ -74,7 +71,6 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
         expandWorldRectForLayoutSize,
       } from "/camera-framing.js";
       import { createTerminalWheelScrollController } from "/terminal-wheel-scroll.js";
-      import { renderWindowTabs as renderWindowTabsView } from "/window-tabs-renderer.js";
       // SPEC-3038 US-3: Close Guard confirm modal renderer.
       import { renderWindowCloseConfirmModal } from "/window-close-confirm-modal.js";
       // SPEC-3064 Phase 3 (E4): the Settings windows surface (and its
@@ -174,6 +170,8 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
         surfaceForWindow,
       } from "/surface-rail.js";
       import { createSplitSurfaces } from "/split-surfaces.js";
+      import { createAgentsSurface } from "/agents-surface.js";
+      import { createTerminalTextPreview } from "/terminal-text-preview.js";
       import { shouldSkipTerminalFocusActivation } from "/clone-modal-focus-guard.js";
       import { createUiTraceProfiler } from "/ui-trace-profiler.js";
       import { UI_TRACE_EVENT, createUiTraceWiring } from "/ui-trace-wiring.js";
@@ -307,6 +305,10 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
       });
       const windowMap = new Map();
       let splitSurfaces = null;
+      let agentsSurface = null;
+      let agentsHost = null;
+      const textPreviews = new Map();
+      const agentPreviousHosts = new Map();
       const renderedWindowElementKeys = new Map();
       const renderedRuntimeStatusKeys = new Map();
       const renderedAgentKanbanBodyKeys = new Map();
@@ -472,7 +474,6 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
       let reconnectTimer = null;
       let focusedId = null;
       let dragState = null;
-      let windowTabDragState = null;
       let panState = null;
       let resizeState = null;
       const geometrySyncState = createGeometrySyncState();
@@ -545,6 +546,8 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
       function workspaceWindowsRenderKey(workspace) {
         const windows = workspace?.windows || [];
         const parts = [];
+        appendRenderKeyPart(parts, "agents_hosted");
+        appendRenderKeyPart(parts, Boolean(agentsHost));
         appendRenderKeyPart(parts, "active_tab_id");
         appendRenderKeyPart(parts, appState?.active_tab_id || null);
         appendRenderKeyPart(parts, "active_window_ids");
@@ -1539,13 +1542,6 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
         return windowData?.tab_group_id || windowData?.id || "";
       }
 
-      function windowTabsFor(windowData) {
-        const groupId = windowGroupId(windowData);
-        return (activeWorkspace().windows || []).filter(
-          (candidate) => windowGroupId(candidate) === groupId,
-        );
-      }
-
       function visibleWindowData(windowData) {
         if (isOffCanvasPlacement(windowData)) {
           return false;
@@ -1554,29 +1550,6 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
           return true;
         }
         return Boolean(windowData.tab_group_active);
-      }
-
-      function trackWindowTabDragPoint(event) {
-        if (!windowTabDragState) return;
-        const point = clientPointFromDragEvent(event, canvas.getBoundingClientRect());
-        if (point) {
-          windowTabDragState.lastClientPoint = point;
-        }
-      }
-
-      function detachGeometryFromTabDrag(event, drag, windowData) {
-        const canvasRect = canvas.getBoundingClientRect();
-        const releasePoint = resolveDragReleasePoint(
-          event,
-          drag?.lastClientPoint,
-          canvasRect,
-        );
-        return detachGeometryFromClientPoint(
-          releasePoint,
-          windowData,
-          canvasRect,
-          viewport,
-        );
       }
 
       function pointerWorldPoint(event) {
@@ -2045,20 +2018,13 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
         focusOrSpawnPreset("issue");
       }
 
-      // Issue #4777 T-1: until the Agents surface lands (T-4), the canvas is
-      // where every agent is visible, so Agents frames all agent windows.
-      // The PM is not one of them. With no agent yet, it opens the Add Window
-      // deck to launch one.
+      // Issue #4777: fixed surfaces share the rail and optional split host.
       function openSurface(surface) {
         if (splitSurfaces?.isOpen()) {
-          if (!splitSurfaces.select(surface)) {
-            const existing = (activeWorkspace().windows || []).find(
-              (data) => surfaceForWindow(data) === surface && splitSurfaces.containsWindow(data.id),
-            );
-            if (existing) splitSurfaces.focusWindow(existing.id);
-          }
+          if (!splitSurfaces.select(surface)) splitSurfaces.focusSurface(surface);
           return;
         }
+        if (surface !== "agents") setAgentsHost(null);
         switch (surface) {
           case "issues":
             openWorkspaceOverview();
@@ -2070,15 +2036,8 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
             focusOrSpawnPreset("settings");
             return;
           case "agents":
-            if (
-              fitAll({
-                include: (windowData) => surfaceForWindow(windowData) === "agents",
-              })
-            ) {
-              applySurfaceSelection(document, "agents");
-            } else {
-              openModal();
-            }
+            setAgentsHost(stage.closest(".canvas-area"));
+            syncSurfaceRail();
             return;
           default:
             return;
@@ -2444,6 +2403,13 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
           // PM and legacy surfaces keep their existing single-view route.
           splitSurfaces.close();
         }
+        // The Windows rail also lists inactive members of saved window groups.
+        // Activate first; the next workspace render completes the pending frame.
+        if (windowData.tab_group_id && !windowData.tab_group_active) {
+          pendingFrameWindowId = windowId;
+          send({ kind: "activate_window_tab", id: windowId });
+          return;
+        }
         // Cap framing at 1:1 so the focused terminal never CSS-upscales (blur).
         const target = viewportForWorldRect(framingRectForWindow(windowData), {
           maxZoom: FRAME_ZOOM_MAX,
@@ -2767,6 +2733,8 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
       // unit tests can reuse it.
       function canRefreshTerminalViewport(windowId) {
         const workspaceWindow = workspaceWindowById(windowId);
+        if (agentsHost && agentsSurface?.contains(windowId)) return true;
+        if (agentsHost === stage.closest(".canvas-area")) return false;
         if (splitSurfaces?.isOpen() && !isOffCanvasPlacement(workspaceWindow)) {
           return splitSurfaces.containsWindow(windowId);
         }
@@ -3309,7 +3277,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
         ),
       ) {
         const windowData = workspaceWindowById(windowId);
-        if (isOffCanvasPlacement(windowData) || splitSurfaces?.containsWindow(windowId)) {
+        if (isOffCanvasPlacement(windowData) || splitSurfaces?.containsWindow(windowId) || (agentsHost && agentsSurface?.contains(windowId))) {
           send(updateTerminalGridMessage(windowId, cols, rows));
           return;
         }
@@ -3520,6 +3488,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
       let pendingPmFrame = false;
 
       function openPmAgent() {
+        if (agentsHost) setAgentsHost(null);
         if (pmWindowId && windowMap.has(pmWindowId)) {
           requestWindowFrame(pmWindowId);
           return;
@@ -3759,8 +3728,6 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
             const element = windowMap.get(windowId);
             if (!element) {
               renderWindowList();
-              refreshWindowTabTelemetry(windowData);
-
               return;
             }
             const chip = element.querySelector(".status-chip");
@@ -3790,7 +3757,6 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
             // expose either control.
             updateWindowKillSwitchControls(element, windowData, runtimeState);
             recomputeOperatorTelemetry();
-            refreshWindowTabTelemetry(windowData);
             label.textContent = windowRuntimeLabel(runtimeState);
             const runtimeDescription = windowRuntimeDescription(runtimeState, windowData?.preset);
             const statusTitle = effectiveDetail
@@ -3904,11 +3870,14 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
         syncSurfaceRail();
       }
 
-      // Issue #4777 T-1: the pressed rail surface is the one the focused
-      // window belongs to; no second selection state is kept.
+      // The selected pane or Agents host takes precedence over canvas focus.
       function syncSurfaceRail() {
         if (splitSurfaces?.isOpen()) {
           applySurfaceSelection(document, splitSurfaces.activeSurface());
+          return;
+        }
+        if (agentsHost) {
+          applySurfaceSelection(document, "agents");
           return;
         }
         const focused = focusedId
@@ -4036,75 +4005,6 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
         ) {
           send({ kind: "stop_all_windows" });
         }
-      }
-
-      // SPEC-3038 US-2: tabs carry the same Living Telemetry the window chrome
-      // shows. Only agent panes (terminal surface) report a state; other
-      // surfaces render plain tabs.
-      function windowTabTelemetryState(tab) {
-        if (!shouldShowRuntimeStatus(tab)) return "";
-        return runtimeStateForWindow(tab);
-      }
-
-      // AS-2.2: a runtime state change must repaint the tab strip of every
-      // window in the group (the visible strip belongs to the active window's
-      // element, not necessarily the one whose status changed).
-      function refreshWindowTabTelemetry(windowData) {
-        if (!windowData?.tab_group_id) return;
-        for (const tab of windowTabsFor(windowData)) {
-          const tabElement = windowMap.get(tab.id);
-          if (tabElement) renderWindowTabs(tab, tabElement);
-        }
-      }
-
-      function renderWindowTabs(windowData, element) {
-        const strip = element.querySelector(".window-tab-strip");
-        if (!strip) return;
-        renderWindowTabsView({
-          strip,
-          tabs: windowTabsFor(windowData).map((tab) => ({
-            ...tab,
-            agent_state: windowTabTelemetryState(tab),
-          })),
-          activeWindowId: windowData.id,
-          tooltipForWindow: windowTitleTooltip,
-          send,
-          requestClose: requestCloseWindow,
-          onTabDragStart: (event, tabId) => {
-            if (splitSurfaces?.isOpen()) {
-              event.preventDefault();
-              return;
-            }
-            windowTabDragState = {
-              id: tabId,
-              docked: false,
-              lastClientPoint: clientPointFromDragEvent(
-                event,
-                canvas.getBoundingClientRect(),
-              ),
-            };
-            event.dataTransfer?.setData("text/plain", tabId);
-            if (event.dataTransfer) {
-              event.dataTransfer.effectAllowed = "move";
-            }
-          },
-          onTabDrag: trackWindowTabDragPoint,
-          onTabDragEnd: (event) => {
-            const drag = windowTabDragState;
-            trackWindowTabDragPoint(event);
-            windowTabDragState = null;
-            if (!drag || drag.docked) return;
-            const draggedWindow = workspaceWindowById(drag.id);
-            if (!draggedWindow?.tab_group_id) return;
-            const geometry = detachGeometryFromTabDrag(event, drag, draggedWindow);
-            if (!geometry) return;
-            send({
-              kind: "detach_window_tab",
-              id: drag.id,
-              geometry,
-            });
-          },
-        });
       }
 
       // SPEC-2008 camera-focus (UX fix): focus and camera move are SEPARATE.
@@ -4306,7 +4206,24 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
         return runtime;
       }
 
+      function cleanupTextPreviews(all = false) {
+        for (const [container, cleanup] of textPreviews) {
+          if (all || !container.isConnected) { cleanup(); textPreviews.delete(container); }
+        }
+      }
+
       function createTerminalRuntime(windowId, terminalContainer, options = {}) {
+        if (options.readOnly && agentsHost && surfaceForWindow(workspaceWindowById(windowId)) === "agents") {
+          const runtime = terminalMap.get(windowId) || createTerminalRuntime(windowId, terminalContainer);
+          if (runtime) {
+            queueMicrotask(cleanupTextPreviews);
+            textPreviews.get(terminalContainer)?.();
+            textPreviews.set(terminalContainer, createTerminalTextPreview({
+              document, terminal: runtime.terminal, container: terminalContainer,
+            }));
+            return runtime;
+          }
+        }
         if (terminalMap.has(windowId)) {
           return reparentTerminalRuntime(
             windowId,
@@ -4865,7 +4782,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
         // SPEC-3671 FR-007 / FR-008: the Issue preview mounts the shared terminal
         // runtime read-only, so the live output streams but no input path exists.
         createTerminalRuntime: (id, terminalRoot, options) =>
-          createTerminalRuntime(id, terminalRoot, options),
+          createTerminalRuntime(id, terminalRoot, { ...options, readOnly: Boolean(agentsHost) || options?.readOnly }),
         windowDisplayTitle,
         windowRoleBadgeLabel,
         // SPEC-3671 FR-010: Windowize is the same Canvas handoff the Agent Kanban
@@ -5666,10 +5583,10 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
                 <button class="icon-button" data-action="restart" aria-label="Restart agent" title="Restart agent" hidden>↻</button>
                 <button class="icon-button" data-action="minimize-to-issue" aria-label="Return to Issue list" title="Return to Issue list" hidden>▁</button>
                 <button class="icon-button" data-action="open-issue" aria-label="Open Issue" title="Open Issue" hidden>⧉</button>
+                <button class="icon-button" data-action="ungroup" aria-label="Ungroup window" title="Ungroup window" hidden>↗</button>
                 <button class="icon-button" data-action="close" aria-label="Close window">×</button>
               </div>
             </div>
-            <div class="window-tab-strip" aria-label="Window tabs"></div>
             <div class="window-body"></div>
             <div class="resize-handle"></div>
           `;
@@ -5678,6 +5595,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
 
           const titlebar = element.querySelector(".titlebar");
           const closeButton = element.querySelector("[data-action='close']");
+          const ungroupButton = element.querySelector("[data-action='ungroup']");
           const restartButton = element.querySelector("[data-action='restart']");
           const minimizeToIssueButton = element.querySelector("[data-action='minimize-to-issue']");
           const openIssueButton = element.querySelector("[data-action='open-issue']");
@@ -5712,6 +5630,17 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
               "open-issue",
               workspaceWindowById(windowData.id) || windowData,
             );
+          });
+
+          ungroupButton.addEventListener("click", (event) => {
+            event.stopPropagation();
+            const currentWindow = workspaceWindowById(windowData.id);
+            if (!currentWindow?.tab_group_id) return;
+            send({
+              kind: "detach_window_tab",
+              id: currentWindow.id,
+              geometry: currentWindow.geometry,
+            });
           });
 
           // SPEC-2008 camera-focus: minimize/maximize buttons were removed
@@ -5760,30 +5689,6 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
             };
             titlebar.setPointerCapture(event.pointerId);
           });
-          titlebar.addEventListener("dragover", (event) => {
-            if (!windowTabDragState || windowTabDragState.id === windowData.id) {
-              return;
-            }
-            trackWindowTabDragPoint(event);
-            event.preventDefault();
-            if (event.dataTransfer) {
-              event.dataTransfer.dropEffect = "move";
-            }
-          });
-          titlebar.addEventListener("drop", (event) => {
-            if (!windowTabDragState || windowTabDragState.id === windowData.id) {
-              return;
-            }
-            event.preventDefault();
-            trackWindowTabDragPoint(event);
-            windowTabDragState.docked = true;
-            send({
-              kind: "dock_window_tab",
-              id: windowTabDragState.id,
-              target_id: windowData.id,
-            });
-          });
-
           resizeHandle.addEventListener("pointerdown", (event) => {
             event.stopPropagation();
             // SPEC-2014 Phase C1: Windows WebView2 occasionally fails to
@@ -5886,7 +5791,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
         // SPEC-3671 FR-010: Windowize (and Agent Kanban undock) moves a window back
         // to the canvas without changing its preset, so `mountWindowBody` does not
         // run again. Reclaim the live terminal into this window's own body.
-        if (surface === "terminal" && !isOffCanvasPlacement(windowData)) {
+        if (surface === "terminal" && !isOffCanvasPlacement(windowData) && !agentsHost) {
           const terminalRoot = element.querySelector(".window-body .terminal-root");
           if (
             terminalRoot &&
@@ -5921,6 +5826,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
           return;
         }
 
+        element.querySelector("[data-action='ungroup']").hidden = !windowData.tab_group_id;
         element.querySelector(".title-text").textContent = windowDisplayTitle(windowData);
         const titleText = element.querySelector(".title-text");
         titleText.title = windowTitleTooltip(windowData);
@@ -5937,7 +5843,6 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
         } else {
           delete element.dataset.pm;
         }
-        renderWindowTabs(windowData, element);
         if (windowData.agent_color) {
           element.dataset.agentColor = windowData.agent_color;
         } else {
@@ -5956,7 +5861,6 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
         const shouldPersistTerminalGeometry =
           previousWidth !== windowData.geometry.width ||
           previousHeight !== windowData.geometry.height;
-        element.classList.toggle("tabbed", windowTabsFor(windowData).length > 1);
         element.style.left = `${windowData.geometry.x}px`;
         element.style.top = `${windowData.geometry.y}px`;
         element.style.width = `${windowData.geometry.width}px`;
@@ -6118,7 +6022,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
               // with agent status events.
               recompute: recomputeOperatorTelemetry,
               afterSync: () => {
-                if (splitSurfaces?.isOpen()) return;
+                if (splitSurfaces?.isOpen() || agentsHost) return;
                 const topmostId = topmostWindowId(workspace);
                 if (topmostId && activeWindowIdSet?.has(topmostId)) {
                   focusWindowLocally(topmostId);
@@ -6133,6 +6037,8 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
               },
             });
             splitSurfaces?.sync();
+            if (agentsHost) agentsSurface.sync(workspace.windows || []);
+            cleanupTextPreviews();
           },
         );
       }
@@ -7019,8 +6925,6 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
         }
       });
 
-      window.addEventListener("dragover", trackWindowTabDragPoint);
-
       window.addEventListener("pointerup", (event) => {
         if (panState && panState.pointerId === event.pointerId) {
           tracePointer(UI_TRACE_EVENT.pointerPanEnd, event, {
@@ -7543,11 +7447,53 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
       if (kanbanDrawerBackdrop) {
         kanbanDrawerBackdrop.addEventListener("click", closeKanbanDrawer);
       }
+      function setAgentsHost(host) {
+        if (agentsHost === host) return;
+        agentsHost = host;
+        const area = stage.closest(".canvas-area");
+        area.classList.toggle("is-agents", host === area);
+        agentsSurface.element.hidden = !host;
+        (host || area).appendChild(agentsSurface.element);
+        if (host) agentsSurface.sync(activeWorkspace().windows || []);
+        else {
+          for (const [id, previous] of agentPreviousHosts) {
+            const runtime = terminalMap.get(id);
+            if (runtime && previous.container.isConnected) {
+              reparentTerminalRuntime(id, runtime, previous.container, { readOnly: previous.readOnly });
+            }
+          }
+          agentPreviousHosts.clear();
+          cleanupTextPreviews(true);
+        }
+        renderedIssuePreviewBodyKeys.clear();
+        requestAnimationFrame(() => renderWorkspace(activeWorkspace()));
+      }
+      agentsSurface = createAgentsSurface({
+        document,
+        mountTerminal: (id, root) => {
+          const runtime = terminalMap.get(id);
+          if (runtime && runtime.terminalContainer !== root && !agentPreviousHosts.get(id)?.container.isConnected) {
+            agentPreviousHosts.set(id, { container: runtime.terminalContainer, readOnly: runtime.readOnly });
+          }
+          createTerminalRuntime(id, root);
+        },
+        sendInput: sendPaneInput,
+        onFocus: focusWindowLocally,
+        onLayout: () => requestAnimationFrame(() => {
+          if (!agentsHost) return;
+          for (const id of terminalMap.keys()) {
+            if (agentsSurface.contains(id)) scheduleTerminalFit(id, true);
+          }
+        }),
+      });
+      agentsSurface.element.hidden = true;
+      stage.closest(".canvas-area").appendChild(agentsSurface.element);
       splitSurfaces = createSplitSurfaces({
         document,
         stage,
         getWindows: () => (activeWorkspace().windows || []).filter((data) => !isOffCanvasPlacement(data)),
         getElement: (id) => windowMap.get(id),
+        onAgentsHost: setAgentsHost,
         restoreVisibility: (id, element) => { element.hidden = !visibleWindowData(workspaceWindowById(id)); },
         openSurface: (surface) => {
           const preset = surface === "issues" ? "issue" : surface;
@@ -7560,12 +7506,12 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
       });
       document.getElementById("split-view-button").addEventListener("click", () => {
         if (splitSurfaces.isOpen()) splitSurfaces.close();
-        else splitSurfaces.open(surfaceForWindow(workspaceWindowById(focusedId)));
+        else splitSurfaces.open(agentsHost ? "agents" : surfaceForWindow(workspaceWindowById(focusedId)));
       });
       window.addEventListener("resize", () => {
-        if (!splitSurfaces.isOpen()) return;
+        if (!splitSurfaces.isOpen() && !agentsHost) return;
         for (const id of windowMap.keys()) {
-          if (splitSurfaces.containsWindow(id)) scheduleTerminalFit(id, true);
+          if (splitSurfaces.containsWindow(id) || (agentsHost && agentsSurface.contains(id))) scheduleTerminalFit(id, true);
         }
       });
       installSurfaceRail(document, { openSurface });
@@ -7845,6 +7791,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
             return {
               hasRuntime: Boolean(runtime),
               isReady: runtime?.isReady ?? null,
+              readOnly: runtime?.readOnly ?? null,
               viewportRefreshPending: runtime?.viewportRefreshPending === true,
               cols: terminal?.cols ?? 0,
               rows: terminal?.rows ?? 0,

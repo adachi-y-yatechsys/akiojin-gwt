@@ -229,14 +229,22 @@ pub(super) fn run<E: CliEnv>(
 /// whole failure it recovers from is a durable snapshot that disagrees with the
 /// windows that are actually running.
 pub(super) fn live_window_ids(default_project_root: &Path) -> Result<BTreeSet<String>, String> {
+    Ok(live_windows(default_project_root)?
+        .into_iter()
+        .map(|window| window.id)
+        .collect())
+}
+
+pub(super) fn live_windows(
+    default_project_root: &Path,
+) -> Result<Vec<PersistedWindowState>, String> {
     let ws_url = pane_websocket_url_from_env()?;
     let project_root = project_root_for_pane(default_project_root);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|err| format!("failed to create pane runtime: {err}"))?;
-    let windows = runtime.block_on(request_window_list(&ws_url, &project_root))?;
-    Ok(windows.into_iter().map(|window| window.id).collect())
+    runtime.block_on(request_window_list(&ws_url, &project_root))
 }
 
 async fn run_async(
@@ -1872,6 +1880,7 @@ mod tests {
             SessionObservation {
                 session_id: id.to_string(),
                 issue_number: Some(4305),
+                execution_binding_missing: false,
                 agent_id: "codex".to_string(),
                 worktree_path: "/repo/work/issue-4305".into(),
                 worktree_exists: exists,

@@ -17849,6 +17849,82 @@ impl IssueMonitorState {
         );
     }
 
+    /// Issue #4862: hand a revoked launch's slot to another window of the same
+    /// Issue that a fresh observation still shows, instead of failing the row.
+    ///
+    /// Narrow on purpose. It applies only to an operator revoke (`stopped: …`,
+    /// what `issue.monitor.stop` writes) — an agent failure or a launch failure
+    /// is about the work, not about one window, and must still fail the row.
+    /// It also requires a *different* live window: revoking the only window
+    /// there is remains a decided fact, so the existing "never revives a
+    /// revoked launch" contract is untouched.
+    ///
+    /// Returns whether the caller should stop and leave the row launched.
+    fn rebind_revoked_launch_to_a_surviving_window(
+        &mut self,
+        issue_number: u64,
+        message: &str,
+        now: &str,
+    ) -> bool {
+        if !message.starts_with("stopped:") {
+            return false;
+        }
+        let revoked = self.launched_windows.get(&issue_number).cloned();
+        // Absence from a fresh snapshot is the only liveness evidence this
+        // judgement accepts, matching `reconcile_launch_bindings`. Without one,
+        // nothing is known and the ordinary failure path stands.
+        let Some(snapshot) = self.fresh_window_snapshot(now) else {
+            return false;
+        };
+        let survivor = snapshot
+            .windows
+            .iter()
+            .filter(|observed| {
+                !matches!(observed.status, WindowState::Stopped | WindowState::Error)
+            })
+            .map(|observed| observed.window_id.clone())
+            .find(|live| {
+                revoked
+                    .as_deref()
+                    .is_none_or(|revoked| !issue_monitor_window_ids_match(revoked, live))
+                    && self.launch_bindings.iter().any(|(bound, bound_issue)| {
+                        *bound_issue == issue_number && issue_monitor_window_ids_match(bound, live)
+                    })
+            });
+        let Some(survivor) = survivor else {
+            return false;
+        };
+        if let Some(revoked) = revoked.as_deref() {
+            self.launch_bindings
+                .retain(|bound, _| !issue_monitor_window_ids_match(bound, revoked));
+            self.record_launch_binding_replacement(issue_number, revoked, &survivor);
+        }
+        self.launched_windows.insert(issue_number, survivor.clone());
+        self.launch_bindings.insert(survivor.clone(), issue_number);
+        if !self.active_launches.contains(&issue_number) {
+            self.active_launches.push(issue_number);
+        }
+        // The row carries its own copy of the binding, so the ledger and the
+        // card disagree unless both move. The card reading the revoked window is
+        // the other half of this defect.
+        if let Some(item) = self
+            .inbox
+            .iter_mut()
+            .find(|item| item.issue.number == issue_number)
+        {
+            item.state = MonitorInboxState::Launched;
+            item.launched_window_id = Some(survivor.clone());
+            item.error_message = None;
+        }
+        tracing::warn!(
+            issue_number,
+            revoked = ?revoked,
+            survivor = %survivor,
+            "issue monitor moved a revoked launch's binding to a window that is still running (Issue #4862)"
+        );
+        true
+    }
+
     fn record_failed_issue_classified_at(
         &mut self,
         issue_number: u64,
@@ -17858,6 +17934,17 @@ impl IssueMonitorState {
         now: &str,
     ) {
         let message = message.into();
+        // Issue #4862: revoking one window must not revoke the Issue. Closing a
+        // duplicate window (#4804) failed the row, which dropped the window that
+        // was actually implementing out of `active_launches` and barred
+        // `readopt_live_launch_bindings` from ever re-adopting it — the card left
+        // Active while the agent kept working, and the slot accounting
+        // under-counted the running fleet. Same shape as the Issue #4150 guard
+        // below it: the stop named a window, so hand the binding to the window
+        // that is still there instead of failing the Issue.
+        if self.rebind_revoked_launch_to_a_surviving_window(issue_number, &message, now) {
+            return;
+        }
         // Issue #3941 AC-3: a launch aborted by transient infrastructure (exact
         // package probe timeout with no cached version, a remote-tracking ref
         // race between concurrent fetches) is neither an agent failure nor an
@@ -23174,6 +23261,127 @@ mod tests {
             "another tab's window is invisible from here, not dead (#3627)"
         );
         assert_eq!(foreign.prefs().launch_bindings.len(), 1);
+    }
+
+    /// Issue #4862 AC-3/AC-4, the live case: #4777 was working in its window while
+    /// its row read `hold_excluded` with no bound window at all, so the card sat
+    /// outside Active and the slot accounting under-counted by one
+    /// (`active_session_count` 4 against `occupied_slot_count` 2). A `hold` label
+    /// is an admission decision about launching new work; it must not unbind a
+    /// launch that is already running.
+    #[test]
+    fn a_hold_label_must_not_unbind_a_launch_that_is_already_running() {
+        let mut held = issue(4777);
+        held.labels = vec!["hold".to_string()];
+
+        let mut monitor = launched_cohort(&[(4777, "project-a::agent-1343")]);
+        // The label is added while the agent works, so the next scan sees it.
+        scan_queued_candidates(&mut monitor, &[held], "2026-10-01T10:30:00Z");
+
+        assert_eq!(
+            monitor
+                .inbox_item(4777)
+                .and_then(|item| item.launched_window_id.clone()),
+            Some("project-a::agent-1343".to_string()),
+            "AC-3: a hold decides admission, not whether the running window is bound"
+        );
+        assert_eq!(
+            monitor.active_count(),
+            1,
+            "AC-4: the slot stays occupied, so the fleet accounting matches the live sessions"
+        );
+    }
+
+    /// Issue #4862 AC-1/AC-2, the path that actually happened: the duplicate was
+    /// not merely closed, it was revoked (`issue.monitor.stop` / a launch
+    /// failure). Revocation is recorded per Issue, not per window, so revoking
+    /// the duplicate also bars re-adopting the window that is still
+    /// implementing — `readopt_live_launch_bindings` refuses any Issue in
+    /// `failed_issues`. The card leaves Active and never comes back on its own.
+    #[test]
+    fn revoking_a_duplicate_window_must_not_orphan_the_one_still_working() {
+        let now = "2026-10-01T10:22:00Z";
+        let mut monitor = launched_cohort(&[(4777, "tab-1::agent-1343")]);
+        monitor.complete_active_launch_at(4777, "tab-1::agent-1345", now);
+
+        // Absence from a fresh observation is the only liveness evidence this
+        // judgement accepts, so the canvas reports both windows: the duplicate
+        // has stopped, the implementing one is still running.
+        let observed_at = chrono::Utc::now().to_rfc3339();
+        monitor.record_window_snapshot(pane_snapshot(
+            &observed_at,
+            vec![
+                live_pane_observation("tab-1::agent-1343", 4777, WindowState::Running),
+                live_pane_observation("tab-1::agent-1345", 4777, WindowState::Stopped),
+            ],
+        ));
+
+        // The PM revokes the duplicate launch. `issue.monitor.stop` writes
+        // `stopped: <reason>`; "duplicate" in the message would instead reach the
+        // Issue #4150 refusal path, which is a different decision.
+        monitor.record_launch_failed(4777, "stopped: delivered");
+
+        assert_eq!(
+            monitor
+                .inbox_item(4777)
+                .and_then(|item| item.launched_window_id.clone()),
+            Some("tab-1::agent-1343".to_string()),
+            "AC-2: revoking the duplicate must not unbind the window still implementing"
+        );
+        assert_eq!(
+            monitor.active_count(),
+            1,
+            "AC-4: the slot stays held while that window works, so nothing relaunches over it"
+        );
+    }
+
+    /// Issue #4862 AC-1/AC-2: the Kanban card moved Active -> Backlog while the
+    /// agent kept working. A second window appeared for the same Issue (#4804),
+    /// the ACK moved the binding onto it, and closing that second window
+    /// requeued the row — leaving the window that was actually implementing
+    /// unbound, so the card left Active and the Monitor was free to launch a
+    /// third window for work already in progress.
+    #[test]
+    fn closing_a_duplicate_window_rebinds_to_the_one_still_working() {
+        let now = "2026-10-01T10:22:00Z";
+        // The window that is actually implementing.
+        let mut monitor = launched_cohort(&[(4777, "project-a::agent-1343")]);
+        // Issue #4804: a second window is created for the same worktree and its
+        // ACK takes the binding.
+        monitor.complete_active_launch_at(4777, "project-a::agent-1345", now);
+        assert_eq!(
+            monitor
+                .inbox_item(4777)
+                .and_then(|item| item.launched_window_id.clone()),
+            Some("project-a::agent-1345".to_string()),
+            "the later ACK owns the binding, which is the state this test starts from"
+        );
+
+        // The duplicate is closed; the implementing window is untouched.
+        monitor.requeue_window_at("project-a::agent-1345", now);
+        monitor.reconcile_launch_bindings(
+            "project-a",
+            &live_windows(&["project-a::agent-1343"]),
+            now,
+        );
+
+        assert_eq!(
+            monitor
+                .inbox_item(4777)
+                .and_then(|item| item.launched_window_id.clone()),
+            Some("project-a::agent-1343".to_string()),
+            "AC-2: the bind moves to the live window in the same worktree, not to None"
+        );
+        assert_eq!(
+            monitor.inbox_item(4777).map(|item| item.state),
+            Some(MonitorInboxState::Launched),
+            "AC-4: the card stays Active while a session is still working"
+        );
+        assert_eq!(
+            monitor.active_count(),
+            1,
+            "and the slot stays held, so no third window is launched for work in progress"
+        );
     }
 
     #[test]

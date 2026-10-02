@@ -444,6 +444,9 @@ pub struct Session {
     pub launch_command: String,
     #[serde(default)]
     pub launch_args: Vec<String>,
+    /// Non-secret effective Codex authentication root captured at launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_auth_root: Option<crate::CodexAuthRoot>,
     /// GUI window lifecycle flag used by startup restore. Conversation
     /// history alone must not reopen a window after the user closed it.
     #[serde(default)]
@@ -592,6 +595,7 @@ impl Session {
             workflow_bypass_armed_at: None,
             launch_command: String::new(),
             launch_args: Vec::new(),
+            codex_auth_root: None,
             restore_window_on_startup: false,
             consecutive_interruptions: 0,
             backend_id: None,
@@ -637,6 +641,7 @@ impl Session {
         session.launch_route = config.launch_route;
         session.launch_command = durable_session_launch_command(config);
         session.launch_args = config.args.clone();
+        session.codex_auth_root = config.validated_codex_auth_root_for_cwd(&session.worktree_path);
         session.windows_shell = config.windows_shell;
         session.update_status(AgentStatus::Running);
         session

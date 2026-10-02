@@ -1218,6 +1218,19 @@ fn parse(input: &str) -> Result<ParsedEnvelope, CliParseError> {
         "register.abort" => {
             skill_state(params, SkillActionKind::Abort).map(CliCommand::Register)?
         }
+        "provider.reset" => {
+            reject_unknown_params(params, &["provider", "window_id"], "provider.reset")?;
+            CliCommand::ProviderReset(super::provider_reset::ProviderResetCommand::Execute {
+                provider: required_string(params, "provider")?,
+                window_id: required_string(params, "window_id")?,
+            })
+        }
+        "provider.reset.proposals" => {
+            reject_unknown_params(params, &["min_reset_wait_secs"], "provider.reset.proposals")?;
+            CliCommand::ProviderReset(super::provider_reset::ProviderResetCommand::Proposals {
+                min_reset_wait_secs: optional_u64(params, "min_reset_wait_secs")?.unwrap_or(86400),
+            })
+        }
         "pane.list" => CliCommand::Pane(PaneCommand::List),
         "pane.read" => CliCommand::Pane(PaneCommand::Read {
             id: required_string(params, "id")?,
@@ -2239,6 +2252,26 @@ mod tests {
     use crate::cli::{BoardCommand, IssueMonitorPriorityPosition};
     use crate::protocol::{IndexSearchMatchMode, IndexSearchScope};
     use serde_json::{json, Value};
+
+    #[test]
+    fn provider_reset_operations_never_accept_caller_supplied_approval() {
+        let request = json!({"provider":"codex", "window_id":"tab-1::agent-2"});
+        assert!(parse(&envelope("provider.reset", request.clone())).is_ok());
+        for key in ["approved", "confirmed", "approval_token", "autonomous_mode"] {
+            let mut supplied = request.clone();
+            supplied[key] = json!(true);
+            assert!(matches!(
+                err("provider.reset", supplied),
+                CliParseError::InvalidJson(_)
+            ));
+        }
+        assert!(parse(&envelope(
+            "provider.reset.proposals",
+            json!({"min_reset_wait_secs":3600})
+        ))
+        .is_ok());
+        assert!(parse(&envelope("provider.reset", json!({"provider":"codex"}))).is_err());
+    }
 
     fn envelope(operation: &str, params: Value) -> String {
         json!({
