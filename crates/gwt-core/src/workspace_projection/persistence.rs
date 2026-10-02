@@ -4361,6 +4361,20 @@ fn with_workspace_transaction_recovery_observed_profiled<T>(
                     };
                     if let Some(external_commit) = transaction.external_commit.as_ref() {
                         if external_commit.phase == ExternalWorkspaceCommitPhase::Prepared {
+                            // Probe without waiting: the finalizer acquires these
+                            // state locks while holding its operation lock.
+                            if try_acquire_external_workspace_operation_lock(
+                                &transaction.current_path,
+                                &transaction.work_items_path,
+                                &external_commit.operation_id,
+                            )?
+                            .is_none()
+                            {
+                                return Err(GwtError::Other(format!(
+                                    "workspace operation {} is in flight; wait for its finalizer to complete and retry in 5 seconds (completion may take longer); no recovery action is needed while it is running",
+                                    external_commit.operation_id
+                                )));
+                            }
                             return Err(GwtError::Other(format!(
                             "workspace state transaction external commit is unresolved for operation {}",
                             external_commit.operation_id

@@ -2195,6 +2195,9 @@ fn workspace_state_transaction_commit_refusal_blocks_until_explicit_rejection() 
         blocked.is_err(),
         "ordinary writers must fail closed while external commit state is unresolved"
     );
+    let error = blocked.unwrap_err().to_string();
+    assert!(error.contains("unresolved"), "{error}");
+    assert!(!error.contains("in flight"), "{error}");
     assert_eq!(
         fs::read(&current).expect("read current while blocked"),
         current_before
@@ -2263,6 +2266,9 @@ fn workspace_state_transaction_reject_reports_busy_during_in_flight_external_com
         workspace_id: None,
         updated_at: now,
     });
+    let mut other_session = initial.agents[0].clone();
+    other_session.session_id = "session-waiting-writer".to_string();
+    initial.agents.push(other_session);
     save_workspace_projection_to_path(&current, &initial).expect("save initial current");
 
     let (commit_entered_tx, commit_entered_rx) = std::sync::mpsc::channel();
@@ -2308,6 +2314,19 @@ fn workspace_state_transaction_reject_reports_busy_during_in_flight_external_com
         .recv()
         .expect("external commit must start");
 
+    let retry_update = || {
+        transact_workspace_state_at(&current, &works, &events, &root, |projection, _, _| {
+            let agent = projection
+                .agents
+                .iter_mut()
+                .find(|agent| agent.session_id == "session-waiting-writer")
+                .expect("same waiting Session");
+            agent.current_focus = Some("retried update".to_string());
+            Ok(((), Vec::new()))
+        })
+    };
+    let in_flight_result = retry_update();
+
     assert_eq!(
         resolve_workspace_state_external_commit_at(
             &current,
@@ -2329,6 +2348,15 @@ fn workspace_state_transaction_reject_reports_busy_during_in_flight_external_com
         .join()
         .expect("join transaction")
         .expect("external commit and Work publication succeed");
+    let error = in_flight_result.expect_err("writer must wait").to_string();
+    assert!(error.contains("continue-operation-in-flight"), "{error}");
+    assert!(error.contains("in flight"), "{error}");
+    assert!(
+        error.contains("wait") && error.contains("retry in 5 seconds"),
+        "{error}"
+    );
+    assert!(!error.contains("unresolved"), "{error}");
+    retry_update().expect("same Session update succeeds after external commit completes");
     assert!(
         resolve_workspace_state_external_commit_at(
             &current,
@@ -2343,6 +2371,16 @@ fn workspace_state_transaction_reject_reports_busy_during_in_flight_external_com
     let saved = load_workspace_projection_from_path(&current)
         .expect("load current")
         .expect("current exists");
+    assert_eq!(
+        saved
+            .agents
+            .iter()
+            .find(|agent| agent.session_id == "session-waiting-writer")
+            .unwrap()
+            .current_focus
+            .as_deref(),
+        Some("retried update")
+    );
     assert_eq!(
         workspace_assignment_for_session(&saved, "session-in-flight-commit"),
         WorkspaceSessionAssignment::Assigned("work-in-flight-commit".to_string())
