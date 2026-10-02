@@ -1076,8 +1076,10 @@ pub(super) fn is_explicit_model_selection(model: &str) -> bool {
 /// launch as-is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentSetupKind {
-    /// The executable is missing and no runtime `latest` route exists.
+    /// Install a missing executable ahead of launch.
     Install,
+    /// Refresh an installed CLI before launching.
+    Update,
     /// The executable is launchable but first-time configuration is missing.
     Configure,
 }
@@ -1086,6 +1088,7 @@ impl AgentSetupKind {
     pub fn wire_value(self) -> &'static str {
         match self {
             Self::Install => "install",
+            Self::Update => "update",
             Self::Configure => "configure",
         }
     }
@@ -1101,15 +1104,46 @@ pub struct AgentSetupAffordance {
     pub action_label: Option<String>,
 }
 
-/// Derive the setup affordance for one built-in purely from its descriptor
-/// plus the detection / configuration state (SPEC-3864 FR-006): adding an
-/// agent means filling in `distribution` / `setup_args`, never a new branch.
+pub(super) fn agent_install_update_command(
+    descriptor: &gwt_agent::BuiltinAgentDescriptor,
+    update: bool,
+) -> Option<String> {
+    match descriptor.id {
+        gwt_agent::AgentId::ClaudeCode if update => Some("claude update".to_string()),
+        gwt_agent::AgentId::ClaudeCode if cfg!(windows) => Some(
+            r#"powershell -NoProfile -Command "irm https://claude.ai/install.ps1 | iex""#
+                .to_string(),
+        ),
+        gwt_agent::AgentId::ClaudeCode => {
+            Some("curl -fsSL https://claude.ai/install.sh | bash".to_string())
+        }
+        gwt_agent::AgentId::Codex => Some("npm install -g @openai/codex".to_string()),
+        _ => descriptor.distribution.install_shell_command(),
+    }
+}
+
+/// Derive setup from distribution and detection state (SPEC-3864 FR-006).
+/// Claude and Codex additionally expose pre-install/update commands because
+/// their default Host launch prefers the installed CLI (Issue #3894).
 pub fn agent_setup_affordance(
     descriptor: &gwt_agent::BuiltinAgentDescriptor,
     available: bool,
     needs_configuration: bool,
 ) -> Option<AgentSetupAffordance> {
     let name = descriptor.display_name;
+    if matches!(
+        descriptor.id,
+        gwt_agent::AgentId::ClaudeCode | gwt_agent::AgentId::Codex
+    ) {
+        let verb = if available { "Update" } else { "Install" };
+        let command = agent_install_update_command(descriptor, available)?;
+        return Some(AgentSetupAffordance {
+            kind: if available { AgentSetupKind::Update } else { AgentSetupKind::Install },
+            title: format!("{verb} {name} before launch"),
+            detail: format!("Run `{command}` in a host shell pane. Restart gwt afterward to refresh the detected version. Installed launches prefer PATH and use a package runner only if the installed CLI cannot launch."),
+            action_label: Some(format!("{verb} {name}")),
+        });
+    }
     if !available && !descriptor.distribution.supports_runtime_latest() {
         let title = format!("{name} is not installed");
         return Some(match descriptor.distribution.install_shell_command() {
@@ -1214,11 +1248,55 @@ pub fn build_agent_options(
 /// (SPEC-3864 FR-002) so `available` / `installed_version` reflect the host
 /// instead of an empty detection list.
 pub fn load_agent_options(cache: &gwt_agent::VersionCache) -> Vec<AgentOption> {
+    let environment = crate::profile_dispatch::config_path()
+        .map_err(|error| error.to_string())
+        .and_then(|path| {
+            gwt_agent::LaunchEnvironment::from_active_profile(
+                &path,
+                gwt_agent::LaunchRuntimeTarget::Host,
+            )
+        })
+        .map(gwt_agent::LaunchEnvironment::into_parts);
+    if let Err(error) = &environment {
+        tracing::warn!(%error, "cannot detect installed agents in the active profile");
+    }
     build_agent_options(
-        gwt_agent::AgentDetector::detect_all(),
+        detect_wizard_agents(environment.as_ref().ok()),
         cache,
         load_global_custom_agents(),
     )
+}
+
+fn detect_wizard_agents(
+    environment: Option<&(std::collections::HashMap<String, String>, Vec<String>)>,
+) -> Vec<gwt_agent::DetectedAgent> {
+    std::thread::scope(|scope| {
+        let probes: Vec<_> = gwt_agent::builtin_agent_descriptors()
+            .iter()
+            .map(|descriptor| {
+                scope.spawn(move || {
+                    if matches!(
+                        descriptor.id,
+                        gwt_agent::AgentId::ClaudeCode | gwt_agent::AgentId::Codex
+                    ) {
+                        let (env, remove_env) = environment?;
+                        gwt_agent::AgentDetector::detect_by_command_with_environment(
+                            descriptor.command,
+                            env,
+                            remove_env,
+                            None,
+                        )
+                    } else {
+                        gwt_agent::AgentDetector::detect_by_command(descriptor.command)
+                    }
+                })
+            })
+            .collect();
+        probes
+            .into_iter()
+            .filter_map(|probe| probe.join().ok().flatten())
+            .collect()
+    })
 }
 
 pub fn build_builtin_agent_options(
@@ -1399,6 +1477,18 @@ mod tests {
             "1",
         );
 
+        let _home = gwt_core::test_support::ScopedEnvVar::set("HOME", dir.path());
+        let _userprofile = gwt_core::test_support::ScopedEnvVar::set("USERPROFILE", dir.path());
+        let mut settings = gwt_config::Settings::default();
+        settings.profiles.normalize_active_profile();
+        settings.profiles.profiles[0]
+            .env_vars
+            .insert("PATH".into(), dir.path().to_string_lossy().into_owned());
+        settings
+            .save(&gwt_config::Settings::global_config_path_for_home(
+                dir.path(),
+            ))
+            .unwrap();
         let options = load_agent_options(&gwt_agent::VersionCache::new());
 
         let agy = options
@@ -1471,7 +1561,7 @@ mod tests {
             );
             assert!(affordance.action_label.is_some(), "{command}");
         }
-        for command in ["openclaw", "opencode", "claude"] {
+        for command in ["openclaw", "opencode"] {
             let descriptor = gwt_agent::builtin_agent_descriptor_for_command(command)
                 .expect("built-in descriptor");
             assert_eq!(
@@ -1485,6 +1575,115 @@ mod tests {
                 "{command}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wizard_detection_uses_the_active_profile_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        for (directory, version) in [("old", "2.1.153"), ("new", "2.1.156")] {
+            let bin = temp.path().join(directory);
+            std::fs::create_dir(&bin).unwrap();
+            let executable = bin.join("claude");
+            std::fs::write(&executable, format!("#!/bin/sh\nprintf '{version}\\n'\n")).unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let environment = (
+                std::collections::HashMap::from([(
+                    "PATH".into(),
+                    bin.to_string_lossy().into_owned(),
+                )]),
+                Vec::new(),
+            );
+            let detected = detect_wizard_agents(Some(&environment));
+            let options =
+                build_agent_options(detected, &gwt_agent::VersionCache::default(), Vec::new());
+            let claude = options.iter().find(|agent| agent.id == "claude").unwrap();
+            assert!(claude.available);
+            assert_eq!(claude.installed_version.as_deref(), Some(version));
+        }
+    }
+
+    #[test]
+    fn installed_preference_normalizes_default_on_runtime_transitions() {
+        let mut state = claude_state("opus", true);
+        state.set_runtime_target(gwt_agent::LaunchRuntimeTarget::Docker);
+        assert_eq!(state.view().selected_version, "latest");
+        state.set_version("installed");
+        state.set_runtime_target(gwt_agent::LaunchRuntimeTarget::Docker);
+        assert_eq!(
+            state.view().selected_version,
+            "installed",
+            "preserve Docker installed intent"
+        );
+        state.set_version("latest");
+        state.set_runtime_target(gwt_agent::LaunchRuntimeTarget::Host);
+        assert_eq!(state.view().selected_version, "installed");
+        state.detected_agents[0].versions.push("2.1.153".into());
+        state.set_version("2.1.153");
+        state.set_runtime_target(gwt_agent::LaunchRuntimeTarget::Docker);
+        assert_eq!(state.view().selected_version, "2.1.153");
+    }
+
+    #[test]
+    fn installed_preference_missing_host_codex_switches_to_docker_latest() {
+        let mut options = sample_agent_options();
+        let codex = options
+            .iter_mut()
+            .find(|agent| agent.id == "codex")
+            .unwrap();
+        codex.available = false;
+        codex.installed_version = None;
+        let mut state = LaunchWizardState::open_with(
+            context(branch("feature/gui"), "feature/gui"),
+            options,
+            Vec::new(),
+        );
+        state.set_agent_id("codex");
+        assert_eq!(state.view().selected_version, "installed");
+        state.step = LaunchWizardStep::RuntimeTarget;
+        state.selected = 1;
+        state.apply_selection();
+        assert_eq!(state.view().selected_version, "latest");
+    }
+
+    #[test]
+    fn installed_preference_agents_offer_install_and_update() {
+        for command in ["claude", "codex"] {
+            let descriptor = gwt_agent::builtin_agent_descriptor_for_command(command).unwrap();
+            let install = agent_setup_affordance(descriptor, false, false).expect("install");
+            assert_eq!(install.kind.wire_value(), "install");
+            let update = agent_setup_affordance(descriptor, true, false).expect("update");
+            assert_eq!(update.kind.wire_value(), "update");
+        }
+    }
+
+    #[test]
+    fn installed_preference_uses_detected_version_and_preserves_pins_and_docker() {
+        let mut state = claude_state("opus", true);
+        state.context.ultracode_supported = false;
+        assert_eq!(state.view().selected_version, "installed");
+        assert!(claude_reasoning_values(&state).contains(&"ultracode"));
+        let options = state.current_version_options();
+        assert!(options[0].label.contains("2.1.156"));
+        assert!(options[0].label.contains("PATH"));
+        state.set_version("latest");
+        assert_eq!(state.view().selected_version, "installed");
+        state.detected_agents[0].versions.push("2.1.153".into());
+        state.set_version("2.1.153");
+        assert_eq!(state.view().selected_version, "2.1.153");
+        state.detected_agents[0].available = false;
+        state.detected_agents[0].installed_version = None;
+        state.set_version("installed");
+        assert!(state.current_version_options()[0]
+            .label
+            .contains("not found; package fallback"));
+        assert!(!claude_reasoning_values(&state).contains(&"ultracode"));
+        state.runtime_target = gwt_agent::LaunchRuntimeTarget::Docker;
+        assert!(state
+            .current_version_options()
+            .iter()
+            .any(|option| option.value == "latest"));
     }
 
     /// SPEC-3864 FR-006 / FR-007 (AC-6): the affordance is derived from the
@@ -2154,13 +2353,20 @@ mod tests {
             id: "claude".to_string(),
             name: "Claude Code".to_string(),
             available: true,
-            installed_version: Some("2.1.156 (Claude Code)".to_string()),
+            installed_version: Some(
+                if ultracode_supported {
+                    "2.1.156 (Claude Code)"
+                } else {
+                    "2.1.153 (Claude Code)"
+                }
+                .to_string(),
+            ),
             versions: Vec::new(),
             custom_agent: None,
         }];
         let mut ctx = context(branch("feature/gui"), "feature/gui");
-        // Installed capability is captured at wizard open, while selected
-        // npm versions are evaluated from `state.version`.
+        // Detection supplies installed capabilities; pins use state.version.
+        // The legacy snapshot is intentionally independent of the version.
         ctx.ultracode_supported = ultracode_supported;
         ctx.claude_workflows_enabled = true;
         let mut state = LaunchWizardState::open_with(ctx, agent_options, Vec::new());
@@ -2231,10 +2437,9 @@ mod tests {
     }
 
     #[test]
-    fn fable_reasoning_includes_ultracode_for_latest_version() {
+    fn fable_reasoning_excludes_ultracode_for_latest_with_unsupported_installed_version() {
         let values = claude_reasoning_values(&claude_state_with_version("fable", false, "latest"));
-        assert!(values.contains(&"ultracode"));
-        assert_eq!(values.last(), Some(&"ultracode"));
+        assert!(!values.contains(&"ultracode"));
     }
 
     #[test]
