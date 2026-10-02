@@ -317,6 +317,7 @@ fn scan_codex_hook_trust_from_path(
 /// Codex normalizes discovered paths lexically, without following symlinks.
 /// Derive the path form Codex keys a `[hooks.state]` entry by.
 ///
+/// Issue #4071: preserve plain lexical paths rather than Windows verbatim paths.
 /// Issue #4879: this is the single derivation every caller — the registration
 /// side and the tests that assert what it wrote — must use. Codex normalizes
 /// the hooks path it discovered but never canonicalizes it, so the key is
@@ -357,6 +358,11 @@ pub fn register_codex_managed_hook_trust(
     )
 }
 
+/// Register only the paths returned by discovery for `mode`.
+///
+/// The host launch deliberately passes `Both`, even when generation uses
+/// `WorkspaceHome`: self-heal can leave both hook files on disk (#3967).
+/// This lower-level operation does not widen the caller's discovery mode.
 pub fn register_codex_managed_hook_trust_for_mode(
     worktree: &Path,
     config_path: &Path,
@@ -4161,5 +4167,121 @@ trust_level = "trusted"
                 "entry {key} is not addressable by the shared derivation {key_prefix}"
             );
         }
+    }
+
+    // A symlink makes the #4881 path asymmetry deterministic on Unix, including
+    // Linux where tempfile paths normally have no macOS /var alias.
+    #[cfg(unix)]
+    fn linked_worktree_with_mixed_discovery_paths() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "--initial-branch=develop"]);
+        git(&repo, &["config", "user.email", "test@example.com"]);
+        git(&repo, &["config", "user.name", "Test"]);
+        git(&repo, &["commit", "--allow-empty", "-qm", "fixture"]);
+        let real = dir.path().join("worktree");
+        git(
+            &repo,
+            &["worktree", "add", "-q", "--detach", real.to_str().unwrap()],
+        );
+        let worktree = dir.path().join("worktree-alias");
+        std::os::unix::fs::symlink(&real, &worktree).unwrap();
+        generate_codex_hooks_for_mode(&worktree, CodexHookDiscoveryMode::Both).unwrap();
+        let paths = codex_hooks_paths_for_codex_discovery(&worktree, CodexHookDiscoveryMode::Both);
+        assert_eq!(paths.len(), 2);
+        assert_ne!(
+            paths[0],
+            dunce::canonicalize(&paths[0]).unwrap(),
+            "local discovery must retain the alias"
+        );
+        assert_eq!(
+            paths[1],
+            dunce::canonicalize(&paths[1]).unwrap(),
+            "gitdir discovery must already be canonical"
+        );
+        (dir, worktree)
+    }
+
+    /// #4881 AC-1/2/3: compare the entire written key set with discovery, so
+    /// either an omitted path or an extra path fails the same invariant.
+    #[cfg(unix)]
+    #[test]
+    fn discovery_paths_are_exactly_the_registered_keys_in_every_mode() {
+        use std::collections::BTreeSet;
+        let (dir, worktree) = linked_worktree_with_mixed_discovery_paths();
+        for mode in [
+            CodexHookDiscoveryMode::WorktreeLocal,
+            CodexHookDiscoveryMode::WorkspaceHome,
+            CodexHookDiscoveryMode::Both,
+        ] {
+            let config = dir.path().join(format!("{}.toml", mode.as_cli_value()));
+            let expected: BTreeSet<_> = codex_hooks_paths_for_codex_discovery(&worktree, mode)
+                .into_iter()
+                .flat_map(|path| {
+                    let path = codex_hook_trust_key_path(&path).unwrap();
+                    [
+                        "session_start",
+                        "user_prompt_submit",
+                        "pre_tool_use",
+                        "post_tool_use",
+                        "stop",
+                    ]
+                    .into_iter()
+                    .map(move |event| format!("{}:{event}:0:0", path.display()))
+                })
+                .collect();
+            let report =
+                register_codex_managed_hook_trust_for_mode(&worktree, &config, mode).unwrap();
+            assert!(
+                report.untrusted_gwt_hooks.is_empty(),
+                "{mode:?}: {report:?}"
+            );
+            let state = trust_state(&config);
+            assert_eq!(
+                state.keys().cloned().collect::<BTreeSet<_>>(),
+                expected,
+                "{mode:?}"
+            );
+            for entry in report.trusted_entries {
+                assert_eq!(
+                    state[&entry.key]["trusted_hash"].as_str(),
+                    Some(entry.trusted_hash.as_str())
+                );
+                assert_eq!(state[&entry.key]["enabled"].as_bool(), Some(true));
+            }
+        }
+    }
+
+    /// #4881 AC-4: a valid hash under an inert canonical alias must not stand
+    /// in for the lexical key Codex actually reads. Registration repairs it.
+    #[cfg(unix)]
+    #[test]
+    fn discovery_registration_repairs_an_inert_canonical_key() {
+        let (dir, worktree) = linked_worktree_with_mixed_discovery_paths();
+        let config = dir.path().join("codex.toml");
+        let mode = CodexHookDiscoveryMode::Both;
+        register_codex_managed_hook_trust_for_mode(&worktree, &config, mode).unwrap();
+        let path =
+            codex_hooks_paths_for_codex_discovery(&worktree, CodexHookDiscoveryMode::WorktreeLocal)
+                .remove(0);
+        let correct = format!(
+            "{}:stop:0:0",
+            codex_hook_trust_key_path(&path).unwrap().display()
+        );
+        let inert = format!("{}:stop:0:0", dunce::canonicalize(&path).unwrap().display());
+        assert_ne!(correct, inert);
+        let mut root: toml::Value = toml::from_str(&fs::read_to_string(&config).unwrap()).unwrap();
+        let state = root["hooks"]["state"].as_table_mut().unwrap();
+        let trusted = state.remove(&correct).unwrap();
+        state.insert(inert.clone(), trusted.clone());
+        fs::write(&config, toml::to_string(&root).unwrap()).unwrap();
+        assert!(!trust_state(&config).contains_key(&correct));
+
+        let report = register_codex_managed_hook_trust_for_mode(&worktree, &config, mode).unwrap();
+        assert!(report.untrusted_gwt_hooks.is_empty(), "{report:?}");
+        assert_eq!(trust_state(&config)[&correct], trusted);
+        // Cleaning obsolete aliases is #4230, not part of registration.
+        assert_eq!(trust_state(&config)[&inert], trusted);
     }
 }
