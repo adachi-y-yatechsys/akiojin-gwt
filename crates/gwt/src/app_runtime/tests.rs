@@ -41638,9 +41638,17 @@ fn app_runtime_directory_trust_prompt_is_inert_for_unowned_codex_window() {
 
     assert_eq!(
         events.len(),
-        1,
-        "unowned output remains ordinary terminal output"
+        2,
+        "unowned output only emits terminal output and its read-only preview"
     );
+    assert!(matches!(
+        events[0].event,
+        BackendEvent::TerminalOutput { .. }
+    ));
+    assert!(matches!(
+        events[1].event,
+        BackendEvent::TerminalPreview { .. }
+    ));
     assert!(
         gwt::load_issue_monitor_prefs(&gwt::issue_monitor_prefs_path_for_repo_path(&repo))
             .map_or(true, |prefs| prefs.failed_issues.is_empty())
