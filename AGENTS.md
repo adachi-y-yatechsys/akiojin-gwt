@@ -194,6 +194,7 @@ develop への着地は GitHub merge queue を通す（ユーザー裁定 2026-1
 - **現在の状態の読み方:** `gh api graphql -f query='query{repository(owner:"akiojin",name:"gwt"){mergeQueue(branch:"develop"){id}}}'` が `null` ならキューは無効、id を返せば有効。設定値を変えたらこの表も更新する。
 - **有効化直後に確認すること:** `strict`（Require branches to be up to date）を残したまま `BEHIND` の PR がキューに入れるかは未実測である。入れない場合は `strict` を外す（最新 base でのテストはキューが担うので保証は変わらない）。確認せずに「update-branch 不要」と運用を切り替えない。
 - **キュー有効時の運用（上の確認が済んでから）:** `BEHIND` は base 同期のやり直しを意味しなくなる。PR の必須チェックが緑で auto-merge が armed なら GitHub がキューへ入れ、最新 base 上で再テストして着地させる。キューから外された PR は「最新 base の上で赤」なので、同期し直すのではなく失敗した check を直す。
+- **`pr.list` での見分け方（AC-4）:** non-Draft の `BEHIND` 行（および mergeability が `UNKNOWN` で `BEHIND` として保持されうる行）には `merge_queue`（`enabled` / `position` / `state`）が載る。`enabled: true` の行は `default_action` が `leave:` で始まり operation を持たないので、`pr.update_branch` を打たない（キュー内の PR へ push するとキューから外れる）。`merge_queue` キーが無い行は「不明」であり「キュー無し」ではない。
 - **切り戻し:** 「Require merge queue」を無効にすれば従来の `strict` 運用へ戻る。workflow の `merge_group` トリガはキューが無ければ発火しないので、戻す必要はない。
 
 ## 開発ワークフロー
