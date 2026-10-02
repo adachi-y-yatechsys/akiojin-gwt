@@ -301,7 +301,9 @@ fn canonical_pm_runtime_cwd_is_allowed_without_accepting_other_directories() {
 #[test]
 fn reader_only_parses_appended_complete_records() {
     use std::io::Write;
-    let _env = gwt_core::test_support::env_lock().lock().unwrap();
+    let _env = gwt_core::test_support::env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let home = tempfile::tempdir().unwrap();
     let _home = gwt_core::test_support::ScopedEnvVar::set("CLAUDE_CONFIG_DIR", home.path());
     let dir = home.path().join("projects/project");
@@ -348,7 +350,9 @@ fn reader_only_parses_appended_complete_records() {
 
 #[test]
 fn reader_resets_for_truncation_replacement_and_same_length_rewrite() {
-    let _env = gwt_core::test_support::env_lock().lock().unwrap();
+    let _env = gwt_core::test_support::env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let home = tempfile::tempdir().unwrap();
     let _home = gwt_core::test_support::ScopedEnvVar::set("CLAUDE_CONFIG_DIR", home.path());
     let dir = home.path().join("projects/project");
@@ -382,7 +386,9 @@ fn reader_resets_for_truncation_replacement_and_same_length_rewrite() {
 
 #[test]
 fn reader_does_not_reuse_another_identity_home_or_source() {
-    let _env = gwt_core::test_support::env_lock().lock().unwrap();
+    let _env = gwt_core::test_support::env_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let home = tempfile::tempdir().unwrap();
     let _home = gwt_core::test_support::ScopedEnvVar::set("CLAUDE_CONFIG_DIR", home.path());
     let dir = home.path().join("projects/project");
