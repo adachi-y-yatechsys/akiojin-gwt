@@ -223,6 +223,34 @@ fn pending_manifest_covers(latest: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Invalidate a staged older release before announcing its replacement.
+/// Same-version discovery (including Later) leaves the staged update intact.
+pub fn discard_superseded_pending_update(latest: &str) -> Result<Option<String>, String> {
+    let Some(manifest) = gwt_core::update::load_pending_update_manifest() else {
+        return Ok(None);
+    };
+    if !gwt_core::update::pending_version_is_newer(latest, &manifest.version) {
+        return Ok(None);
+    }
+    // The semver comparison above also validates the version before using it
+    // as a directory name. Remove only this release's managed download tree.
+    let directory = gwt_core::paths::gwt_updates_dir().join(format!(
+        "v{}",
+        manifest.version.trim().trim_start_matches('v')
+    ));
+    match std::fs::remove_dir_all(&directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("Failed to remove superseded update: {error}")),
+    }
+    gwt_core::update::clear_pending_update_manifest()?;
+    gwt_core::update::log_update_event(
+        "pending_superseded",
+        &[("version", &manifest.version), ("latest", latest)],
+    );
+    Ok(Some(manifest.version))
+}
+
 trait UpdateApplyOps {
     fn write_restart_args_file(&mut self, path: &Path, args: Vec<String>) -> Result<(), String>;
     fn make_helper_copy(&mut self, current_exe: &Path, latest: &str) -> Result<PathBuf, String>;
