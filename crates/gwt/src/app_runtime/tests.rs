@@ -79513,6 +79513,199 @@ fn startup_restore_refuses_a_monitor_held_row_and_keeps_the_placeholder() {
     }
 }
 
+/// Issue #4783 AC-1 / AC-3: a gwt restart over three Issue worktrees whose
+/// execution ledgers read Completed, Blocked-by-`issue.monitor.stop`, and
+/// ordinary recoverable Blocked restores only the last — with no Monitor
+/// hold left in the prefs to lean on. The admitted restore is then re-judged
+/// at the spawn boundary (AC-2): a hold that lands between the sweep and the
+/// drain stops the spawn.
+#[test]
+fn startup_restore_refuses_completed_and_monitor_revoked_generations() {
+    let _env_lock = crate::env_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().expect("tempdir");
+    let _gwt_home = ScopedGwtHome::set(temp.path());
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    let placeholders = vec![
+        (
+            "agent-completed".to_string(),
+            "session-completed".to_string(),
+        ),
+        ("agent-revoked".to_string(), "session-revoked".to_string()),
+        ("agent-blocked".to_string(), "session-blocked".to_string()),
+    ];
+    let tab = restore_fixture_tab("tab-1", &repo, &placeholders);
+    let mut runtime = sample_runtime(temp.path(), vec![tab], Some("tab-1"));
+    let owner_of = |number: u64| gwt::cli::execution_state::ExecutionOwnerKey {
+        kind: gwt::cli::execution_state::ExecutionOwnerKind::Issue,
+        number,
+    };
+    let mut worktrees = HashMap::new();
+    for (session_id, worktree, issue) in [
+        ("session-completed", "wt-completed", 4291u64),
+        ("session-revoked", "wt-revoked", 4294),
+        ("session-blocked", "wt-blocked", 4275),
+    ] {
+        let worktree = temp.path().join(worktree);
+        fs::create_dir_all(&worktree).expect("create worktree");
+        init_repo(&worktree);
+        save_restore_fixture_session(
+            &runtime.sessions_dir,
+            session_id,
+            &worktree,
+            Some(&format!("native-{session_id}")),
+            Some(issue),
+        );
+        gwt::cli::execution_state::materialize_at_launch(
+            &worktree,
+            gwt::cli::execution_state::ExecutionOwnerKind::Issue,
+            issue,
+            session_id,
+            "gwt-execute",
+            false,
+        )
+        .expect("materialize execution record");
+        worktrees.insert(session_id, (worktree, issue));
+    }
+    // #4291: the PR landed and the agent settled its generation.
+    let (completed_wt, _) = &worktrees["session-completed"];
+    assert!(matches!(
+        gwt::cli::execution_state::settle(
+            completed_wt,
+            "session-completed",
+            gwt::cli::execution_state::ExecutionSettlement::Completed,
+        )
+        .expect("settle completed generation"),
+        gwt::cli::execution_state::SettleResult::Settled(_)
+    ));
+    // #4294: the PM ran `issue.monitor.stop`, which revokes the generation
+    // on the ledger. The Monitor prefs carry no hold any more (a requeue or
+    // a prefs reset in between), so only the ledger can say it was stopped.
+    let (revoked_wt, revoked_issue) = &worktrees["session-revoked"];
+    gwt::cli::execution_state::ensure_generation_ledger(
+        revoked_wt,
+        owner_of(*revoked_issue),
+        gwt::cli::execution_state::LegacyActiveDisposition::Live,
+    )
+    .expect("materialize owner ledger");
+    assert!(matches!(
+        gwt::cli::execution_state::release_revoked_launch_generation(
+            revoked_wt,
+            owner_of(*revoked_issue),
+            "the operator revoked this launch: PR opened, holding",
+        )
+        .expect("release revoked generation"),
+        gwt::cli::execution_state::LaunchGenerationRelease::Released { .. }
+    ));
+    // #4275: an ordinary Blocked generation, recoverable by reopen.
+    let (blocked_wt, _) = &worktrees["session-blocked"];
+    assert!(matches!(
+        gwt::cli::execution_state::settle(
+            blocked_wt,
+            "session-blocked",
+            gwt::cli::execution_state::ExecutionSettlement::Blocked {
+                reason: "build failed".to_string(),
+                missing_verification: Some("full matrix".to_string()),
+            },
+        )
+        .expect("settle blocked generation"),
+        gwt::cli::execution_state::SettleResult::Settled(_)
+    ));
+
+    let logs = capture_tracing_events(|| {
+        runtime.queue_startup_auto_resume_sessions(&HashSet::new());
+    });
+    let queued = runtime
+        .pending_startup_auto_resume_sessions
+        .iter()
+        .map(|pending| pending.session.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        queued,
+        vec!["session-blocked"],
+        "only the recoverable Blocked generation restores"
+    );
+    let refusals = restore_admission_refusals(&logs);
+    let completed = refusals
+        .get("session-completed")
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        completed == "completed_work_retained" || completed == "terminal_work:settled_execution",
+        "a Completed generation is finished Work, got {completed:?}"
+    );
+    assert_eq!(
+        refusals.get("session-revoked").map(String::as_str),
+        Some("monitor_hold:launch_revoked"),
+        "{refusals:?}"
+    );
+    // The Monitor-revoked generation is a hold, not a terminal: the
+    // placeholder and the restore flag stay for `execution.reopen`.
+    assert!(runtime
+        .tab("tab-1")
+        .expect("tab")
+        .workspace
+        .persisted()
+        .windows
+        .iter()
+        .any(|window| window.session_id.as_deref() == Some("session-revoked")));
+    assert!(
+        gwt_agent::Session::load(&runtime.sessions_dir.join("session-revoked.toml"))
+            .expect("load revoked session")
+            .restore_window_on_startup
+    );
+
+    // AC-2: between the sweep and the drain the PM stops #4275 through the
+    // Monitor. The queued restore is re-judged at the spawn boundary and
+    // nothing spawns.
+    let mut monitor = gwt::IssueMonitorState::new(gwt::IssueMonitorConfig::default());
+    monitor.escalate_to_needs_human(
+        4275,
+        gwt::NeedsHumanKind::UserChoiceRequired,
+        "stopped: PM held this row after the sweep",
+    );
+    gwt::save_issue_monitor_prefs(
+        &gwt::issue_monitor_prefs_path_for_repo_path(&repo),
+        &monitor.prefs(),
+    )
+    .expect("seed monitor prefs");
+    let drain_logs = capture_tracing_events(|| {
+        runtime.startup_auto_resume_ready_events(canvas_bounds());
+    });
+    assert!(
+        runtime.restore_launch_windows.is_empty() && runtime.pending_auto_resume_sources.is_empty(),
+        "a restore refused at the spawn boundary spawns nothing"
+    );
+    // The spawn boundary logs the hold; the drain then counts the missing
+    // spawn as `launch_not_started`, so both reasons name this Session.
+    let late = drain_logs
+        .iter()
+        .filter(|event| {
+            event.fields.get("message").map(String::as_str) == Some("session restore refused")
+                && event.fields.get("session_id").map(String::as_str) == Some("session-blocked")
+        })
+        .filter_map(|event| event.fields.get("reason").cloned())
+        .collect::<Vec<_>>();
+    assert!(
+        late.iter()
+            .any(|reason| reason.starts_with("monitor_hold:")),
+        "the late refusal names the hold, got {late:?}"
+    );
+    assert!(
+        runtime
+            .tab("tab-1")
+            .expect("tab")
+            .workspace
+            .persisted()
+            .windows
+            .iter()
+            .any(|window| window.session_id.as_deref() == Some("session-blocked")),
+        "a held row keeps its placeholder"
+    );
+}
+
 /// Issue #4441 AC-1: the restore flag is honored on the placeholder path too.
 ///
 /// A settled agent whose window nobody closed by hand keeps its placeholder;
