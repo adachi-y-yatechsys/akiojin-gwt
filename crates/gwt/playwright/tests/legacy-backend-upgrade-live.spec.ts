@@ -24,12 +24,13 @@ const MESSAGE = "旧 backend 設定は自動移行されません。Settings で
 
 test.describe("Retired backend upgrade (live backend)", () => {
   test.skip(!BASE, "GWT_PLAYWRIGHT_BASE_URL is not set");
-  test.setTimeout(120_000);
+  test.setTimeout(240_000);
 
   test("launch explains Settings recovery without migrating or deleting the old config", async ({ page }, testInfo) => {
     expect(CHECK_HOME, "Set GWT_PLAYWRIGHT_CHECK_HOME to the seeded isolated HOME").not.toBe("");
     const release = await acquireLiveGwtBackendLock(BASE, testInfo);
     let fixture: LiveLaunchWizardFixture | undefined;
+    let failed = false;
     const errors: string[] = [];
     page.on("pageerror", (error) => errors.push(String(error)));
     page.on("console", (message) => {
@@ -39,7 +40,7 @@ test.describe("Retired backend upgrade (live backend)", () => {
       const configPath = join(CHECK_HOME, ".gwt", "config.toml");
       const seed = await readFile(join(__dirname, "../fixtures/legacy-backend-config.toml"), "utf8");
       expect(await readFile(configPath, "utf8")).toContain(seed.trim());
-      await gotoLiveGwt(page, BASE, { enableTestBridge: true });
+      await gotoLiveGwt(page, BASE, { enableTestBridge: true, hub: true });
       await openLiveGwtProject(page);
       const theme = testInfo.project.use.colorScheme === "light" ? "light" : "dark";
       await page.locator(`#op-theme-toggle [data-theme-value="${theme}"]`).click();
@@ -47,7 +48,9 @@ test.describe("Retired backend upgrade (live backend)", () => {
       await clearLiveLaunchWizard(page);
       fixture = await openLiveLaunchWizardForBranch(page);
       const wizard = page.locator("#wizard-modal");
-      await expect(wizard).toBeVisible();
+      // Cold Windows HOME measured 101–127s Frontend stalls before the first
+      // wizard. Bound the real DOM wait; do not retry or warm it up.
+      await expect(wizard).toBeVisible({ timeout: 150_000 });
       await sendLiveGwtEvent(page, {
         kind: "launch_wizard_action",
         action: { kind: "set_launch_path", path: "manual_setup" },
@@ -69,12 +72,21 @@ test.describe("Retired backend upgrade (live backend)", () => {
         contentType: "image/png",
       });
       expect(errors).toEqual([]);
+    } catch (error) {
+      failed = true;
+      throw error;
     } finally {
       try {
         if (fixture) {
           await clearLiveLaunchWizard(page);
           await fixture.cleanup();
         }
+      } catch (error) {
+        if (!failed) throw error;
+        await testInfo.attach("cleanup-error", {
+          body: String(error),
+          contentType: "text/plain",
+        });
       } finally {
         await release();
       }
