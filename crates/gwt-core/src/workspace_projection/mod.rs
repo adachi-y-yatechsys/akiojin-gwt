@@ -95,7 +95,7 @@ pub use persistence::{
     SessionBoundWorkspaceTerminalTarget, StaleReason, TrackedWorkEventPolicy, WorkItemsCache,
     WorkItemsLoadProfile, WorkItemsRebuildOutcome, WorkspaceRetentionConfig,
     WorkspaceSessionAssignment, WorkspaceTerminalEventOutcome, WorktreeReconcileSource,
-    WORK_ITEMS_REBUILD_VERSION,
+    WORKSPACE_WORK_ITEMS_LOCK_OPERATION, WORK_ITEMS_REBUILD_VERSION,
 };
 pub(crate) use persistence::{
     apply_workspace_container_detachments, with_workspace_current_and_work_items_lock,
