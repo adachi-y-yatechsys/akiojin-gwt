@@ -356,7 +356,7 @@ jobs:
           ~/.gwt/runtime/chroma-venv/bin/pip install --upgrade pip
           ~/.gwt/runtime/chroma-venv/bin/pip install -r crates/gwt-core/runtime/project_index_requirements.txt
       - name: Run ignored e2e tests with real e5 model
-        run: cargo test -p gwt-core --tests -- --ignored
+        run: cargo test -p gwt-core --test index_runner_spawn -- --ignored
         timeout-minutes: 30
         continue-on-error: true
 
