@@ -76,7 +76,7 @@ pub(super) fn collect_quick_start_entries_from_sessions(
             tool_label: session.display_name.clone(),
             model: session.model.clone(),
             reasoning: session.reasoning_level.clone(),
-            version: session.tool_version.clone().or_else(|| {
+            version: session.launch_tool_version().or_else(|| {
                 session
                     .agent_id
                     .npm_package()

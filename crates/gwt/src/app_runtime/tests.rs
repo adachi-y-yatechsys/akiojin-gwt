@@ -18416,6 +18416,21 @@ fn continue_work_grok_preflight_uses_the_active_profile_environment() {
 }
 
 #[test]
+fn persisted_direct_session_observed_version_does_not_pin_restore() {
+    let temp = tempdir().expect("tempdir");
+    let mut session = gwt_agent::Session::new(
+        temp.path(),
+        "work/issue-3894",
+        gwt_agent::AgentId::ClaudeCode,
+    );
+    session.tool_version = Some("2.1.156".into());
+    session.launch_command = "/opt/bin/claude".into();
+    let config = super::launch_config_from_persisted_session(&session);
+    assert_eq!(config.command, "claude");
+    assert_eq!(config.tool_version.as_deref(), Some("installed"));
+}
+
+#[test]
 fn persisted_session_launch_config_restores_path_independent_tool_runtime_provenance() {
     let temp = tempdir().expect("tempdir");
     let _gwt_home = ScopedGwtHome::set(temp.path());
@@ -43392,7 +43407,8 @@ fn board_origin_agent_resume_config_uses_exact_saved_session() {
     session.agent_session_id = Some("codex-resume-123".to_string());
     session.model = Some("gpt-5.5".to_string());
     session.reasoning_level = Some("high".to_string());
-    session.tool_version = Some("latest".to_string());
+    session.tool_version = Some("0.116.0".to_string());
+    session.tool_version_selector = Some("latest".to_string());
     session.tool_runtime_provenance = Some(gwt_agent::ToolRuntimeProvenance {
         schema_version: gwt_agent::ToolRuntimeProvenance::CURRENT_SCHEMA_VERSION,
         official_package: "@openai/codex".to_string(),
@@ -43409,6 +43425,8 @@ fn board_origin_agent_resume_config_uses_exact_saved_session() {
         .board_origin_agent_resume_config("session-origin")
         .expect("resume config");
 
+    assert_eq!(config.command, "codex");
+    assert_eq!(config.tool_version_selector.as_deref(), Some("latest"));
     assert_eq!(config.branch.as_deref(), Some("work/board-origin"));
     assert_eq!(config.working_dir.as_deref(), Some(repo.as_path()));
     assert_eq!(
@@ -45684,6 +45702,17 @@ fn app_runtime_select_and_save_profile_broadcasts_snapshot_to_profile_windows() 
             && snapshot.selected_profile == "dev"
     ));
 
+    runtime.launch_wizard_cache = LaunchWizardMemoryCache::load_with_agent_options(
+        temp.path(),
+        vec![gwt::AgentOption {
+            id: "stale-detection-sentinel".into(),
+            name: "Stale detection".into(),
+            available: false,
+            installed_version: None,
+            versions: Vec::new(),
+            custom_agent: None,
+        }],
+    );
     let events = runtime.handle_frontend_event(
         "client-1".to_string(),
         FrontendEvent::SaveProfile {
@@ -45699,6 +45728,14 @@ fn app_runtime_select_and_save_profile_broadcasts_snapshot_to_profile_windows() 
         },
     );
 
+    assert!(
+        runtime
+            .launch_wizard_cache
+            .agent_options()
+            .iter()
+            .all(|agent| { agent.id != "stale-detection-sentinel" }),
+        "saving a profile must invalidate installed CLI detection"
+    );
     assert_eq!(events.len(), 2);
     assert!(events.iter().any(|event| matches!(
         event,

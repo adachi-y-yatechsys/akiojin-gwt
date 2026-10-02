@@ -1682,16 +1682,59 @@ mod tests {
         }
     }
 
+    #[test]
+    fn installed_preference_setup_runs_install_and_update_in_host_shell() {
+        for agent in ["claude", "codex"] {
+            for available in [false, true] {
+                let mut options = sample_agent_options();
+                options
+                    .iter_mut()
+                    .find(|option| option.id == agent)
+                    .unwrap()
+                    .available = available;
+                let mut state = LaunchWizardState::open_with(
+                    context(branch("feature/gui"), "feature/gui"),
+                    options,
+                    Vec::new(),
+                );
+                state.set_agent_id(agent);
+                state.apply(LaunchWizardAction::RunAgentSetup);
+                let Some(LaunchWizardCompletion::Launch(request)) = state.completion else {
+                    panic!("expected setup launch for {agent}");
+                };
+                let LaunchWizardLaunchRequest::Shell(config) = *request else {
+                    panic!("shell");
+                };
+                let args = config.command_args_override.unwrap();
+                if agent == "codex" {
+                    assert_eq!(args.last().unwrap(), "npm install -g @openai/codex");
+                } else if available {
+                    assert_eq!(args.last().unwrap(), "claude update");
+                } else {
+                    assert!(args.last().unwrap().contains("https://claude.ai/install."));
+                }
+                assert_eq!(config.runtime_target, gwt_agent::LaunchRuntimeTarget::Host);
+            }
+        }
+    }
+
     /// SPEC-3864 FR-006: a synthetic setup request for an agent that needs
     /// nothing is an error, not a silent no-op launch.
     #[test]
     fn run_agent_setup_without_affordance_reports_error() {
         let mut state = LaunchWizardState::open_with(
             context(branch("feature/gui"), "feature/gui"),
-            sample_agent_options(),
+            vec![AgentOption {
+                id: "openclaw".into(),
+                name: "OpenClaw".into(),
+                available: true,
+                installed_version: Some("1.0.0".into()),
+                versions: Vec::new(),
+                custom_agent: None,
+            }],
             Vec::new(),
         );
-        state.set_agent_id("claude");
+        state.set_agent_id("openclaw");
         state.apply(LaunchWizardAction::RunAgentSetup);
         assert!(state.completion.is_none());
         assert!(state.error.is_some(), "expected an error");
