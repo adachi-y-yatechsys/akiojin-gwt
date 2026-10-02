@@ -394,6 +394,9 @@ pub struct Session {
     pub session_history: Vec<AgentSessionHistoryEntry>,
     pub status: AgentStatus,
     pub tool_version: Option<String>,
+    /// User-selected launch route, separate from the observed runtime version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_version_selector: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_runtime_provenance: Option<ToolRuntimeProvenance>,
     pub model: Option<String>,
@@ -548,6 +551,40 @@ pub struct SessionRuntimeState {
 }
 
 impl Session {
+    /// Recover the launch selector separately from the observed runtime version.
+    /// Direct Host runs must continue using the installed executable on restore.
+    pub fn launch_tool_version(&self) -> Option<String> {
+        if self.runtime_target == LaunchRuntimeTarget::Host
+            && matches!(self.agent_id, AgentId::ClaudeCode | AgentId::Codex)
+        {
+            if let Some(selector) = &self.tool_version_selector {
+                return Some(selector.clone());
+            }
+            if let Some(provenance) = &self.tool_runtime_provenance {
+                return Some(provenance.requested_selector.clone());
+            }
+            let command = Path::new(&self.launch_command)
+                .file_stem()
+                .and_then(|name| name.to_str());
+            if command.is_some_and(|name| name.eq_ignore_ascii_case(self.agent_id.command())) {
+                return Some("installed".into());
+            }
+            if command.is_some_and(|name| {
+                name.eq_ignore_ascii_case("npx") || name.eq_ignore_ascii_case("bunx")
+            }) {
+                let prefix = format!("{}@", self.agent_id.npm_package()?);
+                if let Some(selector) = self
+                    .launch_args
+                    .iter()
+                    .find_map(|arg| arg.strip_prefix(&prefix))
+                {
+                    return Some(selector.into());
+                }
+            }
+        }
+        self.tool_version.clone()
+    }
+
     /// Current persisted session schema version. SPEC-1921 Phase 53 / FR-066.
     /// Bump when adding a new migration in `migrate_legacy_launch_args` and
     /// ensure the new migration is idempotent relative to this value.
@@ -575,6 +612,7 @@ impl Session {
             session_history: Vec::new(),
             status: AgentStatus::Unknown,
             tool_version: None,
+            tool_version_selector: None,
             tool_runtime_provenance: None,
             model: None,
             reasoning_level: None,
@@ -627,6 +665,7 @@ impl Session {
         let mut session = Self::new(worktree_path, branch, config.agent_id.clone());
         session.display_name = config.display_name.clone();
         session.tool_version = config.tool_version.clone();
+        session.tool_version_selector = config.tool_version_selector.clone();
         session.tool_runtime_provenance = config.tool_runtime_provenance.clone();
         session.model = config.model.clone();
         session.reasoning_level = config.reasoning_level.clone();
@@ -2923,6 +2962,26 @@ mod tests {
         assert!(!session.id.is_empty());
         // Verify it's a valid UUID
         assert!(Uuid::parse_str(&session.id).is_ok());
+    }
+
+    #[test]
+    fn launch_tool_version_keeps_observed_direct_versions_out_of_package_pins() {
+        let mut session = Session::new("/tmp/wt", "main", AgentId::ClaudeCode);
+        session.tool_version = Some("2.1.156".into());
+        session.launch_command = "/opt/bin/claude".into();
+        assert_eq!(session.launch_tool_version().as_deref(), Some("installed"));
+        session.launch_command = "npx".into();
+        session.launch_args = vec!["-y".into(), "@anthropic-ai/claude-code@latest".into()];
+        assert_eq!(session.launch_tool_version().as_deref(), Some("latest"));
+        session.launch_args = vec!["-y".into(), "@anthropic-ai/claude-code@2.1.156".into()];
+        assert_eq!(session.launch_tool_version().as_deref(), Some("2.1.156"));
+        session.tool_version_selector = Some("latest".into());
+        session.launch_command = "bun".into();
+        session.launch_args = vec!["/cache/claude.js".into()];
+        assert_eq!(session.launch_tool_version().as_deref(), Some("latest"));
+        session.runtime_target = LaunchRuntimeTarget::Docker;
+        session.launch_command = "claude".into();
+        assert_eq!(session.launch_tool_version().as_deref(), Some("2.1.156"));
     }
 
     #[test]
