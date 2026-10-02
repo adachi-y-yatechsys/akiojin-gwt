@@ -918,6 +918,13 @@ fn parse(input: &str) -> Result<ParsedEnvelope, CliParseError> {
         }),
         "actions.job_logs" | "actions.job-logs" => CliCommand::Actions(ActionsCommand::JobLogs {
             job_id: required_u64(params, "job_id")?,
+            // Issue #4849 AC-2: `failed_only` narrows the log to the lines
+            // around failure markers; `context_lines` sizes the window.
+            failed_only: optional_bool(params, "failed_only")?.unwrap_or(false),
+            context_lines: optional_u64(params, "context_lines")?.map_or(
+                super::actions::DEFAULT_FAILURE_CONTEXT_LINES,
+                super::actions::clamp_failure_context_lines,
+            ),
         }),
         "actions.rerun" => CliCommand::Actions(ActionsCommand::Rerun {
             target: actions_rerun_target(params)?,
@@ -5617,10 +5624,26 @@ mod tests {
             ok("actions.logs", json!({"run_id": 5})),
             CliCommand::Actions(ActionsCommand::Logs { .. })
         ));
-        assert!(matches!(
+        assert_eq!(
             ok("actions.job_logs", json!({"job_id": 5})),
-            CliCommand::Actions(ActionsCommand::JobLogs { .. })
-        ));
+            CliCommand::Actions(ActionsCommand::JobLogs {
+                job_id: 5,
+                failed_only: false,
+                context_lines: 5,
+            })
+        );
+        // Issue #4849 AC-2: the failures view and its (clamped) context.
+        assert_eq!(
+            ok(
+                "actions.job_logs",
+                json!({"job_id": 5, "failed_only": true, "context_lines": 400})
+            ),
+            CliCommand::Actions(ActionsCommand::JobLogs {
+                job_id: 5,
+                failed_only: true,
+                context_lines: 50,
+            })
+        );
         assert!(matches!(
             ok("actions.job-logs", json!({"job_id": 5})),
             CliCommand::Actions(ActionsCommand::JobLogs { .. })
