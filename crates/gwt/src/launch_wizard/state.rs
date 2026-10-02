@@ -3373,40 +3373,10 @@ mod tests {
         assert!(!view.show_docker_lifecycle);
     }
 
+    /// SPEC-1921 AS-1921-A: a saved profile cannot launch a built-in that is
+    /// not installed. There is no package route left to start it through.
     #[test]
-    fn previous_profile_keeps_saved_builtin_agent_without_host_detection() {
-        let mut options = sample_agent_options();
-        options
-            .iter_mut()
-            .find(|option| option.id == "codex")
-            .expect("codex option")
-            .available = false;
-        let state = LaunchWizardState::open_with_previous_profile(
-            context(branch("feature/current"), "feature/current"),
-            options,
-            Vec::new(),
-            Some(LaunchWizardPreviousProfile {
-                agent_id: "codex".to_string(),
-                model: Some("gpt-5.5".to_string()),
-                reasoning: Some("high".to_string()),
-                session_mode: gwt_agent::SessionMode::Normal,
-                skip_permissions: true,
-                fast_mode: true,
-                runtime_target: gwt_agent::LaunchRuntimeTarget::Host,
-                docker_service: None,
-                docker_lifecycle_intent: gwt_agent::DockerLifecycleIntent::Connect,
-                windows_shell: None,
-                hermes: Default::default(),
-            }),
-        );
-
-        assert_eq!(state.view().selected_agent_id, "codex");
-        let config = state.build_launch_config().expect("launch config");
-        assert_eq!(config.agent_id, gwt_agent::AgentId::Codex);
-    }
-
-    #[test]
-    fn previous_profile_uses_builtin_agent_even_when_none_are_host_detected() {
+    fn previous_profile_for_an_uninstalled_builtin_agent_is_refused_at_launch() {
         let mut options = sample_agent_options();
         for option in &mut options {
             option.available = false;
@@ -3431,8 +3401,10 @@ mod tests {
         );
 
         assert_eq!(state.view().selected_agent_id, "codex");
-        let config = state.build_launch_config().expect("launch config");
-        assert_eq!(config.agent_id, gwt_agent::AgentId::Codex);
+        let error = state
+            .build_launch_config()
+            .expect_err("an uninstalled agent has nothing to launch");
+        assert!(error.contains("not installed"), "{error}");
     }
 
     #[test]

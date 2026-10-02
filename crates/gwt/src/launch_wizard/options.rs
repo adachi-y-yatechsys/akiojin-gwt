@@ -2080,7 +2080,7 @@ mod tests {
             docker_lifecycle_intent: gwt_agent::DockerLifecycleIntent::Restart,
         });
 
-        assert_eq!(summary, "Codex · gpt-5.5 · high · 0.110.0 · docker:gwt");
+        assert_eq!(summary, "Codex · gpt-5.5 · high · docker:gwt");
     }
 
     #[test]
