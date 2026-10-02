@@ -3534,6 +3534,7 @@ where
                 revalidate_verification_caller_authority(worktree, session_id, authority)?;
             }
             let verified_head = current_head_sha(worktree).ok();
+            interruption::previous_external_terminations(worktree, verified_head.as_deref())?;
             Ok((
                 owner_number,
                 execution_binding,
@@ -3598,6 +3599,14 @@ where
         if let Some(authority) = authority {
             revalidate_verification_caller_authority(worktree, session_id, authority)?;
         }
+        // Recheck while replacing the prior record: a concurrent watchdog may
+        // have settled it since the initial snapshot.
+        running
+            .lifecycle
+            .as_mut()
+            .expect("unfinished run")
+            .external_terminations =
+            interruption::previous_external_terminations(worktree, verified_head.as_deref())?;
         save(worktree, &running)
     })
     .map_err(|error| format!("failed to save verification start: {error}"))?;
@@ -3998,7 +4007,7 @@ impl EvidenceStatus {
                 "no verification run record exists — run the verification matrix through JSON operation `verify.run` with `params.commands:[...]`"
             }
             Self::Running => "verification is still running — wait for its terminal result",
-            Self::Interrupted => "the last verification run was interrupted before completion — rerun verify.run; this is not a test failure",
+            Self::Interrupted => "the last verification run was interrupted before completion; this is not a test failure. Inspect lifecycle.reason: two consecutive external terminations on the same HEAD require infrastructure diagnosis and a corrected HEAD before retrying; otherwise rerun verify.run",
             Self::WrongSession => {
                 "the verification record belongs to another session — rerun `verify.run` from this session"
             }
@@ -5123,6 +5132,16 @@ pub(super) fn run<E: CliEnv>(
             user_verification_result,
             headed_e2e_commands,
         } => {
+            // Refuse exhausted retries before taking a host lease or starting
+            // a watchdog. The runner checks again under its write lease.
+            crate::cli::trusted_store::with_write_lease(&worktree, || {
+                revalidate_verification_caller_authority(&worktree, &session_id, &authority)?;
+                interruption::previous_external_terminations(
+                    &worktree,
+                    current_head_sha(&worktree).ok().as_deref(),
+                )
+            })
+            .map_err(|error| SpecOpsError::from(ApiError::Unexpected(error.to_string())))?;
             if let Some(refusal) = user_verification_result
                 .as_deref()
                 .and_then(|result| autonomous_confirmation_refusal(Some(&session_id), result))
@@ -6476,6 +6495,16 @@ mod tests {
     #[test]
     fn run_verification_records_pass_and_fail() {
         let dir = tempfile::tempdir().unwrap();
+        // The documented recovery for unreadable verification evidence is
+        // rerunning verify.run; retry admission must preserve that contract.
+        crate::cli::trusted_store::write_with_mirror(
+            dir.path(),
+            "verification-run.json",
+            &state_path(dir.path()),
+            b"not-json",
+        )
+        .unwrap();
+        assert_eq!(load(dir.path()).unwrap_err().kind(), ErrorKind::InvalidData);
         let (record, transcript) =
             run_verification(dir.path(), "sess-1", &["git --version".to_string()]).unwrap();
         assert!(record.all_passed, "{transcript}");
