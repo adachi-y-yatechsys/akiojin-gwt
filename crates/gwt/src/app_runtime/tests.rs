@@ -59158,7 +59158,6 @@ fn wait_for_active_work_prepare_completions(
     }
 }
 
-#[allow(dead_code)]
 fn active_work_refresh_requests(events: &Arc<Mutex<Vec<UserEvent>>>, project_root: &Path) -> usize {
     events
         .lock()
