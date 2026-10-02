@@ -11263,10 +11263,17 @@ impl IssueMonitorState {
             // merged into `develop` never closes its Issue — so a delivered row
             // otherwise looks like ordinary queued work and relaunches forever.
             return match self.merged_deliveries.get(&item.issue.number) {
-                Some(delivery) if !self.issue_is_closed(item.issue.number) => (
-                    true,
-                    Some(format!("delivered_by_pr_{}", delivery.pr_number)),
-                ),
+                // Issue #4852 AC-1: a delivery older than the row's current
+                // launch is the previous attempt's, not this one's.
+                Some(delivery)
+                    if !self.issue_is_closed(item.issue.number)
+                        && self.merged_delivery_postdates_launch(item.issue.number) =>
+                {
+                    (
+                        true,
+                        Some(format!("delivered_by_pr_{}", delivery.pr_number)),
+                    )
+                }
                 _ => (false, None),
             };
         }
@@ -12890,7 +12897,24 @@ impl IssueMonitorState {
                 blocking_claim_id == Some(identity.claim_id.as_str())
                     || identity.owner == blocking_owner
             });
-        if !own_claim {
+        // Issue #4852 AC-2: the owner label is `hostname:user:pid`, and the pid
+        // is the one thing a daemon restart changes. The claim comment the
+        // earlier pid wrote on this host, for this user, is still this
+        // Monitor's own claim — reporting it as a foreign hold parked the
+        // Issue until the TTL while its pane kept running.
+        let own_host_claim = !own_claim && {
+            let current_owner = crate::process::current_claim_owner();
+            crate::process::same_host_and_user(blocking_owner, &current_owner)
+        };
+        if own_host_claim {
+            tracing::info!(
+                issue_number,
+                blocking_owner,
+                ?blocking_claim_id,
+                "issue monitor treats a claim from another pid of this host and user as its own"
+            );
+        }
+        if !(own_claim || own_host_claim) {
             return false;
         }
         if self.active_launches.contains(&issue_number) {
@@ -14945,17 +14969,43 @@ impl IssueMonitorState {
         issue_number: u64,
         evidence: IssueCompletionEvidence,
     ) -> bool {
+        self.record_issue_completion_with_live_pane(issue_number, evidence, false)
+    }
+
+    /// Issue #4852 AC-3: [`Self::record_issue_completion`] told whether the
+    /// launch's agent pane is still alive. A merged delivery that does not
+    /// complete the Issue (a SPEC slice PR, an Open Issue's partial PR) while
+    /// the agent that opened it keeps working is not the end of the launch:
+    /// the slot stays held and the row stays `launched`, so the claim-TTL
+    /// expiry cannot relaunch the same Issue into the same worktree against
+    /// the session that still holds its execution authority. Completion
+    /// evidence that does complete the Issue is applied regardless.
+    fn record_issue_completion_with_live_pane(
+        &mut self,
+        issue_number: u64,
+        evidence: IssueCompletionEvidence,
+        live_pane: bool,
+    ) -> bool {
         let issue = self.inbox_item(issue_number).map(|item| item.issue.clone());
+        let decision = issue
+            .as_ref()
+            .map(Self::issue_completion_decision)
+            .unwrap_or(IssueCompletionDecision::Unknown);
+        if decision != IssueCompletionDecision::Complete
+            && live_pane
+            && self.active_launches.contains(&issue_number)
+        {
+            tracing::info!(
+                issue_number,
+                "issue monitor kept a live launch through a partial merged delivery"
+            );
+            return false;
+        }
         // A merged branch/PR completes this delivery regardless of whether it
         // completes the Issue. Free the slot before evaluating Issue-wide
         // completion so ordinary Open work can return to the queue promptly.
         self.clear_active_tracking(issue_number);
-        if issue
-            .as_ref()
-            .map(Self::issue_completion_decision)
-            .unwrap_or(IssueCompletionDecision::Unknown)
-            != IssueCompletionDecision::Complete
-        {
+        if decision != IssueCompletionDecision::Complete {
             let updated_at = issue.as_ref().and_then(|issue| issue.updated_at.clone());
             self.transition_completion(
                 issue_number,
@@ -15110,16 +15160,114 @@ impl IssueMonitorState {
     /// the shared completion policy decides whether the Issue is terminal or
     /// must return to the queue for remaining tasks.
     pub fn reconcile_merged_branches(&mut self, merged_branches: &BTreeSet<String>) -> Vec<u64> {
+        let now = format_rfc3339_utc(chrono::Utc::now());
+        self.reconcile_merged_branches_at(merged_branches, &now)
+    }
+
+    /// [`Self::reconcile_merged_branches`] judged at `now`, the scan clock the
+    /// canvas snapshot is ordered against.
+    ///
+    /// Issue #4852 AC-1: a branch stays in the merged list forever, so a PR
+    /// merged *before* the current launch started (the previous slice of the
+    /// same SPEC, a day-old PR that referenced the Issue) used to settle a
+    /// launch seconds after it began. Only a delivery merged after the launch
+    /// started is that launch's delivery. Issue #4852 AC-3: a delivery that
+    /// lands while the launch's pane is still running is a partial merge of a
+    /// live launch; the slot is kept (see
+    /// [`Self::record_issue_completion_with_live_pane`]). The returned list
+    /// names the launches whose slots were actually freed or settled.
+    pub fn reconcile_merged_branches_at(
+        &mut self,
+        merged_branches: &BTreeSet<String>,
+        now: &str,
+    ) -> Vec<u64> {
         let to_merge: Vec<u64> = self
             .active_launched_branches()
             .into_iter()
             .filter(|(_, branch)| merged_branches.contains(branch))
             .map(|(number, _)| number)
+            .filter(|number| self.merged_delivery_postdates_launch(*number))
             .collect();
-        for number in &to_merge {
-            self.record_merged(*number);
+        let mut merged = Vec::with_capacity(to_merge.len());
+        for number in to_merge {
+            let live_pane = self.launch_has_live_pane(number, now);
+            self.record_issue_completion_with_live_pane(
+                number,
+                IssueCompletionEvidence::WorkBranch,
+                live_pane,
+            );
+            // A launch kept alive through a partial merge still holds its
+            // slot; only a freed or settled one is reported as merged.
+            if !self.active_launches.contains(&number) {
+                merged.push(number);
+            }
         }
-        to_merge
+        merged
+    }
+
+    /// Issue #4852 AC-1: when the current launch of `issue_number` started —
+    /// the claim anchor while the launch is unbound, the launch ACK once it is
+    /// bound. `None` when the Issue holds no slot or the launch predates the
+    /// ordering evidence (older prefs).
+    fn active_launch_started_at(&self, issue_number: u64) -> Option<&str> {
+        if !self.active_launches.contains(&issue_number) {
+            return None;
+        }
+        self.launching_claimed_at
+            .get(&issue_number)
+            .map(String::as_str)
+            .or_else(|| {
+                self.pending_launch_deliveries
+                    .iter()
+                    .find(|delivery| delivery.issue_number == issue_number)
+                    .map(|delivery| delivery.created_at.as_str())
+            })
+            .or_else(|| {
+                self.launch_confirmations
+                    .get(&issue_number)
+                    .map(|ack| ack.confirmed_at.as_str())
+            })
+    }
+
+    /// Issue #4852 AC-1: whether the merged delivery recorded for
+    /// `issue_number`'s work branch landed after its current launch started.
+    /// Without both instants there is nothing to order, and the pre-#4852
+    /// behaviour (the merge counts) is kept.
+    fn merged_delivery_postdates_launch(&self, issue_number: u64) -> bool {
+        let merged_at = self
+            .merged_deliveries
+            .get(&issue_number)
+            .and_then(|delivery| delivery.merged_at.as_deref())
+            .and_then(parse_rfc3339_utc);
+        let started_at = self
+            .active_launch_started_at(issue_number)
+            .and_then(parse_rfc3339_utc);
+        match (merged_at, started_at) {
+            (Some(merged), Some(started)) => merged > started,
+            _ => true,
+        }
+    }
+
+    /// Issue #4852 AC-3: whether the launch of `issue_number` still has a live
+    /// agent pane on the latest fresh canvas snapshot. The bound window's own
+    /// observation decides when there is one (the same judgement
+    /// `runtime_consistency` reports on the row); an unbound launch falls back
+    /// to the pane the canvas attributes to the Issue (#4802). A missing,
+    /// stale, or foreign-tab snapshot is "no live pane", which keeps the
+    /// pre-#4852 re-queue.
+    fn launch_has_live_pane(&self, issue_number: u64, now: &str) -> bool {
+        if !self.active_launches.contains(&issue_number) {
+            return false;
+        }
+        match self.runtime_consistency_at(issue_number, now).consistency {
+            Some(IssueMonitorRuntimeConsistency::Consistent) => true,
+            Some(
+                IssueMonitorRuntimeConsistency::Terminal | IssueMonitorRuntimeConsistency::Missing,
+            ) => false,
+            Some(IssueMonitorRuntimeConsistency::Unavailable) | None => {
+                self.observed_live_issue_pane(issue_number, now).is_some()
+            }
+        }
     }
 
     /// Issue #3645 AC-3/AC-4: issues whose completion the launch tracking
@@ -35371,6 +35519,314 @@ mod tests {
             MonitorInboxState::BlockedByClaim
         );
         assert_eq!(monitor.active_count(), 0);
+    }
+
+    fn owner_on_this_host(pid_offset: u32) -> String {
+        format!(
+            "{}:{}:{}",
+            crate::process::current_hostname(),
+            crate::process::current_username(),
+            std::process::id().wrapping_add(pid_offset)
+        )
+    }
+
+    /// Issue #4852 AC-2: after a daemon restart the claim comment the earlier
+    /// pid wrote comes back as the winner. Same host, same user: it is this
+    /// Monitor's own claim, so the bound launch is readopted, never parked.
+    #[test]
+    fn issue_4852_a_claim_from_an_earlier_pid_of_this_host_is_own() {
+        let mut monitor = IssueMonitorState::with_prefs(
+            IssueMonitorConfig::default(),
+            IssueMonitorPrefs {
+                enabled: true,
+                max_active_agents: 2,
+                ..IssueMonitorPrefs::default()
+            },
+        );
+        monitor.set_gui_connected(true);
+        scan_queued_candidates(&mut monitor, &[issue(4740)], "2026-10-01T10:07:15Z");
+        // The identity the restarted process restored names yet another pid
+        // and claim id, so neither exact comparison of #4328 can match.
+        assert!(monitor.apply_confirmed_claim(
+            4740,
+            "gwt-auto-improve:restored",
+            owner_on_this_host(2),
+            "synchronous-claim:gwt-auto-improve:restored",
+            "2026-10-01T10:07:15Z",
+        ));
+        monitor.complete_active_launch_at(4740, "tab-1::agent-348", "2026-10-01T10:07:15Z");
+        assert_eq!(
+            monitor.requeue_window_at("tab-1::agent-348", "2026-10-01T10:10:09Z"),
+            Some(4740)
+        );
+
+        assert!(
+            !monitor.record_blocked_by_claim(
+                issue(4740),
+                owner_on_this_host(1),
+                "2026-10-01T10:40:09Z",
+                Some("gwt-auto-improve:predecessor"),
+            ),
+            "a claim from another pid of this host/user is not a foreign hold"
+        );
+        let repaired = monitor.inbox_item(4740).unwrap();
+        assert_eq!(repaired.state, MonitorInboxState::Launched);
+        assert_eq!(repaired.blocked_by_owner, None);
+        assert_eq!(repaired.exclusion_reason, None);
+        assert_eq!(monitor.active_count(), 1);
+
+        // Another host with this user, or this host with another user, is
+        // still foreign and still blocks.
+        for foreign in [
+            format!(
+                "other-host:{}:{}",
+                crate::process::current_username(),
+                std::process::id()
+            ),
+            format!(
+                "{}:other-user:{}",
+                crate::process::current_hostname(),
+                std::process::id()
+            ),
+        ] {
+            let mut monitor = IssueMonitorState::new(IssueMonitorConfig::default());
+            monitor.set_gui_connected(true);
+            scan_queued_candidates(&mut monitor, &[issue(4740)], "2026-10-01T10:07:15Z");
+            assert!(monitor.record_blocked_by_claim(
+                issue(4740),
+                foreign.clone(),
+                "2026-10-01T10:40:09Z",
+                Some("gwt-auto-improve:foreign"),
+            ));
+            assert_eq!(
+                monitor.inbox_item(4740).unwrap().state,
+                MonitorInboxState::BlockedByClaim,
+                "{foreign} is a foreign owner"
+            );
+        }
+    }
+
+    /// Issue #4852 AC-1: PR #4808 merged the day before; a fresh launch of the
+    /// same work branch is not delivered by it. Only a PR merged after the
+    /// launch started settles that launch.
+    #[test]
+    fn issue_4852_a_merge_older_than_the_launch_never_settles_it() {
+        let mut monitor = IssueMonitorState::new(IssueMonitorConfig::default());
+        scan_queued_candidates(&mut monitor, &[issue(4740)], "2026-10-01T10:00:00Z");
+        monitor.set_gui_connected(true);
+        assert!(monitor
+            .next_launch_request("2026-10-01T10:00:00Z")
+            .is_some());
+        monitor.complete_active_launch_at(4740, "tab-1::agent-1", "2026-10-01T10:00:05Z");
+        let branch = monitor.active_launched_branches()[0].1.clone();
+        let merged = BTreeSet::from([branch.clone()]);
+
+        let mut deliveries = BTreeMap::new();
+        deliveries.insert(
+            branch.clone(),
+            merged_delivery(4808, "aaa", "2026-09-30T12:00:00Z"),
+        );
+        monitor.record_merged_deliveries(&deliveries);
+        assert!(
+            monitor
+                .reconcile_merged_branches_at(&merged, "2026-10-01T10:00:30Z")
+                .is_empty(),
+            "an older merge is not this launch's delivery"
+        );
+        assert_eq!(monitor.active_count(), 1, "the slot stays held");
+        assert_eq!(
+            monitor.inbox_item(4740).map(|item| item.state),
+            Some(MonitorInboxState::Launched)
+        );
+        let row = monitor
+            .agent_status_at("2026-10-01T10:00:30Z")
+            .inbox
+            .into_iter()
+            .find(|row| row.issue_number == 4740)
+            .expect("row");
+        assert!(!row.recoverable_merged);
+        assert_eq!(row.completion_reason, None);
+
+        // A delivery merged after the launch started still settles it (no
+        // pane observed, so the ordinary re-queue runs).
+        deliveries.insert(branch, merged_delivery(4855, "bbb", "2026-10-01T11:00:00Z"));
+        monitor.record_merged_deliveries(&deliveries);
+        assert_eq!(
+            monitor.reconcile_merged_branches_at(&merged, "2026-10-01T11:00:30Z"),
+            vec![4740]
+        );
+        assert_eq!(monitor.active_count(), 0);
+        assert_eq!(
+            monitor.inbox_item(4740).map(|item| item.state),
+            Some(MonitorInboxState::Queued)
+        );
+    }
+
+    /// Issue #4852 AC-3: a SPEC's slice PR merges while the agent that opened
+    /// it keeps working in its pane. The launch keeps its slot and stays
+    /// `launched`; nothing re-queues it and no fresh session is required.
+    /// Once the pane is gone, the same merge runs the existing re-queue.
+    #[test]
+    fn issue_4852_a_merge_during_a_live_pane_keeps_the_launch() {
+        let candidate = spec_issue(
+            4740,
+            IssueMonitorReadiness::ReadyWithOpenTasks,
+            "2026-10-01T09:00:00Z",
+        );
+        let mut monitor = IssueMonitorState::new(IssueMonitorConfig {
+            max_active: 1,
+            ..IssueMonitorConfig::default()
+        });
+        scan_queued_candidates(
+            &mut monitor,
+            &[candidate, issue(4823)],
+            "2026-10-01T10:00:00Z",
+        );
+        monitor.set_gui_connected(true);
+        let request = monitor
+            .next_launch_request("2026-10-01T10:00:00Z")
+            .expect("launch");
+        assert_eq!(request.issue_number, 4740);
+        monitor.complete_active_launch_at(4740, "tab-1::agent-1", "2026-10-01T10:00:05Z");
+        let branch = monitor.active_launched_branches()[0].1.clone();
+        let merged = BTreeSet::from([branch.clone()]);
+        let mut deliveries = BTreeMap::new();
+        deliveries.insert(branch, merged_delivery(4855, "aaa", "2026-10-01T12:00:00Z"));
+        monitor.record_merged_deliveries(&deliveries);
+
+        monitor.record_window_snapshot(pane_snapshot(
+            "2026-10-01T12:00:20Z",
+            vec![live_pane_observation(
+                "tab-1::agent-1",
+                4740,
+                WindowState::Running,
+            )],
+        ));
+        assert!(
+            monitor
+                .reconcile_merged_branches_at(&merged, "2026-10-01T12:00:30Z")
+                .is_empty(),
+            "a launch with a live pane is not freed by a slice merge"
+        );
+        assert_eq!(monitor.active_count(), 1, "the slot stays held");
+        assert_eq!(
+            monitor.inbox_item(4740).map(|item| item.state),
+            Some(MonitorInboxState::Launched)
+        );
+        assert_eq!(monitor.launched_window_issue("tab-1::agent-1"), Some(4740));
+        assert!(!monitor.queue.contains(&4740));
+        assert!(
+            !monitor
+                .prefs()
+                .queued_launch_session_strategies
+                .contains_key(&4740),
+            "no fresh session is required for a launch that is still running"
+        );
+        assert!(
+            monitor
+                .next_launch_request("2026-10-01T12:00:30Z")
+                .is_none(),
+            "max_active is still honoured: #4823 waits"
+        );
+        // The next scan sees the same merged branch again: idempotent.
+        monitor.record_window_snapshot(pane_snapshot(
+            "2026-10-01T12:01:20Z",
+            vec![live_pane_observation(
+                "tab-1::agent-1",
+                4740,
+                WindowState::Running,
+            )],
+        ));
+        assert!(monitor
+            .reconcile_merged_branches_at(&merged, "2026-10-01T12:01:30Z")
+            .is_empty());
+        assert_eq!(monitor.active_count(), 1);
+
+        // The pane ended: the existing re-queue path runs.
+        monitor.record_window_snapshot(pane_snapshot(
+            "2026-10-01T13:00:20Z",
+            vec![live_pane_observation(
+                "tab-1::agent-1",
+                4740,
+                WindowState::Stopped,
+            )],
+        ));
+        assert_eq!(
+            monitor.reconcile_merged_branches_at(&merged, "2026-10-01T13:00:30Z"),
+            vec![4740]
+        );
+        assert_eq!(monitor.active_count(), 0, "a finished pane frees the slot");
+        assert_eq!(
+            monitor.inbox_item(4740).map(|item| item.state),
+            Some(MonitorInboxState::Queued)
+        );
+        assert!(monitor
+            .prefs()
+            .queued_launch_session_strategies
+            .contains_key(&4740));
+    }
+
+    /// Issue #4852 AC-3 (negative half): with no pane on a fresh snapshot, or
+    /// no snapshot at all, the merge re-queues exactly as before.
+    #[test]
+    fn issue_4852_a_merge_without_a_live_pane_requeues() {
+        let cases: Vec<(&str, Option<IssueMonitorWindowSnapshot>)> = vec![
+            ("no snapshot", None),
+            (
+                "pane missing",
+                Some(pane_snapshot("2026-10-01T12:00:20Z", Vec::new())),
+            ),
+            (
+                "stale snapshot",
+                Some(pane_snapshot(
+                    "2026-10-01T11:00:00Z",
+                    vec![live_pane_observation(
+                        "tab-1::agent-1",
+                        4740,
+                        WindowState::Running,
+                    )],
+                )),
+            ),
+            (
+                "another tab's pane",
+                Some(pane_snapshot(
+                    "2026-10-01T12:00:20Z",
+                    vec![live_pane_observation(
+                        "tab-2::agent-1",
+                        4740,
+                        WindowState::Running,
+                    )],
+                )),
+            ),
+        ];
+        for (label, snapshot) in cases {
+            let mut monitor = IssueMonitorState::new(IssueMonitorConfig::default());
+            scan_queued_candidates(&mut monitor, &[issue(4740)], "2026-10-01T10:00:00Z");
+            monitor.set_gui_connected(true);
+            assert!(monitor
+                .next_launch_request("2026-10-01T10:00:00Z")
+                .is_some());
+            monitor.complete_active_launch_at(4740, "tab-1::agent-1", "2026-10-01T10:00:05Z");
+            let branch = monitor.active_launched_branches()[0].1.clone();
+            let merged = BTreeSet::from([branch.clone()]);
+            let mut deliveries = BTreeMap::new();
+            deliveries.insert(branch, merged_delivery(4855, "aaa", "2026-10-01T12:00:00Z"));
+            monitor.record_merged_deliveries(&deliveries);
+            if let Some(snapshot) = snapshot {
+                monitor.record_window_snapshot(snapshot);
+            }
+            assert_eq!(
+                monitor.reconcile_merged_branches_at(&merged, "2026-10-01T12:00:30Z"),
+                vec![4740],
+                "{label}: nothing live keeps the slot"
+            );
+            assert_eq!(monitor.active_count(), 0, "{label}");
+            assert_eq!(
+                monitor.inbox_item(4740).map(|item| item.state),
+                Some(MonitorInboxState::Queued),
+                "{label}"
+            );
+        }
     }
 
     #[test]
