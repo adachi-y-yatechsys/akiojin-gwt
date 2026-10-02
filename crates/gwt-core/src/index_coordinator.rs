@@ -267,6 +267,10 @@ pub struct Ticket {
     /// long as its holder, which is how index jobs have always behaved.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at_ms: Option<u64>,
+    /// Published atomically with the TTL. `None` on legacy tickets means
+    /// renewal is unknown, not that the holder has never made progress.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_renewed: Option<bool>,
     /// Nice value of the holding process (Issue #4409 AC-4).
     ///
     /// A waiter reading the status needs this to tell a holder that is slow
@@ -292,6 +296,7 @@ impl Ticket {
             acquired_at_ms: now_ms(),
             lease_id: None,
             expires_at_ms: None,
+            ttl_renewed: None,
             holder_nice: None,
             holder_spawn_host: None,
         }
@@ -377,6 +382,7 @@ pub struct HeavyLeaseStatus {
     pub priority: Option<JobPriority>,
     pub acquired_at_ms: Option<u64>,
     pub expires_at_ms: Option<u64>,
+    pub ttl_renewed: Option<bool>,
     /// Milliseconds left before the TTL lapses; `None` for leases without a
     /// TTL, `Some(0)` once an expired lease is still physically held.
     pub remaining_ms: Option<u64>,
@@ -907,6 +913,7 @@ impl IndexCoordinator {
                 // No live holder means no honest deadline: a TTL remainder
                 // here is exactly the number that told waiters to sit still.
                 expires_at_ms: None,
+                ttl_renewed: ticket.ttl_renewed,
                 remaining_ms: None,
                 expired: false,
                 pending,
@@ -956,6 +963,7 @@ impl IndexCoordinator {
             priority: Some(ticket.priority),
             acquired_at_ms: Some(ticket.acquired_at_ms),
             expires_at_ms: ticket.expires_at_ms,
+            ttl_renewed: ticket.ttl_renewed,
             remaining_ms,
             expired: ticket.expires_at_ms.is_some_and(|at| now >= at),
             pending,
@@ -1307,6 +1315,7 @@ fn acquire_heavy_at(
                         lease_id: Some(uuid::Uuid::new_v4().to_string()),
                         expires_at_ms: ttl
                             .map(|ttl| acquired_at_ms.saturating_add(ttl.as_millis() as u64)),
+                        ttl_renewed: ttl.map(|_| false),
                         holder_nice: crate::verification_priority::LauncherPriority::current().nice,
                         // Filled in by the holder once it knows: the
                         // coordinator has no opinion about daemons.
@@ -1501,6 +1510,7 @@ impl HeavyLease {
     /// ticket behind the holder's back.
     pub fn extend_until(&mut self, expires_at_ms: u64) -> Result<(), CoordinatorError> {
         self.ticket.expires_at_ms = Some(expires_at_ms);
+        self.ticket.ttl_renewed = Some(true);
         write_json_atomic(&self.ticket_path, &self.ticket)?;
         self.record_event(LeaseEventKind::Extended, None);
         Ok(())

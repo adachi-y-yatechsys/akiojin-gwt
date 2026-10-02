@@ -1167,6 +1167,16 @@ pub struct LaunchConfig {
     /// so it is stamped here and persisted onto the Session rather than being
     /// re-derived later from the agent's environment.
     pub launch_route: LaunchRoute,
+    /// Issue #4783 AC-2: this Resume launch is an automatic restore (startup
+    /// auto-resume / Open Project sweep), not an operator's restart or a
+    /// launch the operator chose. Only the restore spawn boundary sets it.
+    ///
+    /// The durable `Session.launch_origin` cannot carry this: it is written
+    /// after `AgentStarted`, so the first automatic restore of a Session has
+    /// no origin on disk yet. The launch worker reads it before recovering
+    /// producing authority, where a restore must never reactivate a terminal
+    /// execution generation.
+    pub automatic_restore: bool,
     /// Issue #4543: the Permission Mode Decision this launch was materialized
     /// under, already checked against the argv and environment above.
     ///
@@ -1766,6 +1776,7 @@ impl AgentLaunchBuilder {
             explicit_follow_up: self.explicit_follow_up,
             execution_intent: self.execution_intent,
             launch_route: self.launch_route,
+            automatic_restore: false,
             permission_decision,
         }
     }

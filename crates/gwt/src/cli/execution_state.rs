@@ -2072,7 +2072,7 @@ impl LaunchGenerationReleaseAuthority {
 
     fn missing_verification(self) -> &'static str {
         match self {
-            Self::Revoked => "revoked launch settlement",
+            Self::Revoked => REVOKED_LAUNCH_MISSING_VERIFICATION,
             Self::Unstarted => "unstarted launch settlement",
         }
     }
@@ -2084,6 +2084,13 @@ impl LaunchGenerationReleaseAuthority {
         }
     }
 }
+
+/// The `missing_verification` a revoked-launch release stamps on the Blocked
+/// generation (Issue #4200). Issue #4783 AC-1 reads it back from the
+/// diagnosis: a generation Blocked this way was stopped through the Monitor,
+/// and a restart must not restore its agent window even when the Monitor
+/// prefs no longer carry the hold.
+pub const REVOKED_LAUNCH_MISSING_VERIFICATION: &str = "revoked launch settlement";
 
 /// What a launch-generation release did to an owner's generation.
 #[derive(Debug, Clone, PartialEq, Eq)]

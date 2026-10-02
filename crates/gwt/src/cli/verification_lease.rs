@@ -452,6 +452,7 @@ fn reclaim_holder(
     let Some(owner) = status.owner.clone() else {
         return Err(canonical_refusal(lease_id, None));
     };
+    protect_renewed_holder(&status, lease_id)?;
     let first = reclaimer.observe(owner.pid, &status, Duration::ZERO);
     let Some(first) = first.filter(holder_activity::HolderActivity::reclaimable) else {
         return Err(canonical_refusal(
@@ -484,9 +485,11 @@ fn reclaim_holder(
     // The lease must still be the same one, under the same owner, right
     // before its holder is ended: a pid is only a name, and ten seconds is
     // long enough for the lease to change hands.
-    if held(&coordinator).and_then(|status| status.owner) != Some(owner.clone()) {
+    let current = held(&coordinator).ok_or_else(|| missing_lease(lease_id))?;
+    if current.owner != Some(owner.clone()) {
         return Err(missing_lease(lease_id));
     }
+    protect_renewed_holder(&current, lease_id)?;
     reclaimer.terminate(owner.pid, false).map_err(unexpected)?;
     if await_settled(lease_id).is_err() {
         reclaimer.terminate(owner.pid, true).map_err(unexpected)?;
@@ -511,6 +514,21 @@ fn reclaim_holder(
     ));
     push_status_fields(out, &self::status()?, current_project);
     Ok(0)
+}
+
+/// Renewal observes the exact command tree; a reclaimer's process sample can
+/// miss delegated work. Keep a renewed lease protected until that TTL expires.
+/// Expiry alone still does not authorize reclaiming it.
+fn protect_renewed_holder(status: &HeavyLeaseStatus, lease_id: &str) -> Result<(), SpecOpsError> {
+    // The diagnostic event ledger is best-effort. Only the atomically
+    // published ticket can establish that a valid TTL has not been renewed.
+    if status.expires_at_ms.is_some() && !status.expired && status.ttl_renewed != Some(false) {
+        return Err(canonical_refusal(
+            lease_id,
+            Some("the holder renewed its active TTL or its renewal state is unknown; wait for its verification to finish"),
+        ));
+    }
+    Ok(())
 }
 
 /// Issue #4633 AC-4: what a caller closing a pane in `worktree` should know
@@ -1659,6 +1677,67 @@ mod tests {
             let reason = event.reason.as_deref().unwrap_or_default();
             assert!(reason.contains("reclaimed by pid"), "{reason}");
             assert!(reason.contains("window closed"), "{reason}");
+        }
+
+        #[test]
+        fn a_renewing_holder_is_protected_even_when_process_samples_look_orphaned() {
+            struct RenewingReclaimer<'a>(ScriptedReclaimer<'a>);
+            impl OrphanReclaimer for RenewingReclaimer<'_> {
+                fn observe(
+                    &mut self,
+                    pid: u32,
+                    status: &HeavyLeaseStatus,
+                    pause: Duration,
+                ) -> Option<HolderActivity> {
+                    self.0
+                        .held
+                        .lease
+                        .as_mut()
+                        .unwrap()
+                        .extend(Duration::from_secs(2_700))
+                        .unwrap();
+                    // The diagnostic ledger is best-effort. Its absence must
+                    // not erase a renewal already published in the ticket.
+                    fs::remove_file(open_coordinator().unwrap().lease_event_log_path()).unwrap();
+                    self.0.observe(pid, status, pause)
+                }
+
+                fn terminate(&mut self, pid: u32, force: bool) -> Result<(), String> {
+                    self.0.terminate(pid, force)
+                }
+            }
+
+            // Cover a renewal already published and one that arrives while
+            // the reclaimer samples processes, without any real waiting.
+            for already_renewed in [true, false] {
+                let mut held = hold_lease();
+                if already_renewed {
+                    held.lease
+                        .as_mut()
+                        .unwrap()
+                        .extend(Duration::from_secs(2_700))
+                        .unwrap();
+                    fs::remove_file(open_coordinator().unwrap().lease_event_log_path()).unwrap();
+                }
+                let lease_id = held.lease_id.clone();
+                let mut reclaimer = RenewingReclaimer(ScriptedReclaimer {
+                    readings: vec![Some(orphan()), Some(orphan())],
+                    held: &mut held,
+                    terminated: Vec::new(),
+                });
+                let error = release(
+                    "99a8660247f5bc49",
+                    &lease_id,
+                    Some("suspected orphan"),
+                    &mut reclaimer,
+                    &mut String::new(),
+                )
+                .unwrap_err()
+                .to_string();
+                assert!(error.contains("renewed"), "{error}");
+                assert!(reclaimer.0.terminated.is_empty());
+                assert!(still_held(&lease_id));
+            }
         }
 
         #[test]
