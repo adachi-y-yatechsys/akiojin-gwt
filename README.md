@@ -90,6 +90,28 @@ and basic `gwt.exe` launch evidence.
 curl -fsSL https://raw.githubusercontent.com/akiojin/gwt/main/installers/macos/uninstall.sh | bash
 ```
 
+### Upgrade floor
+
+The upgrade floor for retiring one-shot migrations is **v9.72.1**, the latest
+release on 2026-08-03 UTC (60 days before the 2026-10-02 change). For an older
+installation, first install [v9.106.0](https://github.com/akiojin/gwt/releases/tag/v9.106.0),
+open your projects to run their retained migrations, then install the new version.
+Back up your gwt configuration and project state before upgrading.
+
+Legacy Claude Code backend rows are an exception: no released startup path ran
+their automatic migration. **旧 backend 設定は自動移行されません。Settings で provider を再登録してください**
+(Old backend settings are not migrated automatically; re-register the provider in
+Settings → Agent Backends.) Copy the endpoint, API key and model from the old
+entry, then select the built-in Claude Code agent with the registered backend.
+The old configuration remains readable and is not rewritten or deleted on launch.
+
+Migrations introduced after this floor remain supported, including Session schema
+5, PM scratch relocation, work-item projection rebuild v2 and ProjectKey migration.
+The usage `window_minutes` contract and the Workspace projection backfill associated
+with open SPEC #2359 are also retained. Importing old HOME / Workspace state from
+`workspace/current.json` and `work_items.json` remains a data-protection exception
+until startup can safely diagnose unsupported layouts before creating new state.
+
 ## Requirements
 
 - `git` available in `PATH`

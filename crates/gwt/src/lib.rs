@@ -268,6 +268,7 @@ pub use protocol::{
     UiTraceEntry, UiTracePayload, WorkAgentView, WorkEventView, WorkItemView,
     WorkspaceExecutionContainerView, WorkspaceExecutionDiagnosisView, WorkspaceHistoryAgentView,
     WorkspaceHistoryEventView, WorkspaceHistorySessionView, WorkspaceHistoryView,
-    WorkspaceJournalEntryView, WorkspaceResumeSource, WorkspaceView,
+    WorkspaceJournalEntryView, WorkspaceResumeSource, WorkspaceStateNoticeKind,
+    WorkspaceStateNoticeView, WorkspaceView,
 };
 pub use window_canvas::WindowCanvasState;

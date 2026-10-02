@@ -8656,6 +8656,7 @@ fn issue_monitor_autonomous_record(
         review_dispatch_hold: None,
         last_failure_message: None,
         delivering_since: None,
+        review_attempts: None,
     }
 }
 
@@ -38080,6 +38081,16 @@ fn bootstrap_hands_its_worktree_inventory_to_the_startup_ingest() {
         sample_runtime_with_events(temp.path(), vec![tab], Some("tab-repo"));
     let (spawner, _tasks) = BlockingTaskSpawner::queued();
     runtime.blocking_tasks = spawner;
+    // Startup performs retained legacy import before the asynchronous watcher
+    // can see it, so startup itself must publish the informational notice.
+    let legacy_path =
+        gwt_core::paths::gwt_project_dir_for_repo_path(&repo).join("workspace/current.json");
+    let legacy = serde_json::to_vec(
+        &gwt_core::workspace_projection::WorkspaceProjection::default_for_project(&repo),
+    )
+    .unwrap();
+    fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+    fs::write(&legacy_path, &legacy).unwrap();
 
     runtime.bootstrap();
 
@@ -38110,6 +38121,11 @@ fn bootstrap_hands_its_worktree_inventory_to_the_startup_ingest() {
         !local_branches.is_empty(),
         "the reconcile ran on the worker from the bootstrap listing: {local_branches:?}"
     );
+    assert!(events.lock().unwrap().iter().any(|event| matches!(
+        recorded_project_payload(event),
+        UserEvent::WorkspaceProjectionLoaded { imported_from: Some(path), .. } if path == &legacy_path
+    )), "startup import must reach the common notice delivery path");
+    assert_eq!(fs::read(&legacy_path).unwrap(), legacy);
 }
 
 thread_local! {
@@ -47390,6 +47406,7 @@ fn agent_launch_purpose_title_reads_detached_issue_cache_for_non_repo_root() {
             Some("work/issue-3426"),
             temp.path(),
         )
+        .expect("healthy workspace state")
         .as_deref(),
         Some("fix(launch): stranded Active generation recovery"),
     );
@@ -47799,6 +47816,7 @@ fn app_runtime_agent_failed_ack_runs_ui_finalize_without_a_local_write() {
                 review_dispatch_hold: None,
                 last_failure_message: None,
                 delivering_since: None,
+                review_attempts: None,
             }],
             ..gwt::IssueMonitorPrefs::default()
         },
@@ -54312,8 +54330,16 @@ fn app_runtime_answered_handoff_exact_resume_retains_autonomous_context() {
 /// fixture pins one. Drop the pin and the guard refuses the probe by name
 /// instead of spawning the host `npx` under a five-second budget — the failure
 /// mode that turned unrelated `app_runtime` tests red on a loaded CI runner.
+///
+/// Issue #4927: the Session asks for an exact package version. A Host Codex
+/// launch that asks for `latest` prefers the installed CLI (#4917), so whether
+/// it reaches the package runner at all would depend on what the machine
+/// running the test has installed. An exact version takes the package-runner
+/// route on every host.
 #[test]
 fn monitor_launch_without_pinned_package_runners_is_refused() {
+    // Never published, so no host package cache can answer for it.
+    const EXACT_PACKAGE_VERSION: &str = "0.0.0";
     let _env_lock = env_test_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -54338,6 +54364,18 @@ fn monitor_launch_without_pinned_package_runners_is_refused() {
             .expect("fixture profile config path"),
         &Settings::default(),
     );
+    let mut source = gwt_agent::Session::load(
+        &fixture
+            .sessions_dir
+            .join(format!("{}.toml", fixture.source_session_id)),
+    )
+    .expect("load monitored Session");
+    source.tool_version = Some(EXACT_PACKAGE_VERSION.to_string());
+    source
+        .save(&fixture.sessions_dir)
+        .expect("save exact-version Session");
+    // The resume candidate is read from the launch wizard cache, not from disk.
+    fixture.runtime.launch_wizard_cache.record_session(source);
 
     fixture.runtime.auto_launch_issue_monitor_delivery_events(
         &fixture.runtime.test_context(),
@@ -54353,6 +54391,11 @@ fn monitor_launch_without_pinned_package_runners_is_refused() {
     assert!(
         error.contains(gwt_core::process_console::REAL_RUNNER_PROBE_BLOCKED_ERROR_CODE),
         "the refusal must name the guard, not look like a runner timeout: {error}"
+    );
+    assert!(
+        error.contains(&format!("@openai/codex@{EXACT_PACKAGE_VERSION}")),
+        "the refused probe must be the exact package the Session asked for, not a fallback \
+         from an installed CLI: {error}"
     );
 }
 
@@ -59702,6 +59745,84 @@ fn background_work_scan_results_refresh_active_work_off_the_gui_event_loop() {
         "the merge scan result reached the row"
     );
     assert_eq!(row.work_summary.as_deref(), Some("tip subject"));
+}
+
+#[test]
+fn workspace_state_load_failure_keeps_rail_and_replays_until_recovery() {
+    let _env_lock = env_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().unwrap();
+    let _gwt_home = gwt_core::test_support::ScopedGwtHome::set(temp.path());
+    let _home = ScopedEnvVar::set("HOME", temp.path());
+    let _userprofile = ScopedEnvVar::set("USERPROFILE", temp.path());
+    let repo = temp.path().join("repo");
+    let (mut runtime, _, _) = active_work_off_loop_setup(temp.path(), &repo);
+    gwt_core::workspace_projection::save_workspace_projection(
+        &repo,
+        &gwt_core::workspace_projection::WorkspaceProjection::default_for_project(&repo),
+    )
+    .unwrap();
+    drain_active_work_projection_refresh(&mut runtime, &repo);
+    let cached = || {
+        runtime
+            .project_state_for_tab("tab-1")
+            .unwrap()
+            .active_work_projection_cache
+            .borrow()
+            .get("tab-1")
+            .cloned()
+    };
+    let before = serde_json::to_value(cached()).unwrap();
+    let path = gwt_core::paths::gwt_workspace_projection_path_for_repo_path(&repo);
+    let original = fs::read(&path).unwrap();
+    fs::write(&path, b"{broken workspace").unwrap();
+
+    let events = drain_active_work_projection_refresh(&mut runtime, &repo);
+    assert!(events
+        .iter()
+        .any(|event| event.event.event_kind() == "workspace_state_notice"));
+    assert_eq!(
+        serde_json::to_value(
+            runtime
+                .project_state_for_tab("tab-1")
+                .unwrap()
+                .active_work_projection_cache
+                .borrow()
+                .get("tab-1")
+        )
+        .unwrap(),
+        before
+    );
+    let context = runtime.project_context_for_root(&repo).unwrap();
+    let replay = runtime.frontend_project_sync_events("reconnected", &context);
+    assert!(replay
+        .iter()
+        .any(|event| event.event.event_kind() == "workspace_state_notice"));
+    assert_eq!(fs::read(&path).unwrap(), b"{broken workspace");
+
+    fs::write(&path, original).unwrap();
+    let cached_refresh = drain_active_work_projection_refresh(&mut runtime, &repo);
+    assert!(
+        !cached_refresh.iter().any(|event| {
+            matches!(
+                &event.event,
+                BackendEvent::WorkspaceStateNotice { notice: None }
+            )
+        }),
+        "a cache hit must not clear the notice before a fresh load"
+    );
+    let Some(UserEvent::WorkspaceProjectionLoaded { imported_from, .. }) =
+        crate::load_workspace_projection_user_event(&repo)
+    else {
+        panic!("repaired canonical files must load successfully");
+    };
+    let recovered = runtime.handle_workspace_state_loaded(&repo, imported_from);
+    let notice = recovered
+        .iter()
+        .find(|event| event.event.event_kind() == "workspace_state_notice")
+        .expect("clear the pending load notice");
+    assert!(serde_json::to_value(&notice.event).unwrap()["notice"].is_null());
 }
 
 #[test]
