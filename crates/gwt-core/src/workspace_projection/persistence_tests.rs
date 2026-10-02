@@ -7488,6 +7488,11 @@ fn workspace_work_items_synthesize_from_legacy_current_and_journal_without_rewri
     projection.board_refs.push("board-legacy-1".to_string());
     let mut foreign_agent = assigned_agent("session-foreign", "codex", "workspace-other");
     foreign_agent.status_category = WorkspaceStatusCategory::Blocked;
+    foreign_agent.updated_at = second_at;
+    let mut stale_agent = foreign_agent.clone();
+    stale_agent.workspace_id = Some(projection.id.clone());
+    stale_agent.updated_at = first_at;
+    projection.agents.push(stale_agent);
     projection.agents.push(foreign_agent);
     save_workspace_projection_to_path(&current_path, &projection).expect("save legacy projection");
 

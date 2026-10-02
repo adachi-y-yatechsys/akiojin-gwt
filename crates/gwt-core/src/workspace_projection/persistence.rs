@@ -7971,12 +7971,16 @@ fn synthesize_workspace_work_item_from_legacy(
     // legacy WorkItem must only inherit the selected Work's agents/status.
     let scoped_projection = projection.map(|projection| {
         let mut scoped = projection.clone();
-        scoped.agents.retain(|agent| {
-            agent
-                .workspace_id
-                .as_deref()
-                .is_none_or(|id| id == scoped.id)
-        });
+        scoped.agents = projection
+            .latest_agents()
+            .filter(|agent| {
+                agent
+                    .workspace_id
+                    .as_deref()
+                    .is_none_or(|id| id == scoped.id)
+            })
+            .cloned()
+            .collect();
         scoped
     });
     let projection = scoped_projection.as_ref();
