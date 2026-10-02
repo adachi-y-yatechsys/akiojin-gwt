@@ -2508,14 +2508,6 @@ pub fn parse_pr_titles_by_branch(json: &str) -> Result<std::collections::HashMap
         .collect())
 }
 
-/// Branches (PR head refs) whose PR has merged, from the differential sync
-/// behind [`fetch_merged_pr_deliveries`]. A transient failure returns an `Err`
-/// (the caller keeps work as launched) rather than an empty set, so closing
-/// the active slot only happens on a positive merge signal.
-pub fn fetch_merged_pr_branches(repo_path: &Path) -> Result<std::collections::BTreeSet<String>> {
-    fetch_merged_pr_deliveries(repo_path).map(|merged| merged.branches)
-}
-
 /// The base branch whose merges deliver a work branch (Issue #3917). `main`
 /// merges are release integration, not delivery, so they never settle an Issue.
 pub const SETTLEMENT_BASE_BRANCH: &str = "develop";
@@ -3087,17 +3079,6 @@ where
     Ok(open_pr_numbers_by_branch(&pages.rows))
 }
 
-/// Parse an open-PR list (REST `head.ref` / `number`, or the GraphQL
-/// `headRefName` spelling) into `branch -> open PR number`. Rows without a
-/// head ref are dropped; the highest number per branch wins.
-pub fn parse_open_pr_numbers_by_branch(
-    json: &str,
-) -> Result<std::collections::HashMap<String, u64>> {
-    let arr: Vec<serde_json::Value> = serde_json::from_str(json)
-        .map_err(|error| GwtError::Other(format!("gh pr list open inventory JSON: {error}")))?;
-    Ok(open_pr_numbers_by_branch(&arr))
-}
-
 fn open_pr_numbers_by_branch(rows: &[serde_json::Value]) -> std::collections::HashMap<String, u64> {
     let mut index = std::collections::HashMap::new();
     for value in rows {
@@ -3206,16 +3187,6 @@ where
 {
     try_fetch_pr_status_check_rollup_with(repo_path, number, run_gh)
         .unwrap_or_else(|_| "[]".to_string())
-}
-
-/// Fetch a PR's unified diff for the independent review agent. Capped to
-/// `max_bytes` (truncated with a marker) so a huge diff never blows the prompt.
-/// `None` on any gh failure (the review then runs without a diff and, being
-/// adversarial + fail-closed, will reject).
-pub fn fetch_pr_diff(repo_path: &Path, number: u64, max_bytes: usize) -> Option<String> {
-    try_fetch_pr_diff(repo_path, number, max_bytes)
-        .ok()
-        .flatten()
 }
 
 /// Checked variant used by deadline-integral scans.
@@ -3443,12 +3414,6 @@ where
     )
 }
 
-/// Disarm a previously-armed auto-merge (SPEC #3200 FR-024: HEAD advanced past
-/// the reviewed SHA ⇒ revoke). Fail-closed `bool`.
-pub fn disable_pr_auto_merge(repo_path: &Path, number: u64) -> bool {
-    disable_pr_auto_merge_with(repo_path, number, run_gh_command)
-}
-
 /// Disarm auto-merge idempotently from a fresh remote state readback.
 pub fn disarm_pr_auto_merge(
     repo_path: &Path,
@@ -3540,6 +3505,7 @@ fn run_auto_merge_command(
     })
 }
 
+#[cfg(test)]
 fn disable_pr_auto_merge_with<F>(repo_path: &Path, number: u64, mut run_gh: F) -> bool
 where
     F: FnMut(&Path, &[&str]) -> Result<GhCliOutput>,
@@ -3562,13 +3528,6 @@ pub fn parse_pr_merge_commit_sha(json: &str) -> Option<String> {
         .and_then(serde_json::Value::as_str)
         .filter(|sha| !sha.trim().is_empty())
         .map(str::to_string)
-}
-
-/// Fetch a merged PR's merge-commit SHA (fail-closed `Option`).
-pub fn fetch_pr_merge_commit_sha(repo_path: &Path, number: u64) -> Option<String> {
-    try_fetch_pr_merge_commit_sha(repo_path, number)
-        .ok()
-        .flatten()
 }
 
 /// Checked variant used by deadline-integral scans.

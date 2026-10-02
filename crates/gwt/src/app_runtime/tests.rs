@@ -1848,13 +1848,13 @@ fn pin_monitor_fixture_package_runners(
 /// health-checks whatever `npx` / `bunx` the machine happens to have, which is
 /// invisible on a developer box with the provider CLI installed (the direct
 /// probe succeeds and returns early) and fails on CI, where the fallback runs.
-fn pin_runtime_package_runners(
-    runtime: &AppRuntime,
-    _temp_root: &Path,
-    extra_env: &[(&str, &str)],
-) {
+fn pin_runtime_package_runners(runtime: &AppRuntime, temp_root: &Path, extra_env: &[(&str, &str)]) {
     let mut settings = Settings::default();
-    pin_launch_package_runners(&mut settings, shared_fixture_package_runner_bin());
+    let runner_bin = write_fixture_package_runners(temp_root);
+    // Monitor launches prefer installed providers; keep their version evidence
+    // hermetic without shadowing provider fixtures in unrelated runtime tests.
+    write_fixture_runners(temp_root, &["codex", "claude"]);
+    pin_launch_package_runners(&mut settings, &runner_bin);
     for (key, value) in extra_env {
         settings
             .profiles
@@ -13691,7 +13691,7 @@ fn app_runtime_open_launch_wizard_uses_cached_previous_profile_without_hydrating
     assert_eq!(view.selected_agent_id, "codex");
     assert_eq!(view.selected_model, "gpt-5.5");
     assert_eq!(view.selected_reasoning, "high");
-    assert_eq!(view.selected_version, "latest");
+    assert_eq!(view.selected_version, "installed");
     assert_eq!(view.selected_execution_mode, "continue");
     // Issue #3462: Continue inherits the persisted Skip Permissions preference.
     assert!(view.skip_permissions);
@@ -18413,6 +18413,22 @@ fn continue_work_grok_preflight_uses_the_active_profile_environment() {
     );
     assert_eq!(config.session_mode, gwt_agent::SessionMode::Resume);
     assert_eq!(config.resume_session_id.as_deref(), Some(conversation_id));
+}
+
+#[test]
+fn persisted_direct_session_observed_version_does_not_pin_restore() {
+    let temp = tempdir().expect("tempdir");
+    let _gwt_home = ScopedGwtHome::set(temp.path());
+    let mut session = gwt_agent::Session::new(
+        temp.path(),
+        "work/issue-3894",
+        gwt_agent::AgentId::ClaudeCode,
+    );
+    session.tool_version = Some("2.1.156".into());
+    session.launch_command = "/opt/bin/claude".into();
+    let config = super::launch_config_from_persisted_session(&session);
+    assert_eq!(config.command, "claude");
+    assert_eq!(config.tool_version.as_deref(), Some("installed"));
 }
 
 #[test]
@@ -43392,7 +43408,8 @@ fn board_origin_agent_resume_config_uses_exact_saved_session() {
     session.agent_session_id = Some("codex-resume-123".to_string());
     session.model = Some("gpt-5.5".to_string());
     session.reasoning_level = Some("high".to_string());
-    session.tool_version = Some("latest".to_string());
+    session.tool_version = Some("0.116.0".to_string());
+    session.tool_version_selector = Some("latest".to_string());
     session.tool_runtime_provenance = Some(gwt_agent::ToolRuntimeProvenance {
         schema_version: gwt_agent::ToolRuntimeProvenance::CURRENT_SCHEMA_VERSION,
         official_package: "@openai/codex".to_string(),
@@ -43409,6 +43426,8 @@ fn board_origin_agent_resume_config_uses_exact_saved_session() {
         .board_origin_agent_resume_config("session-origin")
         .expect("resume config");
 
+    assert_eq!(config.command, "codex");
+    assert_eq!(config.tool_version_selector.as_deref(), Some("latest"));
     assert_eq!(config.branch.as_deref(), Some("work/board-origin"));
     assert_eq!(config.working_dir.as_deref(), Some(repo.as_path()));
     assert_eq!(
@@ -45684,6 +45703,17 @@ fn app_runtime_select_and_save_profile_broadcasts_snapshot_to_profile_windows() 
             && snapshot.selected_profile == "dev"
     ));
 
+    runtime.launch_wizard_cache = LaunchWizardMemoryCache::load_with_agent_options(
+        temp.path(),
+        vec![gwt::AgentOption {
+            id: "stale-detection-sentinel".into(),
+            name: "Stale detection".into(),
+            available: false,
+            installed_version: None,
+            versions: Vec::new(),
+            custom_agent: None,
+        }],
+    );
     let events = runtime.handle_frontend_event(
         "client-1".to_string(),
         FrontendEvent::SaveProfile {
@@ -45699,6 +45729,14 @@ fn app_runtime_select_and_save_profile_broadcasts_snapshot_to_profile_windows() 
         },
     );
 
+    assert!(
+        runtime
+            .launch_wizard_cache
+            .agent_options()
+            .iter()
+            .all(|agent| { agent.id != "stale-detection-sentinel" }),
+        "saving a profile must invalidate installed CLI detection"
+    );
     assert_eq!(events.len(), 2);
     assert!(events.iter().any(|event| matches!(
         event,
@@ -53453,7 +53491,11 @@ fn assert_monitor_fresh_successor(result: AgentLaunchResult, fixture: &MonitorRe
     assert_eq!(successor.model.as_deref(), Some("gpt-5.5"));
     assert_eq!(successor.reasoning_level.as_deref(), Some("high"));
     assert_eq!(successor.agent_id, gwt_agent::AgentId::Codex);
-    assert_eq!(successor.tool_version.as_deref(), Some("latest"));
+    assert_eq!(successor.tool_version.as_deref(), Some("1.2.3"));
+    assert_eq!(
+        successor.tool_version_selector.as_deref(),
+        Some("installed")
+    );
     assert!(successor.skip_permissions);
     assert!(!successor.fast_mode);
     assert!(!successor.codex_fast_mode);
@@ -54876,7 +54918,11 @@ fn app_runtime_monitor_fresh_required_switches_to_current_provider_profile() {
     assert!(successor.agent_session_id.is_none());
     assert_eq!(successor.model.as_deref(), Some("sonnet"));
     assert_eq!(successor.reasoning_level.as_deref(), Some("low"));
-    assert_eq!(successor.tool_version.as_deref(), Some("latest"));
+    assert_eq!(successor.tool_version.as_deref(), Some("1.2.3"));
+    assert_eq!(
+        successor.tool_version_selector.as_deref(),
+        Some("installed")
+    );
     assert!(successor.skip_permissions);
     assert!(!successor.fast_mode);
     assert!(!successor.codex_fast_mode);
@@ -59501,7 +59547,6 @@ fn wait_for_active_work_prepare_completions(
     }
 }
 
-#[allow(dead_code)]
 fn active_work_refresh_requests(events: &Arc<Mutex<Vec<UserEvent>>>, project_root: &Path) -> usize {
     events
         .lock()

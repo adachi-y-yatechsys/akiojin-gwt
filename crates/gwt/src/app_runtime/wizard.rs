@@ -1727,7 +1727,7 @@ impl AppRuntime {
         if let Some(model) = session.model.clone() {
             builder = builder.model(model);
         }
-        if let Some(version) = session.tool_version.clone() {
+        if let Some(version) = session.launch_tool_version() {
             builder = builder.version(version);
         }
         if let Some(level) = session.reasoning_level.clone() {
@@ -1776,10 +1776,9 @@ impl AppRuntime {
         }
 
         let mut config = builder.build();
-        // Preserve persisted tool version + display name so the launcher
-        // does not re-derive them from version cache (mirrors Quick Start
-        // Resume behavior).
-        if let Some(version) = session.tool_version.clone() {
+        // Preserve the requested selector and display name when resuming.
+        // The observed runtime version must not become a package pin.
+        if let Some(version) = session.launch_tool_version() {
             config.tool_version = Some(version);
         }
         if !session.display_name.is_empty() {

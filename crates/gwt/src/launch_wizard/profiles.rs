@@ -128,11 +128,12 @@ pub fn quick_start_entries_from_sessions(
 fn previous_profile_from_session(session: gwt_agent::Session) -> LaunchWizardPreviousProfile {
     let fast_mode = session.fast_mode_enabled();
     let hermes = hermes_preferences_from_session(&session);
+    let version = session.launch_tool_version();
     LaunchWizardPreviousProfile {
         agent_id: session.agent_id.command().to_string(),
         model: session.model,
         reasoning: session.reasoning_level,
-        version: session.tool_version.or_else(|| {
+        version: version.or_else(|| {
             session
                 .agent_id
                 .npm_package()
