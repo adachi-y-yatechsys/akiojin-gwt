@@ -228,6 +228,30 @@ fn split_pane_submit(text: &str) -> (&str, Option<&str>) {
     (text, None)
 }
 
+/// Issue #4909: the body of one injected prompt as the PTY must receive it.
+///
+/// With bracketed-paste mode on (Claude Code and Codex both enable it), the
+/// body is delivered as one paste, `ESC [ 200 ~ … ESC [ 201 ~`, so the
+/// composer takes `@`, a leading `/`, `?`, and embedded newlines as pasted
+/// text instead of as the keys that open its file / slash-command pickers.
+/// The submit terminator is deliberately not part of the paste: it is still
+/// written on its own after the TUI has settled (SPEC-3431 FR-108c), so the
+/// provider's UserPromptSubmit hook sees exactly one prompt. With the mode
+/// off, the body is written raw, exactly as before.
+fn pane_input_body_bytes(body: &str, bracketed_paste: bool) -> Vec<u8> {
+    if !bracketed_paste {
+        return body.as_bytes().to_vec();
+    }
+    let mut bytes = Vec::with_capacity(body.len() + 12);
+    bytes.extend_from_slice(BRACKETED_PASTE_START);
+    bytes.extend_from_slice(body.as_bytes());
+    bytes.extend_from_slice(BRACKETED_PASTE_END);
+    bytes
+}
+
+const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
+const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
+
 /// Result of a body-once, submit-until-verified delivery. Verification is a
 /// semantic target acknowledgement, never merely a successful PTY write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -240,6 +264,7 @@ pub(super) enum VerifiedPaneSubmitOutcome {
 /// injected semantic acknowledgement says the exact target turn started.
 pub(super) fn drive_verified_pane_submit(
     text: &str,
+    bracketed_paste: bool,
     max_submit_attempts: usize,
     mut write: impl FnMut(&[u8]) -> Result<(), String>,
     mut settle: impl FnMut(Duration),
@@ -247,7 +272,7 @@ pub(super) fn drive_verified_pane_submit(
 ) -> Result<VerifiedPaneSubmitOutcome, String> {
     let (body, submit) = split_pane_submit(text);
     if !body.is_empty() {
-        write(body.as_bytes())?;
+        write(&pane_input_body_bytes(body, bracketed_paste))?;
     }
     let Some(submit) = submit else {
         return Ok(VerifiedPaneSubmitOutcome::Verified { submit_attempts: 0 });
@@ -298,8 +323,13 @@ pub(super) fn write_pane_input_then_submit(
         .reserve_input_transaction()
         .map_err(|error| error.to_string())?;
     if !body.is_empty() {
+        // Issue #4909: a submit-bearing body is a prompt, so it is pasted
+        // when the composer accepts pastes.
         reservation
-            .write_input(body.as_bytes())
+            .write_input(&pane_input_body_bytes(
+                body,
+                reservation.bracketed_paste_enabled(),
+            ))
             .map_err(|error| error.to_string())?;
     }
     let submit = submit.to_string();
@@ -336,8 +366,12 @@ pub(super) fn write_pane_input_and_submit_blocking(
         .reserve_input_transaction()
         .map_err(|error| error.to_string())?;
     if !body.is_empty() {
+        // Issue #4909: see `write_pane_input_then_submit`.
         reservation
-            .write_input(body.as_bytes())
+            .write_input(&pane_input_body_bytes(
+                body,
+                reservation.bracketed_paste_enabled(),
+            ))
             .map_err(|error| error.to_string())?;
     }
     thread::sleep(PANE_SUBMIT_SETTLE);
@@ -1548,7 +1582,56 @@ fn pane_runtime_user_event(event: gwt::pane_runtime::PaneRuntimeEvent) -> UserEv
 
 #[cfg(test)]
 mod submit_split_tests {
-    use super::{drive_verified_pane_submit, split_pane_submit, VerifiedPaneSubmitOutcome};
+    use super::{
+        drive_verified_pane_submit, pane_input_body_bytes, split_pane_submit,
+        VerifiedPaneSubmitOutcome,
+    };
+
+    /// Issue #4909 AC-2 / AC-3: the exact bytes the injection layer writes for
+    /// a prompt that carries an `@` mention, a leading `/`, and two lines.
+    /// With bracketed paste on, the body is one paste and the submit byte is
+    /// still a separate write; with it off, the raw path is byte-identical to
+    /// before.
+    #[test]
+    fn injected_body_is_wrapped_as_a_paste_only_when_the_composer_accepts_pastes() {
+        let prompt = "/mnt/work/notes.md\n@agent-1 please review\r";
+        let body = "/mnt/work/notes.md\n@agent-1 please review";
+        assert_eq!(
+            pane_input_body_bytes(body, true),
+            [b"\x1b[200~".as_slice(), body.as_bytes(), b"\x1b[201~"].concat()
+        );
+        assert_eq!(pane_input_body_bytes(body, false), body.as_bytes());
+
+        for bracketed_paste in [true, false] {
+            let writes = std::cell::RefCell::new(Vec::<Vec<u8>>::new());
+            let outcome = drive_verified_pane_submit(
+                prompt,
+                bracketed_paste,
+                1,
+                |bytes| {
+                    writes.borrow_mut().push(bytes.to_vec());
+                    Ok(())
+                },
+                |_| {},
+                || Ok(true),
+            )
+            .expect("delivered");
+            assert_eq!(
+                outcome,
+                VerifiedPaneSubmitOutcome::Verified { submit_attempts: 1 }
+            );
+            let expected_body = if bracketed_paste {
+                format!("\x1b[200~{body}\x1b[201~").into_bytes()
+            } else {
+                body.as_bytes().to_vec()
+            };
+            assert_eq!(
+                *writes.borrow(),
+                vec![expected_body, b"\r".to_vec()],
+                "bracketed_paste={bracketed_paste}: body in one write, submit byte on its own"
+            );
+        }
+    }
 
     /// SPEC-3431 FR-108c: the body and the submit byte must be separable, so
     /// the writer can put the carriage return in its own PTY write. A single
@@ -1603,6 +1686,7 @@ mod submit_split_tests {
 
         let outcome = drive_verified_pane_submit(
             "protected body\r",
+            false,
             2,
             |bytes| {
                 writes
@@ -1630,6 +1714,7 @@ mod submit_split_tests {
 
         let outcome = drive_verified_pane_submit(
             "protected body\r",
+            false,
             2,
             |bytes| {
                 writes
@@ -1663,6 +1748,7 @@ mod submit_split_tests {
 
         let outcome = drive_verified_pane_submit(
             "protected body\r",
+            false,
             1,
             |bytes| {
                 writes

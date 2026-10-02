@@ -291,6 +291,11 @@ pub struct PtyHandle {
     writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
     input_state: Mutex<PtyInputState>,
     generation_active: AtomicBool,
+    /// Issue #4909: the child has bracketed-paste mode on (`CSI ? 2004 h`
+    /// seen, no `CSI ? 2004 l` since). Published by the pane's output parser,
+    /// read by prompt injection off any thread that holds the handle, so a
+    /// delivery worker never needs the pane lock to know how to write a body.
+    bracketed_paste: AtomicBool,
     // Wrapped so `kill` (which takes `&self`) can synchronously terminate the
     // group without waiting for `Drop`. Declared last so that when `Drop` runs
     // the direct child has already been signaled above.
@@ -549,8 +554,20 @@ impl PtyHandle {
             writer: Arc::new(Mutex::new(Some(writer))),
             input_state: Mutex::new(PtyInputState::default()),
             generation_active: AtomicBool::new(true),
+            bracketed_paste: AtomicBool::new(false),
             process_group: Mutex::new(process_group),
         })
+    }
+
+    /// Issue #4909: whether the child currently has bracketed-paste mode on.
+    pub fn bracketed_paste_enabled(&self) -> bool {
+        self.bracketed_paste.load(Ordering::Acquire)
+    }
+
+    /// Issue #4909: record the child's bracketed-paste mode as the output
+    /// parser last saw it.
+    pub fn set_bracketed_paste(&self, enabled: bool) {
+        self.bracketed_paste.store(enabled, Ordering::Release);
     }
 
     // Only the unix reaping tests inject a spawn failure; gating on `test`
@@ -1239,6 +1256,11 @@ pub struct PtyInputReservation {
 }
 
 impl PtyInputReservation {
+    /// Issue #4909: see [`PtyHandle::bracketed_paste_enabled`].
+    pub fn bracketed_paste_enabled(&self) -> bool {
+        self.handle.bracketed_paste_enabled()
+    }
+
     pub fn write_input(&self, data: &[u8]) -> Result<(), TerminalError> {
         if !self.handle.generation_active.load(Ordering::Acquire) {
             return Err(TerminalError::PtyIoError {
