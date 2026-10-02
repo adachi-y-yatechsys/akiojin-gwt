@@ -106,8 +106,11 @@ entry, then select the built-in Claude Code agent with the registered backend.
 The old configuration remains readable and is not rewritten or deleted on launch.
 
 Migrations introduced after this floor remain supported, including Session schema
-5 and PM scratch relocation. The usage `window_minutes` contract and the Workspace
-projection backfill associated with open SPEC #2359 are also retained.
+5, PM scratch relocation, work-item projection rebuild v2 and ProjectKey migration.
+The usage `window_minutes` contract and the Workspace projection backfill associated
+with open SPEC #2359 are also retained. Importing old HOME / Workspace state from
+`workspace/current.json` and `work_items.json` remains a data-protection exception
+until startup can safely diagnose unsupported layouts before creating new state.
 
 ## Requirements
 

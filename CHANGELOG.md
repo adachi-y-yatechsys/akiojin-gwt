@@ -3,6 +3,10 @@
 All notable changes to this project will be documented in this file.
 ## [9.108.0] - 2026-10-02
 
+### Upgrade Notes
+
+- **migration:** 一回限り移行の upgrade floor は v9.72.1（2026-08-03 UTC、変更日の60日前）。古い環境は先に v9.106.0 で各プロジェクトを開いてから更新してください。旧 Claude Code backend 行の未使用の自動移行は廃止しました。旧 backend 設定は自動移行されません。Settings で provider を再登録してください。旧設定は保持されます。
+
 ### Bug Fixes
 
 - **test:** Daemon起動予算とatomic公開テストの負荷依存を除く
@@ -87,10 +91,6 @@ All notable changes to this project will be documented in this file.
 - **windows:** 追加した回帰を事前ビルド済みバイナリで実行する
 
 ## [9.107.0] - 2026-10-01
-
-### Upgrade Notes
-
-- **migration:** 一回限り移行の upgrade floor は v9.72.1（2026-08-03 UTC、変更日の60日前）。古い環境は先に v9.106.0 で各プロジェクトを開いてから更新してください。旧 Claude Code backend 行の未使用の自動移行は廃止しました。旧 backend 設定は自動移行されません。Settings で provider を再登録してください。旧設定は保持されます。
 
 ### Bug Fixes
 

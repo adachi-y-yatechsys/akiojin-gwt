@@ -101,9 +101,12 @@ Settings → Agent Backends で旧設定の endpoint・API key・model を再登
 組み込みの Claude Code と登録した backend を選択してください。
 旧設定は引き続き読み取り可能で、起動時に書き換えたり削除したりしません。
 
-floor 以降に追加された Session schema 5、PM scratch の移行は維持します。
+floor 以降に追加された Session schema 5、PM scratch、work-item projection rebuild v2、
+ProjectKey の移行は維持します。
 usage の `window_minutes` 契約と、未完了の SPEC #2359 に属する Workspace projection
-backfill も維持します。
+backfill も維持します。旧 HOME / Workspace の `workspace/current.json` と
+`work_items.json` からの取り込みはデータ保護の例外として保持し、起動時に新しい状態を
+作る前に未対応の配置を安全に案内できるようになるまで削除しません。
 
 ## 前提
 
