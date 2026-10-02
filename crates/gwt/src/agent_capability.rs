@@ -166,7 +166,6 @@ impl AgentSessionPrincipal {
         )
     }
 
-    #[allow(dead_code)]
     fn new_prepared(
         project_root: &Path,
         session_id: &str,
@@ -259,7 +258,6 @@ impl AgentSessionPrincipal {
         &self.canonical_project_root
     }
 
-    #[allow(dead_code)]
     pub fn execution_binding(&self) -> Option<&gwt_agent::SessionExecutionBinding> {
         self.execution_authority.binding()
     }
@@ -790,7 +788,6 @@ impl AgentCapabilityRegistry {
         self.issue_principal(principal)
     }
 
-    #[allow(dead_code)]
     pub fn issue_prepared(
         &self,
         project_root: &Path,
@@ -1648,7 +1645,6 @@ impl AgentCapabilityIssuer {
         })
     }
 
-    #[allow(dead_code)]
     pub fn issue_prepared(
         &self,
         project_root: &Path,

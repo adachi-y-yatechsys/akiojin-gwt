@@ -4452,26 +4452,6 @@ fn workspace_ensure_error_with_remedy(session_id: &str, reason: &str, remedy: &s
     ))
 }
 
-#[allow(dead_code)] // Legacy non-mutation callers may still use fail-open root lookup.
-pub(crate) fn project_state_root_for_agent_session_or_fallback(
-    fallback_repo_path: &Path,
-    session_id: &str,
-) -> PathBuf {
-    load_session(session_id)
-        .map(|session| canonical_project_state_root_for_session(&session, fallback_repo_path))
-        .unwrap_or_else(|| normalize_project_state_root(fallback_repo_path))
-}
-
-#[allow(dead_code)] // Legacy non-mutation callers may still use fail-open root lookup.
-pub(crate) fn work_event_root_for_agent_session_or_fallback(
-    fallback_repo_path: &Path,
-    session_id: &str,
-) -> PathBuf {
-    load_session(session_id)
-        .map(|session| normalize_project_state_root(&session.worktree_path))
-        .unwrap_or_else(|| normalize_project_state_root(fallback_repo_path))
-}
-
 pub(crate) fn agent_session_roots_or_fallback(
     fallback_repo_path: &Path,
     session_id: &str,
@@ -4549,23 +4529,6 @@ pub(crate) fn repair_split_agent_state_if_needed(
         Ok(changed)
     })
     .map(Option::unwrap_or_default)
-}
-
-#[allow(dead_code)] // Shared by the retained legacy fail-open root helpers.
-fn load_session(session_id: &str) -> Option<Session> {
-    match try_load_session(session_id) {
-        Ok(session) => session,
-        Err(error) => {
-            let path = gwt_core::paths::gwt_sessions_dir().join(format!("{session_id}.toml"));
-            tracing::debug!(
-                error = %error,
-                session_id,
-                path = %path.display(),
-                "failed to load agent session for Project State root resolution"
-            );
-            None
-        }
-    }
 }
 
 fn try_load_session(session_id: &str) -> std::io::Result<Option<Session>> {

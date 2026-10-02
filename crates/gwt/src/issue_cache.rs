@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::{
     collections::BTreeMap,
     fs,
@@ -32,6 +30,7 @@ const SPEC_LABEL: &str = "gwt-spec";
 /// [`gwt_github::body::SpecBody::parse`].
 const SPEC_BODY_HEADER_MARKER: &str = "<!-- gwt-spec id=";
 const ISSUE_CACHE_REFRESH_META_FILE: &str = "refresh-meta.json";
+#[cfg(test)]
 const ISSUE_CACHE_REFRESH_LIMIT: &str = "1000";
 pub const ISSUE_CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 
