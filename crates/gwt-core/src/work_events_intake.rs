@@ -25,7 +25,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::error::{GwtError, JsonDecodeKind, Result};
+use crate::error::{GwtError, Result, WorkspaceStateLoadErrorKind};
 use crate::workspace_projection::{
     decode_workspace_work_event_line, load_workspace_work_items_from_path,
     save_workspace_work_items_projection_to_path, workspace_execution_container_same,
@@ -549,18 +549,13 @@ fn rebuild_work_event_sources_locked_with_legacy(
     close_content: Option<&str>,
     extra_legacy_items: Vec<WorkItem>,
 ) -> Result<WorkEventsIntakeReport> {
+    let mut corrupt_state = None;
     let previous = match load_workspace_work_items_from_path(work_items_path) {
         Ok(previous) => previous,
-        Err(GwtError::JsonDecode {
-            kind: JsonDecodeKind::Malformed,
-            message: error,
-            ..
-        }) => {
-            tracing::warn!(
-                %error,
-                path = %work_items_path.display(),
-                "work events rebuild: discarding corrupt projection"
-            );
+        Err(GwtError::WorkspaceStateLoad(error))
+            if error.kind == WorkspaceStateLoadErrorKind::Malformed =>
+        {
+            corrupt_state = Some(error);
             None
         }
         Err(error) => return Err(error),
@@ -582,6 +577,16 @@ fn rebuild_work_event_sources_locked_with_legacy(
         incoming.extend(collect_machine_local_work_events(content)?);
     }
 
+    if let Some(error) = &corrupt_state {
+        if incoming.is_empty() || report.skipped_invalid > 0 || report.skipped_opaque > 0 {
+            let mut error = error.clone();
+            error
+                .message
+                .push_str("; recovery refused: complete readable event history is required");
+            return Err(error.into());
+        }
+    }
+
     let initial_updated_at = incoming
         .iter()
         .map(|(event, _)| event.updated_at)
@@ -601,7 +606,15 @@ fn rebuild_work_event_sources_locked_with_legacy(
         .work_items
         .sort_by_key(|item| std::cmp::Reverse(item.updated_at));
     projection.updated_at = Utc::now();
-    save_workspace_work_items_projection_to_path(work_items_path, &projection)?;
+    if let Some(error) = corrupt_state {
+        crate::workspace_projection::save_workspace_work_items_projection_after_rebuild(
+            work_items_path,
+            &projection,
+        )?;
+        tracing::warn!(%error, "work events rebuild: recovered corrupt projection from complete event history");
+    } else {
+        save_workspace_work_items_projection_to_path(work_items_path, &projection)?;
+    }
     Ok(report)
 }
 
@@ -2142,6 +2155,36 @@ mod tests {
             .events
             .iter()
             .any(|event| event.id == "evt-recovered"));
+    }
+
+    #[test]
+    fn rebuild_preserves_corrupt_projection_when_sources_are_empty_or_incomplete() {
+        let tmp = tempfile::tempdir().unwrap();
+        let works = tmp.path().join("works.json");
+        let original = b"{\"updated_at\":";
+        let valid = event_json(
+            "evt-recovered",
+            "work-recovered",
+            "start",
+            "2026-07-16T07:00:00Z",
+            ",\"title\":\"Recovered\",\"status_category\":\"active\"",
+        );
+        let opaque = event_json(
+            "evt-future",
+            "work-recovered",
+            "future_event",
+            "2026-07-16T08:00:00Z",
+            "",
+        );
+        for source in [
+            String::new(),
+            format!("{valid}\n{{"),
+            format!("{valid}\n{opaque}"),
+        ] {
+            std::fs::write(&works, original).unwrap();
+            assert!(rebuild_work_events_contents(&works, [source.as_str()], None).is_err());
+            assert_eq!(std::fs::read(&works).unwrap(), original);
+        }
     }
 
     #[test]

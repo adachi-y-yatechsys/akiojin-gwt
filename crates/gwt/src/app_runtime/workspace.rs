@@ -67,20 +67,29 @@ pub(super) fn active_agent_summary_from_session(
 pub(super) fn workspace_projection_owner_title(
     project_root: &Path,
     branch_name: Option<&str>,
-) -> Option<String> {
-    let branch_name = branch_name?.trim();
-    if branch_name.is_empty() {
-        return None;
+) -> gwt_core::error::Result<Option<String>> {
+    let Some(branch_name) = branch_name
+        .map(str::trim)
+        .filter(|branch| !branch.is_empty())
+    else {
+        return Ok(None);
+    };
+    let Some(projection) = gwt_core::workspace_projection::load_workspace_projection(project_root)?
+    else {
+        return Ok(None);
+    };
+    let projection_branch = projection
+        .git_details
+        .as_ref()
+        .and_then(|details| details.branch.as_deref())
+        .map(str::trim);
+    if projection_branch != Some(branch_name) {
+        return Ok(None);
     }
-    let projection = gwt_core::workspace_projection::load_workspace_projection(project_root)
-        .ok()
-        .flatten()?;
-    let projection_branch = projection.git_details.as_ref()?.branch.as_deref()?.trim();
-    if projection_branch != branch_name {
-        return None;
-    }
-    let owner = projection.owner?.trim().to_string();
-    (!owner.is_empty()).then_some(owner)
+    Ok(projection
+        .owner
+        .map(|owner| owner.trim().to_string())
+        .filter(|owner| !owner.is_empty()))
 }
 
 pub(super) fn merge_active_sessions_into_projection<'a>(
@@ -775,6 +784,89 @@ fn spawn_branch_cleanup_async(proxy: AppEventProxy, task: BranchCleanupAsyncTask
 }
 
 impl AppRuntime {
+    /// A cached rail refresh cannot prove that an unreadable works.json has
+    /// recovered: file permissions are not part of its cache signature.
+    pub(crate) fn recheck_workspace_state_after_projection(
+        &self,
+        project_root: &Path,
+        imported_from: Option<PathBuf>,
+    ) {
+        let Some(context) = self.project_context_for_root(project_root) else {
+            return;
+        };
+        let pending = self.project_state(&context).is_some_and(|state| {
+            state
+                .workspace_state_notice
+                .as_ref()
+                .is_some_and(|notice| notice.kind == gwt::WorkspaceStateNoticeKind::LoadError)
+        });
+        if pending || imported_from.is_some() {
+            crate::spawn_workspace_projection_reload(
+                &self.blocking_tasks,
+                self.proxy.clone(),
+                context,
+                imported_from,
+            );
+        }
+    }
+
+    pub(crate) fn handle_workspace_state_load_failed(
+        &mut self,
+        project_root: &Path,
+        error: gwt_core::WorkspaceStateLoadError,
+    ) -> Vec<OutboundEvent> {
+        let Some(context) = self.project_context_for_root(project_root) else {
+            return Vec::new();
+        };
+        tracing::warn!(path = %error.path.display(), error = %error.message, "workspace state load failed");
+        let notice = gwt::WorkspaceStateNoticeView {
+            path: error.path.display().to_string(),
+            message: error.message,
+            kind: gwt::WorkspaceStateNoticeKind::LoadError,
+        };
+        self.project_state_mut(&context)
+            .expect("current project")
+            .workspace_state_notice = Some(notice.clone());
+        vec![OutboundEvent::project(
+            context.project_key,
+            BackendEvent::WorkspaceStateNotice {
+                notice: Some(notice),
+            },
+        )]
+    }
+
+    pub(crate) fn handle_workspace_state_loaded(
+        &mut self,
+        project_root: &Path,
+        imported_from: Option<PathBuf>,
+    ) -> Vec<OutboundEvent> {
+        let Some(context) = self.project_context_for_root(project_root) else {
+            return Vec::new();
+        };
+        let state = self.project_state_mut(&context).expect("current project");
+        let recovered = state
+            .workspace_state_notice
+            .as_ref()
+            .is_some_and(|notice| notice.kind == gwt::WorkspaceStateNoticeKind::LoadError);
+        if imported_from.is_none() && !recovered {
+            return Vec::new();
+        }
+        let notice = imported_from.map(|path| gwt::WorkspaceStateNoticeView {
+            path: path.display().to_string(),
+            message: "旧配置から取り込みました。元のファイルは保持されています。".to_string(),
+            kind: gwt::WorkspaceStateNoticeKind::LegacyImported,
+        });
+        state.workspace_state_notice = notice.clone();
+        if recovered {
+            self.spawn_work_events_ingest(project_root.to_path_buf(), true);
+            let _ = self.active_work_projection_broadcast_for_tab(&context.tab_id);
+        }
+        vec![OutboundEvent::project(
+            context.project_key,
+            BackendEvent::WorkspaceStateNotice { notice },
+        )]
+    }
+
     pub(crate) fn run_branch_cleanup_events(
         &self,
         client_id: &str,

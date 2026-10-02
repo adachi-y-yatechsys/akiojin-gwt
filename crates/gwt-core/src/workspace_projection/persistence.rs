@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use crate::{
     coordination::{BoardEntry, BoardEntryKind},
-    error::{GwtError, JsonDecodeKind, Result},
+    error::{GwtError, JsonDecodeKind, Result, WorkspaceStateLoadError},
     paths::{
         gwt_project_dir_for_repo_path, gwt_repo_local_work_events_dir,
         gwt_repo_local_work_events_path, gwt_work_event_shard_path,
@@ -97,6 +97,33 @@ fn legacy_workspace_work_items_path_for_repo_path(repo_path: &Path) -> PathBuf {
 
 fn legacy_workspace_work_events_path_for_repo_path(repo_path: &Path) -> PathBuf {
     gwt_project_dir_for_repo_path(repo_path).join("workspace/work_events.jsonl")
+}
+
+/// Return the first legacy state file that the next load would import.
+/// Existence errors remain load errors, never evidence of a fresh project.
+pub fn pending_legacy_workspace_state_import(repo_path: &Path) -> Result<Option<PathBuf>> {
+    for (canonical, legacy) in [
+        (
+            gwt_workspace_projection_path_for_repo_path(repo_path),
+            legacy_workspace_projection_path_for_repo_path(repo_path),
+        ),
+        (
+            gwt_workspace_work_items_path_for_repo_path(repo_path),
+            legacy_workspace_work_items_path_for_repo_path(repo_path),
+        ),
+    ] {
+        if canonical != legacy
+            && !canonical
+                .try_exists()
+                .map_err(|error| WorkspaceStateLoadError::io(&canonical, error))?
+            && legacy
+                .try_exists()
+                .map_err(|error| WorkspaceStateLoadError::io(&legacy, error))?
+        {
+            return Ok(Some(legacy));
+        }
+    }
+    Ok(None)
 }
 
 fn copy_legacy_workspace_file_if_needed(legacy_path: &Path, canonical_path: &Path) -> Result<()> {
@@ -3811,12 +3838,12 @@ pub fn load_workspace_projection_from_path(path: &Path) -> Result<Option<Workspa
     match fs::read(path) {
         Ok(bytes) => {
             let mut projection: WorkspaceProjection = serde_json::from_slice(&bytes)
-                .map_err(|error| GwtError::Other(format!("workspace projection json: {error}")))?;
+                .map_err(|error| WorkspaceStateLoadError::json(path, error))?;
             migrate_workspace_to_work_terminology(&mut projection);
             Ok(Some(projection))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
+        Err(error) => Err(WorkspaceStateLoadError::io(path, error).into()),
     }
 }
 
@@ -3865,7 +3892,7 @@ pub fn load_workspace_work_items_from_path(path: &Path) -> Result<Option<WorkIte
             #[cfg(debug_assertions)]
             mark_playwright_work_items_decode_started(path);
             let mut items: WorkItemsProjection = serde_json::from_slice(&bytes)
-                .map_err(|error| classify_json_decode_error("workspace work items json", error))?;
+                .map_err(|error| WorkspaceStateLoadError::json(path, error))?;
             for item in &mut items.work_items {
                 if item.title == "Workspace" {
                     item.title = "Work".to_string();
@@ -3887,7 +3914,7 @@ pub fn load_workspace_work_items_from_path(path: &Path) -> Result<Option<WorkIte
             Ok(Some(items))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
+        Err(error) => Err(WorkspaceStateLoadError::io(path, error).into()),
     }
 }
 
@@ -4217,6 +4244,18 @@ impl WorkItemsCache {
 }
 
 pub fn save_workspace_work_items_projection_to_path(
+    path: &Path,
+    projection: &WorkItemsProjection,
+) -> Result<()> {
+    // Callers already hold the non-reentrant Workspace transaction lock.
+    // Validate before every ordinary write, including a GUI default snapshot.
+    validate_existing_workspace_state::<WorkItemsProjection>(path)?;
+    save_workspace_work_items_projection_after_rebuild(path, projection)
+}
+
+/// Only the complete-source rebuild may replace a syntactically corrupt file.
+/// Its caller must hold the Workspace lock and validate the entire source first.
+pub(crate) fn save_workspace_work_items_projection_after_rebuild(
     path: &Path,
     projection: &WorkItemsProjection,
 ) -> Result<()> {
@@ -7033,9 +7072,22 @@ fn save_workspace_projection_to_path_unlocked(
     path: &Path,
     projection: &WorkspaceProjection,
 ) -> Result<()> {
+    validate_existing_workspace_state::<WorkspaceProjection>(path)?;
     let bytes = serde_json::to_vec_pretty(projection)
         .map_err(|error| GwtError::Other(format!("workspace projection json: {error}")))?;
     write_atomic(path, &bytes)
+}
+
+fn validate_existing_workspace_state<T: serde::de::DeserializeOwned>(path: &Path) -> Result<()> {
+    match fs::read(path) {
+        Ok(bytes) => {
+            serde_json::from_slice::<T>(&bytes)
+                .map_err(|error| WorkspaceStateLoadError::json(path, error))?;
+            Ok(())
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(WorkspaceStateLoadError::io(path, error).into()),
+    }
 }
 
 pub fn update_workspace_projection_with_journal_paths(
@@ -8683,7 +8735,7 @@ pub fn classify_workspace_projections<F>(
     config: &WorkspaceRetentionConfig,
     now: DateTime<Utc>,
     is_active_session: F,
-) -> Vec<ClassifiedProjection>
+) -> Result<Vec<ClassifiedProjection>>
 where
     F: Fn(&WorkspaceProjection) -> bool,
 {
@@ -8691,28 +8743,31 @@ where
 
     let entries = match fs::read_dir(scan_root) {
         Ok(entries) => entries,
-        Err(_) => return results,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(results),
+        Err(error) => return Err(WorkspaceStateLoadError::io(scan_root, error).into()),
     };
 
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry.map_err(|error| WorkspaceStateLoadError::io(scan_root, error))?;
         let project_dir = entry.path();
-        if !project_dir.is_dir() {
+        if !fs::metadata(&project_dir)
+            .map_err(|error| WorkspaceStateLoadError::io(&project_dir, error))?
+            .is_dir()
+        {
             continue;
         }
         let state_dir = project_dir.join("project-state");
         let legacy_dir = project_dir.join("workspace");
-        let workspace_dir = if state_dir.join("current.json").is_file() {
-            state_dir
-        } else if legacy_dir.join("current.json").is_file() {
-            legacy_dir
-        } else {
-            continue;
-        };
-        let current_json = workspace_dir.join("current.json");
-        let projection = match load_workspace_projection_from_path(&current_json) {
-            Ok(Some(p)) => p,
-            _ => continue,
-        };
+        let (workspace_dir, projection) =
+            match load_workspace_projection_from_path(&state_dir.join("current.json"))? {
+                Some(projection) => (state_dir, projection),
+                None => {
+                    match load_workspace_projection_from_path(&legacy_dir.join("current.json"))? {
+                        Some(projection) => (legacy_dir, projection),
+                        None => continue,
+                    }
+                }
+            };
 
         let stale_reason = workspace_projection_stale_reason(&projection, config, now);
 
@@ -8759,7 +8814,7 @@ where
         });
     }
 
-    results
+    Ok(results)
 }
 
 fn workspace_projection_is_empty_default(projection: &WorkspaceProjection) -> bool {
@@ -8808,17 +8863,25 @@ fn workspace_agent_is_empty_stub(agent: &WorkspaceAgentSummary) -> bool {
 pub fn apply_prune_plan(plan: &[ClassifiedProjection], dry_run: bool) -> Result<PruneSummary> {
     let mut summary = PruneSummary::default();
     for item in plan {
+        let current_json = item.workspace_dir.join("current.json");
+        let work_items_path =
+            item.workspace_dir
+                .join(if item.workspace_dir.ends_with("workspace") {
+                    "work_items.json"
+                } else {
+                    "works.json"
+                });
         match &item.action {
             PruneAction::Skip { .. } => {
                 summary.skipped += 1;
             }
             PruneAction::Archive => {
                 if !dry_run {
-                    let current_json = item.workspace_dir.join("current.json");
-                    let work_items_path = current_json.with_file_name("works.json");
-                    with_workspace_work_items_lock(&work_items_path, || {
-                        if let Ok(Some(mut projection)) =
-                            load_workspace_projection_from_path(&current_json)
+                    let lock_target = current_json.with_file_name("works.json");
+                    with_workspace_work_items_lock(&lock_target, || {
+                        validate_existing_workspace_state::<WorkItemsProjection>(&work_items_path)?;
+                        if let Some(mut projection) =
+                            load_workspace_projection_from_path(&current_json)?
                         {
                             projection.lifecycle_stage = WorkspaceLifecycleStage::Archived;
                             projection.updated_at = Utc::now();
@@ -8831,6 +8894,10 @@ pub fn apply_prune_plan(plan: &[ClassifiedProjection], dry_run: bool) -> Result<
             }
             PruneAction::Delete => {
                 if !dry_run {
+                    // Validate immediately before removal. Holding works.lock
+                    // inside this directory prevents its deletion on Windows.
+                    validate_existing_workspace_state::<WorkspaceProjection>(&current_json)?;
+                    validate_existing_workspace_state::<WorkItemsProjection>(&work_items_path)?;
                     remove_workspace_dir_and_empty_project_dir(&item.workspace_dir)?;
                 }
                 summary.deleted += 1;
