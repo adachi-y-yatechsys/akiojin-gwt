@@ -406,6 +406,9 @@ jobs:
       - name: Run Windows PTY resolver adapter tests
         run: node scripts/ci-windows-tests.mjs run gwt-terminal lib gwt_terminal pty::windows_spawn::tests -- --test-threads=1
         timeout-minutes: 15
+      - name: Run inherited Claude session environment regressions
+        run: node scripts/ci-windows-tests.mjs run gwt-agent lib gwt_agent claude_child_session_marker -- --test-threads=1
+        timeout-minutes: 15
       # Issue #3631: a GUI-subsystem PTY start gate is never attached to the
       # pane's pseudoconsole, so the released agent renders in an external
       # Windows Terminal window. Both guards are Windows-only and would be

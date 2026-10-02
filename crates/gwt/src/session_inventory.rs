@@ -10,6 +10,9 @@ use serde::Serialize;
 pub struct SessionObservation {
     pub session_id: String,
     pub issue_number: Option<u64>,
+    /// A linked Session cannot produce work without a durable binding.
+    /// This reports absence only, not validity or permission to run.
+    pub execution_binding_missing: bool,
     pub agent_id: String,
     pub worktree_path: PathBuf,
     pub worktree_exists: bool,
@@ -357,6 +360,8 @@ fn observe_candidates(
             inventory.sessions.push(SessionObservation {
                 session_id: session.id.clone(),
                 issue_number: session.linked_issue_number,
+                execution_binding_missing: session.linked_issue_number.is_some()
+                    && session.execution_binding.is_none(),
                 agent_id: session.agent_id.command().to_string(),
                 worktree_exists: session.worktree_path.is_dir(),
                 worktree_path: session.worktree_path.clone(),
@@ -473,6 +478,24 @@ mod tests {
         ] {
             save_runtime(&sessions, &project, worktree, id, Some(child));
         }
+        let mut unlinked = Session::load(&sessions.join("second.toml")).unwrap();
+        unlinked.linked_issue_number = None;
+        unlinked.save(&sessions).unwrap();
+        let mut bound = Session::load(&sessions.join("missing.toml")).unwrap();
+        bound.execution_binding = Some(gwt_agent::SessionExecutionBinding {
+            schema_version: 1,
+            session_id: bound.id.clone(),
+            repo_hash: "repo".to_string(),
+            owner_kind: "issue".to_string(),
+            owner_number: 4305,
+            identity: gwt_agent::ExecutionBindingIdentity {
+                binding_id: "binding".to_string(),
+                generation_id: "generation".to_string(),
+                ledger_head_hash: "head".to_string(),
+            },
+            capability_generation: 1,
+        });
+        bound.save(&sessions).unwrap();
         let duplicate = gwt_agent::runtime_state_path_for_pid(&sessions, 100, "first");
         let duplicate_target = gwt_agent::runtime_state_path_for_pid(&sessions, 101, "first");
         std::fs::create_dir_all(duplicate_target.parent().unwrap()).unwrap();
@@ -501,6 +524,16 @@ mod tests {
             "count each live PTY, not distinct owners"
         );
         assert!(observed.uncertainties.is_empty());
+        // Issue #4788: this inventory is serialized as active_sessions by
+        // issue.monitor.status; an unbound linked window must be identifiable.
+        let status_sessions = serde_json::to_value(&observed.sessions).unwrap();
+        for row in status_sessions.as_array().unwrap() {
+            assert_eq!(
+                row["execution_binding_missing"],
+                serde_json::json!(row["session_id"] == "first"),
+                "only the linked unbound Session lacks producing authority: {row}"
+            );
+        }
         let first = observed
             .sessions
             .iter()

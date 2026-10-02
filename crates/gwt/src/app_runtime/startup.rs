@@ -1098,23 +1098,7 @@ impl AppRuntime {
             return Err(RestoreRefusal::DiagnosticWindow);
         }
         // Preserve terminal cleanup before applying spawn-only refusals.
-        let mut completed_work = false;
-        match self.restore_work_terminality(session, project_root, window_id) {
-            RestoreAdmission::RefuseTerminal(reason) => {
-                return Err(RestoreRefusal::TerminalWork(reason))
-            }
-            RestoreAdmission::RefuseUnprovable(cause) => {
-                return Err(RestoreRefusal::TerminalFactsUnreadable(cause))
-            }
-            RestoreAdmission::RefuseRetainedTerminal => {
-                return Err(RestoreRefusal::ClosedWorkDiagnostic)
-            }
-            RestoreAdmission::RefuseHeld(cause) => return Err(RestoreRefusal::MonitorHold(cause)),
-            // Issue #4802 (AC-4): a spawn-only refusal, reported after the
-            // more specific worktree answers below.
-            RestoreAdmission::RefuseCompletedWork => completed_work = true,
-            RestoreAdmission::Admit => {}
-        }
+        let completed_work = self.work_terminality_refusal(session, project_root, window_id)?;
         // Reopened #4143 AC-6: queued and in-flight restores reserve their
         // worktree before a PTY attaches and enters active_agent_sessions.
         let worktree = &session.worktree_path;
@@ -1173,6 +1157,62 @@ impl AppRuntime {
             return Err(RestoreRefusal::NoResumeSession);
         }
         Ok(())
+    }
+
+    /// The Work-terminality half of [`Self::restore_admission`]. `Ok(true)`
+    /// is the spawn-only `CompletedWork` refusal of Issue #4802 (AC-4), which
+    /// the caller reports after the more specific worktree answers.
+    fn work_terminality_refusal(
+        &self,
+        session: &gwt_agent::Session,
+        project_root: &Path,
+        window_id: Option<&str>,
+    ) -> Result<bool, RestoreRefusal> {
+        match self.restore_work_terminality(session, project_root, window_id) {
+            RestoreAdmission::RefuseTerminal(reason) => Err(RestoreRefusal::TerminalWork(reason)),
+            RestoreAdmission::RefuseUnprovable(cause) => {
+                Err(RestoreRefusal::TerminalFactsUnreadable(cause))
+            }
+            RestoreAdmission::RefuseRetainedTerminal => Err(RestoreRefusal::ClosedWorkDiagnostic),
+            RestoreAdmission::RefuseHeld(cause) => Err(RestoreRefusal::MonitorHold(cause)),
+            RestoreAdmission::RefuseCompletedWork => Ok(true),
+            RestoreAdmission::Admit => Ok(false),
+        }
+    }
+
+    /// Issue #4783 AC-2: the admission decision, re-read at the spawn
+    /// boundary of an automatic restore.
+    ///
+    /// Admission runs once, at the startup sweep or the Open Project sweep;
+    /// the PTY spawn that restores the window happens later, after the canvas
+    /// round trip (and, for a PM worktree, an asynchronous preparation). The
+    /// spawn used to re-check only the cwd and the PM guards, so Work that
+    /// became terminal in between — or was admitted on facts a concurrent
+    /// Monitor scan has since settled — still came back as an agent. Reading
+    /// the same facts again immediately before the spawn is what keeps the
+    /// restore honest to the decision it was granted.
+    fn late_restore_refusal(
+        &self,
+        tab_id: &str,
+        session: &gwt_agent::Session,
+    ) -> Option<RestoreRefusal> {
+        let tab = self.tab(tab_id)?;
+        let placeholder_window_id = tab
+            .workspace
+            .persisted()
+            .windows
+            .iter()
+            .find(|window| window.session_id.as_deref() == Some(session.id.as_str()))
+            .map(|window| combined_window_id(tab_id, &window.id));
+        match self.work_terminality_refusal(
+            session,
+            &tab.project_root,
+            placeholder_window_id.as_deref(),
+        ) {
+            Err(refusal) => Some(refusal),
+            Ok(true) => Some(RestoreRefusal::CompletedWork),
+            Ok(false) => None,
+        }
     }
 
     /// Only discard a provably empty placeholder. An unknown execution,
@@ -1660,10 +1700,27 @@ impl AppRuntime {
         fallback_geometry: WindowGeometry,
         origin: RestoreOrigin,
     ) -> Vec<OutboundEvent> {
+        // Issue #4783 AC-2: re-evaluate the admission immediately before the
+        // spawn. A refusal here is logged like the sweep's, and a terminal
+        // one removes its placeholder the same way; the caller then counts
+        // the missing spawn as `launch_not_started`.
+        if origin == RestoreOrigin::Automatic {
+            if let Some(refusal) = self.late_restore_refusal(tab_id, &session) {
+                RestoreAdmissionLog::default().refuse(&session.id, refusal);
+                if let Some(reason) = refusal.removal_reason() {
+                    self.remove_refused_session_restore(tab_id, &session.id, None, reason);
+                }
+                return Vec::new();
+            }
+        }
         let mut config = launch_config_from_persisted_session(&session);
         if origin == RestoreOrigin::UserRequested {
             config.launch_route = gwt_agent::LaunchRoute::Manual;
         }
+        // Issue #4783 AC-2: tell the launch worker this Resume is a restore
+        // nobody asked for, so a terminal predecessor generation is left
+        // alone instead of being continued into a new Active generation.
+        config.automatic_restore = origin == RestoreOrigin::Automatic;
         let geometry = self
             .remove_stale_paused_agent_window(tab_id, &session.id, None)
             .unwrap_or(fallback_geometry);
