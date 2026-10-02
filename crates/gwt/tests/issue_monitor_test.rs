@@ -2708,6 +2708,7 @@ fn migration_preserves_windows_needs_human_and_all_unrelated_prefs() {
         review_dispatch_hold: None,
         last_failure_message: None,
         delivering_since: None,
+        review_attempts: None,
     });
     let mut monitor = IssueMonitorState::with_prefs(IssueMonitorConfig::default(), prefs);
     scan_queued_candidates(

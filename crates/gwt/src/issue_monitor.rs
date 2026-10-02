@@ -4861,7 +4861,46 @@ pub struct AutonomousIssueRecord {
     /// `Delivering`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivering_since: Option<String>,
+    /// Issue #4815: failed independent-review dispatches for the current
+    /// reviewed SHA. Kept apart from `attempts`: a review window that could
+    /// not start or died without a verdict is not a failed implementation,
+    /// and the implementation launch keeps its slot while the review backs
+    /// off. A new head SHA starts the count over.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_attempts: Option<AutonomousReviewAttempts>,
 }
+
+/// Issue #4815: the review-dispatch half of the retry ladder, keyed by the
+/// reviewed SHA.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutonomousReviewAttempts {
+    pub reviewed_sha: String,
+    /// Failed review windows for `reviewed_sha` so far.
+    pub count: u32,
+    pub last_error: String,
+    pub last_failed_at: String,
+    /// RFC3339 before which no review for `reviewed_sha` is dispatched
+    /// (the 60→1800 s ladder, same tuning as implementation retries).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_before: Option<String>,
+}
+
+/// Issue #4815: what recording a failed review window did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutonomousReviewFailureOutcome {
+    /// The next dispatch for the same SHA waits until `not_before`.
+    Retry {
+        attempt: u32,
+        not_before: Option<String>,
+    },
+    /// `max_attempts` identical failures: dispatch stops for this SHA and the
+    /// PM is asked to steer.
+    Exhausted { attempt: u32 },
+}
+
+/// Issue #4815 AC-3: the launch-stage marker the GUI logs when the PTY was
+/// handed over; a pane that dies right after it never ran a hook.
+const REVIEW_PTY_HANDOFF_MARKER: &str = "PTY handoff complete";
 
 /// Issue #4726: why a `Delivering` record stops watching for its merge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5124,6 +5163,18 @@ pub fn autonomous_retry_backoff_secs(attempt: u32, base_secs: u64, cap_secs: u64
     scaled.min(cap_secs)
 }
 
+/// Issue #4815 AC-3: the text a failed review window is recorded with. A pane
+/// that died before its first hook carries only the GUI's launch-stage marker
+/// ("PTY handoff complete") or nothing at all; neither is a failure reason,
+/// so the row says what actually happened.
+fn review_failure_message(message: String) -> String {
+    let trimmed = message.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case(REVIEW_PTY_HANDOFF_MARKER) {
+        return "review window exited before its first hook (start-gate failure)".to_string();
+    }
+    trimmed.to_string()
+}
+
 /// Add `secs` to an RFC3339 instant, returning the new RFC3339 string. `None`
 /// when `now` is not parseable as RFC3339.
 fn rfc3339_plus_secs(now: &str, secs: u64) -> Option<String> {
@@ -5255,6 +5306,7 @@ impl AutonomousIssueRecord {
             review_dispatch_hold: None,
             last_failure_message: None,
             delivering_since: None,
+            review_attempts: None,
         }
     }
 }
@@ -12287,7 +12339,11 @@ impl IssueMonitorState {
     /// SPEC #3200 FR-015: record the independent-review verdict for the in-flight
     /// reviewed SHA. The gate is evaluated on the next tick.
     pub fn record_review_verdict(&mut self, issue_number: u64, passed: bool) {
-        self.autonomous_record_mut(issue_number).review_passed = Some(passed);
+        let record = self.autonomous_record_mut(issue_number);
+        record.review_passed = Some(passed);
+        // Issue #4815: a verdict means the review window ran; the failures
+        // that preceded it no longer describe this SHA.
+        record.review_attempts = None;
         // Issue #4117 AC-2: the verdict is the review window's last act; its
         // slot is free even though the idle pane is closed a scan later.
         self.forget_review_window(issue_number);
@@ -12315,9 +12371,14 @@ impl IssueMonitorState {
         &self,
         issue_number: u64,
         pr_number: u64,
+        head_sha: Option<&str>,
         now: &str,
     ) -> Option<AutonomousReviewDispatchHold> {
-        let reason = if let Some(window) = self
+        let reason = if let Some(reason) =
+            self.review_retry_hold_reason(issue_number, pr_number, head_sha, now)
+        {
+            reason
+        } else if let Some(window) = self
             .review_windows
             .values()
             .find(|window| window.pr_number == pr_number)
@@ -12352,6 +12413,190 @@ impl IssueMonitorState {
         Some(AutonomousReviewDispatchHold { reason, since })
     }
 
+    /// Issue #4815 AC-1/AC-2: the review ladder's own refusal. `head_sha` is
+    /// the PR head when the caller already read it: a head that moved on from
+    /// the failed SHA is a new review and is never held by the old one. With
+    /// no head to compare, the recorded SHA is assumed current (the worker
+    /// reads the head first whenever attempts are recorded, see
+    /// [`Self::review_attempts_recorded`]).
+    fn review_retry_hold_reason(
+        &self,
+        issue_number: u64,
+        pr_number: u64,
+        head_sha: Option<&str>,
+        now: &str,
+    ) -> Option<String> {
+        let attempts = self
+            .autonomous_records
+            .get(&issue_number)?
+            .review_attempts
+            .as_ref()?;
+        if head_sha.is_some_and(|sha| sha != attempts.reviewed_sha) {
+            return None;
+        }
+        let max = self.autonomous_tuning.max_attempts;
+        if attempts.count >= max {
+            return Some(format!(
+                "independent review for PR #{pr_number} at {} failed {}/{max} times (last error: {}); dispatch stops until the PR head changes or the operator steers",
+                attempts.reviewed_sha, attempts.count, attempts.last_error
+            ));
+        }
+        let not_before = attempts.not_before.as_deref()?;
+        let pending = match (
+            chrono::DateTime::parse_from_rfc3339(now),
+            chrono::DateTime::parse_from_rfc3339(not_before),
+        ) {
+            (Ok(now), Ok(not_before)) => now < not_before,
+            // An unparseable clock fails open, like `retry_ready`.
+            _ => false,
+        };
+        pending.then(|| {
+            format!(
+                "independent review for PR #{pr_number} at {} is backing off until {not_before} (attempt {}/{max} failed: {})",
+                attempts.reviewed_sha, attempts.count, attempts.last_error
+            )
+        })
+    }
+
+    /// Issue #4815: whether the review ladder holds anything for this Issue,
+    /// so the worker reads the PR head before asking for the hold.
+    pub fn review_attempts_recorded(&self, issue_number: u64) -> bool {
+        self.autonomous_records
+            .get(&issue_number)
+            .is_some_and(|record| record.review_attempts.is_some())
+    }
+
+    /// Issue #4815 AC-1: one failed review window — a spawn that errored, or a
+    /// pane that ended without a verdict — for the SHA under review.
+    ///
+    /// Counts on the record's review ladder (not on `attempts`: the
+    /// implementation did not fail, and its launch keeps its slot), schedules
+    /// the next dispatch on the 60→1800 s ladder, puts the record back to
+    /// `Implementing` so the next scan re-detects the PR, and writes the
+    /// reason on the inbox row. At `max_attempts` identical failures (AC-2)
+    /// dispatch for this SHA stops and the PM is asked to steer. `None` when
+    /// no review is in flight for the Issue.
+    pub fn record_review_failure(
+        &mut self,
+        issue_number: u64,
+        message: impl Into<String>,
+        now: &str,
+    ) -> Option<AutonomousReviewFailureOutcome> {
+        let record = self.autonomous_records.get(&issue_number)?;
+        if record.phase != AutonomousPhase::Reviewing || record.review_passed.is_some() {
+            return None;
+        }
+        let pr_number = record.pr_number?;
+        let reviewed_sha = record.reviewed_sha.clone().unwrap_or_default();
+        let message = review_failure_message(message.into());
+        let max = self.autonomous_tuning.max_attempts;
+        let base = self.autonomous_tuning.retry_backoff_base_secs;
+        let cap = self.autonomous_tuning.retry_backoff_cap_secs;
+        let record = self.autonomous_record_mut(issue_number);
+        // AC-2: a new head SHA resets the count.
+        let count = record
+            .review_attempts
+            .as_ref()
+            .filter(|attempts| attempts.reviewed_sha == reviewed_sha)
+            .map_or(0, |attempts| attempts.count)
+            .saturating_add(1);
+        let not_before = rfc3339_plus_secs(now, autonomous_retry_backoff_secs(count, base, cap));
+        record.review_attempts = Some(AutonomousReviewAttempts {
+            reviewed_sha: reviewed_sha.clone(),
+            count,
+            last_error: message.clone(),
+            last_failed_at: now.to_string(),
+            not_before: not_before.clone(),
+        });
+        // The record returns to Implementing: the PR is still open and the
+        // next scan re-detects it; the ladder decides when it is dispatched.
+        // The heartbeat is refreshed for the same reason
+        // `resume_inflight_reviews_after_restart` refreshes it — a review
+        // failure is not implementation silence.
+        record.phase = AutonomousPhase::Implementing;
+        record.review_passed = None;
+        record.last_heartbeat = Some(now.to_string());
+        self.forget_review_window(issue_number);
+        let row_message = format!(
+            "independent review for PR #{pr_number} at {reviewed_sha} failed (attempt {count}/{max}): {message}"
+        );
+        if let Some(item) = self
+            .inbox
+            .iter_mut()
+            .find(|item| item.issue.number == issue_number)
+        {
+            item.error_message = Some(row_message.clone());
+        }
+        self.push_autonomous_notice("warn", issue_number, row_message);
+        let hold_reason = self
+            .review_retry_hold_reason(issue_number, pr_number, Some(&reviewed_sha), now)
+            .unwrap_or_else(|| {
+                format!(
+                    "independent review for PR #{pr_number} at {reviewed_sha} failed: {message}"
+                )
+            });
+        let since = self
+            .autonomous_records
+            .get(&issue_number)
+            .and_then(|record| record.review_dispatch_hold.as_ref())
+            .map(|hold| hold.since.clone())
+            .unwrap_or_else(|| now.to_string());
+        self.hold_review_dispatch(
+            issue_number,
+            AutonomousReviewDispatchHold {
+                reason: hold_reason,
+                since,
+            },
+        );
+        if count >= max {
+            self.request_autonomous_steering(
+                issue_number,
+                format!(
+                    "independent review for PR #{pr_number} at {reviewed_sha} failed {count}/{max} times; last error: {message}; dispatch stops until the PR head changes"
+                ),
+                now,
+            );
+            return Some(AutonomousReviewFailureOutcome::Exhausted { attempt: count });
+        }
+        Some(AutonomousReviewFailureOutcome::Retry {
+            attempt: count,
+            not_before,
+        })
+    }
+
+    /// Issue #4815: whether a failure reported for `issue_number` belongs to
+    /// its in-flight review rather than to the implementation launch. A
+    /// launch failure while the record is `Reviewing` can only be the review
+    /// window (the implementation is already launched); an agent failure is
+    /// the review's unless a fresh canvas shows the bound implementation pane
+    /// itself dead.
+    fn review_failure_applies(
+        &self,
+        issue_number: u64,
+        state: MonitorInboxState,
+        now: &str,
+    ) -> bool {
+        let Some(record) = self.autonomous_records.get(&issue_number) else {
+            return false;
+        };
+        if record.phase != AutonomousPhase::Reviewing || record.review_passed.is_some() {
+            return false;
+        }
+        if state != MonitorInboxState::AgentFailed {
+            return true;
+        }
+        let (Some(window_id), Some(snapshot)) = (
+            self.launched_windows.get(&issue_number),
+            self.fresh_window_snapshot(now),
+        ) else {
+            return true;
+        };
+        !snapshot.windows.iter().any(|observed| {
+            issue_monitor_window_ids_match(window_id, &observed.window_id)
+                && matches!(observed.status, WindowState::Stopped | WindowState::Error)
+        })
+    }
+
     /// Issue #4117: keep the refusal on the record the PM reads.
     pub fn hold_review_dispatch(&mut self, issue_number: u64, hold: AutonomousReviewDispatchHold) {
         self.autonomous_record_mut(issue_number)
@@ -12378,13 +12623,24 @@ impl IssueMonitorState {
     ) -> Result<(), AutonomousReviewDispatchHold> {
         let issue_number = dispatch.issue_number;
         let pr_number = dispatch.pr_number;
-        if let Some(hold) = self.review_dispatch_hold(issue_number, pr_number, now) {
+        if let Some(hold) =
+            self.review_dispatch_hold(issue_number, pr_number, Some(&dispatch.reviewed_sha), now)
+        {
             self.hold_review_dispatch(issue_number, hold.clone());
             return Err(hold);
         }
         self.begin_review(issue_number, pr_number, dispatch.reviewed_sha.clone());
-        self.autonomous_record_mut(issue_number)
-            .review_dispatch_hold = None;
+        let record = self.autonomous_record_mut(issue_number);
+        record.review_dispatch_hold = None;
+        // Issue #4815 AC-2: the ladder belongs to one SHA; a dispatch for a
+        // new head starts clean.
+        if record
+            .review_attempts
+            .as_ref()
+            .is_some_and(|attempts| attempts.reviewed_sha != dispatch.reviewed_sha)
+        {
+            record.review_attempts = None;
+        }
         self.review_windows.insert(
             issue_number,
             IssueMonitorReviewWindow {
@@ -12440,20 +12696,66 @@ impl IssueMonitorState {
                 }
             }
         }
+        // Issue #4815 AC-1: a review window that left the canvas, died on it,
+        // or never appeared is a review that produced no verdict. Record the
+        // failure on the review ladder instead of only forgetting the entry,
+        // or the next scan re-dispatches the same SHA with no backoff.
+        let mut failed = Vec::new();
         self.review_windows
-            .retain(|_, window| match window.window_id.as_deref() {
-                Some(window_id) => {
-                    let owned_here = issue_monitor_qualified_window_id(window_id)
-                        .is_some_and(|(tab_id, _)| tab_id == snapshot.project_tab_id);
-                    !owned_here
-                        || snapshot.windows.iter().any(|observed| {
-                            issue_monitor_window_ids_match(window_id, &observed.window_id)
-                                && idle_window_is_alive(observed.status)
-                        })
+            .retain(|issue_number, window| {
+                let (alive, reason) = match window.window_id.as_deref() {
+                    Some(window_id) => {
+                        let owned_here = issue_monitor_qualified_window_id(window_id)
+                            .is_some_and(|(tab_id, _)| tab_id == snapshot.project_tab_id);
+                        if !owned_here {
+                            (true, None)
+                        } else {
+                            match snapshot.windows.iter().find(|observed| {
+                                issue_monitor_window_ids_match(window_id, &observed.window_id)
+                            }) {
+                                Some(observed) if idle_window_is_alive(observed.status) => {
+                                    (true, None)
+                                }
+                                Some(observed) => (
+                                    false,
+                                    Some(format!(
+                                        "review window {window_id} exited without a verdict ({:?})",
+                                        observed.status
+                                    )),
+                                ),
+                                None => (
+                                    false,
+                                    Some(format!(
+                                        "review window {window_id} left the canvas without a verdict"
+                                    )),
+                                ),
+                            }
+                        }
+                    }
+                    None => {
+                        if rfc3339_elapsed_secs(&window.dispatched_at, now)
+                            .is_none_or(|elapsed| elapsed < REVIEW_WINDOW_SPAWN_GRACE_SECS)
+                        {
+                            (true, None)
+                        } else {
+                            (
+                                false,
+                                Some(format!(
+                                    "review window dispatched at {} never appeared within {REVIEW_WINDOW_SPAWN_GRACE_SECS}s",
+                                    window.dispatched_at
+                                )),
+                            )
+                        }
+                    }
+                };
+                if let Some(reason) = reason {
+                    failed.push((*issue_number, reason));
                 }
-                None => rfc3339_elapsed_secs(&window.dispatched_at, now)
-                    .is_none_or(|elapsed| elapsed < REVIEW_WINDOW_SPAWN_GRACE_SECS),
+                alive
             });
+        for (issue_number, reason) in failed {
+            self.record_review_failure(issue_number, reason, now);
+        }
     }
 
     /// SPEC #3200 FR-015/FR-016: apply a raw review verdict reported by the
@@ -14343,7 +14645,7 @@ impl IssueMonitorState {
         self.record_launch_failed_at(issue_number, message, &now);
     }
 
-    fn record_launch_failed_at(
+    pub(crate) fn record_launch_failed_at(
         &mut self,
         issue_number: u64,
         message: impl Into<String>,
@@ -17812,6 +18114,14 @@ impl IssueMonitorState {
         // non-`Idle` phase forever and the daemon waits for a verdict that will
         // never arrive. The plain human-gated `LaunchFailed`/`AgentFailed` path
         // below is preserved for every non-autonomous issue.
+        // Issue #4815 AC-1: a review window that could not start, or died
+        // without a verdict, is a failed review — not a failed implementation.
+        // It spends the review ladder, keeps the implementation's slot, and
+        // returns the record to Implementing for the backed-off re-dispatch.
+        if self.autonomous_mode && self.review_failure_applies(issue_number, state, now) {
+            self.record_review_failure(issue_number, message, now);
+            return;
+        }
         if self.autonomous_mode && self.is_autonomous_in_flight(issue_number) {
             // Issue #4161 AC-6: the retry ladder keeps retrying past its own
             // attempt cap, so a launch that is refused deterministically —
@@ -18717,42 +19027,6 @@ mod tests {
         }
     }
 
-    fn assert_manual_relaunch_accepts_fresh_lifecycle_failures(base: &IssueMonitorState) {
-        for (agent_failure, expected_state) in [
-            (false, MonitorInboxState::LaunchFailed),
-            (true, MonitorInboxState::AgentFailed),
-        ] {
-            let mut relaunched = base.clone();
-            relaunched.complete_active_launch(7, "tab-1::manual-relaunch-7");
-            assert_eq!(relaunched.active_count(), 1, "manual relaunch is active");
-            assert_eq!(
-                relaunched.inbox_item(7).map(|item| item.state),
-                Some(MonitorInboxState::Launched)
-            );
-
-            if agent_failure {
-                relaunched.record_agent_issue_failed(7, "fresh manual agent failure");
-            } else {
-                relaunched.record_launch_failed(7, "fresh manual launch failure");
-            }
-
-            assert_eq!(
-                relaunched.inbox_item(7).map(|item| item.state),
-                Some(expected_state),
-                "new launch tracking distinguishes a fresh failure from receipt replay"
-            );
-            assert_eq!(relaunched.active_count(), 0);
-            assert!(
-                relaunched
-                    .prefs()
-                    .failed_issues
-                    .iter()
-                    .any(|failed| failed.issue_number == 7),
-                "fresh manual relaunch failure is persisted"
-            );
-        }
-    }
-
     // SPEC-3431 T-023 (AS2 / FR-006): the PM's launch_now writes the target to
     // the head of priority_order and asks for a scan. This pins the two
     // properties that make it safe: the reordered issue is the one the very
@@ -19599,6 +19873,7 @@ mod tests {
             review_dispatch_hold: None,
             last_failure_message: None,
             delivering_since: None,
+            review_attempts: None,
         };
         let disk = IssueMonitorPrefs {
             launch_profile: Some(profile.clone()),
@@ -19723,6 +19998,7 @@ mod tests {
             review_dispatch_hold: None,
             last_failure_message: None,
             delivering_since: None,
+            review_attempts: None,
         };
         save_issue_monitor_prefs(
             &path,
@@ -19793,6 +20069,7 @@ mod tests {
                 review_dispatch_hold: None,
                 last_failure_message: None,
                 delivering_since: None,
+                review_attempts: None,
             }],
             ..IssueMonitorPrefs::default()
         };
@@ -19863,6 +20140,7 @@ mod tests {
             review_dispatch_hold: None,
             last_failure_message: None,
             delivering_since: None,
+            review_attempts: None,
         };
         let older_disk = IssueMonitorPrefs {
             legacy_git_launch_failure_migration_version: 0,
@@ -19922,6 +20200,7 @@ mod tests {
             review_dispatch_hold: None,
             last_failure_message: None,
             delivering_since: None,
+            review_attempts: None,
         };
         let mut stale = IssueMonitorState::with_prefs(
             IssueMonitorConfig::default(),
@@ -32832,31 +33111,41 @@ mod tests {
 
         monitor.record_launch_failed(7, "Independent review could not start");
 
+        // Issue #4815 AC-1: the review's failure is the review ladder's, not
+        // the implementation's. The record returns to Implementing (the PR
+        // is still open) and the implementation launch keeps its slot.
         let record = monitor.autonomous_record(7).expect("record retained");
         assert_eq!(
             record.phase,
-            AutonomousPhase::Idle,
-            "routed back to Idle for retry, not stranded in Reviewing"
+            AutonomousPhase::Implementing,
+            "routed back to Implementing for the backed-off re-dispatch, not stranded in Reviewing"
         );
-        assert_eq!(monitor.attempt_count(7), 1, "the failed attempt is counted");
+        assert_eq!(
+            monitor.attempt_count(7),
+            0,
+            "no implementation attempt is spent"
+        );
+        let attempts = record
+            .review_attempts
+            .as_ref()
+            .expect("the review ladder counts the failure");
+        assert_eq!(
+            (attempts.reviewed_sha.as_str(), attempts.count),
+            ("abc123", 1)
+        );
         assert!(
-            record.retry_not_before.is_some(),
-            "a retry backoff is scheduled"
+            attempts.not_before.is_some(),
+            "a review backoff is scheduled"
         );
         assert_eq!(
             monitor.inbox_item(7).map(|item| item.state),
-            Some(MonitorInboxState::Queued),
-            "re-queued for automatic relaunch (not parked in LaunchFailed)"
+            Some(MonitorInboxState::Launched),
+            "the implementation stays launched (not re-queued, not parked)"
         );
-
-        let mut pre_materialization = monitor.clone();
-        pre_materialization.record_launch_failed(7, "fresh pre-materialization failure");
-        assert_eq!(
-            pre_materialization.inbox_item(7).map(|item| item.state),
-            Some(MonitorInboxState::LaunchFailed),
-            "a distinct admission before materialization cannot be mistaken for receipt replay"
-        );
-        assert_manual_relaunch_accepts_fresh_lifecycle_failures(&monitor);
+        assert!(monitor
+            .inbox_item(7)
+            .and_then(|item| item.error_message.clone())
+            .is_some_and(|error| error.contains("Independent review could not start")));
     }
 
     #[test]
@@ -32874,22 +33163,32 @@ mod tests {
 
         monitor.record_launch_failed(7, "review spawn failed at cap");
 
+        // Issue #4815 AC-2: at the review cap the record stays Implementing
+        // with its slot, dispatch for this SHA stops, and the PM is asked to
+        // steer with the PR, the SHA and the last error.
         assert_eq!(
             monitor.autonomous_record(7).map(|r| r.phase),
-            Some(AutonomousPhase::Idle),
-            "attempts exhausted ⇒ retried through the ladder, not parked"
+            Some(AutonomousPhase::Implementing),
+            "review attempts exhausted ⇒ held for steering, not parked, not re-queued"
         );
         assert_eq!(
             monitor.inbox_item(7).map(|item| item.state),
-            Some(MonitorInboxState::Queued)
+            Some(MonitorInboxState::Launched)
         );
         assert!(
             monitor
                 .autonomous_record(7)
                 .and_then(|r| r.steering.as_ref())
-                .is_some_and(|steering| steering.reason.contains("review spawn failed at cap")),
-            "the PM is asked to look at the failing launch"
+                .is_some_and(
+                    |steering| steering.reason.contains("review spawn failed at cap")
+                        && steering.reason.contains("PR #99")
+                        && steering.reason.contains("abc123")
+                ),
+            "the PM is asked to look at the failing review"
         );
+        assert!(monitor
+            .review_dispatch_hold(7, 99, Some("abc123"), "2026-06-30T12:00:00Z")
+            .is_some_and(|hold| hold.reason.contains("failed 1/1 times")));
     }
 
     #[test]
@@ -36266,5 +36565,270 @@ mod tests {
             )],
         ));
         assert!(monitor.review_windows().is_empty());
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #4815: failed review windows spend a per-SHA ladder, back off,
+    // and stop at the cap with a steering reason.
+    // ---------------------------------------------------------------------
+
+    fn review_attempts_of(
+        monitor: &IssueMonitorState,
+        issue_number: u64,
+    ) -> Option<AutonomousReviewAttempts> {
+        monitor
+            .autonomous_record(issue_number)
+            .and_then(|record| record.review_attempts.clone())
+    }
+
+    /// Issue #4815 AC-1: a review window that dies without a verdict counts
+    /// one review attempt for its SHA (not an implementation attempt), keeps
+    /// the implementation's slot, and two scans inside the backoff produce
+    /// exactly one dispatch.
+    #[test]
+    fn issue_4815_failed_review_window_backs_off_the_next_dispatch_for_its_sha() {
+        let mut monitor = autonomous_launched_cohort(&[(41, "tab-1::impl-41")]);
+        monitor.set_max_active_agents(3);
+        let implementation_attempts = monitor.attempt_count(41);
+        monitor
+            .dispatch_review(review_dispatch_for(41, 410), "2026-09-07T04:00:00Z")
+            .expect("first dispatch is admitted");
+        assert_eq!(monitor.take_pending_review_dispatches().len(), 1);
+        monitor.record_window_snapshot(idle_snapshot(
+            "2026-09-07T04:00:30Z",
+            vec![
+                idle_observation("tab-1::impl-41", Some(41), WindowState::Running, false),
+                idle_observation("tab-1::review-41", Some(41), WindowState::Running, true),
+            ],
+        ));
+        // The review pane dies (start-gate failure) before any verdict.
+        monitor.record_window_snapshot(idle_snapshot(
+            "2026-09-07T04:00:45Z",
+            vec![
+                idle_observation("tab-1::impl-41", Some(41), WindowState::Running, false),
+                idle_observation("tab-1::review-41", Some(41), WindowState::Error, true),
+            ],
+        ));
+        let attempts = review_attempts_of(&monitor, 41).expect("review failure recorded");
+        assert_eq!(attempts.reviewed_sha, "sha-410");
+        assert_eq!(attempts.count, 1);
+        assert_eq!(
+            attempts.not_before.as_deref(),
+            Some("2026-09-07T04:01:45Z"),
+            "60 s ladder"
+        );
+        assert_eq!(
+            monitor.attempt_count(41),
+            implementation_attempts,
+            "the implementation ladder is untouched"
+        );
+        assert_eq!(
+            monitor.autonomous_record(41).map(|record| record.phase),
+            Some(AutonomousPhase::Implementing),
+            "the record returns to Implementing for the backed-off re-dispatch"
+        );
+        assert!(monitor.review_windows().is_empty());
+        assert_eq!(
+            monitor.active_issue_numbers(),
+            vec![41],
+            "the implementation keeps its slot"
+        );
+        assert_eq!(
+            monitor.inbox_item(41).map(|item| item.state),
+            Some(MonitorInboxState::Launched)
+        );
+        let error = monitor
+            .inbox_item(41)
+            .and_then(|item| item.error_message.clone())
+            .expect("the row names the failure");
+        assert!(
+            error.contains("PR #410") && error.contains("sha-410") && error.contains("1/3"),
+            "{error}"
+        );
+
+        // Two scans inside the backoff: both held, no dispatch.
+        for now in ["2026-09-07T04:01:00Z", "2026-09-07T04:01:30Z"] {
+            let hold = monitor
+                .dispatch_review(review_dispatch_for(41, 410), now)
+                .expect_err("inside the backoff the dispatch is held");
+            assert!(
+                hold.reason
+                    .contains("backing off until 2026-09-07T04:01:45Z")
+                    && hold.reason.contains("PR #410")
+                    && hold.reason.contains("sha-410"),
+                "{}",
+                hold.reason
+            );
+            assert!(monitor.take_pending_review_dispatches().is_empty());
+            assert_eq!(review_hold_of(&monitor, 41), Some(hold.reason.clone()));
+        }
+        assert!(monitor
+            .review_dispatch_hold(41, 410, Some("sha-410"), "2026-09-07T04:01:30Z")
+            .is_some());
+        assert!(
+            monitor
+                .stuck_autonomous_issues("2026-09-07T06:00:00Z")
+                .is_empty(),
+            "a backed-off review is not a stalled implementation"
+        );
+
+        // After the backoff the same SHA is dispatched once more.
+        monitor
+            .dispatch_review(review_dispatch_for(41, 410), "2026-09-07T04:02:00Z")
+            .expect("the backoff elapsed");
+        assert_eq!(monitor.take_pending_review_dispatches().len(), 1);
+        assert_eq!(review_hold_of(&monitor, 41), None);
+        assert_eq!(
+            review_attempts_of(&monitor, 41).map(|attempts| attempts.count),
+            Some(1),
+            "the ladder is kept across the retry of the same SHA"
+        );
+        // A verdict ends the ladder.
+        monitor.record_review_verdict(41, true);
+        assert_eq!(review_attempts_of(&monitor, 41), None);
+    }
+
+    /// Issue #4815 AC-2: three identical failures for one SHA stop dispatch
+    /// and ask the PM to steer, naming the PR, the SHA and the last error; a
+    /// new head SHA starts the count over.
+    #[test]
+    fn issue_4815_three_failures_for_one_sha_stop_dispatch_until_the_head_moves() {
+        let mut monitor = autonomous_launched_cohort(&[(41, "tab-1::impl-41")]);
+        monitor.set_max_active_agents(3);
+        let start = chrono::DateTime::parse_from_rfc3339("2026-09-07T04:00:00Z")
+            .expect("start")
+            .to_utc();
+        let at = |secs: i64| {
+            (start + chrono::Duration::seconds(secs))
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        };
+        // Failures at t=0 (backoff 60), t=120 (backoff 120), t=300 (cap).
+        let mut clock = 0;
+        for expected_count in 1..=3 {
+            monitor
+                .dispatch_review(review_dispatch_for(41, 410), &at(clock))
+                .expect("dispatch admitted");
+            monitor.take_pending_review_dispatches();
+            // The GUI reports the spawn error for the review window.
+            monitor.record_launch_failed_at(
+                41,
+                "spawn failed: os error 206 (command line too long)",
+                &at(clock + 5),
+            );
+            let attempts = review_attempts_of(&monitor, 41).expect("attempt recorded");
+            assert_eq!(attempts.count, expected_count);
+            assert_eq!(
+                attempts.last_error,
+                "spawn failed: os error 206 (command line too long)"
+            );
+            clock += 400;
+        }
+        let hold = monitor
+            .dispatch_review(review_dispatch_for(41, 410), &at(clock))
+            .expect_err("the third identical failure stops dispatch for this SHA");
+        assert!(
+            hold.reason.contains("failed 3/3 times")
+                && hold.reason.contains("PR #410")
+                && hold.reason.contains("sha-410")
+                && hold.reason.contains("os error 206"),
+            "{}",
+            hold.reason
+        );
+        assert!(monitor.take_pending_review_dispatches().is_empty());
+        // Long after any backoff it is still held: the cap is not a timer.
+        assert!(monitor
+            .review_dispatch_hold(41, 410, Some("sha-410"), &at(clock + 86_400))
+            .is_some());
+        let steering = monitor
+            .status_view_at(&at(clock))
+            .autonomous_issues
+            .into_iter()
+            .find(|summary| summary.issue_number == 41)
+            .and_then(|summary| summary.steering)
+            .expect("issue.monitor.status carries the steering reason");
+        assert!(
+            steering.reason.contains("PR #410")
+                && steering.reason.contains("sha-410")
+                && steering.reason.contains("os error 206")
+                && steering.reason.contains("3/3"),
+            "{}",
+            steering.reason
+        );
+        assert_eq!(
+            monitor.inbox_item(41).map(|item| item.state),
+            Some(MonitorInboxState::Launched),
+            "the implementation is never re-queued by a review failure"
+        );
+
+        // The head moved: the old ladder does not hold the new SHA, and the
+        // admitted dispatch resets the count.
+        assert!(monitor
+            .review_dispatch_hold(41, 410, Some("sha-410-v2"), &at(clock))
+            .is_none());
+        let mut fresh = review_dispatch_for(41, 410);
+        fresh.reviewed_sha = "sha-410-v2".to_string();
+        monitor
+            .dispatch_review(fresh, &at(clock))
+            .expect("a new head is a new review");
+        assert_eq!(monitor.take_pending_review_dispatches().len(), 1);
+        assert_eq!(review_attempts_of(&monitor, 41), None);
+        assert_eq!(
+            monitor
+                .autonomous_record(41)
+                .and_then(|record| record.reviewed_sha.clone()),
+            Some("sha-410-v2".to_string())
+        );
+    }
+
+    /// Issue #4815 AC-3: a review window that dies before its first hook
+    /// carries only the GUI's "PTY handoff complete" stage marker; the row
+    /// reports a launch failure, never that marker.
+    #[test]
+    fn issue_4815_start_gate_failure_is_reported_as_a_launch_failure() {
+        let mut monitor = autonomous_launched_cohort(&[(41, "tab-1::impl-41")]);
+        monitor.set_max_active_agents(3);
+        monitor
+            .dispatch_review(review_dispatch_for(41, 410), IDLE_NOW)
+            .expect("dispatch admitted");
+        monitor.record_launch_failed_at(41, "PTY handoff complete", "2026-09-07T04:00:10Z");
+        let error = monitor
+            .inbox_item(41)
+            .and_then(|item| item.error_message.clone())
+            .expect("error recorded");
+        assert!(!error.contains("PTY handoff complete"), "{error}");
+        assert!(
+            error.contains("review window exited before its first hook")
+                && error.contains("PR #410"),
+            "{error}"
+        );
+        assert_eq!(
+            review_attempts_of(&monitor, 41).map(|attempts| attempts.last_error),
+            Some("review window exited before its first hook (start-gate failure)".to_string())
+        );
+        // A dead implementation pane during review is still the
+        // implementation's failure, not the review's.
+        let mut monitor = autonomous_launched_cohort(&[(41, "tab-1::impl-41")]);
+        monitor.set_max_active_agents(3);
+        monitor
+            .dispatch_review(review_dispatch_for(41, 410), IDLE_NOW)
+            .expect("dispatch admitted");
+        monitor.record_window_snapshot(idle_snapshot(
+            "2026-09-07T04:00:30Z",
+            vec![
+                idle_observation("tab-1::impl-41", Some(41), WindowState::Error, false),
+                idle_observation("tab-1::review-41", Some(41), WindowState::Running, true),
+            ],
+        ));
+        monitor.record_agent_window_failed_at(
+            "tab-1::impl-41",
+            "implementation agent crashed",
+            "2026-09-07T04:00:40Z",
+        );
+        assert_eq!(review_attempts_of(&monitor, 41), None);
+        assert_eq!(
+            monitor.attempt_count(41),
+            1,
+            "the implementation ladder took it"
+        );
     }
 }

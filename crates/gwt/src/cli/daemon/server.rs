@@ -8861,6 +8861,7 @@ exit 0
                 review_dispatch_hold: None,
                 last_failure_message: None,
                 delivering_since: None,
+                review_attempts: None,
             }],
             ..crate::IssueMonitorPrefs::default()
         };
@@ -8973,6 +8974,7 @@ exit 0
                 review_dispatch_hold: None,
                 last_failure_message: None,
                 delivering_since: None,
+                review_attempts: None,
             }],
             ..crate::IssueMonitorPrefs::default()
         };
@@ -13260,6 +13262,7 @@ exit 0
                     review_dispatch_hold: None,
                     last_failure_message: None,
                     delivering_since: None,
+                    review_attempts: None,
                 }],
                 ..crate::IssueMonitorPrefs::default()
             },
@@ -13749,6 +13752,7 @@ exit 1
                     review_dispatch_hold: None,
                     last_failure_message: None,
                     delivering_since: None,
+                    review_attempts: None,
                 }],
                 ..crate::IssueMonitorPrefs::default()
             },
@@ -16560,6 +16564,7 @@ exit 1
                 review_dispatch_hold: None,
                 last_failure_message: None,
                 delivering_since: None,
+                review_attempts: None,
             }],
             ..crate::IssueMonitorPrefs::default()
         };
@@ -16629,6 +16634,7 @@ exit 1
                 review_dispatch_hold: None,
                 last_failure_message: None,
                 delivering_since: None,
+                review_attempts: None,
             }],
             ..crate::IssueMonitorPrefs::default()
         };
@@ -16751,6 +16757,7 @@ exit 1
                     review_dispatch_hold: None,
                     last_failure_message: None,
                     delivering_since: None,
+                    review_attempts: None,
                 },
                 crate::AutonomousIssueRecord {
                     issue_number: 8,
@@ -16772,6 +16779,7 @@ exit 1
                     review_dispatch_hold: None,
                     last_failure_message: None,
                     delivering_since: None,
+                    review_attempts: None,
                 },
             ],
             ..crate::IssueMonitorPrefs::default()
@@ -16844,6 +16852,7 @@ exit 1
                 review_dispatch_hold: None,
                 last_failure_message: None,
                 delivering_since: None,
+                review_attempts: None,
             }],
             ..crate::IssueMonitorPrefs::default()
         };
@@ -17571,6 +17580,7 @@ exit 1
                 review_dispatch_hold: None,
                 last_failure_message: None,
                 delivering_since: None,
+                review_attempts: None,
             }],
             ..crate::IssueMonitorPrefs::default()
         };
@@ -17718,6 +17728,7 @@ exit 1
                 review_dispatch_hold: None,
                 last_failure_message: None,
                 delivering_since: None,
+                review_attempts: None,
             }],
             ..crate::IssueMonitorPrefs::default()
         };
@@ -17859,6 +17870,7 @@ exit 1
                 review_dispatch_hold: None,
                 last_failure_message: None,
                 delivering_since: None,
+                review_attempts: None,
             }],
             ..crate::IssueMonitorPrefs::default()
         };
@@ -18222,6 +18234,7 @@ exit 1
             review_dispatch_hold: None,
             last_failure_message: None,
             delivering_since: None,
+            review_attempts: None,
         };
         let disk_same_key = record(42, crate::AutonomousPhase::Implementing, 1);
         let local_same_key = record(42, crate::AutonomousPhase::Reviewing, 2);
@@ -18461,6 +18474,7 @@ exit 1
                     review_dispatch_hold: None,
                     last_failure_message: None,
                     delivering_since: None,
+                    review_attempts: None,
                 }],
                 ..crate::IssueMonitorPrefs::default()
             },
@@ -19483,6 +19497,7 @@ exit 1
                     review_dispatch_hold: None,
                     last_failure_message: None,
                     delivering_since: None,
+                    review_attempts: None,
                 }],
                 ..crate::IssueMonitorPrefs::default()
             },
@@ -19781,6 +19796,7 @@ exit 1
             review_dispatch_hold: None,
             last_failure_message: None,
             delivering_since: None,
+            review_attempts: None,
         };
         crate::save_issue_monitor_prefs(
             &prefs_path,

@@ -8656,6 +8656,7 @@ fn issue_monitor_autonomous_record(
         review_dispatch_hold: None,
         last_failure_message: None,
         delivering_since: None,
+        review_attempts: None,
     }
 }
 
@@ -47761,6 +47762,7 @@ fn app_runtime_agent_failed_ack_runs_ui_finalize_without_a_local_write() {
                 review_dispatch_hold: None,
                 last_failure_message: None,
                 delivering_since: None,
+                review_attempts: None,
             }],
             ..gwt::IssueMonitorPrefs::default()
         },
