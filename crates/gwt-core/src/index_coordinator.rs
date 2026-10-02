@@ -1328,6 +1328,7 @@ fn acquire_heavy_at(
                     let _ = fs::remove_file(heavy_queue_entry_path(&pending_dir, &target));
                     record_interactive_burst_grant(root, priority);
                     let lease = HeavyLease {
+                        queue_wait_ms: acquired_at_ms.saturating_sub(queued_at_ms),
                         _lock_file: heavy_file,
                         root: root.to_path_buf(),
                         ticket_path: root.join("heavy.ticket.json"),
@@ -1417,6 +1418,7 @@ impl Drop for TargetJobGuard {
 /// crashed or killed holder never blocks the next claimant regardless of TTL
 /// (T-IDX-383 / SPEC #3576 T-006).
 pub struct HeavyLease {
+    queue_wait_ms: u64,
     _lock_file: File,
     root: PathBuf,
     ticket_path: PathBuf,
@@ -1426,6 +1428,11 @@ pub struct HeavyLease {
 }
 
 impl HeavyLease {
+    /// Time since this target first enrolled, including deferred retries.
+    pub fn queue_wait_ms(&self) -> u64 {
+        self.queue_wait_ms
+    }
+
     /// Lease identity carried in the ticket and in every recorded event.
     pub fn id(&self) -> &str {
         self.ticket.lease_id.as_deref().unwrap_or_default()
