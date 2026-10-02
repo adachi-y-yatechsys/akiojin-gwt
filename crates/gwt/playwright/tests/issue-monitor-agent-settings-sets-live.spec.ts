@@ -39,7 +39,7 @@ test.describe("Issue Monitor Agent Settings sets", () => {
 
       await sendLiveGwtEvent(page, { kind: "issue_monitor_configure_profile" });
       const modal = page.locator("#wizard-modal");
-      // The open is queued behind the status read above on a busy backend.
+      // The open is queued behind the status reads above on a busy backend.
       await expect(modal).toHaveClass(/open/, { timeout: 30_000 });
       const sets = modal.locator(".launch-agent-set");
       await expect(sets).toHaveCount(1);
@@ -115,14 +115,17 @@ test.describe("Issue Monitor Agent Settings sets", () => {
 });
 
 // Waits until the newest `issue_monitor_status` — what `issue.monitor.profiles`
-// reads — lists the candidates in `expected` order. One status read is enough:
-// the backend answers events in order, so it follows the write before it.
+// reads — lists the candidates in `expected` order. The read is re-requested on
+// a slow cadence: one request can be dropped while the page is still
+// connecting, and each one is expensive for the backend to answer.
 async function expectSavedAgents(page: any, expected: string[]): Promise<void> {
-  await sendLiveGwtEvent(page, { kind: "list_issue_monitor" });
-  await expect.poll(() => page.evaluate(() => {
-    const statuses = ((window as any).__gwtPlaywrightMessages ?? [])
-      .filter(({ payload }: any) => payload.kind === "issue_monitor_status");
-    const latest = statuses[statuses.length - 1]?.payload?.status;
-    return (latest?.launch_profile_candidates ?? []).map((candidate: any) => candidate.agent_id);
-  }), { timeout: 30_000 }).toEqual(expected);
+  await expect.poll(async () => {
+    await sendLiveGwtEvent(page, { kind: "list_issue_monitor" });
+    return page.evaluate(() => {
+      const statuses = ((window as any).__gwtPlaywrightMessages ?? [])
+        .filter(({ payload }: any) => payload.kind === "issue_monitor_status");
+      const latest = statuses[statuses.length - 1]?.payload?.status;
+      return (latest?.launch_profile_candidates ?? []).map((candidate: any) => candidate.agent_id);
+    });
+  }, { timeout: 30_000, intervals: [1_000, 2_000, 5_000] }).toEqual(expected);
 }
