@@ -954,6 +954,7 @@ pub(crate) struct ProjectContext {
 }
 
 pub(crate) struct ProjectRuntimeState {
+    pub(crate) workspace_state_notice: Option<gwt::WorkspaceStateNoticeView>,
     /// Latest close preview nonce for each requesting connection; never persisted.
     pub(crate) close_project_nonces: HashMap<ClientId, String>,
     /// Single-use launch requests keyed by the exact wizard that produced
@@ -1044,6 +1045,7 @@ pub(crate) fn initial_project_states(
             (
                 context.project_key.clone(),
                 ProjectRuntimeState {
+                    workspace_state_notice: None,
                     close_project_nonces: HashMap::new(),
                     pending_pm_launches: Default::default(),
                     pending_pm_closes: Default::default(),
@@ -2984,6 +2986,7 @@ impl AppRuntime {
             self.project_states
                 .entry(context.project_key.clone())
                 .or_insert_with(|| ProjectRuntimeState {
+                    workspace_state_notice: None,
                     close_project_nonces: HashMap::new(),
                     pending_pm_launches: Default::default(),
                     pending_pm_closes: Default::default(),
@@ -3489,6 +3492,13 @@ impl AppRuntime {
                     &state_path,
                     worktree_inventory.as_deref().map(Vec::as_slice),
                 );
+            if let Some(error) = summary.load_error.as_ref() {
+                proxy.send(UserEvent::WorkspaceStateLoadFailed {
+                    project_root,
+                    error: error.clone(),
+                });
+                return;
+            }
             // #3065: detection-based repair for the resume owner bleed. Runs
             // after every ingest so re-ingested contaminated logs (from other
             // machines / refs) self-heal; converges to a no-op on clean data.
@@ -8356,6 +8366,7 @@ impl AppRuntime {
                 .map(|address| address.tab_id.as_str()),
             // These operations target the authenticated project connection.
             FrontendEvent::CreateWindow { .. }
+            | FrontendEvent::RetryWorkspaceStateLoad
             | FrontendEvent::OpenActiveWorkLaunchWizard { .. }
             | FrontendEvent::RunWorkspaceCleanup { .. }
             | FrontendEvent::CycleFocus { .. }
@@ -8711,6 +8722,15 @@ impl AppRuntime {
                     refresh.notify_one();
                 }
                 self.frontend_project_sync_events(&client_id, context)
+            }
+            FrontendEvent::RetryWorkspaceStateLoad => {
+                spawn_workspace_projection_reload(
+                    &self.blocking_tasks,
+                    self.proxy.clone(),
+                    context.clone(),
+                    None,
+                );
+                Vec::new()
             }
             FrontendEvent::LoadRecoveryCenter { request_id } => {
                 self.load_recovery_center_events(context, &client_id, &request_id)
@@ -10500,6 +10520,14 @@ impl AppRuntime {
         if let Some(event) = self.active_work_projection_reply(client_id, &context.tab_id) {
             events.insert(1, event);
         }
+        events.push(OutboundEvent::reply(
+            client_id,
+            BackendEvent::WorkspaceStateNotice {
+                notice: self
+                    .project_state(context)
+                    .and_then(|state| state.workspace_state_notice.clone()),
+            },
+        ));
         // SPEC-3431 FR-026: hydrate the PM settings panel on connect. Without
         // this a freshly loaded page shows the panel's built-in defaults until
         // some unrelated PM transition happens to broadcast.
