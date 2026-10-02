@@ -54330,8 +54330,16 @@ fn app_runtime_answered_handoff_exact_resume_retains_autonomous_context() {
 /// fixture pins one. Drop the pin and the guard refuses the probe by name
 /// instead of spawning the host `npx` under a five-second budget — the failure
 /// mode that turned unrelated `app_runtime` tests red on a loaded CI runner.
+///
+/// Issue #4927: the Session asks for an exact package version. A Host Codex
+/// launch that asks for `latest` prefers the installed CLI (#4917), so whether
+/// it reaches the package runner at all would depend on what the machine
+/// running the test has installed. An exact version takes the package-runner
+/// route on every host.
 #[test]
 fn monitor_launch_without_pinned_package_runners_is_refused() {
+    // Never published, so no host package cache can answer for it.
+    const EXACT_PACKAGE_VERSION: &str = "0.0.0";
     let _env_lock = env_test_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -54356,6 +54364,18 @@ fn monitor_launch_without_pinned_package_runners_is_refused() {
             .expect("fixture profile config path"),
         &Settings::default(),
     );
+    let mut source = gwt_agent::Session::load(
+        &fixture
+            .sessions_dir
+            .join(format!("{}.toml", fixture.source_session_id)),
+    )
+    .expect("load monitored Session");
+    source.tool_version = Some(EXACT_PACKAGE_VERSION.to_string());
+    source
+        .save(&fixture.sessions_dir)
+        .expect("save exact-version Session");
+    // The resume candidate is read from the launch wizard cache, not from disk.
+    fixture.runtime.launch_wizard_cache.record_session(source);
 
     fixture.runtime.auto_launch_issue_monitor_delivery_events(
         &fixture.runtime.test_context(),
@@ -54371,6 +54391,11 @@ fn monitor_launch_without_pinned_package_runners_is_refused() {
     assert!(
         error.contains(gwt_core::process_console::REAL_RUNNER_PROBE_BLOCKED_ERROR_CODE),
         "the refusal must name the guard, not look like a runner timeout: {error}"
+    );
+    assert!(
+        error.contains(&format!("@openai/codex@{EXACT_PACKAGE_VERSION}")),
+        "the refused probe must be the exact package the Session asked for, not a fallback \
+         from an installed CLI: {error}"
     );
 }
 
