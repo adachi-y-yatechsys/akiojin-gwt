@@ -857,15 +857,6 @@ impl AppRuntime {
                 true,
                 inventory.clone(),
             );
-            // SPEC-2359 Phase W-11 (US-58 / FR-346): one-shot, version-guarded
-            // clear of legacy prompt-derived title_summary / current_focus so
-            // existing broken titles ("あなたの目的は何ですか" etc.) heal via the
-            // display fallback and agent re-authoring. Idempotent via
-            // `agent_identity.migration.json`; never re-clears agent-authored
-            // values written after the marker.
-            let _ = gwt_core::workspace_projection::reset_legacy_agent_identity_for_repo(
-                &tab.project_root,
-            );
             // Snapshot candidates before the GUI becomes interactive, then
             // inspect/remove only that fixed set on a recovery worker. A new
             // intake launched after startup can never enter this plan.

@@ -1286,62 +1286,6 @@ fn sample_work_event(work_id: &str, updated_at: chrono::DateTime<chrono::Utc>) -
     event.title = Some(format!("title {work_id}"));
     event
 }
-/// SPEC-2359 Phase W-11 (US-58 / SC-228): the one-time reset clears
-/// legacy title_summary / current_focus exactly once (version-guarded),
-/// later runs are a no-op, and agent-authored values written after the
-/// reset are preserved.
-#[test]
-fn reset_legacy_agent_identity_clears_once_and_preserves_later_values() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let current_path = temp.path().join("current.json");
-
-    let mut projection = WorkspaceProjection::default_for_project(temp.path());
-    projection.agents.push(WorkspaceAgentSummary {
-        session_id: "sess-legacy".to_string(),
-        window_id: None,
-        agent_id: "codex".to_string(),
-        display_name: "Codex".to_string(),
-        status_category: WorkspaceStatusCategory::Active,
-        current_focus: Some("/gwt-discussion 生プロンプト focus".to_string()),
-        title_summary: Some("あなたの目的は何ですか".to_string()),
-        worktree_path: None,
-        branch: None,
-        last_board_entry_id: None,
-        last_board_entry_kind: None,
-        coordination_scope: None,
-        affiliation_status: WorkspaceAgentAffiliationStatus::Assigned,
-        workspace_id: None,
-        updated_at: Utc::now(),
-    });
-    save_workspace_projection_to_path(&current_path, &projection).expect("save");
-
-    // First reset clears the legacy values and writes the marker.
-    let applied = reset_legacy_agent_identity_at(&current_path).expect("reset");
-    assert!(applied, "first reset should run and write the marker");
-    let after = load_workspace_projection_from_path(&current_path)
-        .expect("load")
-        .expect("present");
-    assert_eq!(after.agents[0].title_summary, None);
-    assert_eq!(after.agents[0].current_focus, None);
-
-    // The agent authors a real purpose after the migration.
-    let mut authored = after;
-    authored.agents[0].title_summary = Some("Agent タイトル目的化".to_string());
-    save_workspace_projection_to_path(&current_path, &authored).expect("save authored");
-
-    // Second reset is a no-op (marker guard) and preserves the agent value.
-    let applied_again = reset_legacy_agent_identity_at(&current_path).expect("reset again");
-    assert!(!applied_again, "marker must prevent a second clear");
-    let preserved = load_workspace_projection_from_path(&current_path)
-        .expect("load")
-        .expect("present");
-    assert_eq!(
-        preserved.agents[0].title_summary.as_deref(),
-        Some("Agent タイトル目的化"),
-        "agent-authored title must survive later loads"
-    );
-}
-
 #[test]
 fn workspace_update_persists_current_summary_and_journal_entry() {
     let temp = tempfile::tempdir().expect("tempdir");

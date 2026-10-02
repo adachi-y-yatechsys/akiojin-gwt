@@ -69,7 +69,6 @@ pub use persistence::{
     record_workspace_work_paused_event_paths, recover_pending_workspace_state_transaction,
     recover_pending_workspace_state_transaction_for_work_event_root,
     repair_resume_owner_bleed_for_repo, repair_resume_owner_bleed_paths,
-    reset_legacy_agent_identity_at, reset_legacy_agent_identity_for_repo,
     resolve_legacy_workspace_state_external_commit_for_work_event_root,
     resolve_workspace_id_for_mention, resolve_workspace_id_for_session,
     resolve_workspace_state_external_commit, resolve_workspace_state_external_commit_at,
@@ -96,7 +95,7 @@ pub use persistence::{
     SessionBoundWorkspaceTerminalTarget, StaleReason, TrackedWorkEventPolicy, WorkItemsCache,
     WorkItemsLoadProfile, WorkItemsRebuildOutcome, WorkspaceRetentionConfig,
     WorkspaceSessionAssignment, WorkspaceTerminalEventOutcome, WorktreeReconcileSource,
-    WORKSPACE_AGENT_IDENTITY_RESET_VERSION, WORK_ITEMS_REBUILD_VERSION,
+    WORK_ITEMS_REBUILD_VERSION,
 };
 pub(crate) use persistence::{
     apply_workspace_container_detachments, with_workspace_current_and_work_items_lock,

@@ -111,6 +111,10 @@ The usage `window_minutes` contract and the Workspace projection backfill associ
 with open SPEC #2359 are also retained. Importing old HOME / Workspace state from
 `workspace/current.json` and `work_items.json` remains a data-protection exception
 until startup can safely diagnose unsupported layouts before creating new state.
+The coordination event import and discussion import also remain supported: they
+serve the current recovery and session-specific Stop contracts. The obsolete agent
+identity reset is retired; startup preserves saved purpose and focus values and
+leaves `agent_identity.migration.json` unchanged (or absent).
 
 ## Requirements
 
