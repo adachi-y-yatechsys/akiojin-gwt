@@ -330,10 +330,7 @@ fn seed_monitor_pair_with_owner(
 mod tests {
     use super::*;
     use gwt_core::test_support::ScopedEnvVar;
-    use std::{
-        cell::Cell,
-        process::{Child, Command},
-    };
+    use std::{cell::Cell, process::Child};
 
     struct ChildGuard(Child);
     impl Drop for ChildGuard {
@@ -369,8 +366,18 @@ mod tests {
             ExecutionOwnerKey { kind, number: 4466 },
         );
         let mut children = [
-            ChildGuard(Command::new("sleep").arg("60").spawn().unwrap()),
-            ChildGuard(Command::new("sleep").arg("60").spawn().unwrap()),
+            ChildGuard(
+                gwt_core::process::hidden_command("sleep")
+                    .arg("60")
+                    .spawn()
+                    .unwrap(),
+            ),
+            ChildGuard(
+                gwt_core::process::hidden_command("sleep")
+                    .arg("60")
+                    .spawn()
+                    .unwrap(),
+            ),
         ];
         let proofs = pair.map(|session| {
             let index = usize::from(session.id != "holder");

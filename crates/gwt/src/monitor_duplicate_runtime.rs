@@ -481,7 +481,7 @@ mod tests {
         let (local, _local_guard) = runtime(project.path(), &sessions, &pair[0], 1);
         let (peer, _peer_guard) = runtime(project.path(), &sessions, &pair[1], 2);
         // The worker has a captured handle for only one member, as with two hosts.
-        reconcile_project(project.path(), &sessions, &[local.clone()]).unwrap();
+        reconcile_project(project.path(), &sessions, std::slice::from_ref(&local)).unwrap();
         let prefs = crate::load_issue_monitor_prefs(
             &crate::issue_monitor_prefs_path_for_repo_path(project.path()),
         )
@@ -504,7 +504,7 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         crate::cli::trusted_store::init_git_repo_with_origin(project.path());
         let sessions = gwt_core::paths::gwt_sessions_dir();
-        let mut old_host = std::process::Command::new("sleep")
+        let mut old_host = gwt_core::process::hidden_command("sleep")
             .arg("60")
             .spawn()
             .unwrap();
