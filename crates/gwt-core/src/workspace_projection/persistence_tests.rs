@@ -5,6 +5,49 @@ use crate::paths::{gwt_repo_local_work_event_shard_path, gwt_repo_local_work_eve
 
 use super::*;
 
+#[test]
+fn ordinary_workspace_saves_preserve_invalid_existing_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let current = tmp.path().join("current.json");
+    let works = tmp.path().join("works.json");
+    for original in [
+        b"{\"updated_at\":".as_slice(),
+        b"{\"future_schema\":true}".as_slice(),
+    ] {
+        fs::write(&current, original).unwrap();
+        fs::write(&works, original).unwrap();
+        assert!(save_workspace_projection_to_path(
+            &current,
+            &WorkspaceProjection::default_for_project(tmp.path()),
+        )
+        .is_err());
+        assert!(save_workspace_work_items_projection_to_path(
+            &works,
+            &WorkItemsProjection::empty(Utc::now()),
+        )
+        .is_err());
+        assert_eq!(fs::read(&current).unwrap(), original);
+        assert_eq!(fs::read(&works).unwrap(), original);
+    }
+}
+
+#[test]
+fn workspace_load_failures_report_the_affected_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let current = tmp.path().join("current.json");
+    let works = tmp.path().join("works.json");
+    fs::write(&current, b"{").unwrap();
+    fs::create_dir(&works).unwrap();
+    let current_error = load_workspace_projection_from_path(&current).unwrap_err();
+    let works_error = load_workspace_work_items_from_path(&works).unwrap_err();
+    assert!(current_error
+        .to_string()
+        .contains(&current.display().to_string()));
+    assert!(works_error
+        .to_string()
+        .contains(&works.display().to_string()));
+}
+
 /// Issue #4703: repairing the projection must survive replay of its source.
 #[test]
 fn detached_foreign_container_stays_detached_after_intake_and_rebuild() {
@@ -615,10 +658,10 @@ fn work_items_loader_classifies_malformed_and_incompatible_json() {
     std::fs::write(&malformed_path, b"{\"work_items\":").expect("write malformed json");
     assert!(matches!(
         load_workspace_work_items_from_path(&malformed_path),
-        Err(GwtError::JsonDecode {
-            kind: JsonDecodeKind::Malformed,
+        Err(GwtError::WorkspaceStateLoad(WorkspaceStateLoadError {
+            kind: crate::WorkspaceStateLoadErrorKind::Malformed,
             ..
-        })
+        }))
     ));
 
     let incompatible_path = temp.path().join("incompatible.json");
@@ -662,10 +705,10 @@ fn work_items_loader_classifies_malformed_and_incompatible_json() {
     .expect("write incompatible json");
     assert!(matches!(
         load_workspace_work_items_from_path(&incompatible_path),
-        Err(GwtError::JsonDecode {
-            kind: JsonDecodeKind::IncompatibleSchema,
+        Err(GwtError::WorkspaceStateLoad(WorkspaceStateLoadError {
+            kind: crate::WorkspaceStateLoadErrorKind::IncompatibleSchema,
             ..
-        })
+        }))
     ));
 
     let unknown_cases = [
@@ -729,10 +772,10 @@ fn work_items_loader_classifies_malformed_and_incompatible_json() {
 
         assert!(matches!(
             load_workspace_work_items_from_path(&path),
-            Err(GwtError::JsonDecode {
-                kind: JsonDecodeKind::IncompatibleSchema,
+            Err(GwtError::WorkspaceStateLoad(WorkspaceStateLoadError {
+                kind: crate::WorkspaceStateLoadErrorKind::IncompatibleSchema,
                 ..
-            })
+            }))
         ));
         assert_eq!(std::fs::read(&path).unwrap(), original);
     }
@@ -2002,7 +2045,7 @@ fn split_root_transaction_rejects_incompatible_legacy_current_without_materializ
     )
     .expect_err("incompatible legacy current must fail closed");
 
-    assert!(error.to_string().contains("workspace projection json"));
+    assert!(matches!(error, GwtError::WorkspaceStateLoad(_)));
     assert_eq!(
         std::fs::read(&legacy_current).expect("legacy current after refusal"),
         incompatible
@@ -2037,7 +2080,7 @@ fn split_root_transaction_rejects_incompatible_legacy_work_items_without_materia
     )
     .expect_err("incompatible legacy WorkItems must fail closed");
 
-    assert!(error.to_string().contains("workspace work items json"));
+    assert!(matches!(error, GwtError::WorkspaceStateLoad(_)));
     assert_eq!(
         std::fs::read(&legacy_works).expect("legacy WorkItems after refusal"),
         incompatible
@@ -7387,6 +7430,14 @@ fn workspace_work_items_synthesize_from_legacy_current_and_journal_without_rewri
     projection.summary = Some("Legacy current state remains readable.".to_string());
     projection.owner = Some("SPEC-2359".to_string());
     projection.board_refs.push("board-legacy-1".to_string());
+    let mut foreign_agent = assigned_agent("session-foreign", "codex", "workspace-other");
+    foreign_agent.status_category = WorkspaceStatusCategory::Blocked;
+    foreign_agent.updated_at = second_at;
+    let mut stale_agent = foreign_agent.clone();
+    stale_agent.workspace_id = Some(projection.id.clone());
+    stale_agent.updated_at = first_at;
+    projection.agents.push(stale_agent);
+    projection.agents.push(foreign_agent);
     save_workspace_projection_to_path(&current_path, &projection).expect("save legacy projection");
 
     append_workspace_journal_entry_to_path(
@@ -7442,6 +7493,8 @@ fn workspace_work_items_synthesize_from_legacy_current_and_journal_without_rewri
     assert_eq!(item.title, "Work WorkItem history");
     assert_eq!(item.status_category, WorkspaceStatusCategory::Active);
     assert_eq!(item.owner.as_deref(), Some("SPEC-2359"));
+    assert_eq!(item.agents.len(), 1);
+    assert_eq!(item.agents[0].session_id, "session-legacy");
     assert_eq!(item.board_refs, vec!["board-legacy-1".to_string()]);
     assert_eq!(item.events.len(), 2);
     assert_eq!(
@@ -7836,7 +7889,8 @@ fn classify_workspace_projections_deletes_empty_default_projection() {
         &WorkspaceRetentionConfig::default(),
         Utc::now(),
         |_| false,
-    );
+    )
+    .expect("classify projections");
 
     assert_eq!(plan.len(), 1);
     assert_eq!(plan[0].workspace_id, projection.id);
@@ -7861,7 +7915,8 @@ fn classify_workspace_projections_deletes_empty_projection_with_agent_stub() {
         &WorkspaceRetentionConfig::default(),
         Utc::now(),
         |_| false,
-    );
+    )
+    .expect("classify projections");
 
     assert_eq!(plan.len(), 1);
     assert_eq!(plan[0].stale_reason, Some(StaleReason::EmptyProjection));
@@ -7886,7 +7941,8 @@ fn classify_workspace_projections_keeps_projection_with_agent_worktree() {
         &WorkspaceRetentionConfig::default(),
         Utc::now(),
         |_| false,
-    );
+    )
+    .expect("classify projections");
 
     assert_eq!(plan.len(), 1);
     assert_eq!(plan[0].stale_reason, None);
@@ -7913,7 +7969,8 @@ fn apply_prune_plan_removes_empty_project_dir_after_projection_delete() {
         &WorkspaceRetentionConfig::default(),
         Utc::now(),
         |_| false,
-    );
+    )
+    .expect("classify projections");
 
     let summary = apply_prune_plan(&plan, false).expect("apply prune");
 
@@ -9419,6 +9476,34 @@ fn make_classify_projection(
 }
 
 #[test]
+fn classify_workspace_projections_rejects_invalid_canonical_before_legacy() {
+    for unreadable_directory in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("project");
+        let canonical = project_dir.join("project-state/current.json");
+        std::fs::create_dir_all(canonical.parent().unwrap()).unwrap();
+        if unreadable_directory {
+            std::fs::create_dir(&canonical).unwrap();
+        } else {
+            std::fs::write(&canonical, b"{broken canonical").unwrap();
+        }
+        write_projection_at(
+            &project_dir.join("workspace"),
+            &WorkspaceProjection::default_for_project(&project_dir),
+        );
+
+        let error = classify_workspace_projections(
+            tmp.path(),
+            &WorkspaceRetentionConfig::default(),
+            Utc::now(),
+            |_| false,
+        )
+        .expect_err("an existing invalid canonical file must not be skipped or replaced by legacy");
+        assert!(matches!(error, GwtError::WorkspaceStateLoad(error) if error.path == canonical));
+    }
+}
+
+#[test]
 fn classify_workspace_projections_returns_empty_for_missing_scan_root() {
     let scan_root = PathBuf::from("/nonexistent/projects/scan-root-xyz");
     let now = Utc::now();
@@ -9427,7 +9512,8 @@ fn classify_workspace_projections_returns_empty_for_missing_scan_root() {
         &WorkspaceRetentionConfig::default(),
         now,
         |_| false,
-    );
+    )
+    .expect("classify projections");
     assert!(result.is_empty());
 }
 
@@ -9451,7 +9537,8 @@ fn classify_workspace_projections_classifies_stale_active_as_archive() {
         &WorkspaceRetentionConfig::default(),
         now,
         |_| false,
-    );
+    )
+    .expect("classify projections");
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].workspace_id, "ws-archive-me");
     assert_eq!(result[0].action, PruneAction::Archive);
@@ -9478,7 +9565,8 @@ fn classify_workspace_projections_classifies_archived_beyond_threshold_as_delete
         &WorkspaceRetentionConfig::default(),
         now,
         |_| false,
-    );
+    )
+    .expect("classify projections");
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].action, PruneAction::Delete);
 }
@@ -9503,7 +9591,8 @@ fn classify_workspace_projections_skips_archived_too_soon() {
         &WorkspaceRetentionConfig::default(),
         now,
         |_| false,
-    );
+    )
+    .expect("classify projections");
     assert_eq!(result.len(), 1);
     assert_eq!(
         result[0].action,
@@ -9533,7 +9622,8 @@ fn classify_workspace_projections_skips_active_session() {
         &WorkspaceRetentionConfig::default(),
         now,
         |_| true, // every workspace has an active session
-    );
+    )
+    .expect("classify projections");
     assert_eq!(result.len(), 1);
     assert_eq!(
         result[0].action,
@@ -9541,6 +9631,38 @@ fn classify_workspace_projections_skips_active_session() {
             reason: PruneSkipReason::ActiveAgent,
         }
     );
+}
+
+#[test]
+fn apply_prune_plan_refuses_corrupt_state_after_planning() {
+    for action in [PruneAction::Archive, PruneAction::Delete] {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("project");
+        let state_dir = project_dir.join("project-state");
+        write_projection_at(
+            &state_dir,
+            &WorkspaceProjection::default_for_project(&project_dir),
+        );
+        let mut plan = classify_workspace_projections(
+            tmp.path(),
+            &WorkspaceRetentionConfig::default(),
+            Utc::now(),
+            |_| false,
+        )
+        .unwrap();
+        plan[0].action = action;
+        let current = state_dir.join("current.json");
+        let before = std::fs::read(&current).unwrap();
+        let works = state_dir.join("works.json");
+        let broken = b"{broken works after classification";
+        std::fs::write(&works, broken).unwrap();
+
+        let error =
+            apply_prune_plan(&plan, false).expect_err("prune must revalidate before writing");
+        assert!(matches!(error, GwtError::WorkspaceStateLoad(error) if error.path == works));
+        assert_eq!(std::fs::read(&current).unwrap(), before);
+        assert_eq!(std::fs::read(&works).unwrap(), broken);
+    }
 }
 
 #[test]
@@ -9563,7 +9685,8 @@ fn apply_prune_plan_dry_run_counts_without_filesystem_change() {
         &WorkspaceRetentionConfig::default(),
         now,
         |_| false,
-    );
+    )
+    .expect("classify projections");
     let summary = apply_prune_plan(&plan, true).expect("dry run summary");
     assert_eq!(summary.archived, 1);
     assert_eq!(summary.deleted, 0);
@@ -9608,7 +9731,8 @@ fn apply_prune_plan_archives_then_deletes() {
         &WorkspaceRetentionConfig::default(),
         now,
         |_| false,
-    );
+    )
+    .expect("classify projections");
     let summary = apply_prune_plan(&plan, false).expect("apply prune");
     assert_eq!(summary.archived, 1);
     assert_eq!(summary.deleted, 1);
@@ -13198,6 +13322,9 @@ fn repair_resume_owner_bleed_sanitizes_cross_item_stamp() {
     // must still clear the identity.
     current.next_action = Some("Check Board for latest updates".to_string());
     current.status_text = "883 active agents".to_string();
+    current
+        .agents
+        .push(bleed_test_agent("sess-1", "work-work-b-00000001"));
     for seq in 0..5 {
         current.agents.push(bleed_test_agent(
             &format!("dead-{seq}"),
@@ -13247,7 +13374,8 @@ fn repair_resume_owner_bleed_sanitizes_cross_item_stamp() {
         .expect("current exists");
     assert_eq!(repaired_current.owner, None);
     assert_eq!(repaired_current.next_action, None);
-    assert!(repaired_current.agents.is_empty(), "dead agents purged");
+    assert_eq!(repaired_current.agents.len(), 1, "unbacked agents purged");
+    assert_eq!(repaired_current.agents[0].session_id, "sess-1");
 
     let second = repair_resume_owner_bleed_paths(&work_items_path, &current_path, now)
         .expect("repair rerun");
@@ -13287,6 +13415,40 @@ fn repair_resume_owner_bleed_keeps_legitimate_duplicates_below_threshold() {
             .iter()
             .all(|item| item.owner.as_deref() == Some("SPEC-2359")),
         "below-threshold duplicates keep their owner"
+    );
+}
+
+#[test]
+fn repair_resume_owner_bleed_preserves_other_work_session_assignment_after_reload() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let works_path = temp.path().join("works.json");
+    let current_path = temp.path().join("current.json");
+    let now = Utc.timestamp_opt(31_000, 0).unwrap();
+    let mut works = WorkItemsProjection::empty(now);
+    let mut current = WorkspaceProjection::default_for_project("/repo");
+    current.id = "work-a".to_string();
+    for (work_id, session_id) in [("work-a", "session-a"), ("work-b", "session-b")] {
+        let mut event = WorkEvent::new(WorkEventKind::Start, work_id, now);
+        event.agent_session_id = Some(session_id.to_string());
+        works.apply_event(event);
+        current.agents.push(bleed_test_agent(session_id, work_id));
+    }
+    save_workspace_work_items_projection_to_path(&works_path, &works).unwrap();
+    save_workspace_projection_to_path(&current_path, &current).unwrap();
+    drop(current);
+    drop(works);
+
+    repair_resume_owner_bleed_paths(&works_path, &current_path, now).unwrap();
+
+    let reloaded = load_workspace_projection_from_path(&current_path)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reloaded
+            .latest_agent_for_session("session-b")
+            .and_then(|agent| agent.workspace_id.as_deref()),
+        Some("work-b"),
+        "restart/intake repair must preserve another Work's canonical Session assignment"
     );
 }
 
