@@ -939,12 +939,19 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
         }
         if ((message.kind === "terminal_input" || message.kind === "pane_send_input")
           && !activeProjectKey()) {
+          connectionOverlay.reportInputDropped();
           return "unavailable";
         }
         if (socket && socket.readyState === WebSocket.OPEN
           && socketProjectKey === activeProjectKey()) {
           socket.send(JSON.stringify(message));
           return "sent";
+        }
+        // Keystrokes depend on the program's current prompt. Never replay
+        // them after reconnecting into a potentially different prompt (#4941).
+        if (message.kind === "terminal_input" || message.kind === "pane_send_input") {
+          connectionOverlay.reportInputDropped();
+          return "unavailable";
         }
         // Acknowledgements describe this connection's observed revision; a
         // restarted server may reuse revision numbers. Never queue them.
@@ -1169,7 +1176,17 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
       // SPEC-2359 W-17 (FR-399): explicit full-screen overlay while the
       // WebSocket bridge is down — a tiny status-strip label alone reads as
       // a frozen app when every click needs the socket.
-      const connectionOverlay = createConnectionOverlay({ document });
+      const connectionOverlay = createConnectionOverlay({
+        document,
+        onInputDropped: (reconnected) => alertsToasts.push({
+          id: "terminal-input-dropped",
+          level: "warn",
+          title: reconnected ? "Connection restored" : "Input not sent",
+          message: reconnected
+            ? "Input typed while disconnected was discarded and was not resent. Retype it when ready."
+            : "Input typed while disconnected was discarded. Retype it after reconnecting.",
+        }),
+      });
 
       // Issue #3365 — persistent notice for render/receive failures that the
       // resilient paths below swallow (dispatcher warn-and-continue, per-window
