@@ -10,8 +10,8 @@ use std::{
 use crate::{
     error::Result,
     repo_hash::{
-        compute_path_hash, detect_repo_hash, resolve_repo_identity, RepoHash,
-        RepoIdentityCandidate, RepoIdentityResolution, RepoIdentitySource,
+        compute_path_hash, resolve_repo_identity, RepoHash, RepoIdentityCandidate,
+        RepoIdentityResolution, RepoIdentitySource,
     },
 };
 
@@ -814,27 +814,6 @@ pub fn gwt_board_remote_roots_path(repo_root: &Path) -> PathBuf {
     gwt_repo_local_work_dir(repo_root).join("board-remote-roots.jsonl")
 }
 
-/// Return the repo-scoped notes root (`~/.gwt/notes/`).
-pub fn gwt_notes_dir() -> PathBuf {
-    gwt_home().join("notes")
-}
-
-/// Return the notes directory for a repository hash.
-pub fn gwt_repo_notes_dir(repo_hash: &RepoHash) -> PathBuf {
-    gwt_notes_dir().join(repo_hash.as_str())
-}
-
-/// Return the notes state path for a repository hash.
-pub fn gwt_notes_state_path(repo_hash: &RepoHash) -> PathBuf {
-    gwt_repo_notes_dir(repo_hash).join("notes.json")
-}
-
-/// Return the notes state path for a repository path.
-pub fn gwt_notes_state_path_for_repo_path(repo_path: &Path) -> PathBuf {
-    let repo_hash = project_scope_hash(repo_path);
-    gwt_notes_state_path(&repo_hash)
-}
-
 /// Return the global session state path (`~/.gwt/session.json`).
 pub fn gwt_session_state_path() -> PathBuf {
     gwt_home().join("session.json")
@@ -850,29 +829,14 @@ pub fn gwt_error_ledger_dir() -> PathBuf {
     gwt_logs_dir().join("errors")
 }
 
-/// Return the legacy coordination root (`~/.gwt/coordination/`).
-pub fn gwt_coordination_root() -> PathBuf {
-    gwt_home().join("coordination")
-}
-
 /// Return the coordination directory for a repository hash.
 pub fn gwt_coordination_dir(repo_hash: &RepoHash) -> PathBuf {
     gwt_project_dir(repo_hash).join("coordination")
 }
 
-/// Return the coordination directory for a repository path, if `origin` exists.
-pub fn gwt_coordination_dir_for_repo_path(repo_path: &Path) -> Option<PathBuf> {
-    detect_repo_hash(repo_path).map(|repo_hash| gwt_coordination_dir(&repo_hash))
-}
-
 /// Return the structured-log directory for a repository hash.
 pub fn gwt_project_logs_dir(repo_hash: &RepoHash) -> PathBuf {
     gwt_project_dir(repo_hash).join("logs")
-}
-
-/// Return the structured-log directory for a repository path, if `origin` exists.
-pub fn gwt_project_logs_dir_for_repo_path(repo_path: &Path) -> Option<PathBuf> {
-    detect_repo_hash(repo_path).map(|repo_hash| gwt_project_logs_dir(&repo_hash))
 }
 
 /// Return the canonical structured-log directory for a project path.

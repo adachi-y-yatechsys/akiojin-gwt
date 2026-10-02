@@ -964,7 +964,7 @@ impl AppRuntime {
     /// wake re-arms the loop so the next tick inside the interval is quiet-
     /// gated out. A busy PM pane (Issue #4258) holds the tick without
     /// stamping the wake clock, so the first tick after it is Idle fires.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn pm_periodic_wake_decision_at(
         &mut self,
         project_root: &Path,
@@ -1497,8 +1497,13 @@ impl AppRuntime {
                             .map_err(|error| {
                                 format!("PM pane input transaction unavailable: {error}")
                             })?;
+                        // Issue #4909: the mode is read on the reservation the
+                        // body is written through, so the paste wrapping and
+                        // the write see the same composer state.
+                        let bracketed_paste = reservation.bracketed_paste_enabled();
                         super::pty_io::drive_verified_pane_submit(
                             &protected_prompt,
+                            bracketed_paste,
                             2,
                             |bytes| {
                                 reservation

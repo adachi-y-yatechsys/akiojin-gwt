@@ -38,47 +38,21 @@ impl LaunchWizardState {
             ));
         }
 
-        // SPEC-1921 FR-090 (2026-05-18 amendment) / T295: when a saved
-        // Quick Start entry recorded `AgentId::Custom("<old-id>")` for a
-        // legacy `ClaudeCodeOpenaiCompat` preset that has since been
-        // migrated to `[builtinAgents.claudeCode.backends.<old-id>]`, the
-        // wizard MUST relaunch through the built-in Claude Code path with
-        // the matching backend profile attached. The remap is transparent
-        // to the caller; no UI prompt is shown.
-        let raw_agent_id = agent_id_from_key(&selected_agent.id);
-        let config_path = gwt_core::paths::gwt_config_path();
-        let remap_backend_id = if let gwt_agent::AgentId::Custom(_) = &raw_agent_id {
-            gwt_agent::resolve_legacy_backend_remap(&raw_agent_id, &config_path)
-        } else {
-            None
-        };
-        let (agent_id, backend_profile) = if let Some(backend_id) = remap_backend_id {
-            let profile = gwt_agent::load_backends_for_agent(
-                &config_path,
-                gwt_agent::BuiltinAgentId::ClaudeCode,
-            )
-            .ok()
-            .and_then(|profiles| profiles.into_iter().find(|p| p.id == backend_id));
-            match profile {
-                Some(profile) => (gwt_agent::AgentId::ClaudeCode, Some(profile)),
-                None => (raw_agent_id, None),
-            }
-        } else {
-            (raw_agent_id, None)
-        };
-
+        let agent_id = agent_id_from_key(&selected_agent.id);
         let mut builder = gwt_agent::AgentLaunchBuilder::new(agent_id.clone());
-        // FR-090: drop the legacy `selected_agent.custom_agent` when remap
-        // succeeded — the launch is now a built-in Claude Code with backend
-        // profile, not a Custom Coding Agent.
-        match (&backend_profile, selected_agent.custom_agent) {
-            (Some(profile), _) => {
-                builder = builder.backend_profile(profile.clone());
+        if let Some(custom_agent) = selected_agent.custom_agent {
+            // #4825: the old backend row migration was never wired into
+            // startup. Keep the stored row readable and require explicit
+            // registration instead of silently launching or rewriting it.
+            if custom_agent.command == "@anthropic-ai/claude-code@latest"
+                && custom_agent.env.contains_key("ANTHROPIC_BASE_URL")
+            {
+                return Err(
+                    "旧 backend 設定は自動移行されません。Settings で provider を再登録してください"
+                        .to_string(),
+                );
             }
-            (None, Some(custom_agent)) => {
-                builder = builder.custom_agent(custom_agent);
-            }
-            (None, None) => {}
+            builder = builder.custom_agent(custom_agent);
         }
 
         if !self.is_new_branch {
@@ -1682,16 +1656,59 @@ mod tests {
         }
     }
 
+    #[test]
+    fn installed_preference_setup_runs_install_and_update_in_host_shell() {
+        for agent in ["claude", "codex"] {
+            for available in [false, true] {
+                let mut options = sample_agent_options();
+                options
+                    .iter_mut()
+                    .find(|option| option.id == agent)
+                    .unwrap()
+                    .available = available;
+                let mut state = LaunchWizardState::open_with(
+                    context(branch("feature/gui"), "feature/gui"),
+                    options,
+                    Vec::new(),
+                );
+                state.set_agent_id(agent);
+                state.apply(LaunchWizardAction::RunAgentSetup);
+                let Some(LaunchWizardCompletion::Launch(request)) = state.completion else {
+                    panic!("expected setup launch for {agent}");
+                };
+                let LaunchWizardLaunchRequest::Shell(config) = *request else {
+                    panic!("shell");
+                };
+                let args = config.command_args_override.unwrap();
+                if agent == "codex" {
+                    assert_eq!(args.last().unwrap(), "npm install -g @openai/codex");
+                } else if available {
+                    assert_eq!(args.last().unwrap(), "claude update");
+                } else {
+                    assert!(args.last().unwrap().contains("https://claude.ai/install."));
+                }
+                assert_eq!(config.runtime_target, gwt_agent::LaunchRuntimeTarget::Host);
+            }
+        }
+    }
+
     /// SPEC-3864 FR-006: a synthetic setup request for an agent that needs
     /// nothing is an error, not a silent no-op launch.
     #[test]
     fn run_agent_setup_without_affordance_reports_error() {
         let mut state = LaunchWizardState::open_with(
             context(branch("feature/gui"), "feature/gui"),
-            sample_agent_options(),
+            vec![AgentOption {
+                id: "openclaw".into(),
+                name: "OpenClaw".into(),
+                available: true,
+                installed_version: Some("1.0.0".into()),
+                versions: Vec::new(),
+                custom_agent: None,
+            }],
             Vec::new(),
         );
-        state.set_agent_id("claude");
+        state.set_agent_id("openclaw");
         state.apply(LaunchWizardAction::RunAgentSetup);
         assert!(state.completion.is_none());
         assert!(state.error.is_some(), "expected an error");
@@ -1699,6 +1716,11 @@ mod tests {
 
     #[test]
     fn run_opencode_setup_yields_shell_completion_with_auth_login_command() {
+        // Keep both runner lookups on the same PATH while detection fixtures
+        // temporarily replace the process environment in parallel tests.
+        let _env = gwt_core::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // SPEC-3151 FR-010 / SPEC-3864 FR-006: the generic in-pane setup
         // launcher produces a Host shell launch running
         // `<opencode runner> auth login` from the descriptor's setup args.
@@ -1777,6 +1799,29 @@ mod tests {
         let config = state.build_launch_config().expect("config");
 
         assert_eq!(config.linked_issue_number, Some(1234));
+    }
+
+    #[test]
+    fn legacy_backend_requires_manual_registration_without_changing_config() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        let fixture = include_str!("../../playwright/fixtures/legacy-backend-config.toml");
+        std::fs::write(&path, fixture).expect("write pre-floor fixture");
+        let agents = gwt_agent::load_custom_agents_from_path(&path).expect("read legacy data");
+        let mut state = LaunchWizardState::open_with(
+            context(branch("feature/gui"), "feature/gui"),
+            build_agent_options(Vec::new(), &gwt_agent::VersionCache::new(), agents),
+            Vec::new(),
+        );
+        state.set_agent_id("legacy-cc");
+
+        assert_eq!(
+            state
+                .build_launch_config()
+                .expect_err("manual registration required"),
+            "旧 backend 設定は自動移行されません。Settings で provider を再登録してください"
+        );
+        assert_eq!(std::fs::read_to_string(path).unwrap(), fixture);
     }
 
     #[test]

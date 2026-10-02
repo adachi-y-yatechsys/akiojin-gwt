@@ -1071,6 +1071,16 @@ measure; never leave a column out and never guess one.
   `pr.ready` for a Draft `MERGE-CANDIDATE`. A row with no
   `default_action_operation` is advice you act on, not a call you make.
   Never invent an operation for a row that names none.
+- A `BEHIND` row with `merge_queue.enabled: true` is not yours to update
+  (Issue #4872). Its base lands through a merge queue, which re-tests the
+  PR on the latest base by itself; the row names no operation and its
+  `default_action` starts with `leave:`. Do not run `pr.update_branch`
+  on it: the update restarts CI for nothing, and
+  pushing to a queued PR removes it from the queue
+  (`merge_queue.position` is present while it is queued).
+  An absent `merge_queue` key means unknown, not "no merge queue": only
+  non-Draft rows that are, or may be held as, `BEHIND` are probed, and a
+  `BEHIND` row without the key keeps `update-branch`.
 - **Run `pr.update_branch` one PR at a time.** Every merge into the base
   puts every other open PR back to `BEHIND`, so a fan-out re-runs CI on
   branches that are about to go stale again. Each cycle, pick the single
@@ -2300,6 +2310,22 @@ mod tests {
             "pick the single PR closest to promotion",
             "Do not update a second PR in the same cycle",
             "never update every `BEHIND` row at once",
+        ] {
+            assert!(body.contains(phrase), "missing `{phrase}`");
+        }
+    }
+
+    /// Issue #4872 AC-4: on a base that lands through a merge queue, the queue
+    /// brings a `BEHIND` PR up to date. An update-branch there restarts CI for
+    /// nothing and removes a queued PR from the queue, so the PM must read the
+    /// row's `merge_queue` before acting on `BEHIND`.
+    #[test]
+    fn contract_leaves_a_behind_pr_to_an_enabled_merge_queue() {
+        let body = body();
+        for phrase in [
+            "A `BEHIND` row with `merge_queue.enabled: true` is not yours to update",
+            "pushing to a queued PR removes it from the queue",
+            "An absent `merge_queue` key means unknown",
         ] {
             assert!(body.contains(phrase), "missing `{phrase}`");
         }

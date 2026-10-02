@@ -69,10 +69,8 @@ use std::{
 const HOME_IMPLICIT_PATH_HELPERS: &[&str] = &[
     "gwt_cache_dir",
     "gwt_config_path",
-    "gwt_coordination_root",
     "gwt_home",
     "gwt_logs_dir",
-    "gwt_notes_dir",
     "gwt_project_dir_for_repo_path",
     "gwt_projects_dir",
     "gwt_runtime_dir",
