@@ -51,6 +51,7 @@ pub const VERIFICATION_RUN_STATE_RELATIVE: &str = ".gwt/skill-state/verification
 const OUTPUT_TAIL_LIMIT: usize = 8 * 1024;
 
 pub mod headed_e2e;
+pub mod interruption;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerificationCommandResult {
@@ -347,6 +348,9 @@ pub struct VerificationAdjudicationRef {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VerificationRunRecord {
     pub record_id: String,
+    /// Present only while a run is unfinished; omitted for legacy compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle: Option<interruption::RunLifecycle>,
     pub session_id: String,
     /// The reported human verification outcome, separate from automated test
     /// success. Omission remains unknown for existing records (Issue #4217).
@@ -781,7 +785,14 @@ pub fn save(worktree: &Path, record: &VerificationRunRecord) -> io::Result<()> {
         "verification-run.json",
         &state_path(worktree),
         &serialized,
-    )
+    )?;
+    // Diagnostic only: gates continue to read the trusted copy. Atomic rename
+    // also keeps a killed shell redirection from leaving this path empty.
+    let diagnostic_path = worktree.join(".gwt/tmp/verify-run.json");
+    if let Err(error) = gwt_github::cache::write_atomic(&diagnostic_path, &serialized) {
+        tracing::warn!(?error, path = %diagnostic_path.display(), "verification diagnostic mirror write failed");
+    }
+    Ok(())
 }
 
 /// Compute the worktree fingerprint at **content level**: sha256 over
@@ -3449,6 +3460,7 @@ struct RunOptions<'a> {
     on_progress: Option<&'a mut dyn FnMut(usize, usize, std::time::Duration)>,
     /// Lease the run was admitted under, recorded as its provenance.
     lease_id: Option<String>,
+    watch_runner: bool,
 }
 
 fn run_verification_for_caller(
@@ -3522,6 +3534,7 @@ where
                 revalidate_verification_caller_authority(worktree, session_id, authority)?;
             }
             let verified_head = current_head_sha(worktree).ok();
+            interruption::previous_external_terminations(worktree, verified_head.as_deref())?;
             Ok((
                 owner_number,
                 execution_binding,
@@ -3547,6 +3560,56 @@ where
         );
     }
     let started_at = Utc::now();
+    let record_id = format!("vrr-{}", uuid::Uuid::new_v4().simple());
+    let watchdog_token = uuid::Uuid::new_v4().simple().to_string();
+    // The companion must be ready before commands start. It never inherits
+    // the runner's host/target locks (Command uses close-on-exec descriptors).
+    let _watchdog = options
+        .watch_runner
+        .then(|| interruption::Watchdog::start(worktree, &record_id, &watchdog_token))
+        .transpose()
+        .map_err(|error| format!("failed to start verification watchdog: {error}"))?;
+    let mut running = VerificationRunRecord {
+        record_id: record_id.clone(),
+        lifecycle: Some(interruption::RunLifecycle::running(&watchdog_token)),
+        session_id: session_id.to_string(),
+        user_verification_result: options.user_verification_result.map(str::to_owned),
+        owner_number,
+        execution_binding: execution_binding.clone(),
+        lease_id: options.lease_id.clone(),
+        worktree_fingerprint: fingerprint_before.clone(),
+        verified_head: verified_head.clone(),
+        commands: Vec::new(),
+        all_passed: false,
+        quarantined_failures: Vec::new(),
+        adjudications: Vec::new(),
+        started_at: Some(started_at),
+        created_at: started_at,
+        plan_covered: false,
+        planned_missing: commands.to_vec(),
+        verification_plan_snapshot: plan_snapshot.clone(),
+        verification_plan_hash: plan_snapshot
+            .as_ref()
+            .map(|plan| plan.content_hash.clone())
+            .unwrap_or_default(),
+        plan_derived: plan_snapshot.as_ref().is_some_and(|plan| plan.derived),
+        content_hash: String::new(),
+    };
+    crate::cli::trusted_store::with_write_lease(worktree, || {
+        if let Some(authority) = authority {
+            revalidate_verification_caller_authority(worktree, session_id, authority)?;
+        }
+        // Recheck while replacing the prior record: a concurrent watchdog may
+        // have settled it since the initial snapshot.
+        running
+            .lifecycle
+            .as_mut()
+            .expect("unfinished run")
+            .external_terminations =
+            interruption::previous_external_terminations(worktree, verified_head.as_deref())?;
+        save(worktree, &running)
+    })
+    .map_err(|error| format!("failed to save verification start: {error}"))?;
     let mut results: Vec<VerificationCommandResult> = Vec::new();
     let mut transcript = String::new();
     if std::env::var_os(LIVE_GITHUB_OPT_IN_ENV).is_some() {
@@ -3573,6 +3636,13 @@ where
         on_progress(0, commands.len(), std::time::Duration::ZERO);
     }
     for command in commands {
+        running
+            .lifecycle
+            .as_mut()
+            .expect("unfinished run")
+            .current_command = Some(command.clone());
+        interruption::checkpoint(worktree, &running)
+            .map_err(|error| format!("failed to save verification progress: {error}"))?;
         transcript.push_str(&format!("$ {command}\n"));
         let capture = options
             .headed_e2e_commands
@@ -3621,6 +3691,14 @@ where
             headed_e2e,
             terminated_by_signal,
         });
+        running.commands = results.clone();
+        running
+            .lifecycle
+            .as_mut()
+            .expect("unfinished run")
+            .current_command = None;
+        interruption::checkpoint(worktree, &running)
+            .map_err(|error| format!("failed to save verification progress: {error}"))?;
         if let Some(on_progress) = options.on_progress.as_mut() {
             on_progress(results.len(), commands.len(), commands_started.elapsed());
         }
@@ -3733,7 +3811,8 @@ where
             _ => (false, Vec::new(), String::new(), false),
         };
     let mut record = VerificationRunRecord {
-        record_id: format!("vrr-{}", uuid::Uuid::new_v4().simple()),
+        record_id,
+        lifecycle: None,
         session_id: session_id.to_string(),
         user_verification_result: options.user_verification_result.map(str::to_owned),
         owner_number,
@@ -3758,6 +3837,7 @@ where
     };
 
     crate::cli::trusted_store::with_write_lease(worktree, || {
+        interruption::ensure_current(worktree, &record.record_id)?;
         if let Some(authority) = authority {
             revalidate_verification_caller_authority(worktree, session_id, authority)?;
         }
@@ -3890,6 +3970,8 @@ pub enum EvidenceStatus {
     /// revalidate the current PR reference before mutating or settling.
     FreshWithQuarantine,
     MissingRecord,
+    Running,
+    Interrupted,
     WrongSession,
     WrongOwner,
     /// The record belongs to a legacy/predecessor execution generation.
@@ -3924,6 +4006,8 @@ impl EvidenceStatus {
             Self::MissingRecord => {
                 "no verification run record exists — run the verification matrix through JSON operation `verify.run` with `params.commands:[...]`"
             }
+            Self::Running => "verification is still running — wait for its terminal result",
+            Self::Interrupted => "the last verification run was interrupted before completion; this is not a test failure. Inspect lifecycle.reason: two consecutive external terminations on the same HEAD require infrastructure diagnosis and a corrected HEAD before retrying; otherwise rerun verify.run",
             Self::WrongSession => {
                 "the verification record belongs to another session — rerun `verify.run` from this session"
             }
@@ -4329,6 +4413,12 @@ fn evaluate_evidence_snapshot_inner(
         {
             return EvidenceStatus::WrongGeneration;
         }
+    }
+    if let Some(lifecycle) = &record.lifecycle {
+        return match lifecycle.status {
+            interruption::RunStatus::Running => EvidenceStatus::Running,
+            interruption::RunStatus::Interrupted => EvidenceStatus::Interrupted,
+        };
     }
     if let Some(snapshot) = record.verification_plan_snapshot.as_ref() {
         if record.content_hash.is_empty()
@@ -5042,6 +5132,22 @@ pub(super) fn run<E: CliEnv>(
             user_verification_result,
             headed_e2e_commands,
         } => {
+            // Refuse exhausted retries before taking a host lease or starting
+            // a watchdog. The runner checks again under its write lease.
+            crate::cli::trusted_store::with_write_lease(&worktree, || {
+                revalidate_verification_caller_authority(&worktree, &session_id, &authority)?;
+                match interruption::previous_external_terminations(
+                    &worktree,
+                    current_head_sha(&worktree).ok().as_deref(),
+                ) {
+                    // A live predecessor must reach normal admission so heavy
+                    // runs retain their deferred/wait semantics. The runner
+                    // still refuses to overwrite it under the write lease.
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+                    result => result,
+                }
+            })
+            .map_err(|error| SpecOpsError::from(ApiError::Unexpected(error.to_string())))?;
             if let Some(refusal) = user_verification_result
                 .as_deref()
                 .and_then(|result| autonomous_confirmation_refusal(Some(&session_id), result))
@@ -5094,6 +5200,9 @@ pub(super) fn run<E: CliEnv>(
                 &authority,
                 &prepared_quarantines,
                 RunOptions {
+                    // Unit CLI fixtures are in-process, not a gwtd executable.
+                    // Real runner death is covered by verification_admission_cli_test.
+                    watch_runner: !cfg!(test),
                     user_verification_result: if crate::cli::execution_state::session_launch_route(
                         Some(&session_id),
                     ) == Some(gwt_agent::LaunchRoute::Autonomous)
@@ -5214,8 +5323,9 @@ pub(crate) mod tests {
         run_verification(worktree, session, commands).unwrap()
     }
 
-    fn passing_record(session: &str, fingerprint: &str) -> VerificationRunRecord {
+    pub(super) fn passing_record(session: &str, fingerprint: &str) -> VerificationRunRecord {
         VerificationRunRecord {
+            lifecycle: None,
             record_id: "vr-test".to_string(),
             user_verification_result: None,
             session_id: session.to_string(),
@@ -6269,6 +6379,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(load(dir.path()).unwrap(), None);
         let record = VerificationRunRecord {
+            lifecycle: None,
             record_id: "vrr-test".to_string(),
             user_verification_result: None,
             session_id: "sess-1".to_string(),
@@ -6390,6 +6501,16 @@ mod tests {
     #[test]
     fn run_verification_records_pass_and_fail() {
         let dir = tempfile::tempdir().unwrap();
+        // The documented recovery for unreadable verification evidence is
+        // rerunning verify.run; retry admission must preserve that contract.
+        crate::cli::trusted_store::write_with_mirror(
+            dir.path(),
+            "verification-run.json",
+            &state_path(dir.path()),
+            b"not-json",
+        )
+        .unwrap();
+        assert_eq!(load(dir.path()).unwrap_err().kind(), ErrorKind::InvalidData);
         let (record, transcript) =
             run_verification(dir.path(), "sess-1", &["git --version".to_string()]).unwrap();
         assert!(record.all_passed, "{transcript}");
@@ -6410,6 +6531,38 @@ mod tests {
         assert_ne!(record.commands[1].exit_code, 0);
         // Latest record persisted.
         assert!(!load(dir.path()).unwrap().unwrap().all_passed);
+    }
+
+    #[test]
+    fn diagnostic_mirror_failure_does_not_reverse_the_recorded_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        // An unwritable diagnostic destination cannot invalidate a successful
+        // authoritative write or turn the CLI result into a different verdict.
+        fs::create_dir_all(dir.path().join(".gwt/tmp/verify-run.json")).unwrap();
+        let (record, _) = run_verification(dir.path(), "sess-1", &["git --version".into()])
+            .expect("diagnostic mirror is best effort");
+        assert!(record.all_passed);
+        assert_eq!(load(dir.path()).unwrap().unwrap(), record);
+    }
+
+    #[test]
+    fn an_older_runner_cannot_overwrite_a_replacement_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let replacement = passing_record("replacement", "no-git");
+        let result = run_verification_inner(
+            dir.path(),
+            "sess-1",
+            &["git --version".into()],
+            None,
+            &[],
+            RunOptions::default(),
+            || save(dir.path(), &replacement).unwrap(),
+        );
+        assert!(result.unwrap_err().contains("replaced or interrupted"));
+        assert_eq!(
+            load(dir.path()).unwrap().unwrap().record_id,
+            replacement.record_id
+        );
     }
 
     // Issue #3841 / SPEC #3248 FR-036/FR-053: typed quarantine evidence is
@@ -8876,7 +9029,7 @@ mod tests {
         .expect("register plan before run race");
         let authority = snapshot_verification_caller_authority(dir.path(), session_id)
             .expect("snapshot verification caller before run");
-        let artifacts_before = verification_artifact_bytes(dir.path());
+        let mut artifacts_before_rotation = None;
         let session_for_hook = session_id.to_string();
 
         let error = run_verification_inner(
@@ -8886,7 +9039,8 @@ mod tests {
             Some(&authority),
             &[],
             RunOptions::default(),
-            move || {
+            || {
+                artifacts_before_rotation = Some(verification_artifact_bytes(dir.path()));
                 advance_generation_scoped_session_binding(&session_for_hook, current);
             },
         )
@@ -8901,8 +9055,8 @@ mod tests {
         );
         assert_eq!(
             verification_artifact_bytes(dir.path()),
-            artifacts_before,
-            "capability race must leave plan/run evidence byte-equivalent"
+            artifacts_before_rotation.expect("snapshot immediately before authority rotation"),
+            "revoked capability must leave the running evidence byte-equivalent"
         );
     }
 

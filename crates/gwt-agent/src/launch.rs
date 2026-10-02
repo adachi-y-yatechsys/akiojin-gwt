@@ -824,7 +824,11 @@ fn apply_host_bunx_cache_fast_path_from_uid(
     let Some(package) = config.agent_id.npm_package() else {
         return NotApplicable;
     };
-    let Some(version) = config.tool_version.as_deref() else {
+    let Some(version) = config
+        .tool_version_selector
+        .as_deref()
+        .or(config.tool_version.as_deref())
+    else {
         return NotApplicable;
     };
     if version.is_empty()
@@ -1103,6 +1107,7 @@ pub struct LaunchConfig {
     /// Retained separately from argv so launch provenance still sees its skill.
     pub pending_initial_prompt: Option<String>,
     pub env_vars: HashMap<String, String>,
+    pub codex_auth_root: Option<crate::CodexAuthRoot>,
     pub remove_env: Vec<String>,
     pub working_dir: Option<PathBuf>,
     pub branch: Option<String>,
@@ -1111,6 +1116,9 @@ pub struct LaunchConfig {
     pub color: AgentColor,
     pub model: Option<String>,
     pub tool_version: Option<String>,
+    /// Requested selector, retained separately from the version observed by
+    /// the final runner probe (including after package-cache optimization).
+    pub tool_version_selector: Option<String>,
     /// Path-independent identity of the exact official package selected for a
     /// targeted Windows Host launch. Absolute runner paths remain runtime-only.
     pub tool_runtime_provenance: Option<ToolRuntimeProvenance>,
@@ -1166,6 +1174,16 @@ pub struct LaunchConfig {
     /// so it is stamped here and persisted onto the Session rather than being
     /// re-derived later from the agent's environment.
     pub launch_route: LaunchRoute,
+    /// Issue #4783 AC-2: this Resume launch is an automatic restore (startup
+    /// auto-resume / Open Project sweep), not an operator's restart or a
+    /// launch the operator chose. Only the restore spawn boundary sets it.
+    ///
+    /// The durable `Session.launch_origin` cannot carry this: it is written
+    /// after `AgentStarted`, so the first automatic restore of a Session has
+    /// no origin on disk yet. The launch worker reads it before recovering
+    /// producing authority, where a restore must never reactivate a terminal
+    /// execution generation.
+    pub automatic_restore: bool,
     /// Issue #4543: the Permission Mode Decision this launch was materialized
     /// under, already checked against the argv and environment above.
     ///
@@ -1176,6 +1194,16 @@ pub struct LaunchConfig {
 }
 
 impl LaunchConfig {
+    /// Revalidate captured provenance against the final child environment and cwd.
+    pub fn validated_codex_auth_root_for_cwd(
+        &self,
+        cwd: &std::path::Path,
+    ) -> Option<crate::CodexAuthRoot> {
+        let proof = self.codex_auth_root.as_ref()?;
+        let (path, _) = crate::environment::codex_auth_root_path(self, cwd)?;
+        (proof.path == path).then(|| proof.clone())
+    }
+
     /// Original task arguments for provenance, before file/shell transport.
     pub fn entrypoint_args(&self) -> &[String] {
         self.pending_initial_prompt
@@ -1618,9 +1646,21 @@ impl AgentLaunchBuilder {
         runner_env.extend(self.env_overrides.clone());
         let runner = self.custom_agent.as_ref().map_or_else(
             || {
+                // Host Claude/Codex prefer the user's installation. Preparation
+                // resolves it against the final launch environment and retains
+                // the existing checked package fallback when it is unavailable.
+                let version = self.version.as_deref().unwrap_or("installed");
+                let version = if self.runtime_target == LaunchRuntimeTarget::Host
+                    && matches!(self.agent_id, AgentId::ClaudeCode | AgentId::Codex)
+                    && version == "latest"
+                {
+                    "installed"
+                } else {
+                    version
+                };
                 resolve_runner_with_effective_env(
                     &self.agent_id,
-                    self.version.as_deref().unwrap_or("installed"),
+                    version,
                     &runner_env,
                     &[],
                     self.working_dir.as_deref(),
@@ -1725,6 +1765,7 @@ impl AgentLaunchBuilder {
             command: runner.executable,
             args,
             pending_initial_prompt: None,
+            codex_auth_root: None,
             env_vars,
             remove_env: Vec::new(),
             working_dir: self.working_dir,
@@ -1734,6 +1775,15 @@ impl AgentLaunchBuilder {
             color,
             model,
             tool_version,
+            tool_version_selector: (self.runtime_target == LaunchRuntimeTarget::Host
+                && matches!(self.agent_id, AgentId::ClaudeCode | AgentId::Codex))
+            .then(|| {
+                self.version
+                    .as_deref()
+                    .filter(|version| !version.is_empty())
+                    .unwrap_or("installed")
+                    .to_string()
+            }),
             tool_runtime_provenance,
             tool_runtime_source_session_id,
             reasoning_level,
@@ -1754,6 +1804,7 @@ impl AgentLaunchBuilder {
             explicit_follow_up: self.explicit_follow_up,
             execution_intent: self.execution_intent,
             launch_route: self.launch_route,
+            automatic_restore: false,
             permission_decision,
         }
     }
@@ -1803,10 +1854,8 @@ impl AgentLaunchBuilder {
             // does not see unrelated telemetry POSTs (SPEC-1921 Phase 52
             // preset legacy invariant).
             env_vars.insert("CLAUDE_CODE_ATTRIBUTION_HEADER".into(), "0".into());
-            env_vars.insert(
-                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".into(),
-                "1".into(),
-            );
+            // The umbrella NONESSENTIAL_TRAFFIC flag also disables native
+            // auto-updates. The individual telemetry flags above suffice.
         }
 
         // Permission mode
@@ -3306,6 +3355,36 @@ mod tests {
     }
 
     #[test]
+    fn host_claude_and_codex_latest_prefer_installed_runner() {
+        for agent in [AgentId::ClaudeCode, AgentId::Codex] {
+            let config = AgentLaunchBuilder::new(agent.clone())
+                .version("latest")
+                .build();
+            assert_eq!(config.command, agent.command());
+            assert!(!config.args.iter().any(|arg| arg.contains("@latest")));
+            let empty = AgentLaunchBuilder::new(agent).version("").build();
+            assert_eq!(empty.tool_version_selector.as_deref(), Some("installed"));
+        }
+    }
+
+    #[test]
+    fn installed_claude_backend_keeps_native_auto_updates_enabled() {
+        let config = AgentLaunchBuilder::new(AgentId::ClaudeCode)
+            .version("installed")
+            .backend_profile(sample_claude_backend())
+            .build();
+        for key in [
+            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+            "DISABLE_AUTOUPDATER",
+        ] {
+            assert!(
+                !config.env_vars.contains_key(key),
+                "gwt must not inject {key}"
+            );
+        }
+    }
+
+    #[test]
     fn resolve_runner_empty_version_returns_direct_command() {
         let runner = resolve_runner(&AgentId::Codex, "");
         assert_eq!(runner.executable, "codex");
@@ -3889,15 +3968,24 @@ mod tests {
     }
 
     #[cfg(all(not(windows), unix))]
+    fn codex_latest_package_config() -> LaunchConfig {
+        let mut config = AgentLaunchBuilder::new(AgentId::Codex)
+            .version("latest")
+            .build();
+        let runner = resolve_runner(&AgentId::Codex, "latest");
+        config.command = runner.executable;
+        config.args.splice(0..0, runner.base_args);
+        config
+    }
+
+    #[cfg(all(not(windows), unix))]
     #[test]
     fn fresh_bunx_latest_cache_runs_entrypoint_with_bun_and_preserves_agent_args() {
         let temp = tempfile::tempdir().expect("tempdir");
         let (executable, modified) =
             write_test_bunx_cache(temp.path(), "latest", "@openai/codex", "@openai/codex");
-        let mut config = AgentLaunchBuilder::new(AgentId::Codex)
-            .version("latest")
-            .working_dir("/tmp/project")
-            .build();
+        let mut config = codex_latest_package_config();
+        config.working_dir = Some(PathBuf::from("/tmp/project"));
         let (bun, bunx) = write_test_bun_runtime(temp.path());
         config.command = bunx.to_string_lossy().into_owned();
         config.env_vars.insert(
@@ -3907,6 +3995,7 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
         );
+        config.tool_version = Some("0.145.0".into());
         let original_working_dir = config.working_dir.clone();
 
         let changed = apply_host_bunx_cache_fast_path_from(
@@ -3936,9 +4025,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let (_executable, modified) =
             write_test_bunx_cache(temp.path(), "latest", "@openai/codex", "@openai/codex");
-        let mut stale = AgentLaunchBuilder::new(AgentId::Codex)
-            .version("latest")
-            .build();
+        let mut stale = codex_latest_package_config();
         let original_command = stale.command.clone();
         let original_args = stale.args.clone();
 
@@ -3984,9 +4071,7 @@ mod tests {
         let mut shared_permissions = original_permissions.clone();
         shared_permissions.set_mode(0o777);
         std::fs::set_permissions(temp.path(), shared_permissions).expect("make temp root shared");
-        let mut config = AgentLaunchBuilder::new(AgentId::Codex)
-            .version("latest")
-            .build();
+        let mut config = codex_latest_package_config();
 
         let changed = apply_host_bunx_cache_fast_path_from(
             &mut config,
@@ -4035,9 +4120,7 @@ mod tests {
             write_test_bunx_cache(temp.path(), "latest", "@openai/codex", "@openai/codex");
         let current_uid = current_effective_uid();
         let foreign_uid = if current_uid == 0 { 1 } else { 0 };
-        let mut config = AgentLaunchBuilder::new(AgentId::Codex)
-            .version("latest")
-            .build();
+        let mut config = codex_latest_package_config();
 
         assert!(
             !apply_host_bunx_cache_fast_path_from_uid(
@@ -4065,9 +4148,7 @@ mod tests {
             .permissions();
         permissions.set_mode(0o777);
         std::fs::set_permissions(bin_dir, permissions).expect("make bin dir writable");
-        let mut config = AgentLaunchBuilder::new(AgentId::Codex)
-            .version("latest")
-            .build();
+        let mut config = codex_latest_package_config();
 
         assert!(
             !apply_host_bunx_cache_fast_path_from(
@@ -4091,9 +4172,7 @@ mod tests {
             .join(format!("bunx-{}-@openai", current_effective_uid()));
         let misleading_root = temp.path().join("bunx-evil-@openai");
         std::fs::rename(correct_root, misleading_root).expect("rename cache root");
-        let mut config = AgentLaunchBuilder::new(AgentId::Codex)
-            .version("latest")
-            .build();
+        let mut config = codex_latest_package_config();
 
         assert!(
             !apply_host_bunx_cache_fast_path_from(
@@ -4304,9 +4383,7 @@ mod tests {
             "bin/codex.js",
             ELF_MAGIC,
         );
-        let mut codex = AgentLaunchBuilder::new(AgentId::Codex)
-            .version("latest")
-            .build();
+        let mut codex = codex_latest_package_config();
         codex.command = bunx.to_string_lossy().into_owned();
         assert_eq!(
             apply_host_bunx_cache_fast_path_from(
@@ -4574,7 +4651,7 @@ mod tests {
 
     #[cfg(all(not(windows), unix))]
     #[test]
-    fn builder_latest_selection_uses_explicit_path_and_launch_cwd() {
+    fn builder_pinned_selection_uses_explicit_path_and_launch_cwd() {
         let temp = tempfile::tempdir().expect("tempdir");
         let launch_cwd = temp.path().join("project");
         let bin = launch_cwd.join("tools");
@@ -4584,7 +4661,7 @@ mod tests {
 
         let config = AgentLaunchBuilder::new(AgentId::ClaudeCode)
             .working_dir(&launch_cwd)
-            .version("latest")
+            .version("2.1.156")
             .env("PATH", "tools")
             .build();
 
@@ -4735,9 +4812,10 @@ mod tests {
     }
 
     #[test]
-    fn build_with_version_latest() {
+    fn docker_build_with_version_latest() {
         let config = AgentLaunchBuilder::new(AgentId::ClaudeCode)
             .version("latest")
+            .runtime_target(LaunchRuntimeTarget::Docker)
             .build();
         assert!(
             config.command.contains("bunx") || config.command.contains("npx"),
@@ -5016,13 +5094,9 @@ mod tests {
                 .map(String::as_str),
             Some("0")
         );
-        assert_eq!(
-            config
-                .env_vars
-                .get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC")
-                .map(String::as_str),
-            Some("1")
-        );
+        assert!(!config
+            .env_vars
+            .contains_key("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"));
     }
 
     #[test]

@@ -114,7 +114,7 @@ curl -fsSL https://raw.githubusercontent.com/akiojin/gwt/main/installers/macos/u
   - `OPENAI_API_KEY`
   - `GOOGLE_API_KEY` or `GEMINI_API_KEY`
   - `XAI_API_KEY`
-- Python 3.9+ when gwt needs to bootstrap or repair the shared project index runtime
+- Python 3.10+ when gwt needs to bootstrap or repair the shared project index runtime
 
 Linux desktop builds also require WebKitGTK-related system packages. See
 [docs/docker-usage.md](docs/docker-usage.md) for the dependency set used in CI.
@@ -472,6 +472,35 @@ the materialized `gwt-*` skills and commands, or a `.codex/hooks.json` /
 `.claude/settings.local.json` that still carries no hand-written content.
 Anything else you have not committed keeps the Workspace out of the count.
 
+### Free provider resets
+
+`provider.reset.proposals` reads provider holds and suggests checking a free
+Codex reset when the remaining wait exceeds `min_reset_wait_secs` (default:
+86400). Claude holds instead suggest switching providers: paid `/extra-usage`
+is never enabled by gwt.
+
+`provider.reset` takes `provider: "codex"` and the exact `window_id` from
+`pane.list`. It checks the available free credits, then displays an OS
+confirmation dialog. Choose **Redeem free reset** to consume one free reset
+for that account; Cancel is the default. Confirmation is mandatory even in
+autonomous mode. JSON approval flags and past approvals cannot replace it.
+Only canvas windows using a directly installed Host Codex and its default
+provider are supported; Docker, package-runner launches and custom backends
+are refused. The dialog identifies the authentication root recorded when the
+target window launched and its source (host, profile or caller environment).
+The helper uses that same root. Relaunch older windows that lack this proof;
+unresolved authentication environments are refused. On Windows, set an explicit
+`CODEX_HOME` before launching the target window.
+
+After a confirmed reset, gwt rereads account availability and releases the
+provider hold automatically. Failure or an unconfirmed outcome retains the
+hold. Approval, execution and results are recorded under
+`~/.gwt/provider-resets/<request_id>.jsonl`; the operation returns that path
+and any failure reason. If only the final audit write fails after a successful
+reset and hold release, the result remains successful with an `audit_warning`.
+No credits are purchased, and no paid-usage fallback
+exists. See `gwtd --help provider` for parameters.
+
 ### Autonomous mode (opt-in)
 
 Autonomous mode runs the whole loop unattended: eligible issue → auto-launch →
@@ -604,6 +633,10 @@ and coordination-event summaries.
 - Whether `.codex/hooks.json` is version-controlled is a repository decision.
   When the file already exists, gwt replaces only gwt-managed hook entries and
   keeps user hooks plus unrelated top-level settings.
+- The gwt repository itself ignores `.codex/hooks.json` and generates it locally
+  when gwt prepares an agent session. Windows uses a PowerShell EncodedCommand;
+  macOS and Linux use a POSIX shell command. Keeping this generated file untracked
+  prevents platform-specific changes from dirtying the checkout.
 - A version-controlled `.codex/hooks.json` should keep the portable `gwtd`
   fallback so a machine-local absolute path is never committed. Regenerate it
   with
@@ -1070,6 +1103,33 @@ exceeds 100%. On a host with hundreds of worktrees the daemon can outrank the
 agents themselves, which otherwise only reads as a slow host. The block is
 present with no processes and no warning on platforms without Spotlight.
 
+## Pending application updates
+
+A downloaded update can remain staged while agents finish their work. The
+existing drain evaluates safety on the 15-second terminal convergence tick:
+two quiet observations start a 60-second grace period before applying. The
+`autonomous_tuning.update_drain_notify_after_secs` setting controls the repeated
+waiting notification (default: 1800 seconds); it is not a forced restart deadline.
+Agents are never terminated merely because that interval elapsed.
+
+`~/.gwt/logs/update-YYYY-MM-DD.log` records the stage, wait/refusal reason and,
+when another automatic evaluation is scheduled, `next_evaluation_at`. Unchanged
+wait reasons do not create a log line every tick. The latest per-project
+observation is refreshed on each evaluation; its timestamp is an observation,
+not a guarantee that a stalled or stopped app will run the next tick.
+
+The `release.status` JSON operation distinguishes `pending_update_version`
+(the locally saved manifest version) from `pending_version` (a remote
+release branch's unreleased version bump). `update_wait` reports the latest
+matching local wait observation. If the payload is missing, `update_stage` is
+`payload_missing` and the recovery action asks for a fresh download. `last_apply_result` and `last_apply_failure`
+report the latest completed attempt; `attempt` is the resume marker's counter,
+not a lifetime retry count. A successful result replaces the previous failure.
+A failed install may restart into the old version: restarting alone does not
+prove the update was applied. Follow the reported recovery action and check
+`observed_version`. Requests made while an apply is already resolving or
+committing are coalesced; a failed request permits an explicit retry.
+
 ## Development
 
 ### Build
@@ -1124,6 +1184,30 @@ lint, coverage, direct headed browser checks, and pre-push checks run
 directly without a verification lease. Completion still requires canonical
 verification evidence.
 
+`verify.lease.status` returns `holder_project_relation` (`same_project`,
+`other_project`, or `unknown`), `holder_reclaim_candidate`, and
+`holder_intervention`. Another project's holder, an unidentified owner, or an
+inconclusive activity reading is protected: `holder_intervention: forbidden`.
+Additional sampling does not authorize stopping an `unknown` holder. Only a
+same-project reclaim candidate or legacy control channel reports
+`canonical_release_only`; canonical
+release rechecks its state and refuses requests from another project. A refusal
+must not be bypassed with `kill` or `pkill`.
+
+`estimated_remaining_ms_uncertain: true` accompanies the ETA: it is a batch
+estimate or lease TTL, not a live progress counter. An unchanged value does not
+prove a stall. `waiter_action: wait` means waiting for canonical admission is
+expected; a pending queue position grants no permission to stop the holder.
+
+`verify.run` saves an unfinished record before starting commands. If the runner
+is terminated externally, a companion records the interruption, the last active
+command, and any completed command results. `execution.status` distinguishes
+`running` and `interrupted` from `missing_record`; interrupted evidence cannot
+authorize completion or a PR and requires a new run. The diagnostic copy at
+`.gwt/tmp/verify-run.json` is written atomically; the machine-local trusted record
+remains authoritative. The interruption reason says `signal unknown` when the
+exact signal cannot be observed.
+
 The `pre-push` hook deliberately runs only checks that do not compile the
 workspace: `cargo fmt --all -- --check`, Markdownlint, and the SKILL.md
 frontmatter validation. A Git hook runs under `git push` rather than under
@@ -1136,7 +1220,8 @@ pull request by the Lint, Test, and Coverage workflows instead.
 `verify.lease.extend` now return an error without creating a holder or
 reservation. Replace manual acquisition around canonical verification with
 `verify.run`; remove acquisition around ordinary Cargo commands. Existing
-legacy holders can be drained explicitly without killing their processes:
+legacy holders can be drained explicitly from their owning project without
+killing their processes:
 
 ```bash
 gwtd <<'JSON'

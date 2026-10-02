@@ -226,7 +226,13 @@ pub(super) fn run<E: CliEnv>(
             let mut status = status()?;
             let worktree = resolve_current_worktree_root(env.repo_path());
             observe_holder_activity(&mut status, &worktree);
-            render(out, "held", "free", &status);
+            render(
+                out,
+                "held",
+                "free",
+                &status,
+                project_scope_hash(&worktree).as_str(),
+            );
             Ok(0)
         }
         VerificationLeaseCommand::Acquire { .. }
@@ -241,6 +247,7 @@ pub(super) fn run<E: CliEnv>(
         VerificationLeaseCommand::Release { lease_id, reason } => {
             let worktree = resolve_current_worktree_root(env.repo_path());
             release(
+                project_scope_hash(&worktree).as_str(),
                 &lease_id,
                 reason.as_deref(),
                 &mut SystemReclaimer::new(&worktree),
@@ -251,13 +258,39 @@ pub(super) fn run<E: CliEnv>(
 }
 
 fn release(
+    current_project: &str,
     lease_id: &str,
     reason: Option<&str>,
     reclaimer: &mut dyn OrphanReclaimer,
     out: &mut String,
 ) -> Result<i32, SpecOpsError> {
+    let mut snapshot = status()?;
+    if !snapshot.held || snapshot.lease_id.as_deref() != Some(lease_id) {
+        // A current verification holder can hide a pre-upgrade holder on
+        // the model lane. Check that holder's ownership before writing its
+        // release channel too; a saved control outcome is not authority.
+        snapshot = IndexCoordinator::open_default()
+            .and_then(|coordinator| coordinator.heavy_lease_status())
+            .ok()
+            .filter(|status| {
+                status.held
+                    && status.lease_id.as_deref() == Some(lease_id)
+                    && status.holder_kind == Some(HeavyHolderKind::Verification)
+            })
+            .ok_or_else(|| missing_lease(lease_id))?
+            .into();
+    }
+    let relation = holder_project_relation(snapshot.target.as_deref(), current_project);
+    if relation != HolderProjectRelation::SameProject {
+        return Err(unexpected(format!(
+            "verification lease {lease_id}: {}. You must not reclaim or stop this holder. \
+             Wait for it to finish; only the owning project may request canonical release. \
+             Do not bypass this refusal with kill or pkill.",
+            relation.reason()
+        )));
+    }
     let Some(control) = control_dir_for(lease_id) else {
-        return reclaim_holder(lease_id, reason, reclaimer, out);
+        return reclaim_holder(current_project, lease_id, reason, reclaimer, out);
     };
     // Issue #4360: the holder waits for this file to exist and then reads the
     // reason out of it, so a plain write lets it read the empty moment between
@@ -277,7 +310,7 @@ fn release(
     if let Some(reason) = reason {
         out.push_str(&format!("reason: {reason}\n"));
     }
-    push_status_fields(out, &status()?);
+    push_status_fields(out, &status()?, current_project);
     Ok(0)
 }
 
@@ -400,6 +433,7 @@ fn holder_workload(
 /// two readings [`ORPHAN_CONFIRM_WINDOW`] apart. Every other
 /// holder keeps the protection it had — the manual API cannot touch it.
 fn reclaim_holder(
+    current_project: &str,
     lease_id: &str,
     reason: Option<&str>,
     reclaimer: &mut dyn OrphanReclaimer,
@@ -418,6 +452,7 @@ fn reclaim_holder(
     let Some(owner) = status.owner.clone() else {
         return Err(canonical_refusal(lease_id, None));
     };
+    protect_renewed_holder(&status, lease_id)?;
     let first = reclaimer.observe(owner.pid, &status, Duration::ZERO);
     let Some(first) = first.filter(holder_activity::HolderActivity::reclaimable) else {
         return Err(canonical_refusal(
@@ -450,9 +485,11 @@ fn reclaim_holder(
     // The lease must still be the same one, under the same owner, right
     // before its holder is ended: a pid is only a name, and ten seconds is
     // long enough for the lease to change hands.
-    if held(&coordinator).and_then(|status| status.owner) != Some(owner.clone()) {
+    let current = held(&coordinator).ok_or_else(|| missing_lease(lease_id))?;
+    if current.owner != Some(owner.clone()) {
         return Err(missing_lease(lease_id));
     }
+    protect_renewed_holder(&current, lease_id)?;
     reclaimer.terminate(owner.pid, false).map_err(unexpected)?;
     if await_settled(lease_id).is_err() {
         reclaimer.terminate(owner.pid, true).map_err(unexpected)?;
@@ -475,8 +512,23 @@ fn reclaim_holder(
         "recorded: {} (kind reclaimed)\n",
         coordinator.lease_event_log_path().display()
     ));
-    push_status_fields(out, &self::status()?);
+    push_status_fields(out, &self::status()?, current_project);
     Ok(0)
+}
+
+/// Renewal observes the exact command tree; a reclaimer's process sample can
+/// miss delegated work. Keep a renewed lease protected until that TTL expires.
+/// Expiry alone still does not authorize reclaiming it.
+fn protect_renewed_holder(status: &HeavyLeaseStatus, lease_id: &str) -> Result<(), SpecOpsError> {
+    // The diagnostic event ledger is best-effort. Only the atomically
+    // published ticket can establish that a valid TTL has not been renewed.
+    if status.expires_at_ms.is_some() && !status.expired && status.ttl_renewed != Some(false) {
+        return Err(canonical_refusal(
+            lease_id,
+            Some("the holder renewed its active TTL or its renewal state is unknown; wait for its verification to finish"),
+        ));
+    }
+    Ok(())
 }
 
 /// Issue #4633 AC-4: what a caller closing a pane in `worktree` should know
@@ -562,14 +614,58 @@ const HOLDER_STATE_ADVICE: &str = "holder_state is one sampled reading, not a ve
                                    the work runs outside the holder's tree and was not found; \
                                    `orphaned` means its parent exited with nothing of its own \
                                    left running; `reclaimable` means an old in-tree driver has \
-                                   no remaining workload — `verify.lease.release` with a reason \
-                                   re-checks that and reclaims the lease. Confirm with \
-                                   `ps -eo pid,ppid,time,command` before acting.";
+                                   no remaining workload. `ps -eo pid,ppid,time,command` is diagnostic \
+                                   only; neither it nor repeated sampling grants permission to \
+                                   stop a holder. Follow holder_intervention; never bypass a \
+                                   canonical release refusal with kill or pkill.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HolderProjectRelation {
+    SameProject,
+    OtherProject,
+    Unknown,
+}
+
+impl HolderProjectRelation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SameProject => "same_project",
+            Self::OtherProject => "other_project",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            Self::SameProject => "held by this project",
+            Self::OtherProject => "held by another project",
+            Self::Unknown => "the holder's project could not be established",
+        }
+    }
+}
+
+fn holder_project_relation(target: Option<&str>, current_project: &str) -> HolderProjectRelation {
+    let Some((project, worktree)) = target.and_then(|target| target.split_once("--verification--"))
+    else {
+        return HolderProjectRelation::Unknown;
+    };
+    if project.is_empty() || worktree.is_empty() || current_project.is_empty() {
+        HolderProjectRelation::Unknown
+    } else if project == current_project {
+        HolderProjectRelation::SameProject
+    } else {
+        HolderProjectRelation::OtherProject
+    }
+}
 
 /// Status rendering and the pre-upgrade detached holder wire format.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct LeaseStatusSnapshot {
     held: bool,
+    /// Derived from the live lease's control channel, never trusted from a
+    /// saved pre-upgrade outcome.
+    #[serde(skip)]
+    legacy_release_available: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     lease_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -650,6 +746,7 @@ impl From<HeavyLeaseStatus> for LeaseStatusSnapshot {
     fn from(status: HeavyLeaseStatus) -> Self {
         Self {
             held: status.held,
+            legacy_release_available: false,
             lease_id: status.lease_id,
             target: status.target,
             owner_pid: status.owner.map(|owner| owner.pid),
@@ -692,14 +789,25 @@ fn status() -> Result<LeaseStatusSnapshot, SpecOpsError> {
     let status = open_coordinator()?
         .heavy_lease_status()
         .map_err(|err| unexpected(format!("failed to read the verification lease: {err}")))?;
-    if status.held || status.pending > 0 {
-        return Ok(status.into());
-    }
-    let legacy = IndexCoordinator::open_default()
-        .and_then(|coordinator| coordinator.heavy_lease_status())
-        .ok()
-        .filter(|legacy| legacy.held && legacy.holder_kind == Some(HeavyHolderKind::Verification));
-    Ok(legacy.unwrap_or(status).into())
+    let status = if status.held || status.pending > 0 {
+        status
+    } else {
+        IndexCoordinator::open_default()
+            .and_then(|coordinator| coordinator.heavy_lease_status())
+            .ok()
+            .filter(|legacy| {
+                legacy.held && legacy.holder_kind == Some(HeavyHolderKind::Verification)
+            })
+            .unwrap_or(status)
+    };
+    let mut snapshot = LeaseStatusSnapshot::from(status);
+    snapshot.legacy_release_available = snapshot.held
+        && snapshot
+            .lease_id
+            .as_deref()
+            .and_then(control_dir_for)
+            .is_some();
+    Ok(snapshot)
 }
 
 pub(super) fn open_coordinator() -> Result<IndexCoordinator, SpecOpsError> {
@@ -717,18 +825,49 @@ pub(super) fn verification_key<E: CliEnv>(env: &mut E) -> Result<TargetKey, Spec
     ))
 }
 
-fn render(out: &mut String, held_label: &str, free_label: &str, status: &LeaseStatusSnapshot) {
+fn render(
+    out: &mut String,
+    held_label: &str,
+    free_label: &str,
+    status: &LeaseStatusSnapshot,
+    current_project: &str,
+) {
     let label = if status.held { held_label } else { free_label };
     out.push_str(&format!("verification lease: {label}\n"));
-    push_status_fields(out, status);
+    push_status_fields(out, status, current_project);
 }
 
-fn push_status_fields(out: &mut String, status: &LeaseStatusSnapshot) {
+fn push_status_fields(out: &mut String, status: &LeaseStatusSnapshot, current_project: &str) {
     if let Some(lease_id) = &status.lease_id {
         out.push_str(&format!("lease_id: {lease_id}\n"));
     }
     if let Some(target) = &status.target {
         out.push_str(&format!("target: {target}\n"));
+    }
+    if status.held {
+        let relation = holder_project_relation(status.target.as_deref(), current_project);
+        let candidate = relation == HolderProjectRelation::SameProject
+            && (status.legacy_release_available
+                || matches!(
+                    status.holder_state.as_deref(),
+                    Some("orphaned" | "reclaimable")
+                ));
+        out.push_str(&format!("holder_project_relation: {}\n", relation.as_str()));
+        out.push_str(&format!("holder_reclaim_candidate: {candidate}\n"));
+        if candidate {
+            out.push_str("holder_intervention: canonical_release_only\n");
+            if status.legacy_release_available {
+                out.push_str("holder_intervention_reason: only verify.lease.release may drain this project's legacy control channel; never use kill or pkill\n");
+            } else {
+                out.push_str("holder_intervention_reason: only verify.lease.release with a reason may re-check and reclaim this project's holder; never use kill or pkill\n");
+            }
+        } else {
+            out.push_str("holder_intervention: forbidden\n");
+            out.push_str(&format!(
+                "holder_intervention_reason: {}; you must not reclaim or stop this holder. Wait; do not bypass canonical release refusals with kill or pkill\n",
+                relation.reason()
+            ));
+        }
     }
     if let Some(pid) = status.owner_pid {
         out.push_str(&format!("owner_pid: {pid}\n"));
@@ -768,6 +907,8 @@ fn push_status_fields(out: &mut String, status: &LeaseStatusSnapshot) {
     }
     if let Some(estimate) = status.estimated_remaining_ms {
         out.push_str(&format!("estimated_remaining_ms: {estimate}\n"));
+        out.push_str("estimated_remaining_ms_uncertain: true\n");
+        out.push_str("estimated_remaining_ms_basis: batch estimate or lease TTL, not a live progress counter; unchanged estimates are not evidence of a stalled holder\n");
     }
     if let Some(held) = status.holder_held_ms {
         out.push_str(&format!("holder_held_ms: {held}\n"));
@@ -777,6 +918,9 @@ fn push_status_fields(out: &mut String, status: &LeaseStatusSnapshot) {
     }
     if let Some(state) = &status.holder_state {
         out.push_str(&format!("holder_state: {state}\n"));
+        if state == "unknown" {
+            out.push_str("holder_state_constraint: observation is inconclusive; repeated sampling does not authorize reclaiming or stopping the holder\n");
+        }
         if let Some(detail) = &status.holder_state_detail {
             out.push_str(&format!("holder_state_detail: {detail}\n"));
         }
@@ -786,6 +930,10 @@ fn push_status_fields(out: &mut String, status: &LeaseStatusSnapshot) {
         out.push_str(&format!("holder_state_advice: {HOLDER_STATE_ADVICE}\n"));
     }
     out.push_str(&format!("pending: {}\n", status.pending));
+    if status.held || status.pending > 0 {
+        out.push_str("waiter_action: wait\n");
+        out.push_str("waiter_reason: waiting for canonical admission is expected; queue position does not authorize reclaiming or stopping the holder\n");
+    }
     // Issue #4169 AC-2: `pending` is a count, and a count cannot tell an agent
     // whether it is next or fifth. The queue names every claimant and how long
     // it has been waiting, in the order the lease will be handed over.
@@ -1000,7 +1148,13 @@ mod tests {
     #[test]
     fn free_status_renders_without_holder_fields() {
         let mut out = String::new();
-        render(&mut out, "held", "free", &LeaseStatusSnapshot::default());
+        render(
+            &mut out,
+            "held",
+            "free",
+            &LeaseStatusSnapshot::default(),
+            "repo",
+        );
         assert_eq!(out, "verification lease: free\npending: 0\n");
     }
 
@@ -1013,6 +1167,7 @@ mod tests {
             "free",
             &LeaseStatusSnapshot {
                 held: true,
+                legacy_release_available: false,
                 lease_id: Some("lease-1".to_string()),
                 target: Some("repo--verification--wt".to_string()),
                 owner_pid: Some(4242),
@@ -1048,6 +1203,7 @@ mod tests {
                 holder_job_status: Some("running".to_string()),
                 holder_stale: false,
             },
+            "repo",
         );
         // Issue #4169 AC-2: the waiters are named in service order, each with
         // the moment it joined and how long it has been waiting. Issue #4409
@@ -1058,6 +1214,10 @@ mod tests {
             "verification lease: held\n\
              lease_id: lease-1\n\
              target: repo--verification--wt\n\
+             holder_project_relation: same_project\n\
+             holder_reclaim_candidate: false\n\
+             holder_intervention: forbidden\n\
+             holder_intervention_reason: held by this project; you must not reclaim or stop this holder. Wait; do not bypass canonical release refusals with kill or pkill\n\
              owner_pid: 4242\n\
              acquired_at_ms: 1000\n\
              expires_at_ms: 61000\n\
@@ -1069,7 +1229,11 @@ mod tests {
              holder_alive: true\n\
              holder_job_status: running\n\
              estimated_remaining_ms: 60000\n\
+             estimated_remaining_ms_uncertain: true\n\
+             estimated_remaining_ms_basis: batch estimate or lease TTL, not a live progress counter; unchanged estimates are not evidence of a stalled holder\n\
              pending: 2\n\
+             waiter_action: wait\n\
+             waiter_reason: waiting for canonical admission is expected; queue position does not authorize reclaiming or stopping the holder\n\
              queue[0]: target=repo--verification--early priority=manual-rebuild \
              queued_at_ms=500 waiting_ms=90000\n\
              queue[1]: target=repo--verification--late priority=manual-rebuild \
@@ -1098,6 +1262,7 @@ mod tests {
                 holder_state_detail: Some("holder state unknown: held 8m19s".to_string()),
                 ..LeaseStatusSnapshot::default()
             },
+            "repo",
         );
 
         assert!(out.contains("holder_state: unknown\n"), "{out}");
@@ -1108,6 +1273,80 @@ mod tests {
         assert!(out.contains("holder_state_advice: "), "{out}");
         assert!(out.contains("not a verdict"), "{out}");
         assert!(out.contains("ps -eo pid,ppid,time,command"), "{out}");
+        assert!(out.contains("holder_intervention: forbidden\n"), "{out}");
+        assert!(out.contains("holder_reclaim_candidate: false\n"), "{out}");
+        assert!(
+            out.contains("repeated sampling does not authorize"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn estimates_and_queue_positions_do_not_authorize_intervention() {
+        let mut out = String::new();
+        render(
+            &mut out,
+            "held",
+            "free",
+            &LeaseStatusSnapshot {
+                held: true,
+                estimated_remaining_ms: Some(60_000),
+                pending: 1,
+                ..LeaseStatusSnapshot::default()
+            },
+            "repo",
+        );
+        assert!(
+            out.contains("estimated_remaining_ms: 60000\nestimated_remaining_ms_uncertain: true\n"),
+            "{out}"
+        );
+        assert!(
+            out.contains("unchanged estimates are not evidence of a stalled holder"),
+            "{out}"
+        );
+        assert!(out.contains("waiter_action: wait\n"), "{out}");
+        assert!(out.contains("queue position does not authorize"), "{out}");
+    }
+
+    #[test]
+    fn only_a_known_same_project_orphan_is_a_reclaim_candidate() {
+        let mut snapshot = LeaseStatusSnapshot {
+            held: true,
+            target: Some("repo--verification--wt".to_string()),
+            holder_state: Some("orphaned".to_string()),
+            ..LeaseStatusSnapshot::default()
+        };
+        let mut own = String::new();
+        render(&mut own, "held", "free", &snapshot, "repo");
+        assert!(own.contains("holder_reclaim_candidate: true\n"), "{own}");
+        assert!(
+            own.contains("holder_intervention: canonical_release_only\n"),
+            "{own}"
+        );
+
+        let mut other = String::new();
+        render(&mut other, "held", "free", &snapshot, "another-repo");
+        assert!(
+            other.contains("holder_project_relation: other_project\n"),
+            "{other}"
+        );
+        assert!(
+            other.contains("holder_reclaim_candidate: false\n"),
+            "{other}"
+        );
+        assert!(!other.contains("canonical_release_only"), "{other}");
+
+        snapshot.target = None;
+        let mut unknown = String::new();
+        render(&mut unknown, "held", "free", &snapshot, "repo");
+        assert!(
+            unknown.contains("holder_project_relation: unknown\n"),
+            "{unknown}"
+        );
+        assert!(
+            unknown.contains("holder_reclaim_candidate: false\n"),
+            "{unknown}"
+        );
     }
 
     /// Issue #4352 AC-2: the retired manual acquire never reserves a lease
@@ -1305,6 +1544,73 @@ mod tests {
                 == Some(lease_id)
         }
 
+        #[test]
+        fn another_projects_holder_is_protected_in_status_and_release() {
+            let held = hold_lease();
+            let worktree = tempfile::tempdir().unwrap();
+            let mut env = crate::cli::TestEnv::new(worktree.path().to_path_buf());
+            let mut out = String::new();
+            run(&mut env, VerificationLeaseCommand::Status, &mut out).unwrap();
+            assert!(
+                out.contains("holder_project_relation: other_project\n"),
+                "{out}"
+            );
+            assert!(out.contains("holder_reclaim_candidate: false\n"), "{out}");
+            assert!(out.contains("holder_intervention: forbidden\n"), "{out}");
+            assert!(!out.contains("re-checks that and reclaims"), "{out}");
+
+            let err = run(
+                &mut env,
+                VerificationLeaseCommand::Release {
+                    lease_id: held.lease_id.clone(),
+                    reason: Some("another project is waiting".to_string()),
+                },
+                &mut String::new(),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("held by another project"), "{err}");
+            assert!(err.contains("must not reclaim or stop"), "{err}");
+            assert!(still_held(&held.lease_id));
+        }
+
+        #[test]
+        fn a_current_holder_cannot_hide_another_projects_legacy_holder_from_the_guard() {
+            let current = hold_lease();
+            let coordinator = IndexCoordinator::open_default().unwrap();
+            let key = TargetKey::verification("another-project", "legacy");
+            let JobAdmission::Owner(guard) = coordinator
+                .request_job(&key, JobPriority::ManualRebuild, Duration::from_secs(1))
+                .unwrap()
+            else {
+                panic!("private legacy lane must be free");
+            };
+            let lease = guard.acquire_heavy(Duration::from_secs(1)).unwrap();
+            let control = coordinator_root().join(CONTROL_DIR).join("foreign-legacy");
+            fs::create_dir_all(&control).unwrap();
+            fs::write(
+                control.join(OUTCOME_FILE),
+                serde_json::json!({"granted": true, "held": true, "lease_id": lease.id()})
+                    .to_string(),
+            )
+            .unwrap();
+            let worktree = tempfile::tempdir().unwrap();
+            let mut reclaimer = NeverTerminates(SystemReclaimer::new(worktree.path()));
+            let err = release(
+                "99a8660247f5bc49",
+                lease.id(),
+                Some("drain old holder"),
+                &mut reclaimer,
+                &mut String::new(),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("held by another project"), "{err}");
+            assert!(!control.join(RELEASE_FILE).exists());
+            assert!(coordinator.heavy_lease_status().unwrap().held);
+            assert!(still_held(&current.lease_id));
+        }
+
         /// Issue #4633 AC-3 / AC-6 (a): a live `verify.run` holder — this
         /// process, whose parent is alive — keeps its lease, and the refusal
         /// is the one it has always been.
@@ -1316,6 +1622,7 @@ mod tests {
             let mut out = String::new();
 
             let err = release(
+                "99a8660247f5bc49",
                 &held.lease_id,
                 Some("try to take a live lease"),
                 &mut reclaimer,
@@ -1347,6 +1654,7 @@ mod tests {
             let mut out = String::new();
 
             release(
+                "99a8660247f5bc49",
                 &lease_id,
                 Some("window closed after the provider limit"),
                 &mut reclaimer,
@@ -1372,6 +1680,67 @@ mod tests {
         }
 
         #[test]
+        fn a_renewing_holder_is_protected_even_when_process_samples_look_orphaned() {
+            struct RenewingReclaimer<'a>(ScriptedReclaimer<'a>);
+            impl OrphanReclaimer for RenewingReclaimer<'_> {
+                fn observe(
+                    &mut self,
+                    pid: u32,
+                    status: &HeavyLeaseStatus,
+                    pause: Duration,
+                ) -> Option<HolderActivity> {
+                    self.0
+                        .held
+                        .lease
+                        .as_mut()
+                        .unwrap()
+                        .extend(Duration::from_secs(2_700))
+                        .unwrap();
+                    // The diagnostic ledger is best-effort. Its absence must
+                    // not erase a renewal already published in the ticket.
+                    fs::remove_file(open_coordinator().unwrap().lease_event_log_path()).unwrap();
+                    self.0.observe(pid, status, pause)
+                }
+
+                fn terminate(&mut self, pid: u32, force: bool) -> Result<(), String> {
+                    self.0.terminate(pid, force)
+                }
+            }
+
+            // Cover a renewal already published and one that arrives while
+            // the reclaimer samples processes, without any real waiting.
+            for already_renewed in [true, false] {
+                let mut held = hold_lease();
+                if already_renewed {
+                    held.lease
+                        .as_mut()
+                        .unwrap()
+                        .extend(Duration::from_secs(2_700))
+                        .unwrap();
+                    fs::remove_file(open_coordinator().unwrap().lease_event_log_path()).unwrap();
+                }
+                let lease_id = held.lease_id.clone();
+                let mut reclaimer = RenewingReclaimer(ScriptedReclaimer {
+                    readings: vec![Some(orphan()), Some(orphan())],
+                    held: &mut held,
+                    terminated: Vec::new(),
+                });
+                let error = release(
+                    "99a8660247f5bc49",
+                    &lease_id,
+                    Some("suspected orphan"),
+                    &mut reclaimer,
+                    &mut String::new(),
+                )
+                .unwrap_err()
+                .to_string();
+                assert!(error.contains("renewed"), "{error}");
+                assert!(reclaimer.0.terminated.is_empty());
+                assert!(still_held(&lease_id));
+            }
+        }
+
+        #[test]
         fn a_confirmed_empty_stalled_driver_releases_the_lease() {
             let mut held = hold_lease();
             let lease_id = held.lease_id.clone();
@@ -1383,6 +1752,7 @@ mod tests {
             let mut out = String::new();
 
             release(
+                "99a8660247f5bc49",
                 &lease_id,
                 Some("all commands exited"),
                 &mut reclaimer,
@@ -1419,6 +1789,7 @@ mod tests {
             };
 
             let err = release(
+                "99a8660247f5bc49",
                 &lease_id,
                 Some("looked idle"),
                 &mut reclaimer,
@@ -1443,9 +1814,15 @@ mod tests {
                 terminated: Vec::new(),
             };
 
-            let err = release(&lease_id, Some("  "), &mut reclaimer, &mut String::new())
-                .unwrap_err()
-                .to_string();
+            let err = release(
+                "99a8660247f5bc49",
+                &lease_id,
+                Some("  "),
+                &mut reclaimer,
+                &mut String::new(),
+            )
+            .unwrap_err()
+            .to_string();
 
             assert!(err.contains("needs a reason"), "{err}");
             assert!(reclaimer.terminated.is_empty(), "{err}");
@@ -1465,6 +1842,7 @@ mod tests {
             };
 
             let err = release(
+                "99a8660247f5bc49",
                 &lease_id,
                 Some("looked idle"),
                 &mut reclaimer,
@@ -1488,9 +1866,15 @@ mod tests {
             let worktree = tempfile::tempdir().unwrap();
             let mut reclaimer = NeverTerminates(SystemReclaimer::new(worktree.path()));
 
-            let err = release(&lease_id, Some("gone"), &mut reclaimer, &mut String::new())
-                .unwrap_err()
-                .to_string();
+            let err = release(
+                "99a8660247f5bc49",
+                &lease_id,
+                Some("gone"),
+                &mut reclaimer,
+                &mut String::new(),
+            )
+            .unwrap_err()
+            .to_string();
 
             assert!(err.contains("no live verification lease"), "{err}");
         }

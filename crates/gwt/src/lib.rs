@@ -45,6 +45,7 @@ pub mod launch_wizard;
 pub mod managed_assets;
 pub mod memory_pressure;
 pub mod migration;
+pub mod monitor_duplicate_runtime;
 pub mod native_app;
 pub mod native_notification_permission;
 pub(crate) mod path_filter;
@@ -59,6 +60,7 @@ pub mod project_open_control;
 pub mod project_runtime;
 pub mod project_transport;
 pub mod protocol;
+pub mod provider_reset;
 pub mod pty_start_gate;
 pub mod recovery_delivery;
 pub mod runtime_daemon_events;
@@ -96,11 +98,12 @@ pub use agent_project_state::{
     continue_authenticated_execution, describe_authenticated_host_contract, observe_agent_runtime,
     prepare_resume_producing_authority, probe_authenticated_execution_binding,
     probe_authenticated_prepared_execution_binding, probe_bound_authenticated_work_materialization,
-    AgentBuildAbortTerminalizationRequest, AgentExecutionAdoptionReceipt,
-    AgentExecutionAdoptionRequest, AgentExecutionBindingProbeReceipt,
-    AgentExecutionBindingProbeRequest, AgentExecutionContinuationOutcome,
-    AgentExecutionContinuationReceipt, AgentExecutionContinuationRequest, AgentHostContractReceipt,
-    AgentHostContractRequest, AgentRuntimeObservation, AgentWorkMaterializationProbeReceipt,
+    try_prepare_resume_producing_authority, AgentBuildAbortTerminalizationRequest,
+    AgentExecutionAdoptionReceipt, AgentExecutionAdoptionRequest,
+    AgentExecutionBindingProbeReceipt, AgentExecutionBindingProbeRequest,
+    AgentExecutionContinuationOutcome, AgentExecutionContinuationReceipt,
+    AgentExecutionContinuationRequest, AgentHostContractReceipt, AgentHostContractRequest,
+    AgentRuntimeObservation, AgentWorkMaterializationProbeReceipt,
     AgentWorkMaterializationProbeRequest, AgentWorkTerminalKind, AgentWorkTerminalizationOutcome,
     AgentWorkTerminalizationReceipt, AgentWorkTerminalizationRequest, AgentWorkspaceUpdateError,
     AgentWorkspaceUpdateErrorCode, AgentWorkspaceUpdateIntent, AgentWorkspaceUpdateReceipt,

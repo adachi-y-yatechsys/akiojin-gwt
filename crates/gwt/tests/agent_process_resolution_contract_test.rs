@@ -18,7 +18,9 @@ const AGENT_PROBE_SITES: &[ProbeSite] = &[
     },
     ProbeSite {
         relative_path: "crates/gwt-agent/src/detect.rs",
-        function_name: "fetch_version",
+        // `fetch_version` delegates here so profile overrides and removals
+        // use the same resolved adapter as the default environment.
+        function_name: "fetch_version_with_environment",
     },
     ProbeSite {
         relative_path: "crates/gwt-agent/src/prepare.rs",
@@ -66,7 +68,7 @@ fn codex_hook_discovery_reuses_the_single_canonical_host_health_result() {
         "codex_hook_discovery_mode_for_launch_config(&config, runner_health_report.as_ref())"
     ));
     let profile_env = launch
-        .find(".apply_to_parts(")
+        .find(".apply_to_config(")
         .expect("profile env applied");
     let health = launch
         .find("resolve_host_runner_health_checked(")

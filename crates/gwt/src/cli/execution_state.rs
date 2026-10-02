@@ -42,6 +42,14 @@ use serde::{Deserialize, Serialize};
 
 use super::CliEnv;
 
+mod monitor_duplicate;
+#[cfg(all(test, unix))]
+pub(crate) use monitor_duplicate::seed_monitor_pair_for_test;
+pub use monitor_duplicate::{
+    monitor_runtime_uncertainty_affects_issue, stop_monitor_duplicate,
+    MonitorDuplicateRuntimeProof, MonitorDuplicateStopOutcome,
+};
+
 /// Worktree-relative path of the Execution Control Record's mirror (the
 /// authoritative copy lives in the repo-scoped trusted store, P9b).
 pub const EXECUTION_CONTROL_STATE_RELATIVE: &str = ".gwt/skill-state/execution-control.json";
@@ -52,6 +60,9 @@ pub const EXECUTION_CONTROL_STATE_RELATIVE: &str = ".gwt/skill-state/execution-c
 pub const EXECUTION_GENERATION_POINTER_STATE_RELATIVE: &str =
     ".gwt/skill-state/execution-generation-pointer.json";
 pub(crate) const RECOVERY_ENVELOPE_PREFIX: &str = "gwt:execution-recovery:v1:";
+/// Only the authenticated continuation coordinator may stamp this transfer
+/// correlation. Public adoption rejects it so a caller cannot forge a retry.
+pub(crate) const BLOCKED_CONTINUATION_TRANSFER_PREFIX: &str = "gwt:blocked-continuation:v1:";
 const GENERATION_LEDGER_SCHEMA_VERSION: u32 = 1;
 const GENERATION_LEDGER_FILE: &str = "generation-ledger.json";
 const GENERATION_POINTER_FILE: &str = "execution-generation-pointer.json";
@@ -2061,7 +2072,7 @@ impl LaunchGenerationReleaseAuthority {
 
     fn missing_verification(self) -> &'static str {
         match self {
-            Self::Revoked => "revoked launch settlement",
+            Self::Revoked => REVOKED_LAUNCH_MISSING_VERIFICATION,
             Self::Unstarted => "unstarted launch settlement",
         }
     }
@@ -2073,6 +2084,13 @@ impl LaunchGenerationReleaseAuthority {
         }
     }
 }
+
+/// The `missing_verification` a revoked-launch release stamps on the Blocked
+/// generation (Issue #4200). Issue #4783 AC-1 reads it back from the
+/// diagnosis: a generation Blocked this way was stopped through the Monitor,
+/// and a restart must not restore its agent window even when the Monitor
+/// prefs no longer carry the hold.
+pub const REVOKED_LAUNCH_MISSING_VERIFICATION: &str = "revoked launch settlement";
 
 /// What a launch-generation release did to an owner's generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7221,8 +7239,10 @@ pub fn record_rebound_continuation_validation(
                 "current execution projection is malformed: {error}"
             ))
         })?;
-        if ledger.effective_status_for(current) != ExecutionControlStatus::Active
-            || projection.primary_session_id != session_id
+        if !matches!(
+            ledger.effective_status_for(current),
+            ExecutionControlStatus::Active | ExecutionControlStatus::Blocked
+        ) || projection.primary_session_id != session_id
             || execution_binding_for_generation(&ledger, current) != binding.identity
         {
             return Err(generation_conflict(
@@ -11865,6 +11885,8 @@ fn evidence_status_name(status: crate::cli::verification_record::EvidenceStatus)
         EvidenceStatus::Fresh => "fresh",
         EvidenceStatus::FreshWithQuarantine => "fresh_with_quarantine",
         EvidenceStatus::MissingRecord => "missing_record",
+        EvidenceStatus::Running => "running",
+        EvidenceStatus::Interrupted => "interrupted",
         EvidenceStatus::WrongSession => "wrong_session",
         EvidenceStatus::WrongOwner => "wrong_owner",
         EvidenceStatus::WrongGeneration => "wrong_generation",
@@ -13242,7 +13264,25 @@ fn probe_execution_adopt_for_recovery(
             "exact_unbound_session_requires_execution_continue",
         );
     }
-    probe_execution_adopt(worktree, session_id)
+    let probe = probe_execution_adopt(worktree, session_id);
+    if probe.advertise()
+        && recovery_context
+            .and_then(|context| context.as_ref().ok())
+            .is_some_and(|context| {
+                context.session().runtime_target == gwt_agent::LaunchRuntimeTarget::Host
+                    && context.session().execution_binding.is_none()
+            })
+    {
+        return crate::cli::governance::RecoveryProbe::unavailable(
+            "execution.adopt",
+            protected_recovery_metadata(
+                Some(crate::cli::governance::GovernanceCause::Authority),
+                false,
+            ),
+            "unbound_host_session_requires_execution_continue",
+        );
+    }
+    probe
 }
 
 fn probe_execution_repair_for_recovery(
@@ -13662,6 +13702,18 @@ fn probe_execution_adopt(
             refusal.reason,
         ),
     }
+}
+
+/// Continuation may recover an unbound Resume through the same audited
+/// ownership transfer as adoption, without reopening the Blocked lifecycle.
+pub(crate) fn probe_blocked_continuation_takeover(
+    worktree: &Path,
+    session_id: &str,
+) -> crate::cli::governance::RecoveryProbe {
+    let mut probe = probe_execution_adopt(worktree, session_id);
+    probe.operation = "execution.continue".to_string();
+    probe.governance.target_state = Some("blocked".to_string());
+    probe
 }
 
 #[derive(Debug)]
@@ -16332,6 +16384,59 @@ pub(crate) fn adopt_for_authenticated_host(
     Ok(())
 }
 
+/// Called only after Host continuation has authenticated the exact Session,
+/// repository, owner and worktree. Reuses adoption's liveness checks, transfer
+/// audit and Session CAS, while preserving the Blocked lifecycle.
+pub(crate) fn continue_blocked_takeover(
+    worktree: &Path,
+    expected_session: &gwt_agent::Session,
+    expected_binding: &gwt_agent::ExecutionBindingIdentity,
+    operation_id: &str,
+) -> io::Result<gwt_agent::SessionExecutionBinding> {
+    crate::cli::trusted_store::with_write_lease(worktree, || {
+        let prerequisites = evaluate_execution_adopt_prerequisites(worktree, &expected_session.id)
+            .map_err(|refusal| io::Error::new(ErrorKind::PermissionDenied, refusal.reason))?;
+        let (record, binding) = match prerequisites {
+            ExecutionAdoptPrerequisites::Available { record, binding }
+            | ExecutionAdoptPrerequisites::Satisfied { record, binding } => (record, binding),
+        };
+        if record.status != ExecutionControlStatus::Blocked
+            || binding.as_ref() != Some(expected_binding)
+        {
+            return Err(generation_conflict(
+                "Blocked continuation authority changed",
+            ));
+        }
+        if record.primary_session_id == expected_session.id {
+            return expected_session
+                .execution_binding
+                .as_ref()
+                .filter(|binding| &binding.identity == expected_binding)
+                .cloned()
+                .ok_or_else(|| generation_conflict("Blocked continuation binding is missing"));
+        }
+        let mut out = String::new();
+        let code = run_adopt_locked(
+            worktree,
+            &expected_session.id,
+            expected_session,
+            &format!("{BLOCKED_CONTINUATION_TRANSFER_PREFIX}{operation_id}"),
+            &mut out,
+            &mut None,
+            &mut None,
+        )
+        .map_err(|error| io::Error::other(error.to_string()))?;
+        if code != 0 {
+            return Err(io::Error::new(ErrorKind::PermissionDenied, out));
+        }
+        crate::cli::verification_record::snapshot_current_generation_caller_binding(
+            worktree,
+            Some(&expected_session.id),
+        )?
+        .ok_or_else(|| generation_conflict("Blocked continuation did not publish a binding"))
+    })
+}
+
 #[cfg(test)]
 fn run_adopt(
     worktree: &Path,
@@ -16385,7 +16490,11 @@ fn run_adopt_with_publisher(
             "execution.adopt requires a non-empty params.reason".to_string(),
         )));
     }
-    if reason.trim().starts_with(RECOVERY_ENVELOPE_PREFIX) {
+    if reason.trim().starts_with(RECOVERY_ENVELOPE_PREFIX)
+        || reason
+            .trim()
+            .starts_with(BLOCKED_CONTINUATION_TRANSFER_PREFIX)
+    {
         return Err(SpecOpsError::from(ApiError::Unexpected(
             "execution.adopt reason uses a reserved recovery-envelope namespace".to_string(),
         )));
@@ -16811,7 +16920,7 @@ mod tests {
         content_hash: String,
     }
 
-    fn active_record(session: &str) -> ExecutionControlRecord {
+    pub(super) fn active_record(session: &str) -> ExecutionControlRecord {
         ExecutionControlRecord {
             owner_kind: ExecutionOwnerKind::Spec,
             owner_number: 3248,
@@ -20628,7 +20737,7 @@ mod tests {
         generation_authority_bytes(worktree, owner)
     }
 
-    fn persist_generation_session_binding(
+    pub(super) fn persist_generation_session_binding(
         worktree: &Path,
         owner: ExecutionOwnerKey,
         session_id: &str,
@@ -20685,7 +20794,7 @@ mod tests {
         session
     }
 
-    fn unset_live_session_env() -> Vec<ScopedEnvVar> {
+    pub(super) fn unset_live_session_env() -> Vec<ScopedEnvVar> {
         vec![
             ScopedEnvVar::unset(gwt_agent::GWT_SESSION_ID_ENV),
             ScopedEnvVar::unset(gwt_agent::GWT_SESSION_RUNTIME_PATH_ENV),
@@ -30945,6 +31054,7 @@ exit 1
 
             for (status, reason_code) in [
                 (EvidenceStatus::MissingRecord, "verification_missing_record"),
+                (EvidenceStatus::Interrupted, "verification_interrupted"),
                 (EvidenceStatus::WrongSession, "verification_wrong_session"),
                 (EvidenceStatus::WrongOwner, "verification_wrong_owner"),
                 (
@@ -31714,7 +31824,8 @@ exit 1
         /// that does not own the record, so naming them only burns the Issue
         /// Monitor's attempts.
         #[test]
-        fn status_advertises_adopt_for_a_terminal_record_inherited_from_a_dead_session() {
+        fn status_advertises_continuation_for_an_unbound_terminal_record_inherited_from_a_dead_session(
+        ) {
             let _env_lock = crate::env_test_lock()
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -31735,10 +31846,15 @@ exit 1
                 .filter_map(|value| value.as_str())
                 .collect::<Vec<_>>();
             assert!(
-                recoveries.contains(&"execution.adopt"),
-                "an inherited terminal record must advertise its ownership transfer: {status:?}"
+                recoveries.contains(&"execution.continue"),
+                "an unbound Host must advertise authenticated continuation: {status:?}"
             );
-            for refused in ["verify.plan", "verify.run", "execution.reopen"] {
+            for refused in [
+                "execution.adopt",
+                "verify.plan",
+                "verify.run",
+                "execution.reopen",
+            ] {
                 assert!(
                     !recoveries.contains(&refused),
                     "`{refused}` refuses a caller that does not own the record: {status:?}"
@@ -31959,7 +32075,11 @@ exit 1
             let _session = ScopedEnvVar::set(gwt_agent::GWT_SESSION_ID_ENV, "sess-relaunched");
             let _runtime = ScopedEnvVar::unset(gwt_agent::GWT_SESSION_RUNTIME_PATH_ENV);
             let dir = tempfile::tempdir().unwrap();
-            inherited_terminal_blocked_worktree(dir.path(), "sess-live-holder", "sess-relaunched");
+            let owner = inherited_terminal_blocked_worktree(
+                dir.path(),
+                "sess-live-holder",
+                "sess-relaunched",
+            );
 
             let sessions_dir = gwt_core::paths::gwt_sessions_dir();
             let holder =
@@ -31988,6 +32108,18 @@ exit 1
             );
 
             let before = fs::read(state_path(dir.path())).unwrap();
+            let resumed =
+                gwt_agent::Session::load(&sessions_dir.join("sess-relaunched.toml")).unwrap();
+            assert!(!probe_blocked_continuation_takeover(dir.path(), &resumed.id).advertise());
+            assert!(continue_blocked_takeover(
+                dir.path(),
+                &resumed,
+                &current_execution_binding(dir.path(), owner)
+                    .unwrap()
+                    .unwrap(),
+                "live-holder-refusal",
+            )
+            .is_err());
             let (code, out) = run_cmd(
                 dir.path(),
                 ExecutionCommand::Adopt {
@@ -32276,6 +32408,13 @@ exit 1
                 dir.path(),
                 ExecutionCommand::Adopt {
                     reason: format!("{RECOVERY_ENVELOPE_PREFIX}collision")
+                }
+            )
+            .is_err());
+            assert!(run_cmd(
+                dir.path(),
+                ExecutionCommand::Adopt {
+                    reason: format!("{BLOCKED_CONTINUATION_TRANSFER_PREFIX}collision")
                 }
             )
             .is_err());

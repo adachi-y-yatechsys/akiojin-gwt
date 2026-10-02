@@ -266,6 +266,11 @@ pub enum PrLifecycleClass {
     /// for the owning agent to come back.
     ReadyToPromote,
     MergeCandidate,
+    /// Issue #4836: mergeable, green and `CLEAN` with auto-merge armed, yet
+    /// still open after more than one PM cycle. The flag is only an intent —
+    /// the `Auto Merge PR` workflow performs the merge — so this is what a
+    /// stuck workflow run looks like from the inventory.
+    AutoMergeStalled,
     Conflicted,
     Behind,
     CiRed,
@@ -282,6 +287,7 @@ impl PrLifecycleClass {
         match self {
             Self::ReadyToPromote => "READY_TO_PROMOTE",
             Self::MergeCandidate => "MERGE-CANDIDATE",
+            Self::AutoMergeStalled => "AUTO-MERGE-STALLED",
             Self::Conflicted => "CONFLICTED",
             Self::Behind => "BEHIND",
             Self::CiRed => "CI-RED",
@@ -295,6 +301,7 @@ impl PrLifecycleClass {
         [
             Self::ReadyToPromote,
             Self::MergeCandidate,
+            Self::AutoMergeStalled,
             Self::Conflicted,
             Self::Behind,
             Self::CiRed,
@@ -334,6 +341,10 @@ pub struct PrInventoryFields {
     /// measured against (SPEC #3835 AC-4).
     pub base_ref_name: String,
     pub updated_at: Option<DateTime<Utc>>,
+    /// When the PR was opened. Unlike `updated_at`, no bookkeeping action moves
+    /// it, so it is the only sound basis for "how long has this been waiting"
+    /// (Issue #4836).
+    pub created_at: Option<DateTime<Utc>>,
     pub mergeable: String,
     pub merge_state_status: String,
     pub ci_status: String,
@@ -352,6 +363,11 @@ pub struct PrInventoryFields {
     /// unknown (SPEC #3835 AC-6).
     pub coderabbit_review_complete: Option<bool>,
     pub fallback_owner_closed: bool,
+    /// Whether GitHub's native auto-merge is armed on this PR
+    /// (`autoMergeRequest`). Issue #4836: the flag alone never lands anything —
+    /// the `Auto Merge PR` workflow does — so an armed PR that stays mergeable
+    /// across cycles is the shape the PM must be able to see.
+    pub auto_merge_enabled: bool,
 }
 
 /// Result of classifying one open PR for the PM inventory.
@@ -371,6 +387,10 @@ pub struct PrLifecycleDecision {
     pub default_action: String,
     /// Hours since `updated_at` (Issue #3868 AC-4); `None` without a timestamp.
     pub dwell_hours: Option<i64>,
+    /// Hours since the PR was opened (Issue #4836). `dwell_hours` resets on
+    /// every `updated_at` bump, so a PR the PM re-bases each cycle reports a
+    /// dwell of 0 however long it has waited; this one does not move.
+    pub age_hours: Option<i64>,
     /// Whether the PM can execute `default_action` through JSON operations.
     pub default_action_executable: bool,
     /// SPEC #3835 AC-17: the JSON operation that performs `default_action`,
@@ -400,6 +420,8 @@ pub struct PrInventoryItem {
     #[serde(default)]
     pub base_ref_name: String,
     pub updated_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub created_at: Option<DateTime<Utc>>,
     pub mergeable: String,
     pub merge_state_status: String,
     pub ci_status: String,
@@ -438,6 +460,18 @@ pub struct PrInventoryItem {
     pub default_action: String,
     #[serde(default)]
     pub dwell_hours: Option<i64>,
+    /// Hours since the PR was opened. `dwell_hours` counts from `updated_at`,
+    /// which every branch update, label change and check write bumps, so a PR
+    /// the PM touches each cycle reports a dwell of 0 no matter how long it has
+    /// been waiting to land. This one answers "how long has this been open"
+    /// (Issue #4836); staleness keeps its own `updated_at` basis.
+    #[serde(default)]
+    pub age_hours: Option<i64>,
+    /// Whether GitHub's native auto-merge is armed (Issue #4836). The flag is
+    /// an intent, not a merge: `AUTO-MERGE-STALLED` is what it looks like when
+    /// the workflow that performs the merge is not running.
+    #[serde(default)]
+    pub auto_merge_enabled: bool,
     #[serde(default = "default_stale_after_hours")]
     pub stale_after_hours: i64,
     #[serde(default = "default_true")]
@@ -554,7 +588,25 @@ impl PrInventoryHistory {
             } else {
                 1
             };
+            // Issue #4836 AC-2: a non-draft PR that is mergeable, green and
+            // `CLEAN` with auto-merge armed has nothing left to do, so staying
+            // open across a second observation means the merge is not being
+            // performed. The native flag only records the intent; the
+            // `Auto Merge PR` workflow does the merge, and a queued or failed
+            // run of it leaves the PR exactly here. Judged from
+            // `unchanged_cycles` rather than a wall clock because the PM reads
+            // the inventory once per cycle, and `updated_at` would reset the
+            // moment anything touched the PR.
+            if item.auto_merge_enabled
+                && !item.is_draft
+                && item.unchanged_cycles >= AUTO_MERGE_STALLED_AFTER_CYCLES
+                && PrLifecycleClass::parse(&item.lifecycle)
+                    == Some(PrLifecycleClass::MergeCandidate)
+            {
+                item.apply_derived_class(PrLifecycleClass::AutoMergeStalled);
+            }
             item.escalation_due = item.stale
+                || item.lifecycle == PrLifecycleClass::AutoMergeStalled.as_str()
                 || (item.unchanged_cycles >= options.escalate_after_cycles
                     && item
                         .dwell_hours
@@ -584,6 +636,7 @@ impl PrInventoryItem {
             head_ref_name: self.head_ref_name.clone(),
             base_ref_name: self.base_ref_name.clone(),
             updated_at: self.updated_at,
+            created_at: self.created_at,
             mergeable: self.mergeable.clone(),
             merge_state_status: self.merge_state_status.clone(),
             ci_status: self.ci_status.clone(),
@@ -595,13 +648,26 @@ impl PrInventoryItem {
             unresolved_review_threads: self.unresolved_review_threads,
             coderabbit_review_complete: self.coderabbit_review_complete,
             fallback_owner_closed: self.owner_issue_closed,
+            auto_merge_enabled: self.auto_merge_enabled,
         }
     }
 
     fn apply_held_class(&mut self, class: PrLifecycleClass) {
+        self.apply_class_with_source(class, "held");
+    }
+
+    /// Issue #4836 AC-2: re-decide a class the history pass derived rather than
+    /// held through an `UNKNOWN` answer. `lifecycle_source` must not read
+    /// `held` for it — that word means "GitHub did not answer, so the previous
+    /// class stands", and a reader who sees it stops trusting the class.
+    fn apply_derived_class(&mut self, class: PrLifecycleClass) {
+        self.apply_class_with_source(class, "derived");
+    }
+
+    fn apply_class_with_source(&mut self, class: PrLifecycleClass, source: &str) {
         let decision = decide_for_class(&self.fields(), class);
         self.lifecycle = class.as_str().to_string();
-        self.lifecycle_source = "held".to_string();
+        self.lifecycle_source = source.to_string();
         self.owner_issue_source = decision.owner_issue_source.map(str::to_string);
         self.default_action = decision.default_action;
         self.default_action_executable = decision.default_action_executable;
@@ -631,8 +697,10 @@ fn owner_issue_is_closed(issues: &[PrClosingIssue]) -> bool {
     })
 }
 
-fn pr_dwell_hours(updated_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Option<i64> {
-    updated_at.map(|updated| (now - updated).num_hours().max(0))
+/// Whole hours between `since` and `now`, floored at zero. Used for both
+/// `dwell_hours` (from `updated_at`) and `age_hours` (from `created_at`).
+fn pr_dwell_hours(since: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Option<i64> {
+    since.map(|instant| (now - instant).num_hours().max(0))
 }
 
 fn mergeability_unknown(fields: &PrInventoryFields) -> bool {
@@ -748,6 +816,7 @@ pub fn classify_pr_lifecycle_with(
     };
     let mut decision = decide_for_class(fields, class);
     decision.dwell_hours = pr_dwell_hours(fields.updated_at, now);
+    decision.age_hours = pr_dwell_hours(fields.created_at, now);
     decision.stale = decision
         .dwell_hours
         .is_some_and(|hours| hours >= options.stale_after_hours);
@@ -766,6 +835,9 @@ fn decide_for_class(fields: &PrInventoryFields, class: PrLifecycleClass) -> PrLi
         (PrLifecycleClass::ReadyToPromote, _) => "mark ready".to_string(),
         (PrLifecycleClass::MergeCandidate, true) => "mark ready".to_string(),
         (PrLifecycleClass::MergeCandidate, false) => "propose merge".to_string(),
+        (PrLifecycleClass::AutoMergeStalled, _) => {
+            "rerun the Auto Merge PR workflow run for this head branch".to_string()
+        }
         (PrLifecycleClass::Conflicted, _) => "relaunch owner to resolve conflict".to_string(),
         (PrLifecycleClass::Behind, _) => "update-branch".to_string(),
         (PrLifecycleClass::CiRed, _) => "relaunch owner to fix CI".to_string(),
@@ -801,6 +873,7 @@ fn decide_for_class(fields: &PrInventoryFields, class: PrLifecycleClass) -> PrLi
         owner_issue_source,
         default_action,
         dwell_hours: None,
+        age_hours: None,
         default_action_executable,
         default_action_operation,
         blocker: blocker.map(str::to_string),
@@ -858,6 +931,7 @@ fn inventory_item_from_fields(
         head_ref_name: fields.head_ref_name,
         base_ref_name: fields.base_ref_name,
         updated_at: fields.updated_at,
+        created_at: fields.created_at,
         mergeable: fields.mergeable,
         merge_state_status: fields.merge_state_status,
         ci_status: fields.ci_status,
@@ -877,6 +951,8 @@ fn inventory_item_from_fields(
         owner_issue_source: decision.owner_issue_source.map(str::to_string),
         default_action: decision.default_action,
         dwell_hours: decision.dwell_hours,
+        age_hours: decision.age_hours,
+        auto_merge_enabled: fields.auto_merge_enabled,
         stale_after_hours: options.stale_after_hours,
         default_action_executable: decision.default_action_executable,
         default_action_operation: decision.default_action_operation.map(str::to_string),
@@ -940,6 +1016,10 @@ fn inventory_item_from_value(
             value.get("updatedAt").and_then(serde_json::Value::as_str),
         )
         .or(status.created_at),
+        created_at: parse_github_timestamp(
+            value.get("createdAt").and_then(serde_json::Value::as_str),
+        )
+        .or(status.created_at),
         mergeable: status.mergeable,
         merge_state_status: status.merge_state_status,
         ci_status: status.ci_status,
@@ -954,6 +1034,12 @@ fn inventory_item_from_value(
             .get("fallbackOwnerState")
             .and_then(serde_json::Value::as_str)
             .is_some_and(|state| state.eq_ignore_ascii_case("CLOSED")),
+        // `gh` returns `null` when auto-merge is off and an object when it is
+        // armed, so presence is the signal; an older `gh` that omits the key
+        // reads as off, which is the safe direction (no stalled claim).
+        auto_merge_enabled: value
+            .get("autoMergeRequest")
+            .is_some_and(|request| !request.is_null()),
         closing_issues: value
             .get("closingIssuesReferences")
             .map(parse_closing_issues)
@@ -987,7 +1073,13 @@ pub fn parse_pr_inventory_json_with(
 
 /// The bulk list query (Issue #3891 AC-2): no `body`, no `statusCheckRollup`.
 /// Both are hydrated per PR, and only when that PR needs it.
-const INVENTORY_LIGHT_JSON_FIELDS: &str = "number,title,url,isDraft,headRefName,headRefOid,baseRefName,createdAt,updatedAt,mergeable,mergeStateStatus,reviewDecision,closingIssuesReferences";
+/// Issue #4836 AC-2: observations a promotable PR may stay open for before the
+/// inventory calls its auto-merge stalled. One is the smallest value that still
+/// proves the PM saw it twice: a PR that becomes promotable and lands during
+/// the same cycle is never reported, and the wait is at most one cycle.
+const AUTO_MERGE_STALLED_AFTER_CYCLES: u32 = 1;
+
+const INVENTORY_LIGHT_JSON_FIELDS: &str = "number,title,url,isDraft,headRefName,headRefOid,baseRefName,createdAt,updatedAt,mergeable,mergeStateStatus,reviewDecision,autoMergeRequest,closingIssuesReferences";
 const INVENTORY_LIGHT_JSON_FIELDS_WITHOUT_CLOSING: &str =
     "number,title,url,isDraft,headRefName,headRefOid,baseRefName,createdAt,updatedAt,mergeable,mergeStateStatus,reviewDecision";
 
@@ -2416,14 +2508,6 @@ pub fn parse_pr_titles_by_branch(json: &str) -> Result<std::collections::HashMap
         .collect())
 }
 
-/// Branches (PR head refs) whose PR has merged, from the differential sync
-/// behind [`fetch_merged_pr_deliveries`]. A transient failure returns an `Err`
-/// (the caller keeps work as launched) rather than an empty set, so closing
-/// the active slot only happens on a positive merge signal.
-pub fn fetch_merged_pr_branches(repo_path: &Path) -> Result<std::collections::BTreeSet<String>> {
-    fetch_merged_pr_deliveries(repo_path).map(|merged| merged.branches)
-}
-
 /// The base branch whose merges deliver a work branch (Issue #3917). `main`
 /// merges are release integration, not delivery, so they never settle an Issue.
 pub const SETTLEMENT_BASE_BRANCH: &str = "develop";
@@ -2995,17 +3079,6 @@ where
     Ok(open_pr_numbers_by_branch(&pages.rows))
 }
 
-/// Parse an open-PR list (REST `head.ref` / `number`, or the GraphQL
-/// `headRefName` spelling) into `branch -> open PR number`. Rows without a
-/// head ref are dropped; the highest number per branch wins.
-pub fn parse_open_pr_numbers_by_branch(
-    json: &str,
-) -> Result<std::collections::HashMap<String, u64>> {
-    let arr: Vec<serde_json::Value> = serde_json::from_str(json)
-        .map_err(|error| GwtError::Other(format!("gh pr list open inventory JSON: {error}")))?;
-    Ok(open_pr_numbers_by_branch(&arr))
-}
-
 fn open_pr_numbers_by_branch(rows: &[serde_json::Value]) -> std::collections::HashMap<String, u64> {
     let mut index = std::collections::HashMap::new();
     for value in rows {
@@ -3114,16 +3187,6 @@ where
 {
     try_fetch_pr_status_check_rollup_with(repo_path, number, run_gh)
         .unwrap_or_else(|_| "[]".to_string())
-}
-
-/// Fetch a PR's unified diff for the independent review agent. Capped to
-/// `max_bytes` (truncated with a marker) so a huge diff never blows the prompt.
-/// `None` on any gh failure (the review then runs without a diff and, being
-/// adversarial + fail-closed, will reject).
-pub fn fetch_pr_diff(repo_path: &Path, number: u64, max_bytes: usize) -> Option<String> {
-    try_fetch_pr_diff(repo_path, number, max_bytes)
-        .ok()
-        .flatten()
 }
 
 /// Checked variant used by deadline-integral scans.
@@ -3351,12 +3414,6 @@ where
     )
 }
 
-/// Disarm a previously-armed auto-merge (SPEC #3200 FR-024: HEAD advanced past
-/// the reviewed SHA ⇒ revoke). Fail-closed `bool`.
-pub fn disable_pr_auto_merge(repo_path: &Path, number: u64) -> bool {
-    disable_pr_auto_merge_with(repo_path, number, run_gh_command)
-}
-
 /// Disarm auto-merge idempotently from a fresh remote state readback.
 pub fn disarm_pr_auto_merge(
     repo_path: &Path,
@@ -3448,6 +3505,7 @@ fn run_auto_merge_command(
     })
 }
 
+#[cfg(test)]
 fn disable_pr_auto_merge_with<F>(repo_path: &Path, number: u64, mut run_gh: F) -> bool
 where
     F: FnMut(&Path, &[&str]) -> Result<GhCliOutput>,
@@ -3470,13 +3528,6 @@ pub fn parse_pr_merge_commit_sha(json: &str) -> Option<String> {
         .and_then(serde_json::Value::as_str)
         .filter(|sha| !sha.trim().is_empty())
         .map(str::to_string)
-}
-
-/// Fetch a merged PR's merge-commit SHA (fail-closed `Option`).
-pub fn fetch_pr_merge_commit_sha(repo_path: &Path, number: u64) -> Option<String> {
-    try_fetch_pr_merge_commit_sha(repo_path, number)
-        .ok()
-        .flatten()
 }
 
 /// Checked variant used by deadline-integral scans.
@@ -4922,6 +4973,7 @@ mod tests {
             head_ref_name: "work/issue-10".to_string(),
             base_ref_name: "develop".to_string(),
             updated_at: Some("2026-08-30T00:00:00Z".parse().expect("now")),
+            created_at: Some("2026-08-30T00:00:00Z".parse().expect("created")),
             mergeable: "MERGEABLE".to_string(),
             merge_state_status: "CLEAN".to_string(),
             ci_status: "SUCCESS".to_string(),
@@ -4929,6 +4981,7 @@ mod tests {
             review_status: "APPROVED".to_string(),
             body: "Closes #10".to_string(),
             fallback_owner_closed: false,
+            auto_merge_enabled: false,
             closing_issues: vec![],
             conflict: None,
             unresolved_review_threads: None,
@@ -5190,6 +5243,46 @@ mod tests {
         fields.updated_at = None;
         let decision = classify_pr_lifecycle(&fields, now_3868());
         assert_eq!(decision.dwell_hours, None);
+    }
+
+    /// Issue #4836: `updated_at` moves on every branch update, label change and
+    /// check write, so a PR the PM re-bases each cycle reports a dwell of zero
+    /// however long it has been waiting to land. `age_hours` counts from the
+    /// opening instant, which no bookkeeping action resets, so the two must not
+    /// collapse into one another.
+    #[test]
+    fn age_hours_counts_from_opening_while_dwell_resets_on_every_update() {
+        let mut fields = sample_inventory_fields();
+        fields.created_at = Some("2026-08-29T12:00:00Z".parse().expect("created"));
+        // A bookkeeping touch one minute ago — exactly what `pr.update_branch`
+        // does to a BEHIND row on every supervision cycle.
+        fields.updated_at = Some("2026-09-01T11:59:00Z".parse().expect("updated"));
+
+        let decision = classify_pr_lifecycle(&fields, now_3868());
+
+        assert_eq!(
+            decision.dwell_hours,
+            Some(0),
+            "a fresh bookkeeping touch leaves no dwell, which is why dwell alone \
+             cannot answer how long the PR has waited"
+        );
+        assert_eq!(
+            decision.age_hours,
+            Some(72),
+            "the PR has been open for three days regardless of that touch"
+        );
+        assert!(
+            !decision.stale,
+            "staleness keeps its updated_at basis: something did just happen"
+        );
+    }
+
+    #[test]
+    fn age_hours_is_absent_without_an_opening_timestamp() {
+        let mut fields = sample_inventory_fields();
+        fields.created_at = None;
+        let decision = classify_pr_lifecycle(&fields, now_3868());
+        assert_eq!(decision.age_hours, None);
     }
 
     #[test]
@@ -5619,6 +5712,140 @@ mod tests {
         fields.mergeable = mergeable.to_string();
         fields.ci_status = ci.to_string();
         inventory_item_from_fields(fields, now_3868(), &PrInventoryOptions::default())
+    }
+
+    /// Issue #4836 AC-2: a promotable PR with auto-merge armed that is still
+    /// open on the next observation is what a stuck `Auto Merge PR` workflow run
+    /// looks like. PR #4863 sat exactly here for 25 minutes with 20/20 checks
+    /// green and nothing in the API to read, and the PM reported it as an
+    /// unexplained stall three times in one day.
+    #[test]
+    fn an_armed_auto_merge_that_does_not_land_is_reported_as_stalled() {
+        let mut history = PrInventoryHistory::default();
+        let options = PrInventoryOptions::default();
+        let promotable = || {
+            let mut fields = sample_inventory_fields();
+            fields.auto_merge_enabled = true;
+            // Nothing left to do: mergeable, green, CLEAN, not a draft.
+            fields.is_draft = false;
+            fields.mergeable = "MERGEABLE".to_string();
+            fields.merge_state_status = "CLEAN".to_string();
+            fields.ci_status = "SUCCESS".to_string();
+            vec![inventory_item_from_fields(fields, now_3868(), &options)]
+        };
+
+        let mut first = promotable();
+        history.observe(&mut first, now_3868(), &options);
+        assert_eq!(
+            first[0].lifecycle, "MERGE-CANDIDATE",
+            "the first sighting is not yet evidence that nothing is landing it"
+        );
+        assert!(
+            !first[0].escalation_due,
+            "a PR that becomes promotable and lands in the same cycle is never reported"
+        );
+
+        let mut second = promotable();
+        history.observe(&mut second, now_3868(), &options);
+        assert_eq!(
+            second[0].lifecycle, "AUTO-MERGE-STALLED",
+            "AC-2: still open with nothing left to do means the merge is not being performed"
+        );
+        assert_eq!(
+            second[0].default_action, "rerun the Auto Merge PR workflow run for this head branch",
+            "AC-3: the action names the thing that actually performs the merge"
+        );
+        assert!(
+            second[0].escalation_due,
+            "so the cycle cannot end as a no-change cycle"
+        );
+        assert_eq!(
+            second[0].lifecycle_source, "derived",
+            "not `held`: GitHub answered, the history pass derived this"
+        );
+        assert!(second[0].auto_merge_enabled);
+    }
+
+    /// Issue #4836 AC-4: the detector must not become a way to claim a PR is
+    /// ready to land. Every condition is load-bearing on its own.
+    #[test]
+    fn nothing_but_an_armed_promotable_pr_is_called_auto_merge_stalled() {
+        let options = PrInventoryOptions::default();
+        let base = || {
+            let mut fields = sample_inventory_fields();
+            fields.auto_merge_enabled = true;
+            fields.is_draft = false;
+            fields.mergeable = "MERGEABLE".to_string();
+            fields.merge_state_status = "CLEAN".to_string();
+            fields.ci_status = "SUCCESS".to_string();
+            fields
+        };
+        let cases: Vec<(&str, PrInventoryFields)> = vec![
+            (
+                "auto-merge is not armed",
+                PrInventoryFields {
+                    auto_merge_enabled: false,
+                    ..base()
+                },
+            ),
+            (
+                "it is a draft",
+                PrInventoryFields {
+                    is_draft: true,
+                    ..base()
+                },
+            ),
+            (
+                "CI is red",
+                PrInventoryFields {
+                    ci_status: "FAILURE".to_string(),
+                    ..base()
+                },
+            ),
+            (
+                "CI has not finished",
+                PrInventoryFields {
+                    ci_status: "PENDING".to_string(),
+                    ..base()
+                },
+            ),
+            (
+                "it is behind its base",
+                PrInventoryFields {
+                    merge_state_status: "BEHIND".to_string(),
+                    ..base()
+                },
+            ),
+            (
+                "it conflicts",
+                PrInventoryFields {
+                    mergeable: "CONFLICTING".to_string(),
+                    ..base()
+                },
+            ),
+            (
+                "mergeability is unknown",
+                PrInventoryFields {
+                    mergeable: "UNKNOWN".to_string(),
+                    ..base()
+                },
+            ),
+        ];
+        for (reason, fields) in cases {
+            let mut history = PrInventoryHistory::default();
+            for _ in 0..4 {
+                let mut items = vec![inventory_item_from_fields(
+                    fields.clone(),
+                    now_3868(),
+                    &options,
+                )];
+                history.observe(&mut items, now_3868(), &options);
+                assert_ne!(
+                    items[0].lifecycle, "AUTO-MERGE-STALLED",
+                    "must not be called stalled when {reason}"
+                );
+            }
+        }
     }
 
     #[test]

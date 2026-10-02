@@ -77,12 +77,13 @@ const DAEMON_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 /// short budget they assert on, and none of them take the process-wide env
 /// lock. A prefs transaction that runs on another thread is pinned through
 /// `GWT_TEST_BUDGET_ISSUE_MONITOR_PREFS_MS` under the env lock instead.
-#[cfg(all(test, unix))]
-struct ScopedIssueMonitorPrefsTimeout(
+#[cfg(test)]
+pub(super) struct ScopedIssueMonitorPrefsTimeout(
+    // Retain the guard until scope exit so Drop restores the budget; no field read is needed.
     #[allow(dead_code)] gwt_core::deadline_budget::ScopedDeadlineBudget,
 );
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 impl ScopedIssueMonitorPrefsTimeout {
     fn set(timeout: Duration) -> Self {
         Self(gwt_core::deadline_budget::ScopedDeadlineBudget::pin(
@@ -90,6 +91,12 @@ impl ScopedIssueMonitorPrefsTimeout {
             timeout,
         ))
     }
+}
+
+/// Fixture transactions assert outcomes, not the production filesystem budget.
+#[cfg(test)]
+pub(super) fn pin_prefs_hang_guard() -> ScopedIssueMonitorPrefsTimeout {
+    ScopedIssueMonitorPrefsTimeout::set(gwt_core::deadline_budget::HANG_GUARD)
 }
 
 /// The single seam for the prefs read-lock-modify-write budget.
@@ -255,6 +262,8 @@ pub fn spawn_server(
     hub: BroadcastHub,
 ) -> Result<tokio::task::JoinHandle<Result<i32, SpecOpsError>>, SpecOpsError> {
     // Bind synchronously so test clients never race a scheduled server task.
+    // Pin only this synchronous fixture setup, on Unix and Windows alike.
+    let _prefs_budget = pin_prefs_hang_guard();
     let authority_lease = acquire_daemon_startup_lease(&endpoint.scope)?;
     let bound = bind_daemon(&endpoint, &socket_path, &endpoint_path, authority_lease)?;
     let shutdown = Arc::new(DaemonShutdown::new());
@@ -349,10 +358,11 @@ fn bind_daemon(
         ))
     })?;
     if let Err(err) = persist_endpoint(endpoint_path, endpoint) {
+        // This unpublished bind belongs to us and the startup lease is still
+        // held. Unlink before dropping it: a concurrent fork can briefly inherit
+        // the descriptor and make a liveness probe succeed after our drop.
+        cleanup_stale_bind(socket_path);
         drop(listener);
-        if !bind_is_served(&socket_path.to_string_lossy()) {
-            cleanup_stale_bind(socket_path);
-        }
         return Err(config_error(format!(
             "failed to persist daemon endpoint: {err}"
         )));
@@ -1854,6 +1864,13 @@ enum IssueMonitorControl {
         reason: String,
         released_at: String,
     },
+    /// A reset may release only the exact hold observed before consent.
+    QuotaHoldClearIfMatches {
+        provider: String,
+        reason: String,
+        released_at: String,
+        expected_reset_at: String,
+    },
     ConfigSet {
         enabled: Option<bool>,
         autonomous_mode: Option<bool>,
@@ -2681,8 +2698,11 @@ fn apply_routine_issue_monitor_control(
                 if let Some(issue_number) =
                     issue_number.or_else(|| monitor.launched_window_issue(&window_id))
                 {
-                    monitor.record_agent_issue_failed_classified_at(
+                    // Issue #4815: the window says whether this is the bound
+                    // implementation pane or the review pane.
+                    monitor.record_agent_window_issue_failed_classified_at(
                         issue_number,
+                        &window_id,
                         message,
                         classification,
                         now,
@@ -2700,6 +2720,31 @@ fn apply_routine_issue_monitor_control(
             // inside the same lock-protected commit that persists it, so no
             // later rebase can join the hold back. The decoder already refused
             // a blank provider; the scan readmits the issues the hold held.
+            matches!(
+                monitor.clear_provider_quota_hold(&provider, &reason, &released_at),
+                crate::IssueMonitorProviderQuotaHoldClearOutcome::Cleared { .. }
+            )
+        }
+        IssueMonitorControl::QuotaHoldClearIfMatches {
+            provider,
+            reason,
+            released_at,
+            expected_reset_at,
+        } => {
+            let prefs = monitor.prefs();
+            if prefs.provider_quota_holds.get(&provider) != Some(&expected_reset_at) {
+                // An exact already-committed release can be replayed when
+                // converging a durable control receipt, never over a new hold.
+                return !prefs.provider_quota_holds.contains_key(&provider)
+                    && prefs
+                        .provider_quota_hold_releases
+                        .get(&provider)
+                        .is_some_and(|release| {
+                            release.released_at == released_at
+                                && release.released_reset_at.as_deref()
+                                    == Some(expected_reset_at.as_str())
+                        });
+            }
             matches!(
                 monitor.clear_provider_quota_hold(&provider, &reason, &released_at),
                 crate::IssueMonitorProviderQuotaHoldClearOutcome::Cleared { .. }
@@ -3118,6 +3163,26 @@ fn decode_issue_monitor_control_in_repo(
             // Issue #3961: the PM's release reaches the authoritative state
             // instead of only the durable prefs. A blank provider or fence
             // instant is a malformed control, not a release of nothing.
+            // A distinct key makes old daemons reject rather than ignore the
+            // expected value and perform an unconditional release.
+            if let Some(clear) = payload.get("quota_hold_clear_if_matches") {
+                let provider = clear.get("provider")?.as_str()?.trim();
+                let released_at = clear.get("released_at")?.as_str()?.trim();
+                let expected_reset_at = clear.get("expected_reset_at")?.as_str()?.trim();
+                if provider.is_empty() || released_at.is_empty() || expected_reset_at.is_empty() {
+                    return None;
+                }
+                return Some(IssueMonitorControl::QuotaHoldClearIfMatches {
+                    provider: provider.to_string(),
+                    reason: clear
+                        .get("reason")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    released_at: released_at.to_string(),
+                    expected_reset_at: expected_reset_at.to_string(),
+                });
+            }
             if let Some(clear) = payload.get("quota_hold_clear") {
                 let provider = clear.get("provider")?.as_str()?.trim();
                 let released_at = clear.get("released_at")?.as_str()?.trim();
@@ -5630,20 +5695,12 @@ mod tests {
     use super::{
         apply_issue_monitor_control, build_handshake_response, decode_issue_monitor_control,
         decode_issue_monitor_control_in_repo, handle_connection,
-        issue_monitor_control_is_authorizing, run_server,
+        issue_monitor_control_is_authorizing, pin_prefs_hang_guard, run_server,
         run_server_with_shutdown_and_worker_config, spawn_issue_monitor_worker_with_config,
         spawn_issue_monitor_worker_with_config_and_scan_probe,
         spawn_issue_monitor_worker_with_config_and_timeout, BroadcastHub, ConnectionGuard,
         DaemonShutdown, IssueMonitorControl, IssueMonitorScanConcurrencyProbe,
     };
-
-    /// SPEC #4740: pin the prefs budget for a test whose verdict must not
-    /// depend on how fast the runner's filesystem is. Load mode
-    /// (`GWT_TEST_SHRINK_BUDGETS=1`) fails every test that leans on the
-    /// production default instead.
-    fn pin_prefs_hang_guard() -> super::ScopedIssueMonitorPrefsTimeout {
-        super::ScopedIssueMonitorPrefsTimeout::set(gwt_core::deadline_budget::HANG_GUARD)
-    }
 
     /// SPEC #4778 AC-1: these cases exercise frame shape, not PM authority, so
     /// they decode with no registry reachable — the strictest of the two paths.
@@ -7645,8 +7702,78 @@ exit 0
         (should_scan, publisher.await.expect("publisher task joins"))
     }
 
+    /// Issue #4815: which ladder a failure reported during `Reviewing` lands
+    /// on. The bound implementation window's failure is the implementation's
+    /// (attempt counted, re-queued); a failure with no window, or from the
+    /// review pane, is the review's (record stays `Implementing`, slot kept,
+    /// review ladder counted).
+    #[derive(Clone, Copy)]
+    enum ReviewingFailureRouting {
+        ImplementationRetry,
+        ReviewLadder,
+    }
+
+    /// `slot_held`: the implementation launch still occupies its slot
+    /// (`active_count` on a live monitor, `launched_issues` in prefs).
+    fn assert_reviewing_failure_outcome(
+        routing: ReviewingFailureRouting,
+        record: &crate::AutonomousIssueRecord,
+        slot_held: bool,
+        context: &str,
+    ) {
+        match routing {
+            ReviewingFailureRouting::ImplementationRetry => {
+                assert_eq!(
+                    record.attempts, 1,
+                    "{context}: the failed attempt is counted"
+                );
+                assert_eq!(record.phase, crate::AutonomousPhase::Idle, "{context}");
+                assert!(record.retry_not_before.is_some(), "{context}");
+                assert!(record.review_attempts.is_none(), "{context}");
+                assert!(!slot_held, "{context}: the slot is released for the retry");
+            }
+            ReviewingFailureRouting::ReviewLadder => {
+                assert_eq!(
+                    record.attempts, 0,
+                    "{context}: no implementation attempt is spent"
+                );
+                assert_eq!(
+                    record.phase,
+                    crate::AutonomousPhase::Implementing,
+                    "{context}"
+                );
+                let attempts = record
+                    .review_attempts
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{context}: the review ladder counts the failure"));
+                assert_eq!(attempts.count, 1, "{context}: receipt applies only once");
+                assert_eq!(attempts.reviewed_sha, "abc123", "{context}");
+                assert!(attempts.not_before.is_some(), "{context}");
+                assert!(record.review_dispatch_hold.is_some(), "{context}");
+                assert!(slot_held, "{context}: the implementation keeps its slot");
+            }
+        }
+    }
+
+    fn expected_inbox_state_after_reviewing_failure(
+        routing: ReviewingFailureRouting,
+    ) -> crate::MonitorInboxState {
+        match routing {
+            ReviewingFailureRouting::ImplementationRetry => crate::MonitorInboxState::Queued,
+            ReviewingFailureRouting::ReviewLadder => crate::MonitorInboxState::Launched,
+        }
+    }
+
+    fn prefs_hold_launched_slot(prefs: &crate::IssueMonitorPrefs, issue_number: u64) -> bool {
+        prefs
+            .launched_issues
+            .iter()
+            .any(|launched| launched.issue_number == issue_number)
+    }
+
     async fn assert_ambiguous_autonomous_failure_receipt_replays_once(
         failure_payload: serde_json::Value,
+        routing: ReviewingFailureRouting,
     ) {
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
@@ -7722,9 +7849,12 @@ exit 0
             .iter()
             .find(|record| record.issue_number == 42)
             .expect("first failure outcome is visible");
-        assert_eq!(first.attempts, 1);
-        assert_eq!(first.phase, crate::AutonomousPhase::Idle);
-        assert!(first.retry_not_before.is_some());
+        assert_reviewing_failure_outcome(
+            routing,
+            first,
+            prefs_hold_launched_slot(&visible, 42),
+            "visible snapshot",
+        );
         assert!(
             visible
                 .failed_issues
@@ -7734,14 +7864,17 @@ exit 0
         );
         let live_record = monitor
             .autonomous_record(42)
+            .cloned()
             .expect("visible rename converges the live monitor before retry");
-        assert_eq!(live_record.attempts, 1);
-        assert_eq!(live_record.phase, crate::AutonomousPhase::Idle);
-        assert!(live_record.retry_not_before.is_some());
-        assert_eq!(monitor.active_count(), 0);
+        assert_reviewing_failure_outcome(
+            routing,
+            &live_record,
+            monitor.active_count() == 1,
+            "live monitor before retry",
+        );
         assert_eq!(
             monitor.inbox_item(42).map(|item| item.state),
-            Some(crate::MonitorInboxState::Queued),
+            Some(expected_inbox_state_after_reviewing_failure(routing)),
             "the same-process retry starts from the exact visible control outcome"
         );
 
@@ -7801,14 +7934,18 @@ exit 0
 
         let final_record = monitor
             .autonomous_record(42)
+            .cloned()
             .expect("retry outcome remains recorded");
-        assert_eq!(final_record.attempts, 1, "receipt applies only once");
-        assert_eq!(final_record.phase, crate::AutonomousPhase::Idle);
-        assert!(final_record.retry_not_before.is_some());
+        assert_reviewing_failure_outcome(
+            routing,
+            &final_record,
+            monitor.active_count() == 1,
+            "after replay (receipt applies only once)",
+        );
         assert_eq!(
             monitor.inbox_item(42).map(|item| item.state),
-            Some(crate::MonitorInboxState::Queued),
-            "replay preserves the autonomous retry inbox outcome"
+            Some(expected_inbox_state_after_reviewing_failure(routing)),
+            "replay preserves the inbox outcome"
         );
         let durable = crate::load_issue_monitor_prefs(&prefs_path).expect("reload final prefs");
         let durable_record = durable
@@ -7816,9 +7953,12 @@ exit 0
             .iter()
             .find(|record| record.issue_number == 42)
             .expect("durable retry outcome");
-        assert_eq!(durable_record.attempts, 1);
-        assert_eq!(durable_record.phase, crate::AutonomousPhase::Idle);
-        assert!(durable_record.retry_not_before.is_some());
+        assert_reviewing_failure_outcome(
+            routing,
+            durable_record,
+            prefs_hold_launched_slot(&durable, 42),
+            "durable prefs after replay",
+        );
         assert!(
             durable
                 .failed_issues
@@ -7835,12 +7975,17 @@ exit 0
         let _env_lock = crate::env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert_ambiguous_autonomous_failure_receipt_replays_once(serde_json::json!({
-            "launch_failed": {
-                "issue_number": 42,
-                "message": "independent review could not start",
-            }
-        }))
+        // Issue #4815: a launch failure during `Reviewing` is the review
+        // window's (the implementation is already launched).
+        assert_ambiguous_autonomous_failure_receipt_replays_once(
+            serde_json::json!({
+                "launch_failed": {
+                    "issue_number": 42,
+                    "message": "independent review could not start",
+                }
+            }),
+            ReviewingFailureRouting::ReviewLadder,
+        )
         .await;
     }
 
@@ -7851,13 +7996,18 @@ exit 0
         let _env_lock = crate::env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert_ambiguous_autonomous_failure_receipt_replays_once(serde_json::json!({
-            "agent_failed": {
-                "issue_number": 42,
-                "window_id": "tab-1::agent-42",
-                "message": "agent exited before review",
-            }
-        }))
+        // The bound implementation window failed: the implementation ladder
+        // takes it even though the record is `Reviewing` (Issue #4815).
+        assert_ambiguous_autonomous_failure_receipt_replays_once(
+            serde_json::json!({
+                "agent_failed": {
+                    "issue_number": 42,
+                    "window_id": "tab-1::agent-42",
+                    "message": "agent exited before review",
+                }
+            }),
+            ReviewingFailureRouting::ImplementationRetry,
+        )
         .await;
     }
 
@@ -7902,19 +8052,30 @@ exit 0
             .expect("first admission receipt")
             .control_id
             .clone();
+        // Issue #4815: the review launch failure lands on the review ladder;
+        // the implementation keeps its slot and its attempt budget.
         assert_eq!(
             monitor.autonomous_record(42).map(|record| record.phase),
-            Some(crate::AutonomousPhase::Idle)
+            Some(crate::AutonomousPhase::Implementing)
         );
         assert_eq!(
+            monitor.autonomous_record(42).and_then(|record| record
+                .review_attempts
+                .as_ref()
+                .map(|attempts| attempts.count)),
+            Some(1)
+        );
+        assert_eq!(monitor.attempt_count(42), 0);
+        assert_eq!(
             monitor.inbox_item(42).map(|item| item.state),
-            Some(crate::MonitorInboxState::Queued)
+            Some(crate::MonitorInboxState::Launched)
         );
 
-        // A manual Launch Now can fail before the daemon observes any
-        // materializing/launched marker. Its separate admission ID, rather than
-        // lifecycle-state heuristics, distinguishes it from the first control's
-        // durability retry.
+        // A second, distinct launch failure arrives while the record is back
+        // in `Implementing`. Its separate admission ID, rather than
+        // lifecycle-state heuristics, distinguishes it from the first
+        // control's durability retry: it is applied as a new failure (the
+        // implementation ladder this time) instead of being deduped.
         assert!(matches!(
             apply_control_for_test(
                 &prefs_path,
@@ -7934,14 +8095,28 @@ exit 0
             .expect("second admission receipt");
         assert_ne!(second_receipt.control_id, first_receipt);
         assert_eq!(
-            monitor.inbox_item(42).map(|item| item.state),
-            Some(crate::MonitorInboxState::LaunchFailed)
+            monitor.attempt_count(42),
+            1,
+            "the distinct admission was applied, not replayed"
         );
-        assert!(crate::load_issue_monitor_prefs(&prefs_path)
-            .expect("reload distinct admission")
-            .failed_issues
-            .iter()
-            .any(|failure| failure.issue_number == 42));
+        assert_eq!(
+            monitor.autonomous_record(42).map(|record| record.phase),
+            Some(crate::AutonomousPhase::Idle)
+        );
+        assert_eq!(
+            monitor.inbox_item(42).map(|item| item.state),
+            Some(crate::MonitorInboxState::Queued)
+        );
+        let durable =
+            crate::load_issue_monitor_prefs(&prefs_path).expect("reload distinct admission");
+        assert_eq!(
+            durable
+                .autonomous_records
+                .iter()
+                .find(|record| record.issue_number == 42)
+                .map(|record| record.attempts),
+            Some(1)
+        );
     }
 
     #[test]
@@ -7979,12 +8154,16 @@ exit 0
             apply_accepted_control_for_test(&prefs_path, &mut monitor, accepted.clone()),
             super::IssueMonitorControlCommit::Committed { .. }
         ));
-        assert_eq!(
+        // Issue #4815: the review ladder's backoff is anchored to the
+        // receipt's processing time, exactly as the implementation ladder was.
+        let review_attempts = |monitor: &crate::IssueMonitorState| {
             monitor
                 .autonomous_record(42)
-                .unwrap()
-                .retry_not_before
-                .as_deref(),
+                .and_then(|record| record.review_attempts.clone())
+                .expect("review attempt recorded")
+        };
+        assert_eq!(
+            review_attempts(&monitor).not_before.as_deref(),
             Some("2000-01-01T00:01:00Z")
         );
         assert!(matches!(
@@ -7992,7 +8171,8 @@ exit 0
             super::IssueMonitorControlCommit::Committed { .. }
         ));
         assert_eq!(stale.prefs(), monitor.prefs());
-        assert_eq!(stale.attempt_count(42), 1);
+        assert_eq!(review_attempts(&stale).count, 1);
+        assert_eq!(stale.attempt_count(42), 0);
     }
 
     #[test]
@@ -8069,15 +8249,23 @@ exit 0
             "retry={retry:?}, last_error={:?}",
             monitor.status_view().last_error
         );
-        assert_eq!(monitor.active_count(), 0);
+        // Issue #4815: the converged outcome is the review ladder's.
+        assert_eq!(monitor.active_count(), 1);
         assert_eq!(
             monitor.autonomous_record(42).map(|record| record.phase),
-            Some(crate::AutonomousPhase::Idle)
+            Some(crate::AutonomousPhase::Implementing)
         );
-        assert_eq!(monitor.attempt_count(42), 1);
+        assert_eq!(monitor.attempt_count(42), 0);
+        assert_eq!(
+            monitor.autonomous_record(42).and_then(|record| record
+                .review_attempts
+                .as_ref()
+                .map(|attempts| attempts.count)),
+            Some(1)
+        );
         assert_eq!(
             monitor.inbox_item(42).map(|item| item.state),
-            Some(crate::MonitorInboxState::Queued)
+            Some(crate::MonitorInboxState::Launched)
         );
         assert_eq!(
             monitor.prefs(),
@@ -8808,6 +8996,7 @@ exit 0
                 review_dispatch_hold: None,
                 last_failure_message: None,
                 delivering_since: None,
+                review_attempts: None,
             }],
             ..crate::IssueMonitorPrefs::default()
         };
@@ -8920,6 +9109,7 @@ exit 0
                 review_dispatch_hold: None,
                 last_failure_message: None,
                 delivering_since: None,
+                review_attempts: None,
             }],
             ..crate::IssueMonitorPrefs::default()
         };
@@ -10151,20 +10341,38 @@ exit 0
         let should_scan = apply_issue_monitor_control(&mut monitor, control);
 
         assert!(should_scan);
+        // Issue #4815: the review window's failure is the review ladder's.
+        // The record returns to Implementing for the backed-off re-dispatch
+        // (never stranded in Reviewing) and the implementation keeps its
+        // slot and attempt budget.
+        let record = monitor.autonomous_record(42).expect("record retained");
         assert_eq!(
-            monitor.autonomous_record(42).map(|r| r.phase),
-            Some(crate::AutonomousPhase::Idle),
-            "routed back to Idle for retry, not stranded in Reviewing"
+            record.phase,
+            crate::AutonomousPhase::Implementing,
+            "routed back to Implementing for the backed-off re-dispatch, not stranded in Reviewing"
         );
         assert_eq!(
             monitor.attempt_count(42),
-            1,
-            "the failed attempt is counted"
+            0,
+            "no implementation attempt is spent"
         );
+        let attempts = record
+            .review_attempts
+            .as_ref()
+            .expect("the review ladder counts the failure");
+        assert_eq!(
+            (attempts.reviewed_sha.as_str(), attempts.count),
+            ("abc123", 1)
+        );
+        assert!(attempts.not_before.is_some());
+        assert!(record
+            .review_dispatch_hold
+            .as_ref()
+            .is_some_and(|hold| hold.reason.contains("PR #99") && hold.reason.contains("abc123")));
         assert_eq!(
             monitor.inbox_item(42).map(|item| item.state),
-            Some(crate::MonitorInboxState::Queued),
-            "re-queued for automatic relaunch"
+            Some(crate::MonitorInboxState::Launched),
+            "the implementation stays launched"
         );
     }
 
@@ -10779,6 +10987,57 @@ exit 0
                 std::process::id() + 1,
             );
             assert!(decode_issue_monitor_control(payload).is_none());
+        }
+    }
+
+    #[test]
+    fn quota_hold_clear_if_matches_preserves_new_hold_and_clears_matching_hold() {
+        let _prefs_budget = pin_prefs_hang_guard();
+        let _clock = ScopedOperationClock::set(Instant::now());
+        let temp = TempDir::new().unwrap();
+        let prefs_path = temp.path().join("issue-monitor.json");
+        let current = "2026-10-05T00:00:00Z";
+        let seed = crate::IssueMonitorPrefs {
+            provider_quota_holds: std::collections::BTreeMap::from([(
+                "codex".into(),
+                current.into(),
+            )]),
+            ..Default::default()
+        };
+        crate::save_issue_monitor_prefs(&prefs_path, &seed).unwrap();
+        let mut monitor =
+            crate::IssueMonitorState::with_prefs(crate::IssueMonitorConfig::default(), seed);
+        for (expected, clears) in [("2026-10-04T00:00:00Z", false), (current, true)] {
+            let control = decode_issue_monitor_control_for_test(
+                crate::runtime_daemon_events::issue_monitor_payload(
+                    "control",
+                    serde_json::json!({
+                        "quota_hold_clear_if_matches": {
+                            "provider": "codex", "reason": "verified free reset",
+                            "released_at": "2026-10-01T00:00:00Z", "expected_reset_at": expected
+                        }
+                    }),
+                    std::process::id() + 1,
+                ),
+            )
+            .expect("conditional clear decodes");
+            assert_eq!(
+                super::apply_issue_monitor_control_with_disk_migration(
+                    &prefs_path,
+                    &mut monitor,
+                    control
+                ),
+                clears
+            );
+            let persisted = crate::load_issue_monitor_prefs(&prefs_path).unwrap();
+            assert_eq!(
+                persisted.provider_quota_holds.contains_key("codex"),
+                !clears
+            );
+            assert_eq!(
+                persisted.provider_quota_hold_releases.contains_key("codex"),
+                clears
+            );
         }
     }
 
@@ -13156,6 +13415,7 @@ exit 0
                     review_dispatch_hold: None,
                     last_failure_message: None,
                     delivering_since: None,
+                    review_attempts: None,
                 }],
                 ..crate::IssueMonitorPrefs::default()
             },
@@ -13480,7 +13740,6 @@ exit 0
 
         let ready_pid = wait_for_live_fake_gh_owner(&active_path).await;
 
-        let shutdown_started = Instant::now();
         shutdown.request();
         let server_result = match tokio::time::timeout(Duration::from_secs(3), &mut server).await {
             Ok(result) => Some(result),
@@ -13514,10 +13773,8 @@ exit 0
             .expect("server exits successfully");
         assert_eq!(exit_code, 0);
         ready_pid.unwrap_or_else(|error| panic!("{error}"));
-        assert!(
-            shutdown_started.elapsed() < Duration::from_secs(3),
-            "shutdown exceeded its absolute operation deadline"
-        );
+        // The timeout above bounds server shutdown. Child reaping has its
+        // own guard and must not be charged again to the shutdown deadline.
         let persisted =
             crate::load_issue_monitor_prefs(&prefs_path).expect("reload shutdown prefs");
         assert_eq!(persisted.effect_authority_epoch, 8);
@@ -13648,6 +13905,7 @@ exit 1
                     review_dispatch_hold: None,
                     last_failure_message: None,
                     delivering_since: None,
+                    review_attempts: None,
                 }],
                 ..crate::IssueMonitorPrefs::default()
             },
@@ -16459,6 +16717,7 @@ exit 1
                 review_dispatch_hold: None,
                 last_failure_message: None,
                 delivering_since: None,
+                review_attempts: None,
             }],
             ..crate::IssueMonitorPrefs::default()
         };
@@ -16528,6 +16787,7 @@ exit 1
                 review_dispatch_hold: None,
                 last_failure_message: None,
                 delivering_since: None,
+                review_attempts: None,
             }],
             ..crate::IssueMonitorPrefs::default()
         };
@@ -16650,6 +16910,7 @@ exit 1
                     review_dispatch_hold: None,
                     last_failure_message: None,
                     delivering_since: None,
+                    review_attempts: None,
                 },
                 crate::AutonomousIssueRecord {
                     issue_number: 8,
@@ -16671,6 +16932,7 @@ exit 1
                     review_dispatch_hold: None,
                     last_failure_message: None,
                     delivering_since: None,
+                    review_attempts: None,
                 },
             ],
             ..crate::IssueMonitorPrefs::default()
@@ -16743,6 +17005,7 @@ exit 1
                 review_dispatch_hold: None,
                 last_failure_message: None,
                 delivering_since: None,
+                review_attempts: None,
             }],
             ..crate::IssueMonitorPrefs::default()
         };
@@ -17470,6 +17733,7 @@ exit 1
                 review_dispatch_hold: None,
                 last_failure_message: None,
                 delivering_since: None,
+                review_attempts: None,
             }],
             ..crate::IssueMonitorPrefs::default()
         };
@@ -17617,6 +17881,7 @@ exit 1
                 review_dispatch_hold: None,
                 last_failure_message: None,
                 delivering_since: None,
+                review_attempts: None,
             }],
             ..crate::IssueMonitorPrefs::default()
         };
@@ -17758,6 +18023,7 @@ exit 1
                 review_dispatch_hold: None,
                 last_failure_message: None,
                 delivering_since: None,
+                review_attempts: None,
             }],
             ..crate::IssueMonitorPrefs::default()
         };
@@ -18121,6 +18387,7 @@ exit 1
             review_dispatch_hold: None,
             last_failure_message: None,
             delivering_since: None,
+            review_attempts: None,
         };
         let disk_same_key = record(42, crate::AutonomousPhase::Implementing, 1);
         let local_same_key = record(42, crate::AutonomousPhase::Reviewing, 2);
@@ -18360,6 +18627,7 @@ exit 1
                     review_dispatch_hold: None,
                     last_failure_message: None,
                     delivering_since: None,
+                    review_attempts: None,
                 }],
                 ..crate::IssueMonitorPrefs::default()
             },
@@ -19382,6 +19650,7 @@ exit 1
                     review_dispatch_hold: None,
                     last_failure_message: None,
                     delivering_since: None,
+                    review_attempts: None,
                 }],
                 ..crate::IssueMonitorPrefs::default()
             },
@@ -19680,6 +19949,7 @@ exit 1
             review_dispatch_hold: None,
             last_failure_message: None,
             delivering_since: None,
+            review_attempts: None,
         };
         crate::save_issue_monitor_prefs(
             &prefs_path,

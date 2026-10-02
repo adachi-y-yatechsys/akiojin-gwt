@@ -1958,7 +1958,7 @@ pub(super) fn launch_config_from_persisted_session(
     if let Some(model) = session.model.clone() {
         builder = builder.model(model);
     }
-    if let Some(version) = session.tool_version.clone() {
+    if let Some(version) = session.launch_tool_version() {
         builder = builder.version(version);
     }
     if let Some(level) = session.reasoning_level.clone() {
@@ -2023,7 +2023,7 @@ pub(super) fn launch_config_from_persisted_session(
     }
 
     let mut config = builder.build();
-    if let Some(version) = session.tool_version.clone() {
+    if let Some(version) = session.launch_tool_version() {
         config.tool_version = Some(version);
     }
     if !session.display_name.is_empty() {
@@ -4769,13 +4769,11 @@ impl AppRuntime {
             );
         }
         self.window_details.remove(id);
-        // Publish the PTY handle to the WebSocket fast-path registry BEFORE
-        // inserting the runtime so that the first `terminal_input` from the
-        // frontend (which can arrive immediately after `TerminalStatus`) has a
-        // target to write to. Registry holds a cloned `Arc<PtyHandle>`; the
-        // real owner remains the `Mutex<Pane>` in `WindowRuntime`.
-        self.register_pty_writer(id, &pane);
+        // Publish the handle with its exact runtime incarnation before any
+        // status event exposes the pane. The registry owns only a cloned Arc;
+        // the process owner remains WindowRuntime.
         self.runtimes.insert(id.to_string(), runtime);
+        self.register_pty_writer(id, &pane);
         // Issue #4143 (AC-3): the PTY is live, so this restore no longer needs
         // the pre-PTY failure guard.
         self.restore_launch_windows.remove(id);
@@ -5380,7 +5378,7 @@ impl AppRuntime {
                 config.runtime_target,
             )?
             .with_project_root(&worktree_path)
-            .apply_to_parts(&mut config.env_vars, &mut config.remove_env);
+            .apply_to_config(&mut config);
             if let Some(managed_worktree) = managed_codex_worktree.as_ref() {
                 let report = register_codex_managed_project_trust_for_resolved_launch(
                     &profile_config_path,
@@ -5543,9 +5541,12 @@ impl AppRuntime {
                 gwt_agent::SessionMode::Resume | gwt_agent::SessionMode::Continue
             ) {
                 if let Some(predecessor) = config.predecessor_session_id.clone() {
+                    // Issue #4783 AC-2: an automatic restore never reactivates
+                    // a terminal predecessor generation; see the coordinator.
                     if let Some((receipt, binding)) = gwt::prepare_resume_producing_authority(
                         Path::new(&project_root),
                         &predecessor,
+                        config.automatic_restore,
                     ) {
                         match receipt.outcome {
                             gwt::AgentExecutionContinuationOutcome::SuccessorCreated
@@ -5779,6 +5780,12 @@ impl AppRuntime {
                     })
                 })
                 .transpose()?;
+            // Recheck the proof against the actual child cwd and final environment.
+            // A PM runtime may use a cwd different from the worktree.
+            session.codex_auth_root = pm_provider_runtime_dir(&config)
+                .as_deref()
+                .or(config.working_dir.as_deref())
+                .and_then(|cwd| config.validated_codex_auth_root_for_cwd(cwd));
             if let Err(error) =
                 persist_finalized_launch_session(&sessions_dir, &runtime_path, &mut session, None)
             {
@@ -6846,7 +6853,7 @@ mod agent_endpoint_env_tests {
         .install(&mut env)
         .expect("materialize predecessor generation");
         let (receipt, binding) =
-            gwt::prepare_resume_producing_authority(&launch.project, &launch.session.id)
+            gwt::prepare_resume_producing_authority(&launch.project, &launch.session.id, false)
                 .expect("recover producing authority for the relaunch");
         assert_eq!(
             receipt.outcome,
@@ -8036,7 +8043,7 @@ mod agent_endpoint_env_tests {
         .expect("persist the finished predecessor incarnation");
 
         let (receipt, binding) =
-            gwt::prepare_resume_producing_authority(&launch.project, &holder_id)
+            gwt::prepare_resume_producing_authority(&launch.project, &holder_id, false)
                 .expect("recover producing authority for the relaunch");
         assert_eq!(
             receipt.outcome,

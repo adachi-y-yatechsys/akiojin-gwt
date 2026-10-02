@@ -889,6 +889,8 @@ pub struct IssueMonitorPrefs {
     pub max_active_agents: usize,
     pub priority_order: Vec<u64>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub monitor_runtime_counts: BTreeMap<String, IssueMonitorRuntimeCounts>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub terminal_queues: BTreeMap<String, IssueMonitorTerminalQueue>,
     #[serde(default)]
     pub terminal_queue_auto_refill: bool,
@@ -1114,6 +1116,16 @@ pub struct IssueMonitorPrefs {
     pub agent_blackout_since: Option<String>,
 }
 
+/// Physical implementation processes observed by one exact GUI host runtime.
+/// Empty counts are a durable tombstone; unknown observations must not publish emptiness.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueMonitorRuntimeCounts {
+    pub host_pid: u32,
+    pub host_started_at: u64,
+    pub counts: BTreeMap<u64, usize>,
+    pub observed_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssueMonitorTerminalQueueEntry {
     pub number: u64,
@@ -1136,6 +1148,7 @@ impl Default for IssueMonitorPrefs {
             enabled: false,
             max_active_agents: 1,
             priority_order: Vec::new(),
+            monitor_runtime_counts: BTreeMap::new(),
             terminal_queues: BTreeMap::new(),
             terminal_queue_auto_refill: false,
             terminal_queue_exclusions: BTreeMap::new(),
@@ -3424,6 +3437,8 @@ pub struct IssueMonitorAgentStatus {
     #[serde(default)]
     pub source: IssueMonitorStatusSource,
     pub queue: Vec<u64>,
+    /// Physical implementation count with pending launch reservations retained;
+    /// repeated Issue numbers represent distinct observed processes.
     pub active_launches: Vec<u64>,
     /// Admission occupancy: active_launches plus review_windows. Physical
     /// active_sessions are observations, not a second admission counter.
@@ -4268,6 +4283,8 @@ pub struct IssueMonitorState {
     last_error: Option<String>,
     launch_auth_required: bool,
     active_launches: Vec<u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    monitor_runtime_counts: BTreeMap<String, IssueMonitorRuntimeCounts>,
     priority_order: Vec<u64>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     terminal_queues: BTreeMap<String, IssueMonitorTerminalQueue>,
@@ -4861,7 +4878,46 @@ pub struct AutonomousIssueRecord {
     /// `Delivering`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivering_since: Option<String>,
+    /// Issue #4815: failed independent-review dispatches for the current
+    /// reviewed SHA. Kept apart from `attempts`: a review window that could
+    /// not start or died without a verdict is not a failed implementation,
+    /// and the implementation launch keeps its slot while the review backs
+    /// off. A new head SHA starts the count over.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_attempts: Option<AutonomousReviewAttempts>,
 }
+
+/// Issue #4815: the review-dispatch half of the retry ladder, keyed by the
+/// reviewed SHA.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutonomousReviewAttempts {
+    pub reviewed_sha: String,
+    /// Failed review windows for `reviewed_sha` so far.
+    pub count: u32,
+    pub last_error: String,
+    pub last_failed_at: String,
+    /// RFC3339 before which no review for `reviewed_sha` is dispatched
+    /// (the 60→1800 s ladder, same tuning as implementation retries).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_before: Option<String>,
+}
+
+/// Issue #4815: what recording a failed review window did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AutonomousReviewFailureOutcome {
+    /// The next dispatch for the same SHA waits until `not_before`.
+    Retry {
+        attempt: u32,
+        not_before: Option<String>,
+    },
+    /// `max_attempts` identical failures: dispatch stops for this SHA and the
+    /// PM is asked to steer.
+    Exhausted { attempt: u32 },
+}
+
+/// Issue #4815 AC-3: the launch-stage marker the GUI logs when the PTY was
+/// handed over; a pane that dies right after it never ran a hook.
+const REVIEW_PTY_HANDOFF_MARKER: &str = "PTY handoff complete";
 
 /// Issue #4726: why a `Delivering` record stops watching for its merge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5124,6 +5180,18 @@ pub fn autonomous_retry_backoff_secs(attempt: u32, base_secs: u64, cap_secs: u64
     scaled.min(cap_secs)
 }
 
+/// Issue #4815 AC-3: the text a failed review window is recorded with. A pane
+/// that died before its first hook carries only the GUI's launch-stage marker
+/// ("PTY handoff complete") or nothing at all; neither is a failure reason,
+/// so the row says what actually happened.
+fn review_failure_message(message: String) -> String {
+    let trimmed = message.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case(REVIEW_PTY_HANDOFF_MARKER) {
+        return "review window exited before its first hook (start-gate failure)".to_string();
+    }
+    trimmed.to_string()
+}
+
 /// Add `secs` to an RFC3339 instant, returning the new RFC3339 string. `None`
 /// when `now` is not parseable as RFC3339.
 fn rfc3339_plus_secs(now: &str, secs: u64) -> Option<String> {
@@ -5255,6 +5323,7 @@ impl AutonomousIssueRecord {
             review_dispatch_hold: None,
             last_failure_message: None,
             delivering_since: None,
+            review_attempts: None,
         }
     }
 }
@@ -6497,6 +6566,7 @@ impl IssueMonitorState {
             launch_auth_required: false,
             active_launches: Vec::new(),
             priority_order: Vec::new(),
+            monitor_runtime_counts: BTreeMap::new(),
             terminal_queues: BTreeMap::new(),
             terminal_queue_retirements: BTreeMap::new(),
             terminal_queue_auto_refill: false,
@@ -6575,6 +6645,7 @@ impl IssueMonitorState {
         state.tier_overrides = prefs.tier_overrides.clone();
         state.launch_usage_threshold_percent = prefs.launch_usage_threshold_percent;
         state.priority_order = prefs.priority_order;
+        state.monitor_runtime_counts = prefs.monitor_runtime_counts;
         state.terminal_queues = prefs.terminal_queues;
         state.terminal_queue_auto_refill = prefs.terminal_queue_auto_refill;
         state.terminal_queue_exclusions = prefs.terminal_queue_exclusions;
@@ -6732,6 +6803,7 @@ impl IssueMonitorState {
             enabled: self.config.enabled,
             max_active_agents: self.config.max_active.max(1),
             priority_order: self.priority_order.clone(),
+            monitor_runtime_counts: self.monitor_runtime_counts.clone(),
             terminal_queues: self.terminal_queues.clone(),
             terminal_queue_auto_refill: self.terminal_queue_auto_refill,
             terminal_queue_exclusions: self.terminal_queue_exclusions.clone(),
@@ -9129,11 +9201,32 @@ impl IssueMonitorState {
     }
 
     pub fn active_issue_number(&self) -> Option<u64> {
-        self.active_launches.first().copied()
+        self.active_issue_numbers().first().copied()
     }
 
+    /// Reservations remain present before materialization. Once observed, each
+    /// physical implementation process consumes a slot, including duplicate
+    /// Issue numbers and processes missing from the launch-tracking projection.
+    /// Review processes are accounted for separately by `review_windows`.
     pub fn active_issue_numbers(&self) -> Vec<u64> {
-        self.active_launches.clone()
+        let mut active = self.active_launches.clone();
+        let mut physical = BTreeMap::<u64, usize>::new();
+        for observation in self.monitor_runtime_counts.values() {
+            for (&issue, &count) in &observation.counts {
+                *physical.entry(issue).or_default() += count;
+            }
+        }
+        for (issue, count) in physical {
+            let reserved = usize::from(active.contains(&issue));
+            active.extend(std::iter::repeat_n(issue, count.saturating_sub(reserved)));
+        }
+        active
+    }
+
+    fn has_observed_monitor_runtime(&self, issue_number: u64) -> bool {
+        self.monitor_runtime_counts
+            .values()
+            .any(|observation| observation.counts.get(&issue_number).copied().unwrap_or(0) > 0)
     }
 
     /// Include untracked Launched rows whose execution may have been interrupted.
@@ -9157,8 +9250,102 @@ impl IssueMonitorState {
             .collect()
     }
 
+    /// Repair window projections before attempting to stop an exact duplicate.
+    /// The caller verifies the holder under the execution/session guards. This
+    /// makes late exit events harmless but does not claim that a process exited:
+    /// physical counts remain until a successful census observes its absence.
+    /// Neither the claim nor execution authority is released or replaced.
+    pub fn bind_duplicate_runtime_holder(
+        &mut self,
+        issue_number: u64,
+        target_window_id: &str,
+        holder_window_id: &str,
+    ) -> bool {
+        if target_window_id.is_empty()
+            || holder_window_id.is_empty()
+            || target_window_id == holder_window_id
+            || self
+                .launched_windows
+                .get(&issue_number)
+                .is_some_and(|bound| bound != target_window_id && bound != holder_window_id)
+            || [target_window_id, holder_window_id].iter().any(|window| {
+                self.launch_bindings
+                    .get(*window)
+                    .is_some_and(|issue| *issue != issue_number)
+            })
+        {
+            return false;
+        }
+        self.launch_bindings.remove(target_window_id);
+        self.launch_bindings
+            .insert(holder_window_id.to_string(), issue_number);
+        self.launched_windows
+            .insert(issue_number, holder_window_id.to_string());
+        if self
+            .launch_confirmations
+            .get(&issue_number)
+            .is_some_and(|ack| ack.window_id == target_window_id)
+        {
+            self.launch_confirmations.remove(&issue_number);
+        }
+        if !self.active_launches.contains(&issue_number) {
+            self.active_launches.push(issue_number);
+        }
+        self.queue.retain(|queued| *queued != issue_number);
+        if let Some(item) = self
+            .inbox
+            .iter_mut()
+            .find(|item| item.issue.number == issue_number)
+        {
+            item.launched_window_id = Some(holder_window_id.to_string());
+            item.state = MonitorInboxState::Launched;
+        }
+        self.record_launch_binding_replacement(issue_number, target_window_id, holder_window_id);
+        true
+    }
+
+    /// Record a complete successful census from an exact host runtime. A failed
+    /// or unknown census must leave the previous projection intact. Host death
+    /// is represented by a newer empty census, preserving the rebase fence.
+    pub fn record_monitor_runtime_counts(
+        &mut self,
+        host_pid: u32,
+        host_started_at: u64,
+        mut counts: BTreeMap<u64, usize>,
+        observed_at: impl Into<String>,
+    ) -> bool {
+        let observed_at = observed_at.into();
+        let Some(observed) = parse_rfc3339_utc(&observed_at) else {
+            return false;
+        };
+        if host_pid == 0 || host_started_at == 0 {
+            return false;
+        }
+        let key = format!("{host_pid}:{host_started_at}");
+        if self
+            .monitor_runtime_counts
+            .get(&key)
+            .is_some_and(|previous| {
+                parse_rfc3339_utc(&previous.observed_at).is_some_and(|at| at >= observed)
+            })
+        {
+            return false;
+        }
+        counts.retain(|_, count| *count > 0);
+        self.monitor_runtime_counts.insert(
+            key,
+            IssueMonitorRuntimeCounts {
+                host_pid,
+                host_started_at,
+                counts,
+                observed_at,
+            },
+        );
+        true
+    }
+
     pub fn active_count(&self) -> usize {
-        self.active_launches.len()
+        self.active_issue_numbers().len()
     }
 
     pub fn has_launch_profile(&self) -> bool {
@@ -10080,6 +10267,14 @@ impl IssueMonitorState {
         disk: &IssueMonitorPrefs,
         autonomous_policy: AutonomousRecordRebasePolicy,
     ) {
+        for observation in disk.monitor_runtime_counts.values() {
+            self.record_monitor_runtime_counts(
+                observation.host_pid,
+                observation.host_started_at,
+                observation.counts.clone(),
+                observation.observed_at.clone(),
+            );
+        }
         // An exact failover committed elsewhere revokes the old launch. An
         // epoch alone is global; require the issue's explicit fresh-session
         // marker and absence of a successor before undoing local accounting.
@@ -11154,7 +11349,7 @@ impl IssueMonitorState {
                 "quota_hold".to_string()
             } else if self.update_drain.is_some() {
                 "update_drain".to_string()
-            } else if !self.active_launches.is_empty() {
+            } else if self.active_count() > 0 {
                 if self
                     .active_launches
                     .iter()
@@ -11166,7 +11361,7 @@ impl IssueMonitorState {
                 }
             } else if !self.has_launch_profile()
                 && !self.queue.is_empty()
-                && self.active_launches.is_empty()
+                && self.active_count() == 0
             {
                 "settings_required".to_string()
             } else {
@@ -11183,7 +11378,7 @@ impl IssueMonitorState {
             terminal_queue_auto_refill_limit: self.terminal_queue_auto_refill_limit,
             unqueued_open_count,
             other_terminal_queue_count,
-            active_count: self.active_launches.len(),
+            active_count: self.active_count(),
             max_active_agents: self.config.max_active,
             total_candidates: self.inbox.len(),
             active_issue_number: self.active_issue_number(),
@@ -11263,10 +11458,17 @@ impl IssueMonitorState {
             // merged into `develop` never closes its Issue — so a delivered row
             // otherwise looks like ordinary queued work and relaunches forever.
             return match self.merged_deliveries.get(&item.issue.number) {
-                Some(delivery) if !self.issue_is_closed(item.issue.number) => (
-                    true,
-                    Some(format!("delivered_by_pr_{}", delivery.pr_number)),
-                ),
+                // Issue #4852 AC-1: a delivery older than the row's current
+                // launch is the previous attempt's, not this one's.
+                Some(delivery)
+                    if !self.issue_is_closed(item.issue.number)
+                        && self.merged_delivery_postdates_launch(item.issue.number) =>
+                {
+                    (
+                        true,
+                        Some(format!("delivered_by_pr_{}", delivery.pr_number)),
+                    )
+                }
                 _ => (false, None),
             };
         }
@@ -11609,7 +11811,7 @@ impl IssueMonitorState {
     /// durable fact about the fleet, and the reader that needs it is typically
     /// a different process from the one that watched the fleet go quiet.
     fn observe_agent_blackout(&mut self, now: &str) {
-        let fleet_idle = self.active_launches.is_empty()
+        let fleet_idle = self.active_count() == 0
             && self.launched_windows.is_empty()
             && self.pending_launch_deliveries.is_empty()
             && self.pending_launches.is_empty();
@@ -12287,7 +12489,11 @@ impl IssueMonitorState {
     /// SPEC #3200 FR-015: record the independent-review verdict for the in-flight
     /// reviewed SHA. The gate is evaluated on the next tick.
     pub fn record_review_verdict(&mut self, issue_number: u64, passed: bool) {
-        self.autonomous_record_mut(issue_number).review_passed = Some(passed);
+        let record = self.autonomous_record_mut(issue_number);
+        record.review_passed = Some(passed);
+        // Issue #4815: a verdict means the review window ran; the failures
+        // that preceded it no longer describe this SHA.
+        record.review_attempts = None;
         // Issue #4117 AC-2: the verdict is the review window's last act; its
         // slot is free even though the idle pane is closed a scan later.
         self.forget_review_window(issue_number);
@@ -12301,7 +12507,7 @@ impl IssueMonitorState {
     /// Issue #4117 AC-2: `max_active` slots in use — implementation launches
     /// plus live review windows, which run their own agent each.
     fn occupied_slot_count(&self) -> usize {
-        self.active_launches.len() + self.review_windows.len()
+        self.active_count() + self.review_windows.len()
     }
 
     fn forget_review_window(&mut self, issue_number: u64) {
@@ -12315,9 +12521,14 @@ impl IssueMonitorState {
         &self,
         issue_number: u64,
         pr_number: u64,
+        head_sha: Option<&str>,
         now: &str,
     ) -> Option<AutonomousReviewDispatchHold> {
-        let reason = if let Some(window) = self
+        let reason = if let Some(reason) =
+            self.review_retry_hold_reason(issue_number, pr_number, head_sha, now)
+        {
+            reason
+        } else if let Some(window) = self
             .review_windows
             .values()
             .find(|window| window.pr_number == pr_number)
@@ -12339,7 +12550,7 @@ impl IssueMonitorState {
             }
             format!(
                 "max_active reached ({occupied}/{max_active}: {} implementation launches + {} review windows)",
-                self.active_launches.len(),
+                self.active_count(),
                 self.review_windows.len()
             )
         };
@@ -12350,6 +12561,190 @@ impl IssueMonitorState {
             .map(|hold| hold.since.clone())
             .unwrap_or_else(|| now.to_string());
         Some(AutonomousReviewDispatchHold { reason, since })
+    }
+
+    /// Issue #4815 AC-1/AC-2: the review ladder's own refusal. `head_sha` is
+    /// the PR head when the caller already read it: a head that moved on from
+    /// the failed SHA is a new review and is never held by the old one. With
+    /// no head to compare, the recorded SHA is assumed current (the worker
+    /// reads the head first whenever attempts are recorded, see
+    /// [`Self::review_attempts_recorded`]).
+    fn review_retry_hold_reason(
+        &self,
+        issue_number: u64,
+        pr_number: u64,
+        head_sha: Option<&str>,
+        now: &str,
+    ) -> Option<String> {
+        let attempts = self
+            .autonomous_records
+            .get(&issue_number)?
+            .review_attempts
+            .as_ref()?;
+        if head_sha.is_some_and(|sha| sha != attempts.reviewed_sha) {
+            return None;
+        }
+        let max = self.autonomous_tuning.max_attempts;
+        if attempts.count >= max {
+            return Some(format!(
+                "independent review for PR #{pr_number} at {} failed {}/{max} times (last error: {}); dispatch stops until the PR head changes or the operator steers",
+                attempts.reviewed_sha, attempts.count, attempts.last_error
+            ));
+        }
+        let not_before = attempts.not_before.as_deref()?;
+        let pending = match (
+            chrono::DateTime::parse_from_rfc3339(now),
+            chrono::DateTime::parse_from_rfc3339(not_before),
+        ) {
+            (Ok(now), Ok(not_before)) => now < not_before,
+            // An unparseable clock fails open, like `retry_ready`.
+            _ => false,
+        };
+        pending.then(|| {
+            format!(
+                "independent review for PR #{pr_number} at {} is backing off until {not_before} (attempt {}/{max} failed: {})",
+                attempts.reviewed_sha, attempts.count, attempts.last_error
+            )
+        })
+    }
+
+    /// Issue #4815: whether the review ladder holds anything for this Issue,
+    /// so the worker reads the PR head before asking for the hold.
+    pub fn review_attempts_recorded(&self, issue_number: u64) -> bool {
+        self.autonomous_records
+            .get(&issue_number)
+            .is_some_and(|record| record.review_attempts.is_some())
+    }
+
+    /// Issue #4815 AC-1: one failed review window — a spawn that errored, or a
+    /// pane that ended without a verdict — for the SHA under review.
+    ///
+    /// Counts on the record's review ladder (not on `attempts`: the
+    /// implementation did not fail, and its launch keeps its slot), schedules
+    /// the next dispatch on the 60→1800 s ladder, puts the record back to
+    /// `Implementing` so the next scan re-detects the PR, and writes the
+    /// reason on the inbox row. At `max_attempts` identical failures (AC-2)
+    /// dispatch for this SHA stops and the PM is asked to steer. `None` when
+    /// no review is in flight for the Issue.
+    pub fn record_review_failure(
+        &mut self,
+        issue_number: u64,
+        message: impl Into<String>,
+        now: &str,
+    ) -> Option<AutonomousReviewFailureOutcome> {
+        let record = self.autonomous_records.get(&issue_number)?;
+        if record.phase != AutonomousPhase::Reviewing || record.review_passed.is_some() {
+            return None;
+        }
+        let pr_number = record.pr_number?;
+        let reviewed_sha = record.reviewed_sha.clone().unwrap_or_default();
+        let message = review_failure_message(message.into());
+        let max = self.autonomous_tuning.max_attempts;
+        let base = self.autonomous_tuning.retry_backoff_base_secs;
+        let cap = self.autonomous_tuning.retry_backoff_cap_secs;
+        let record = self.autonomous_record_mut(issue_number);
+        // AC-2: a new head SHA resets the count.
+        let count = record
+            .review_attempts
+            .as_ref()
+            .filter(|attempts| attempts.reviewed_sha == reviewed_sha)
+            .map_or(0, |attempts| attempts.count)
+            .saturating_add(1);
+        let not_before = rfc3339_plus_secs(now, autonomous_retry_backoff_secs(count, base, cap));
+        record.review_attempts = Some(AutonomousReviewAttempts {
+            reviewed_sha: reviewed_sha.clone(),
+            count,
+            last_error: message.clone(),
+            last_failed_at: now.to_string(),
+            not_before: not_before.clone(),
+        });
+        // The record returns to Implementing: the PR is still open and the
+        // next scan re-detects it; the ladder decides when it is dispatched.
+        // The heartbeat is refreshed for the same reason
+        // `resume_inflight_reviews_after_restart` refreshes it — a review
+        // failure is not implementation silence.
+        record.phase = AutonomousPhase::Implementing;
+        record.review_passed = None;
+        record.last_heartbeat = Some(now.to_string());
+        self.forget_review_window(issue_number);
+        let row_message = format!(
+            "independent review for PR #{pr_number} at {reviewed_sha} failed (attempt {count}/{max}): {message}"
+        );
+        if let Some(item) = self
+            .inbox
+            .iter_mut()
+            .find(|item| item.issue.number == issue_number)
+        {
+            item.error_message = Some(row_message.clone());
+        }
+        self.push_autonomous_notice("warn", issue_number, row_message);
+        let hold_reason = self
+            .review_retry_hold_reason(issue_number, pr_number, Some(&reviewed_sha), now)
+            .unwrap_or_else(|| {
+                format!(
+                    "independent review for PR #{pr_number} at {reviewed_sha} failed: {message}"
+                )
+            });
+        let since = self
+            .autonomous_records
+            .get(&issue_number)
+            .and_then(|record| record.review_dispatch_hold.as_ref())
+            .map(|hold| hold.since.clone())
+            .unwrap_or_else(|| now.to_string());
+        self.hold_review_dispatch(
+            issue_number,
+            AutonomousReviewDispatchHold {
+                reason: hold_reason,
+                since,
+            },
+        );
+        if count >= max {
+            self.request_autonomous_steering(
+                issue_number,
+                format!(
+                    "independent review for PR #{pr_number} at {reviewed_sha} failed {count}/{max} times; last error: {message}; dispatch stops until the PR head changes"
+                ),
+                now,
+            );
+            return Some(AutonomousReviewFailureOutcome::Exhausted { attempt: count });
+        }
+        Some(AutonomousReviewFailureOutcome::Retry {
+            attempt: count,
+            not_before,
+        })
+    }
+
+    /// Issue #4815: whether a failure reported for `issue_number` belongs to
+    /// its in-flight review rather than to the implementation launch. A
+    /// launch failure while the record is `Reviewing` can only be the review
+    /// window (the implementation is already launched); an agent failure is
+    /// the review's unless a fresh canvas shows the bound implementation pane
+    /// itself dead.
+    fn review_failure_applies(
+        &self,
+        issue_number: u64,
+        state: MonitorInboxState,
+        now: &str,
+    ) -> bool {
+        let Some(record) = self.autonomous_records.get(&issue_number) else {
+            return false;
+        };
+        if record.phase != AutonomousPhase::Reviewing || record.review_passed.is_some() {
+            return false;
+        }
+        if state != MonitorInboxState::AgentFailed {
+            return true;
+        }
+        let (Some(window_id), Some(snapshot)) = (
+            self.launched_windows.get(&issue_number),
+            self.fresh_window_snapshot(now),
+        ) else {
+            return true;
+        };
+        !snapshot.windows.iter().any(|observed| {
+            issue_monitor_window_ids_match(window_id, &observed.window_id)
+                && matches!(observed.status, WindowState::Stopped | WindowState::Error)
+        })
     }
 
     /// Issue #4117: keep the refusal on the record the PM reads.
@@ -12378,13 +12773,24 @@ impl IssueMonitorState {
     ) -> Result<(), AutonomousReviewDispatchHold> {
         let issue_number = dispatch.issue_number;
         let pr_number = dispatch.pr_number;
-        if let Some(hold) = self.review_dispatch_hold(issue_number, pr_number, now) {
+        if let Some(hold) =
+            self.review_dispatch_hold(issue_number, pr_number, Some(&dispatch.reviewed_sha), now)
+        {
             self.hold_review_dispatch(issue_number, hold.clone());
             return Err(hold);
         }
         self.begin_review(issue_number, pr_number, dispatch.reviewed_sha.clone());
-        self.autonomous_record_mut(issue_number)
-            .review_dispatch_hold = None;
+        let record = self.autonomous_record_mut(issue_number);
+        record.review_dispatch_hold = None;
+        // Issue #4815 AC-2: the ladder belongs to one SHA; a dispatch for a
+        // new head starts clean.
+        if record
+            .review_attempts
+            .as_ref()
+            .is_some_and(|attempts| attempts.reviewed_sha != dispatch.reviewed_sha)
+        {
+            record.review_attempts = None;
+        }
         self.review_windows.insert(
             issue_number,
             IssueMonitorReviewWindow {
@@ -12440,20 +12846,66 @@ impl IssueMonitorState {
                 }
             }
         }
+        // Issue #4815 AC-1: a review window that left the canvas, died on it,
+        // or never appeared is a review that produced no verdict. Record the
+        // failure on the review ladder instead of only forgetting the entry,
+        // or the next scan re-dispatches the same SHA with no backoff.
+        let mut failed = Vec::new();
         self.review_windows
-            .retain(|_, window| match window.window_id.as_deref() {
-                Some(window_id) => {
-                    let owned_here = issue_monitor_qualified_window_id(window_id)
-                        .is_some_and(|(tab_id, _)| tab_id == snapshot.project_tab_id);
-                    !owned_here
-                        || snapshot.windows.iter().any(|observed| {
-                            issue_monitor_window_ids_match(window_id, &observed.window_id)
-                                && idle_window_is_alive(observed.status)
-                        })
+            .retain(|issue_number, window| {
+                let (alive, reason) = match window.window_id.as_deref() {
+                    Some(window_id) => {
+                        let owned_here = issue_monitor_qualified_window_id(window_id)
+                            .is_some_and(|(tab_id, _)| tab_id == snapshot.project_tab_id);
+                        if !owned_here {
+                            (true, None)
+                        } else {
+                            match snapshot.windows.iter().find(|observed| {
+                                issue_monitor_window_ids_match(window_id, &observed.window_id)
+                            }) {
+                                Some(observed) if idle_window_is_alive(observed.status) => {
+                                    (true, None)
+                                }
+                                Some(observed) => (
+                                    false,
+                                    Some(format!(
+                                        "review window {window_id} exited without a verdict ({:?})",
+                                        observed.status
+                                    )),
+                                ),
+                                None => (
+                                    false,
+                                    Some(format!(
+                                        "review window {window_id} left the canvas without a verdict"
+                                    )),
+                                ),
+                            }
+                        }
+                    }
+                    None => {
+                        if rfc3339_elapsed_secs(&window.dispatched_at, now)
+                            .is_none_or(|elapsed| elapsed < REVIEW_WINDOW_SPAWN_GRACE_SECS)
+                        {
+                            (true, None)
+                        } else {
+                            (
+                                false,
+                                Some(format!(
+                                    "review window dispatched at {} never appeared within {REVIEW_WINDOW_SPAWN_GRACE_SECS}s",
+                                    window.dispatched_at
+                                )),
+                            )
+                        }
+                    }
+                };
+                if let Some(reason) = reason {
+                    failed.push((*issue_number, reason));
                 }
-                None => rfc3339_elapsed_secs(&window.dispatched_at, now)
-                    .is_none_or(|elapsed| elapsed < REVIEW_WINDOW_SPAWN_GRACE_SECS),
+                alive
             });
+        for (issue_number, reason) in failed {
+            self.record_review_failure(issue_number, reason, now);
+        }
     }
 
     /// SPEC #3200 FR-015/FR-016: apply a raw review verdict reported by the
@@ -12890,7 +13342,24 @@ impl IssueMonitorState {
                 blocking_claim_id == Some(identity.claim_id.as_str())
                     || identity.owner == blocking_owner
             });
-        if !own_claim {
+        // Issue #4852 AC-2: the owner label is `hostname:user:pid`, and the pid
+        // is the one thing a daemon restart changes. The claim comment the
+        // earlier pid wrote on this host, for this user, is still this
+        // Monitor's own claim — reporting it as a foreign hold parked the
+        // Issue until the TTL while its pane kept running.
+        let own_host_claim = !own_claim && {
+            let current_owner = crate::process::current_claim_owner();
+            crate::process::same_host_and_user(blocking_owner, &current_owner)
+        };
+        if own_host_claim {
+            tracing::info!(
+                issue_number,
+                blocking_owner,
+                ?blocking_claim_id,
+                "issue monitor treats a claim from another pid of this host and user as its own"
+            );
+        }
+        if !(own_claim || own_host_claim) {
             return false;
         }
         if self.active_launches.contains(&issue_number) {
@@ -13328,7 +13797,11 @@ impl IssueMonitorState {
             return None;
         }
         self.reconcile_terminal_queue();
-        let issue_number = self.queue.pop_front()?;
+        let position = self
+            .queue
+            .iter()
+            .position(|issue| !self.has_observed_monitor_runtime(*issue))?;
+        let issue_number = self.queue.remove(position)?;
         if !self.active_launches.contains(&issue_number) {
             self.active_launches.push(issue_number);
         }
@@ -13464,6 +13937,7 @@ impl IssueMonitorState {
             .copied()
             .filter(|issue_number| {
                 self.terminal_queue_contains(*issue_number)
+                    && !self.has_observed_monitor_runtime(*issue_number)
                     && !pending_claims.contains(issue_number)
                     && !settling.contains(issue_number)
             })
@@ -13610,6 +14084,7 @@ impl IssueMonitorState {
         while self.config.enabled && self.gui_connected && self.occupied_slot_count() < max_active {
             let Some(issue_number) = self.queue.iter().copied().find(|issue_number| {
                 self.terminal_queue_contains(*issue_number)
+                    && !self.has_observed_monitor_runtime(*issue_number)
                     && self.retry_ready_for_saved_profile(*issue_number, now)
             }) else {
                 break;
@@ -13917,6 +14392,7 @@ impl IssueMonitorState {
             .filter(|item| {
                 item.state == MonitorInboxState::Queued
                     && self.terminal_queue_contains(issue_number)
+                    && !self.has_observed_monitor_runtime(issue_number)
                     && self.occupied_slot_count() < self.config.max_active.max(1)
             })
             .map(|item| item.issue.clone())
@@ -14343,7 +14819,7 @@ impl IssueMonitorState {
         self.record_launch_failed_at(issue_number, message, &now);
     }
 
-    fn record_launch_failed_at(
+    pub(crate) fn record_launch_failed_at(
         &mut self,
         issue_number: u64,
         message: impl Into<String>,
@@ -14481,6 +14957,51 @@ impl IssueMonitorState {
             MonitorInboxState::AgentFailed,
             classification,
             now,
+        );
+    }
+
+    /// Issue #4815: an agent failure reported with the window it came from.
+    /// The bound implementation window's failure is the implementation's,
+    /// whatever phase the record is in; any other window (the independent
+    /// review pane, an unmapped pane named only by its Issue hint) follows
+    /// the phase-based routing, so a failure during `Reviewing` lands on the
+    /// review ladder.
+    pub fn record_agent_window_issue_failed_classified(
+        &mut self,
+        issue_number: u64,
+        window_id: &str,
+        message: impl Into<String>,
+        classification: IssueMonitorFailureClass,
+    ) {
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        self.record_agent_window_issue_failed_classified_at(
+            issue_number,
+            window_id,
+            message,
+            classification,
+            &now,
+        );
+    }
+
+    pub(crate) fn record_agent_window_issue_failed_classified_at(
+        &mut self,
+        issue_number: u64,
+        window_id: &str,
+        message: impl Into<String>,
+        classification: IssueMonitorFailureClass,
+        now: &str,
+    ) {
+        let bound_window_failure = self
+            .launched_windows
+            .get(&issue_number)
+            .is_some_and(|bound| issue_monitor_window_ids_match(bound, window_id));
+        self.record_failed_issue_routed_at(
+            issue_number,
+            message,
+            MonitorInboxState::AgentFailed,
+            classification,
+            now,
+            bound_window_failure,
         );
     }
 
@@ -14945,17 +15466,43 @@ impl IssueMonitorState {
         issue_number: u64,
         evidence: IssueCompletionEvidence,
     ) -> bool {
+        self.record_issue_completion_with_live_pane(issue_number, evidence, false)
+    }
+
+    /// Issue #4852 AC-3: [`Self::record_issue_completion`] told whether the
+    /// launch's agent pane is still alive. A merged delivery that does not
+    /// complete the Issue (a SPEC slice PR, an Open Issue's partial PR) while
+    /// the agent that opened it keeps working is not the end of the launch:
+    /// the slot stays held and the row stays `launched`, so the claim-TTL
+    /// expiry cannot relaunch the same Issue into the same worktree against
+    /// the session that still holds its execution authority. Completion
+    /// evidence that does complete the Issue is applied regardless.
+    fn record_issue_completion_with_live_pane(
+        &mut self,
+        issue_number: u64,
+        evidence: IssueCompletionEvidence,
+        live_pane: bool,
+    ) -> bool {
         let issue = self.inbox_item(issue_number).map(|item| item.issue.clone());
+        let decision = issue
+            .as_ref()
+            .map(Self::issue_completion_decision)
+            .unwrap_or(IssueCompletionDecision::Unknown);
+        if decision != IssueCompletionDecision::Complete
+            && live_pane
+            && self.active_launches.contains(&issue_number)
+        {
+            tracing::info!(
+                issue_number,
+                "issue monitor kept a live launch through a partial merged delivery"
+            );
+            return false;
+        }
         // A merged branch/PR completes this delivery regardless of whether it
         // completes the Issue. Free the slot before evaluating Issue-wide
         // completion so ordinary Open work can return to the queue promptly.
         self.clear_active_tracking(issue_number);
-        if issue
-            .as_ref()
-            .map(Self::issue_completion_decision)
-            .unwrap_or(IssueCompletionDecision::Unknown)
-            != IssueCompletionDecision::Complete
-        {
+        if decision != IssueCompletionDecision::Complete {
             let updated_at = issue.as_ref().and_then(|issue| issue.updated_at.clone());
             self.transition_completion(
                 issue_number,
@@ -15110,16 +15657,114 @@ impl IssueMonitorState {
     /// the shared completion policy decides whether the Issue is terminal or
     /// must return to the queue for remaining tasks.
     pub fn reconcile_merged_branches(&mut self, merged_branches: &BTreeSet<String>) -> Vec<u64> {
+        let now = format_rfc3339_utc(chrono::Utc::now());
+        self.reconcile_merged_branches_at(merged_branches, &now)
+    }
+
+    /// [`Self::reconcile_merged_branches`] judged at `now`, the scan clock the
+    /// canvas snapshot is ordered against.
+    ///
+    /// Issue #4852 AC-1: a branch stays in the merged list forever, so a PR
+    /// merged *before* the current launch started (the previous slice of the
+    /// same SPEC, a day-old PR that referenced the Issue) used to settle a
+    /// launch seconds after it began. Only a delivery merged after the launch
+    /// started is that launch's delivery. Issue #4852 AC-3: a delivery that
+    /// lands while the launch's pane is still running is a partial merge of a
+    /// live launch; the slot is kept (see
+    /// `record_issue_completion_with_live_pane`). The returned list
+    /// names the launches whose slots were actually freed or settled.
+    pub fn reconcile_merged_branches_at(
+        &mut self,
+        merged_branches: &BTreeSet<String>,
+        now: &str,
+    ) -> Vec<u64> {
         let to_merge: Vec<u64> = self
             .active_launched_branches()
             .into_iter()
             .filter(|(_, branch)| merged_branches.contains(branch))
             .map(|(number, _)| number)
+            .filter(|number| self.merged_delivery_postdates_launch(*number))
             .collect();
-        for number in &to_merge {
-            self.record_merged(*number);
+        let mut merged = Vec::with_capacity(to_merge.len());
+        for number in to_merge {
+            let live_pane = self.launch_has_live_pane(number, now);
+            self.record_issue_completion_with_live_pane(
+                number,
+                IssueCompletionEvidence::WorkBranch,
+                live_pane,
+            );
+            // A launch kept alive through a partial merge still holds its
+            // slot; only a freed or settled one is reported as merged.
+            if !self.active_launches.contains(&number) {
+                merged.push(number);
+            }
         }
-        to_merge
+        merged
+    }
+
+    /// Issue #4852 AC-1: when the current launch of `issue_number` started —
+    /// the claim anchor while the launch is unbound, the launch ACK once it is
+    /// bound. `None` when the Issue holds no slot or the launch predates the
+    /// ordering evidence (older prefs).
+    fn active_launch_started_at(&self, issue_number: u64) -> Option<&str> {
+        if !self.active_launches.contains(&issue_number) {
+            return None;
+        }
+        self.launching_claimed_at
+            .get(&issue_number)
+            .map(String::as_str)
+            .or_else(|| {
+                self.pending_launch_deliveries
+                    .iter()
+                    .find(|delivery| delivery.issue_number == issue_number)
+                    .map(|delivery| delivery.created_at.as_str())
+            })
+            .or_else(|| {
+                self.launch_confirmations
+                    .get(&issue_number)
+                    .map(|ack| ack.confirmed_at.as_str())
+            })
+    }
+
+    /// Issue #4852 AC-1: whether the merged delivery recorded for
+    /// `issue_number`'s work branch landed after its current launch started.
+    /// Without both instants there is nothing to order, and the pre-#4852
+    /// behaviour (the merge counts) is kept.
+    fn merged_delivery_postdates_launch(&self, issue_number: u64) -> bool {
+        let merged_at = self
+            .merged_deliveries
+            .get(&issue_number)
+            .and_then(|delivery| delivery.merged_at.as_deref())
+            .and_then(parse_rfc3339_utc);
+        let started_at = self
+            .active_launch_started_at(issue_number)
+            .and_then(parse_rfc3339_utc);
+        match (merged_at, started_at) {
+            (Some(merged), Some(started)) => merged > started,
+            _ => true,
+        }
+    }
+
+    /// Issue #4852 AC-3: whether the launch of `issue_number` still has a live
+    /// agent pane on the latest fresh canvas snapshot. The bound window's own
+    /// observation decides when there is one (the same judgement
+    /// `runtime_consistency` reports on the row); an unbound launch falls back
+    /// to the pane the canvas attributes to the Issue (#4802). A missing,
+    /// stale, or foreign-tab snapshot is "no live pane", which keeps the
+    /// pre-#4852 re-queue.
+    fn launch_has_live_pane(&self, issue_number: u64, now: &str) -> bool {
+        if !self.active_launches.contains(&issue_number) {
+            return false;
+        }
+        match self.runtime_consistency_at(issue_number, now).consistency {
+            Some(IssueMonitorRuntimeConsistency::Consistent) => true,
+            Some(
+                IssueMonitorRuntimeConsistency::Terminal | IssueMonitorRuntimeConsistency::Missing,
+            ) => false,
+            Some(IssueMonitorRuntimeConsistency::Unavailable) | None => {
+                self.observed_live_issue_pane(issue_number, now).is_some()
+            }
+        }
     }
 
     /// Issue #3645 AC-3/AC-4: issues whose completion the launch tracking
@@ -17701,6 +18346,82 @@ impl IssueMonitorState {
         );
     }
 
+    /// Issue #4862: hand a revoked launch's slot to another window of the same
+    /// Issue that a fresh observation still shows, instead of failing the row.
+    ///
+    /// Narrow on purpose. It applies only to an operator revoke (`stopped: …`,
+    /// what `issue.monitor.stop` writes) — an agent failure or a launch failure
+    /// is about the work, not about one window, and must still fail the row.
+    /// It also requires a *different* live window: revoking the only window
+    /// there is remains a decided fact, so the existing "never revives a
+    /// revoked launch" contract is untouched.
+    ///
+    /// Returns whether the caller should stop and leave the row launched.
+    fn rebind_revoked_launch_to_a_surviving_window(
+        &mut self,
+        issue_number: u64,
+        message: &str,
+        now: &str,
+    ) -> bool {
+        if !message.starts_with("stopped:") {
+            return false;
+        }
+        let revoked = self.launched_windows.get(&issue_number).cloned();
+        // Absence from a fresh snapshot is the only liveness evidence this
+        // judgement accepts, matching `reconcile_launch_bindings`. Without one,
+        // nothing is known and the ordinary failure path stands.
+        let Some(snapshot) = self.fresh_window_snapshot(now) else {
+            return false;
+        };
+        let survivor = snapshot
+            .windows
+            .iter()
+            .filter(|observed| {
+                !matches!(observed.status, WindowState::Stopped | WindowState::Error)
+            })
+            .map(|observed| observed.window_id.clone())
+            .find(|live| {
+                revoked
+                    .as_deref()
+                    .is_none_or(|revoked| !issue_monitor_window_ids_match(revoked, live))
+                    && self.launch_bindings.iter().any(|(bound, bound_issue)| {
+                        *bound_issue == issue_number && issue_monitor_window_ids_match(bound, live)
+                    })
+            });
+        let Some(survivor) = survivor else {
+            return false;
+        };
+        if let Some(revoked) = revoked.as_deref() {
+            self.launch_bindings
+                .retain(|bound, _| !issue_monitor_window_ids_match(bound, revoked));
+            self.record_launch_binding_replacement(issue_number, revoked, &survivor);
+        }
+        self.launched_windows.insert(issue_number, survivor.clone());
+        self.launch_bindings.insert(survivor.clone(), issue_number);
+        if !self.active_launches.contains(&issue_number) {
+            self.active_launches.push(issue_number);
+        }
+        // The row carries its own copy of the binding, so the ledger and the
+        // card disagree unless both move. The card reading the revoked window is
+        // the other half of this defect.
+        if let Some(item) = self
+            .inbox
+            .iter_mut()
+            .find(|item| item.issue.number == issue_number)
+        {
+            item.state = MonitorInboxState::Launched;
+            item.launched_window_id = Some(survivor.clone());
+            item.error_message = None;
+        }
+        tracing::warn!(
+            issue_number,
+            revoked = ?revoked,
+            survivor = %survivor,
+            "issue monitor moved a revoked launch's binding to a window that is still running (Issue #4862)"
+        );
+        true
+    }
+
     fn record_failed_issue_classified_at(
         &mut self,
         issue_number: u64,
@@ -17709,7 +18430,40 @@ impl IssueMonitorState {
         classification: IssueMonitorFailureClass,
         now: &str,
     ) {
+        self.record_failed_issue_routed_at(
+            issue_number,
+            message,
+            state,
+            classification,
+            now,
+            false,
+        );
+    }
+
+    /// `bound_window_failure` (Issue #4815): the caller proved the failure
+    /// came from the Issue's bound implementation window, so it is never
+    /// read as the review's.
+    fn record_failed_issue_routed_at(
+        &mut self,
+        issue_number: u64,
+        message: impl Into<String>,
+        state: MonitorInboxState,
+        classification: IssueMonitorFailureClass,
+        now: &str,
+        bound_window_failure: bool,
+    ) {
         let message = message.into();
+        // Issue #4862: revoking one window must not revoke the Issue. Closing a
+        // duplicate window (#4804) failed the row, which dropped the window that
+        // was actually implementing out of `active_launches` and barred
+        // `readopt_live_launch_bindings` from ever re-adopting it — the card left
+        // Active while the agent kept working, and the slot accounting
+        // under-counted the running fleet. Same shape as the Issue #4150 guard
+        // below it: the stop named a window, so hand the binding to the window
+        // that is still there instead of failing the Issue.
+        if self.rebind_revoked_launch_to_a_surviving_window(issue_number, &message, now) {
+            return;
+        }
         // Issue #3941 AC-3: a launch aborted by transient infrastructure (exact
         // package probe timeout with no cached version, a remote-tracking ref
         // race between concurrent fetches) is neither an agent failure nor an
@@ -17725,6 +18479,17 @@ impl IssueMonitorState {
         // non-`Idle` phase forever and the daemon waits for a verdict that will
         // never arrive. The plain human-gated `LaunchFailed`/`AgentFailed` path
         // below is preserved for every non-autonomous issue.
+        // Issue #4815 AC-1: a review window that could not start, or died
+        // without a verdict, is a failed review — not a failed implementation.
+        // It spends the review ladder, keeps the implementation's slot, and
+        // returns the record to Implementing for the backed-off re-dispatch.
+        if self.autonomous_mode
+            && !bound_window_failure
+            && self.review_failure_applies(issue_number, state, now)
+        {
+            self.record_review_failure(issue_number, message, now);
+            return;
+        }
         if self.autonomous_mode && self.is_autonomous_in_flight(issue_number) {
             // Issue #4161 AC-6: the retry ladder keeps retrying past its own
             // attempt cap, so a launch that is refused deterministically —
@@ -18630,42 +19395,6 @@ mod tests {
         }
     }
 
-    fn assert_manual_relaunch_accepts_fresh_lifecycle_failures(base: &IssueMonitorState) {
-        for (agent_failure, expected_state) in [
-            (false, MonitorInboxState::LaunchFailed),
-            (true, MonitorInboxState::AgentFailed),
-        ] {
-            let mut relaunched = base.clone();
-            relaunched.complete_active_launch(7, "tab-1::manual-relaunch-7");
-            assert_eq!(relaunched.active_count(), 1, "manual relaunch is active");
-            assert_eq!(
-                relaunched.inbox_item(7).map(|item| item.state),
-                Some(MonitorInboxState::Launched)
-            );
-
-            if agent_failure {
-                relaunched.record_agent_issue_failed(7, "fresh manual agent failure");
-            } else {
-                relaunched.record_launch_failed(7, "fresh manual launch failure");
-            }
-
-            assert_eq!(
-                relaunched.inbox_item(7).map(|item| item.state),
-                Some(expected_state),
-                "new launch tracking distinguishes a fresh failure from receipt replay"
-            );
-            assert_eq!(relaunched.active_count(), 0);
-            assert!(
-                relaunched
-                    .prefs()
-                    .failed_issues
-                    .iter()
-                    .any(|failed| failed.issue_number == 7),
-                "fresh manual relaunch failure is persisted"
-            );
-        }
-    }
-
     // SPEC-3431 T-023 (AS2 / FR-006): the PM's launch_now writes the target to
     // the head of priority_order and asks for a scan. This pins the two
     // properties that make it safe: the reordered issue is the one the very
@@ -19512,6 +20241,7 @@ mod tests {
             review_dispatch_hold: None,
             last_failure_message: None,
             delivering_since: None,
+            review_attempts: None,
         };
         let disk = IssueMonitorPrefs {
             launch_profile: Some(profile.clone()),
@@ -19636,6 +20366,7 @@ mod tests {
             review_dispatch_hold: None,
             last_failure_message: None,
             delivering_since: None,
+            review_attempts: None,
         };
         save_issue_monitor_prefs(
             &path,
@@ -19706,6 +20437,7 @@ mod tests {
                 review_dispatch_hold: None,
                 last_failure_message: None,
                 delivering_since: None,
+                review_attempts: None,
             }],
             ..IssueMonitorPrefs::default()
         };
@@ -19776,6 +20508,7 @@ mod tests {
             review_dispatch_hold: None,
             last_failure_message: None,
             delivering_since: None,
+            review_attempts: None,
         };
         let older_disk = IssueMonitorPrefs {
             legacy_git_launch_failure_migration_version: 0,
@@ -19835,6 +20568,7 @@ mod tests {
             review_dispatch_hold: None,
             last_failure_message: None,
             delivering_since: None,
+            review_attempts: None,
         };
         let mut stale = IssueMonitorState::with_prefs(
             IssueMonitorConfig::default(),
@@ -23026,6 +23760,127 @@ mod tests {
             "another tab's window is invisible from here, not dead (#3627)"
         );
         assert_eq!(foreign.prefs().launch_bindings.len(), 1);
+    }
+
+    /// Issue #4862 AC-3/AC-4, the live case: #4777 was working in its window while
+    /// its row read `hold_excluded` with no bound window at all, so the card sat
+    /// outside Active and the slot accounting under-counted by one
+    /// (`active_session_count` 4 against `occupied_slot_count` 2). A `hold` label
+    /// is an admission decision about launching new work; it must not unbind a
+    /// launch that is already running.
+    #[test]
+    fn a_hold_label_must_not_unbind_a_launch_that_is_already_running() {
+        let mut held = issue(4777);
+        held.labels = vec!["hold".to_string()];
+
+        let mut monitor = launched_cohort(&[(4777, "project-a::agent-1343")]);
+        // The label is added while the agent works, so the next scan sees it.
+        scan_queued_candidates(&mut monitor, &[held], "2026-10-01T10:30:00Z");
+
+        assert_eq!(
+            monitor
+                .inbox_item(4777)
+                .and_then(|item| item.launched_window_id.clone()),
+            Some("project-a::agent-1343".to_string()),
+            "AC-3: a hold decides admission, not whether the running window is bound"
+        );
+        assert_eq!(
+            monitor.active_count(),
+            1,
+            "AC-4: the slot stays occupied, so the fleet accounting matches the live sessions"
+        );
+    }
+
+    /// Issue #4862 AC-1/AC-2, the path that actually happened: the duplicate was
+    /// not merely closed, it was revoked (`issue.monitor.stop` / a launch
+    /// failure). Revocation is recorded per Issue, not per window, so revoking
+    /// the duplicate also bars re-adopting the window that is still
+    /// implementing — `readopt_live_launch_bindings` refuses any Issue in
+    /// `failed_issues`. The card leaves Active and never comes back on its own.
+    #[test]
+    fn revoking_a_duplicate_window_must_not_orphan_the_one_still_working() {
+        let now = "2026-10-01T10:22:00Z";
+        let mut monitor = launched_cohort(&[(4777, "tab-1::agent-1343")]);
+        monitor.complete_active_launch_at(4777, "tab-1::agent-1345", now);
+
+        // Absence from a fresh observation is the only liveness evidence this
+        // judgement accepts, so the canvas reports both windows: the duplicate
+        // has stopped, the implementing one is still running.
+        let observed_at = chrono::Utc::now().to_rfc3339();
+        monitor.record_window_snapshot(pane_snapshot(
+            &observed_at,
+            vec![
+                live_pane_observation("tab-1::agent-1343", 4777, WindowState::Running),
+                live_pane_observation("tab-1::agent-1345", 4777, WindowState::Stopped),
+            ],
+        ));
+
+        // The PM revokes the duplicate launch. `issue.monitor.stop` writes
+        // `stopped: <reason>`; "duplicate" in the message would instead reach the
+        // Issue #4150 refusal path, which is a different decision.
+        monitor.record_launch_failed(4777, "stopped: delivered");
+
+        assert_eq!(
+            monitor
+                .inbox_item(4777)
+                .and_then(|item| item.launched_window_id.clone()),
+            Some("tab-1::agent-1343".to_string()),
+            "AC-2: revoking the duplicate must not unbind the window still implementing"
+        );
+        assert_eq!(
+            monitor.active_count(),
+            1,
+            "AC-4: the slot stays held while that window works, so nothing relaunches over it"
+        );
+    }
+
+    /// Issue #4862 AC-1/AC-2: the Kanban card moved Active -> Backlog while the
+    /// agent kept working. A second window appeared for the same Issue (#4804),
+    /// the ACK moved the binding onto it, and closing that second window
+    /// requeued the row — leaving the window that was actually implementing
+    /// unbound, so the card left Active and the Monitor was free to launch a
+    /// third window for work already in progress.
+    #[test]
+    fn closing_a_duplicate_window_rebinds_to_the_one_still_working() {
+        let now = "2026-10-01T10:22:00Z";
+        // The window that is actually implementing.
+        let mut monitor = launched_cohort(&[(4777, "project-a::agent-1343")]);
+        // Issue #4804: a second window is created for the same worktree and its
+        // ACK takes the binding.
+        monitor.complete_active_launch_at(4777, "project-a::agent-1345", now);
+        assert_eq!(
+            monitor
+                .inbox_item(4777)
+                .and_then(|item| item.launched_window_id.clone()),
+            Some("project-a::agent-1345".to_string()),
+            "the later ACK owns the binding, which is the state this test starts from"
+        );
+
+        // The duplicate is closed; the implementing window is untouched.
+        monitor.requeue_window_at("project-a::agent-1345", now);
+        monitor.reconcile_launch_bindings(
+            "project-a",
+            &live_windows(&["project-a::agent-1343"]),
+            now,
+        );
+
+        assert_eq!(
+            monitor
+                .inbox_item(4777)
+                .and_then(|item| item.launched_window_id.clone()),
+            Some("project-a::agent-1343".to_string()),
+            "AC-2: the bind moves to the live window in the same worktree, not to None"
+        );
+        assert_eq!(
+            monitor.inbox_item(4777).map(|item| item.state),
+            Some(MonitorInboxState::Launched),
+            "AC-4: the card stays Active while a session is still working"
+        );
+        assert_eq!(
+            monitor.active_count(),
+            1,
+            "and the slot stays held, so no third window is launched for work in progress"
+        );
     }
 
     #[test]
@@ -27950,6 +28805,140 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_runtime_revoke_preserves_holder_against_late_window_events() {
+        let mut monitor = launched_monitor(42, "tab-1::duplicate");
+        let claim = monitor.live_claim_id(42);
+        let before = monitor.prefs();
+        assert!(!monitor.bind_duplicate_runtime_holder(42, "tab-1::unrelated", "tab-1::holder"));
+        assert_eq!(
+            monitor.prefs(),
+            before,
+            "unrelated primary binding is not overwritten"
+        );
+        monitor.record_monitor_runtime_counts(
+            101,
+            1001,
+            BTreeMap::from([(42, 2)]),
+            "2026-10-02T00:00:02Z",
+        );
+        assert!(monitor.bind_duplicate_runtime_holder(42, "tab-1::duplicate", "tab-1::holder"));
+        assert_eq!(
+            monitor.launched_window_id(42).as_deref(),
+            Some("tab-1::holder")
+        );
+        assert_eq!(monitor.live_claim_id(42), claim);
+        assert_eq!(monitor.launched_window_issue("tab-1::duplicate"), None);
+        assert_eq!(
+            monitor.record_agent_window_failed("tab-1::duplicate", "late exit"),
+            None
+        );
+        assert_eq!(
+            monitor.requeue_window_at("tab-1::duplicate", "2026-10-02T00:00:03Z"),
+            None
+        );
+        assert_eq!(
+            monitor.active_count(),
+            2,
+            "binding repair does not assert a process exit"
+        );
+        assert!(monitor.queued_issue_numbers().is_empty());
+    }
+
+    #[test]
+    fn runtime_process_counts_include_duplicates_and_untracked_launches_in_admission() {
+        let mut monitor = IssueMonitorState::new(IssueMonitorConfig {
+            enabled: true,
+            max_active: 3,
+            ..IssueMonitorConfig::default()
+        });
+        monitor.set_gui_connected(true);
+        scan_queued_candidates(
+            &mut monitor,
+            &[issue(42), issue(43), issue(44)],
+            "2026-10-02T00:00:00Z",
+        );
+        assert!(monitor
+            .next_launch_request("2026-10-02T00:00:01Z")
+            .is_some());
+        monitor.record_monitor_runtime_counts(
+            101,
+            1001,
+            BTreeMap::from([(42, 2), (43, 1)]),
+            "2026-10-02T00:00:02Z",
+        );
+        assert_eq!(monitor.active_issue_numbers(), vec![42, 42, 43]);
+        assert_eq!(monitor.active_count(), 3);
+        assert_eq!(
+            monitor
+                .agent_status_at("2026-10-02T00:00:02Z")
+                .occupied_slot_count,
+            Some(3)
+        );
+        assert_eq!(monitor.claim_probe_plan(3).0, 0);
+        assert!(monitor
+            .next_launch_request("2026-10-02T00:00:03Z")
+            .is_none());
+        monitor.config.max_active = 4;
+        assert_eq!(monitor.claim_probe_plan(4).1, vec![44]);
+        assert!(!monitor.apply_confirmed_claim(
+            43,
+            "claim",
+            "owner",
+            "effect",
+            "2026-10-02T00:00:03Z"
+        ));
+        assert_eq!(
+            monitor
+                .next_launch_request("2026-10-02T00:00:03Z")
+                .unwrap()
+                .issue_number,
+            44
+        );
+    }
+
+    #[test]
+    fn runtime_process_counts_survive_reload_and_stale_rebase_until_a_new_observation() {
+        let mut monitor = IssueMonitorState::new(IssueMonitorConfig::default());
+        let stale = monitor.prefs();
+        monitor.record_monitor_runtime_counts(
+            101,
+            1001,
+            BTreeMap::from([(42, 2)]),
+            "2026-10-02T00:00:02Z",
+        );
+        monitor.rebase_daemon_driver_prefs(&stale);
+        assert_eq!(monitor.active_count(), 2);
+        let mut restored =
+            IssueMonitorState::with_prefs(IssueMonitorConfig::default(), monitor.prefs());
+        assert_eq!(restored.active_count(), 2);
+        assert!(!restored.record_monitor_runtime_counts(
+            101,
+            1001,
+            BTreeMap::new(),
+            "2026-10-02T00:00:01Z"
+        ));
+        assert_eq!(restored.active_count(), 2);
+        restored.record_monitor_runtime_counts(
+            202,
+            2002,
+            BTreeMap::from([(42, 1)]),
+            "2026-10-02T00:00:02Z",
+        );
+        assert_eq!(
+            restored.active_count(),
+            3,
+            "distinct live hosts add their process counts"
+        );
+        restored.record_monitor_runtime_counts(101, 1001, BTreeMap::new(), "2026-10-02T00:00:03Z");
+        monitor.rebase_gui_observer_prefs(&restored.prefs());
+        assert_eq!(
+            monitor.active_count(),
+            1,
+            "empty census releases only its exact host"
+        );
+    }
+
+    #[test]
     fn scan_claim_planning_is_side_effect_free_and_deduplicated() {
         // Phase 7 T-140: the cloned scan may select candidates, but GitHub
         // mutation begins only after the proposal commits and is fenced by the
@@ -32624,31 +33613,41 @@ mod tests {
 
         monitor.record_launch_failed(7, "Independent review could not start");
 
+        // Issue #4815 AC-1: the review's failure is the review ladder's, not
+        // the implementation's. The record returns to Implementing (the PR
+        // is still open) and the implementation launch keeps its slot.
         let record = monitor.autonomous_record(7).expect("record retained");
         assert_eq!(
             record.phase,
-            AutonomousPhase::Idle,
-            "routed back to Idle for retry, not stranded in Reviewing"
+            AutonomousPhase::Implementing,
+            "routed back to Implementing for the backed-off re-dispatch, not stranded in Reviewing"
         );
-        assert_eq!(monitor.attempt_count(7), 1, "the failed attempt is counted");
+        assert_eq!(
+            monitor.attempt_count(7),
+            0,
+            "no implementation attempt is spent"
+        );
+        let attempts = record
+            .review_attempts
+            .as_ref()
+            .expect("the review ladder counts the failure");
+        assert_eq!(
+            (attempts.reviewed_sha.as_str(), attempts.count),
+            ("abc123", 1)
+        );
         assert!(
-            record.retry_not_before.is_some(),
-            "a retry backoff is scheduled"
+            attempts.not_before.is_some(),
+            "a review backoff is scheduled"
         );
         assert_eq!(
             monitor.inbox_item(7).map(|item| item.state),
-            Some(MonitorInboxState::Queued),
-            "re-queued for automatic relaunch (not parked in LaunchFailed)"
+            Some(MonitorInboxState::Launched),
+            "the implementation stays launched (not re-queued, not parked)"
         );
-
-        let mut pre_materialization = monitor.clone();
-        pre_materialization.record_launch_failed(7, "fresh pre-materialization failure");
-        assert_eq!(
-            pre_materialization.inbox_item(7).map(|item| item.state),
-            Some(MonitorInboxState::LaunchFailed),
-            "a distinct admission before materialization cannot be mistaken for receipt replay"
-        );
-        assert_manual_relaunch_accepts_fresh_lifecycle_failures(&monitor);
+        assert!(monitor
+            .inbox_item(7)
+            .and_then(|item| item.error_message.clone())
+            .is_some_and(|error| error.contains("Independent review could not start")));
     }
 
     #[test]
@@ -32666,22 +33665,32 @@ mod tests {
 
         monitor.record_launch_failed(7, "review spawn failed at cap");
 
+        // Issue #4815 AC-2: at the review cap the record stays Implementing
+        // with its slot, dispatch for this SHA stops, and the PM is asked to
+        // steer with the PR, the SHA and the last error.
         assert_eq!(
             monitor.autonomous_record(7).map(|r| r.phase),
-            Some(AutonomousPhase::Idle),
-            "attempts exhausted ⇒ retried through the ladder, not parked"
+            Some(AutonomousPhase::Implementing),
+            "review attempts exhausted ⇒ held for steering, not parked, not re-queued"
         );
         assert_eq!(
             monitor.inbox_item(7).map(|item| item.state),
-            Some(MonitorInboxState::Queued)
+            Some(MonitorInboxState::Launched)
         );
         assert!(
             monitor
                 .autonomous_record(7)
                 .and_then(|r| r.steering.as_ref())
-                .is_some_and(|steering| steering.reason.contains("review spawn failed at cap")),
-            "the PM is asked to look at the failing launch"
+                .is_some_and(
+                    |steering| steering.reason.contains("review spawn failed at cap")
+                        && steering.reason.contains("PR #99")
+                        && steering.reason.contains("abc123")
+                ),
+            "the PM is asked to look at the failing review"
         );
+        assert!(monitor
+            .review_dispatch_hold(7, 99, Some("abc123"), "2026-06-30T12:00:00Z")
+            .is_some_and(|hold| hold.reason.contains("failed 1/1 times")));
     }
 
     #[test]
@@ -35373,6 +36382,314 @@ mod tests {
         assert_eq!(monitor.active_count(), 0);
     }
 
+    fn owner_on_this_host(pid_offset: u32) -> String {
+        format!(
+            "{}:{}:{}",
+            crate::process::current_hostname(),
+            crate::process::current_username(),
+            std::process::id().wrapping_add(pid_offset)
+        )
+    }
+
+    /// Issue #4852 AC-2: after a daemon restart the claim comment the earlier
+    /// pid wrote comes back as the winner. Same host, same user: it is this
+    /// Monitor's own claim, so the bound launch is readopted, never parked.
+    #[test]
+    fn issue_4852_a_claim_from_an_earlier_pid_of_this_host_is_own() {
+        let mut monitor = IssueMonitorState::with_prefs(
+            IssueMonitorConfig::default(),
+            IssueMonitorPrefs {
+                enabled: true,
+                max_active_agents: 2,
+                ..IssueMonitorPrefs::default()
+            },
+        );
+        monitor.set_gui_connected(true);
+        scan_queued_candidates(&mut monitor, &[issue(4740)], "2026-10-01T10:07:15Z");
+        // The identity the restarted process restored names yet another pid
+        // and claim id, so neither exact comparison of #4328 can match.
+        assert!(monitor.apply_confirmed_claim(
+            4740,
+            "gwt-auto-improve:restored",
+            owner_on_this_host(2),
+            "synchronous-claim:gwt-auto-improve:restored",
+            "2026-10-01T10:07:15Z",
+        ));
+        monitor.complete_active_launch_at(4740, "tab-1::agent-348", "2026-10-01T10:07:15Z");
+        assert_eq!(
+            monitor.requeue_window_at("tab-1::agent-348", "2026-10-01T10:10:09Z"),
+            Some(4740)
+        );
+
+        assert!(
+            !monitor.record_blocked_by_claim(
+                issue(4740),
+                owner_on_this_host(1),
+                "2026-10-01T10:40:09Z",
+                Some("gwt-auto-improve:predecessor"),
+            ),
+            "a claim from another pid of this host/user is not a foreign hold"
+        );
+        let repaired = monitor.inbox_item(4740).unwrap();
+        assert_eq!(repaired.state, MonitorInboxState::Launched);
+        assert_eq!(repaired.blocked_by_owner, None);
+        assert_eq!(repaired.exclusion_reason, None);
+        assert_eq!(monitor.active_count(), 1);
+
+        // Another host with this user, or this host with another user, is
+        // still foreign and still blocks.
+        for foreign in [
+            format!(
+                "other-host:{}:{}",
+                crate::process::current_username(),
+                std::process::id()
+            ),
+            format!(
+                "{}:other-user:{}",
+                crate::process::current_hostname(),
+                std::process::id()
+            ),
+        ] {
+            let mut monitor = IssueMonitorState::new(IssueMonitorConfig::default());
+            monitor.set_gui_connected(true);
+            scan_queued_candidates(&mut monitor, &[issue(4740)], "2026-10-01T10:07:15Z");
+            assert!(monitor.record_blocked_by_claim(
+                issue(4740),
+                foreign.clone(),
+                "2026-10-01T10:40:09Z",
+                Some("gwt-auto-improve:foreign"),
+            ));
+            assert_eq!(
+                monitor.inbox_item(4740).unwrap().state,
+                MonitorInboxState::BlockedByClaim,
+                "{foreign} is a foreign owner"
+            );
+        }
+    }
+
+    /// Issue #4852 AC-1: PR #4808 merged the day before; a fresh launch of the
+    /// same work branch is not delivered by it. Only a PR merged after the
+    /// launch started settles that launch.
+    #[test]
+    fn issue_4852_a_merge_older_than_the_launch_never_settles_it() {
+        let mut monitor = IssueMonitorState::new(IssueMonitorConfig::default());
+        scan_queued_candidates(&mut monitor, &[issue(4740)], "2026-10-01T10:00:00Z");
+        monitor.set_gui_connected(true);
+        assert!(monitor
+            .next_launch_request("2026-10-01T10:00:00Z")
+            .is_some());
+        monitor.complete_active_launch_at(4740, "tab-1::agent-1", "2026-10-01T10:00:05Z");
+        let branch = monitor.active_launched_branches()[0].1.clone();
+        let merged = BTreeSet::from([branch.clone()]);
+
+        let mut deliveries = BTreeMap::new();
+        deliveries.insert(
+            branch.clone(),
+            merged_delivery(4808, "aaa", "2026-09-30T12:00:00Z"),
+        );
+        monitor.record_merged_deliveries(&deliveries);
+        assert!(
+            monitor
+                .reconcile_merged_branches_at(&merged, "2026-10-01T10:00:30Z")
+                .is_empty(),
+            "an older merge is not this launch's delivery"
+        );
+        assert_eq!(monitor.active_count(), 1, "the slot stays held");
+        assert_eq!(
+            monitor.inbox_item(4740).map(|item| item.state),
+            Some(MonitorInboxState::Launched)
+        );
+        let row = monitor
+            .agent_status_at("2026-10-01T10:00:30Z")
+            .inbox
+            .into_iter()
+            .find(|row| row.issue_number == 4740)
+            .expect("row");
+        assert!(!row.recoverable_merged);
+        assert_eq!(row.completion_reason, None);
+
+        // A delivery merged after the launch started still settles it (no
+        // pane observed, so the ordinary re-queue runs).
+        deliveries.insert(branch, merged_delivery(4855, "bbb", "2026-10-01T11:00:00Z"));
+        monitor.record_merged_deliveries(&deliveries);
+        assert_eq!(
+            monitor.reconcile_merged_branches_at(&merged, "2026-10-01T11:00:30Z"),
+            vec![4740]
+        );
+        assert_eq!(monitor.active_count(), 0);
+        assert_eq!(
+            monitor.inbox_item(4740).map(|item| item.state),
+            Some(MonitorInboxState::Queued)
+        );
+    }
+
+    /// Issue #4852 AC-3: a SPEC's slice PR merges while the agent that opened
+    /// it keeps working in its pane. The launch keeps its slot and stays
+    /// `launched`; nothing re-queues it and no fresh session is required.
+    /// Once the pane is gone, the same merge runs the existing re-queue.
+    #[test]
+    fn issue_4852_a_merge_during_a_live_pane_keeps_the_launch() {
+        let candidate = spec_issue(
+            4740,
+            IssueMonitorReadiness::ReadyWithOpenTasks,
+            "2026-10-01T09:00:00Z",
+        );
+        let mut monitor = IssueMonitorState::new(IssueMonitorConfig {
+            max_active: 1,
+            ..IssueMonitorConfig::default()
+        });
+        scan_queued_candidates(
+            &mut monitor,
+            &[candidate, issue(4823)],
+            "2026-10-01T10:00:00Z",
+        );
+        monitor.set_gui_connected(true);
+        let request = monitor
+            .next_launch_request("2026-10-01T10:00:00Z")
+            .expect("launch");
+        assert_eq!(request.issue_number, 4740);
+        monitor.complete_active_launch_at(4740, "tab-1::agent-1", "2026-10-01T10:00:05Z");
+        let branch = monitor.active_launched_branches()[0].1.clone();
+        let merged = BTreeSet::from([branch.clone()]);
+        let mut deliveries = BTreeMap::new();
+        deliveries.insert(branch, merged_delivery(4855, "aaa", "2026-10-01T12:00:00Z"));
+        monitor.record_merged_deliveries(&deliveries);
+
+        monitor.record_window_snapshot(pane_snapshot(
+            "2026-10-01T12:00:20Z",
+            vec![live_pane_observation(
+                "tab-1::agent-1",
+                4740,
+                WindowState::Running,
+            )],
+        ));
+        assert!(
+            monitor
+                .reconcile_merged_branches_at(&merged, "2026-10-01T12:00:30Z")
+                .is_empty(),
+            "a launch with a live pane is not freed by a slice merge"
+        );
+        assert_eq!(monitor.active_count(), 1, "the slot stays held");
+        assert_eq!(
+            monitor.inbox_item(4740).map(|item| item.state),
+            Some(MonitorInboxState::Launched)
+        );
+        assert_eq!(monitor.launched_window_issue("tab-1::agent-1"), Some(4740));
+        assert!(!monitor.queue.contains(&4740));
+        assert!(
+            !monitor
+                .prefs()
+                .queued_launch_session_strategies
+                .contains_key(&4740),
+            "no fresh session is required for a launch that is still running"
+        );
+        assert!(
+            monitor
+                .next_launch_request("2026-10-01T12:00:30Z")
+                .is_none(),
+            "max_active is still honoured: #4823 waits"
+        );
+        // The next scan sees the same merged branch again: idempotent.
+        monitor.record_window_snapshot(pane_snapshot(
+            "2026-10-01T12:01:20Z",
+            vec![live_pane_observation(
+                "tab-1::agent-1",
+                4740,
+                WindowState::Running,
+            )],
+        ));
+        assert!(monitor
+            .reconcile_merged_branches_at(&merged, "2026-10-01T12:01:30Z")
+            .is_empty());
+        assert_eq!(monitor.active_count(), 1);
+
+        // The pane ended: the existing re-queue path runs.
+        monitor.record_window_snapshot(pane_snapshot(
+            "2026-10-01T13:00:20Z",
+            vec![live_pane_observation(
+                "tab-1::agent-1",
+                4740,
+                WindowState::Stopped,
+            )],
+        ));
+        assert_eq!(
+            monitor.reconcile_merged_branches_at(&merged, "2026-10-01T13:00:30Z"),
+            vec![4740]
+        );
+        assert_eq!(monitor.active_count(), 0, "a finished pane frees the slot");
+        assert_eq!(
+            monitor.inbox_item(4740).map(|item| item.state),
+            Some(MonitorInboxState::Queued)
+        );
+        assert!(monitor
+            .prefs()
+            .queued_launch_session_strategies
+            .contains_key(&4740));
+    }
+
+    /// Issue #4852 AC-3 (negative half): with no pane on a fresh snapshot, or
+    /// no snapshot at all, the merge re-queues exactly as before.
+    #[test]
+    fn issue_4852_a_merge_without_a_live_pane_requeues() {
+        let cases: Vec<(&str, Option<IssueMonitorWindowSnapshot>)> = vec![
+            ("no snapshot", None),
+            (
+                "pane missing",
+                Some(pane_snapshot("2026-10-01T12:00:20Z", Vec::new())),
+            ),
+            (
+                "stale snapshot",
+                Some(pane_snapshot(
+                    "2026-10-01T11:00:00Z",
+                    vec![live_pane_observation(
+                        "tab-1::agent-1",
+                        4740,
+                        WindowState::Running,
+                    )],
+                )),
+            ),
+            (
+                "another tab's pane",
+                Some(pane_snapshot(
+                    "2026-10-01T12:00:20Z",
+                    vec![live_pane_observation(
+                        "tab-2::agent-1",
+                        4740,
+                        WindowState::Running,
+                    )],
+                )),
+            ),
+        ];
+        for (label, snapshot) in cases {
+            let mut monitor = IssueMonitorState::new(IssueMonitorConfig::default());
+            scan_queued_candidates(&mut monitor, &[issue(4740)], "2026-10-01T10:00:00Z");
+            monitor.set_gui_connected(true);
+            assert!(monitor
+                .next_launch_request("2026-10-01T10:00:00Z")
+                .is_some());
+            monitor.complete_active_launch_at(4740, "tab-1::agent-1", "2026-10-01T10:00:05Z");
+            let branch = monitor.active_launched_branches()[0].1.clone();
+            let merged = BTreeSet::from([branch.clone()]);
+            let mut deliveries = BTreeMap::new();
+            deliveries.insert(branch, merged_delivery(4855, "aaa", "2026-10-01T12:00:00Z"));
+            monitor.record_merged_deliveries(&deliveries);
+            if let Some(snapshot) = snapshot {
+                monitor.record_window_snapshot(snapshot);
+            }
+            assert_eq!(
+                monitor.reconcile_merged_branches_at(&merged, "2026-10-01T12:00:30Z"),
+                vec![4740],
+                "{label}: nothing live keeps the slot"
+            );
+            assert_eq!(monitor.active_count(), 0, "{label}");
+            assert_eq!(
+                monitor.inbox_item(4740).map(|item| item.state),
+                Some(MonitorInboxState::Queued),
+                "{label}"
+            );
+        }
+    }
+
     #[test]
     fn issue_4328_fresh_running_snapshot_readopts_a_queued_launch_before_admission() {
         let mut prefs = launched_cohort(&[(4308, "tab-1::agent-353")]).prefs();
@@ -36058,5 +37375,317 @@ mod tests {
             )],
         ));
         assert!(monitor.review_windows().is_empty());
+    }
+
+    // ---------------------------------------------------------------------
+    // Issue #4815: failed review windows spend a per-SHA ladder, back off,
+    // and stop at the cap with a steering reason.
+    // ---------------------------------------------------------------------
+
+    fn review_attempts_of(
+        monitor: &IssueMonitorState,
+        issue_number: u64,
+    ) -> Option<AutonomousReviewAttempts> {
+        monitor
+            .autonomous_record(issue_number)
+            .and_then(|record| record.review_attempts.clone())
+    }
+
+    /// Issue #4815 AC-1: a review window that dies without a verdict counts
+    /// one review attempt for its SHA (not an implementation attempt), keeps
+    /// the implementation's slot, and two scans inside the backoff produce
+    /// exactly one dispatch.
+    #[test]
+    fn issue_4815_failed_review_window_backs_off_the_next_dispatch_for_its_sha() {
+        let mut monitor = autonomous_launched_cohort(&[(41, "tab-1::impl-41")]);
+        monitor.set_max_active_agents(3);
+        let implementation_attempts = monitor.attempt_count(41);
+        monitor
+            .dispatch_review(review_dispatch_for(41, 410), "2026-09-07T04:00:00Z")
+            .expect("first dispatch is admitted");
+        assert_eq!(monitor.take_pending_review_dispatches().len(), 1);
+        monitor.record_window_snapshot(idle_snapshot(
+            "2026-09-07T04:00:30Z",
+            vec![
+                idle_observation("tab-1::impl-41", Some(41), WindowState::Running, false),
+                idle_observation("tab-1::review-41", Some(41), WindowState::Running, true),
+            ],
+        ));
+        // The review pane dies (start-gate failure) before any verdict.
+        monitor.record_window_snapshot(idle_snapshot(
+            "2026-09-07T04:00:45Z",
+            vec![
+                idle_observation("tab-1::impl-41", Some(41), WindowState::Running, false),
+                idle_observation("tab-1::review-41", Some(41), WindowState::Error, true),
+            ],
+        ));
+        let attempts = review_attempts_of(&monitor, 41).expect("review failure recorded");
+        assert_eq!(attempts.reviewed_sha, "sha-410");
+        assert_eq!(attempts.count, 1);
+        assert_eq!(
+            attempts.not_before.as_deref(),
+            Some("2026-09-07T04:01:45Z"),
+            "60 s ladder"
+        );
+        assert_eq!(
+            monitor.attempt_count(41),
+            implementation_attempts,
+            "the implementation ladder is untouched"
+        );
+        assert_eq!(
+            monitor.autonomous_record(41).map(|record| record.phase),
+            Some(AutonomousPhase::Implementing),
+            "the record returns to Implementing for the backed-off re-dispatch"
+        );
+        assert!(monitor.review_windows().is_empty());
+        assert_eq!(
+            monitor.active_issue_numbers(),
+            vec![41],
+            "the implementation keeps its slot"
+        );
+        assert_eq!(
+            monitor.inbox_item(41).map(|item| item.state),
+            Some(MonitorInboxState::Launched)
+        );
+        let error = monitor
+            .inbox_item(41)
+            .and_then(|item| item.error_message.clone())
+            .expect("the row names the failure");
+        assert!(
+            error.contains("PR #410") && error.contains("sha-410") && error.contains("1/3"),
+            "{error}"
+        );
+
+        // Two scans inside the backoff: both held, no dispatch.
+        for now in ["2026-09-07T04:01:00Z", "2026-09-07T04:01:30Z"] {
+            let hold = monitor
+                .dispatch_review(review_dispatch_for(41, 410), now)
+                .expect_err("inside the backoff the dispatch is held");
+            assert!(
+                hold.reason
+                    .contains("backing off until 2026-09-07T04:01:45Z")
+                    && hold.reason.contains("PR #410")
+                    && hold.reason.contains("sha-410"),
+                "{}",
+                hold.reason
+            );
+            assert!(monitor.take_pending_review_dispatches().is_empty());
+            assert_eq!(review_hold_of(&monitor, 41), Some(hold.reason.clone()));
+        }
+        assert!(monitor
+            .review_dispatch_hold(41, 410, Some("sha-410"), "2026-09-07T04:01:30Z")
+            .is_some());
+        assert!(
+            monitor
+                .stuck_autonomous_issues("2026-09-07T06:00:00Z")
+                .is_empty(),
+            "a backed-off review is not a stalled implementation"
+        );
+
+        // After the backoff the same SHA is dispatched once more.
+        monitor
+            .dispatch_review(review_dispatch_for(41, 410), "2026-09-07T04:02:00Z")
+            .expect("the backoff elapsed");
+        assert_eq!(monitor.take_pending_review_dispatches().len(), 1);
+        assert_eq!(review_hold_of(&monitor, 41), None);
+        assert_eq!(
+            review_attempts_of(&monitor, 41).map(|attempts| attempts.count),
+            Some(1),
+            "the ladder is kept across the retry of the same SHA"
+        );
+        // A verdict ends the ladder.
+        monitor.record_review_verdict(41, true);
+        assert_eq!(review_attempts_of(&monitor, 41), None);
+    }
+
+    /// Issue #4815 AC-2: three identical failures for one SHA stop dispatch
+    /// and ask the PM to steer, naming the PR, the SHA and the last error; a
+    /// new head SHA starts the count over.
+    #[test]
+    fn issue_4815_three_failures_for_one_sha_stop_dispatch_until_the_head_moves() {
+        let mut monitor = autonomous_launched_cohort(&[(41, "tab-1::impl-41")]);
+        monitor.set_max_active_agents(3);
+        let start = chrono::DateTime::parse_from_rfc3339("2026-09-07T04:00:00Z")
+            .expect("start")
+            .to_utc();
+        let at = |secs: i64| {
+            (start + chrono::Duration::seconds(secs))
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        };
+        // Failures at t=0 (backoff 60), t=120 (backoff 120), t=300 (cap).
+        let mut clock = 0;
+        for expected_count in 1..=3 {
+            monitor
+                .dispatch_review(review_dispatch_for(41, 410), &at(clock))
+                .expect("dispatch admitted");
+            monitor.take_pending_review_dispatches();
+            // The GUI reports the spawn error for the review window.
+            monitor.record_launch_failed_at(
+                41,
+                "spawn failed: os error 206 (command line too long)",
+                &at(clock + 5),
+            );
+            let attempts = review_attempts_of(&monitor, 41).expect("attempt recorded");
+            assert_eq!(attempts.count, expected_count);
+            assert_eq!(
+                attempts.last_error,
+                "spawn failed: os error 206 (command line too long)"
+            );
+            clock += 400;
+        }
+        let hold = monitor
+            .dispatch_review(review_dispatch_for(41, 410), &at(clock))
+            .expect_err("the third identical failure stops dispatch for this SHA");
+        assert!(
+            hold.reason.contains("failed 3/3 times")
+                && hold.reason.contains("PR #410")
+                && hold.reason.contains("sha-410")
+                && hold.reason.contains("os error 206"),
+            "{}",
+            hold.reason
+        );
+        assert!(monitor.take_pending_review_dispatches().is_empty());
+        // Long after any backoff it is still held: the cap is not a timer.
+        assert!(monitor
+            .review_dispatch_hold(41, 410, Some("sha-410"), &at(clock + 86_400))
+            .is_some());
+        let steering = monitor
+            .status_view_at(&at(clock))
+            .autonomous_issues
+            .into_iter()
+            .find(|summary| summary.issue_number == 41)
+            .and_then(|summary| summary.steering)
+            .expect("issue.monitor.status carries the steering reason");
+        assert!(
+            steering.reason.contains("PR #410")
+                && steering.reason.contains("sha-410")
+                && steering.reason.contains("os error 206")
+                && steering.reason.contains("3/3"),
+            "{}",
+            steering.reason
+        );
+        assert_eq!(
+            monitor.inbox_item(41).map(|item| item.state),
+            Some(MonitorInboxState::Launched),
+            "the implementation is never re-queued by a review failure"
+        );
+
+        // The head moved: the old ladder does not hold the new SHA, and the
+        // admitted dispatch resets the count.
+        assert!(monitor
+            .review_dispatch_hold(41, 410, Some("sha-410-v2"), &at(clock))
+            .is_none());
+        let mut fresh = review_dispatch_for(41, 410);
+        fresh.reviewed_sha = "sha-410-v2".to_string();
+        monitor
+            .dispatch_review(fresh, &at(clock))
+            .expect("a new head is a new review");
+        assert_eq!(monitor.take_pending_review_dispatches().len(), 1);
+        assert_eq!(review_attempts_of(&monitor, 41), None);
+        assert_eq!(
+            monitor
+                .autonomous_record(41)
+                .and_then(|record| record.reviewed_sha.clone()),
+            Some("sha-410-v2".to_string())
+        );
+    }
+
+    /// Issue #4815 AC-3: a review window that dies before its first hook
+    /// carries only the GUI's "PTY handoff complete" stage marker; the row
+    /// reports a launch failure, never that marker.
+    #[test]
+    fn issue_4815_start_gate_failure_is_reported_as_a_launch_failure() {
+        let mut monitor = autonomous_launched_cohort(&[(41, "tab-1::impl-41")]);
+        monitor.set_max_active_agents(3);
+        monitor
+            .dispatch_review(review_dispatch_for(41, 410), IDLE_NOW)
+            .expect("dispatch admitted");
+        monitor.record_launch_failed_at(41, "PTY handoff complete", "2026-09-07T04:00:10Z");
+        let error = monitor
+            .inbox_item(41)
+            .and_then(|item| item.error_message.clone())
+            .expect("error recorded");
+        assert!(!error.contains("PTY handoff complete"), "{error}");
+        assert!(
+            error.contains("review window exited before its first hook")
+                && error.contains("PR #410"),
+            "{error}"
+        );
+        assert_eq!(
+            review_attempts_of(&monitor, 41).map(|attempts| attempts.last_error),
+            Some("review window exited before its first hook (start-gate failure)".to_string())
+        );
+        // A dead implementation pane during review is still the
+        // implementation's failure, not the review's.
+        let mut monitor = autonomous_launched_cohort(&[(41, "tab-1::impl-41")]);
+        monitor.set_max_active_agents(3);
+        monitor
+            .dispatch_review(review_dispatch_for(41, 410), IDLE_NOW)
+            .expect("dispatch admitted");
+        monitor.record_window_snapshot(idle_snapshot(
+            "2026-09-07T04:00:30Z",
+            vec![
+                idle_observation("tab-1::impl-41", Some(41), WindowState::Error, false),
+                idle_observation("tab-1::review-41", Some(41), WindowState::Running, true),
+            ],
+        ));
+        monitor.record_agent_window_failed_at(
+            "tab-1::impl-41",
+            "implementation agent crashed",
+            "2026-09-07T04:00:40Z",
+        );
+        assert_eq!(review_attempts_of(&monitor, 41), None);
+        assert_eq!(
+            monitor.attempt_count(41),
+            1,
+            "the implementation ladder took it"
+        );
+    }
+
+    /// Issue #4815: the daemon reports agent failures with their window. The
+    /// bound implementation window's failure is the implementation's even
+    /// with no canvas snapshot; the review pane's (or an unmapped pane named
+    /// by its Issue hint) is the review's while the record is `Reviewing`.
+    #[test]
+    fn issue_4815_agent_failure_routing_follows_the_reporting_window() {
+        for (window_id, review_failure) in [
+            ("tab-1::impl-41", false),
+            ("tab-1::review-41", true),
+            ("tab-1::agent-unmapped", true),
+        ] {
+            let mut monitor = autonomous_launched_cohort(&[(41, "tab-1::impl-41")]);
+            monitor.set_max_active_agents(3);
+            monitor
+                .dispatch_review(review_dispatch_for(41, 410), IDLE_NOW)
+                .expect("dispatch admitted");
+            monitor.record_agent_window_issue_failed_classified_at(
+                41,
+                window_id,
+                "agent exited",
+                IssueMonitorFailureClass::Agent,
+                "2026-09-07T04:00:40Z",
+            );
+            if review_failure {
+                assert_eq!(
+                    review_attempts_of(&monitor, 41).map(|attempts| attempts.count),
+                    Some(1),
+                    "{window_id}"
+                );
+                assert_eq!(monitor.attempt_count(41), 0, "{window_id}");
+                assert_eq!(
+                    monitor.inbox_item(41).map(|item| item.state),
+                    Some(MonitorInboxState::Launched),
+                    "{window_id}"
+                );
+            } else {
+                assert_eq!(review_attempts_of(&monitor, 41), None, "{window_id}");
+                assert_eq!(monitor.attempt_count(41), 1, "{window_id}");
+                assert_eq!(
+                    monitor.inbox_item(41).map(|item| item.state),
+                    Some(MonitorInboxState::Queued),
+                    "{window_id}"
+                );
+            }
+        }
     }
 }

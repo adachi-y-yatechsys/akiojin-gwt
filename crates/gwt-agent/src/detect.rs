@@ -1,6 +1,7 @@
 //! Agent detection: discover installed coding agents via PATH lookup.
 
 use std::{
+    collections::HashMap,
     ffi::OsStr,
     io::Read,
     path::{Path, PathBuf},
@@ -113,6 +114,41 @@ impl AgentDetector {
         })
     }
 
+    /// Probe the executable selected by the final Host launch environment.
+    /// Environment overrides/removals and relative PATH entries affect only
+    /// this child; the process-global environment is never changed.
+    pub fn detect_by_command_with_environment(
+        command: &str,
+        env: &HashMap<String, String>,
+        remove_env: &[String],
+        cwd: Option<&Path>,
+    ) -> Option<DetectedAgent> {
+        let executable =
+            crate::launch::resolve_direct_runner_with_effective_env(command, env, remove_env, cwd)?;
+        let descriptor = builtin_agent_descriptor_for_command(command);
+        let env: Vec<_> = env
+            .iter()
+            .map(|(key, value)| (key.as_str(), OsStr::new(value)))
+            .collect();
+        let (version, resolved_path) = Self::fetch_version_with_environment(
+            &executable,
+            descriptor.map_or("--version", |descriptor| descriptor.version_flag),
+            descriptor.map_or(&[], |descriptor| descriptor.version_prefix_args),
+            &env,
+            remove_env,
+            cwd,
+        )
+        .ok()?;
+        Some(DetectedAgent {
+            agent_id: descriptor.map_or_else(
+                || AgentId::Custom(command.into()),
+                |descriptor| descriptor.id.clone(),
+            ),
+            version,
+            path: resolved_path,
+        })
+    }
+
     fn detect_one(probe: &AgentProbe) -> Option<DetectedAgent> {
         let (version, resolved_path) =
             Self::fetch_version(probe.command, probe.version_flag, probe.prefix_args, &[]).ok()?;
@@ -139,12 +175,29 @@ impl AgentDetector {
         prefix_args: &[&str],
         env: &[(&str, &OsStr)],
     ) -> Result<(Option<String>, PathBuf), String> {
-        let request = env.iter().fold(
+        Self::fetch_version_with_environment(command, version_flag, prefix_args, env, &[], None)
+    }
+
+    fn fetch_version_with_environment(
+        command: &str,
+        version_flag: &str,
+        prefix_args: &[&str],
+        env: &[(&str, &OsStr)],
+        remove_env: &[String],
+        cwd: Option<&Path>,
+    ) -> Result<(Option<String>, PathBuf), String> {
+        let mut request = env.iter().fold(
             gwt_core::process::ProcessPlanRequest::new(command)
                 .args(prefix_args)
                 .arg(version_flag),
             |request, (key, value)| request.env(key, value),
         );
+        for key in remove_env {
+            request = request.env_remove(key);
+        }
+        if let Some(cwd) = cwd {
+            request = request.current_dir(cwd);
+        }
         let mut cmd = gwt_core::process::resolved_command(request).map_err(|error| {
             debug!(command, error = %error, "Agent version probe resolution failed");
             error.to_string()
@@ -247,6 +300,33 @@ mod tests {
     #[test]
     fn detect_by_command_nonexistent() {
         assert!(AgentDetector::detect_by_command("gwt_nonexistent_agent_xyz").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detection_uses_launch_path_cwd_and_environment_removals() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        for (directory, version) in [("old", "2.1.153"), ("new", "2.1.156")] {
+            let bin = temp.path().join(directory);
+            std::fs::create_dir(&bin).unwrap();
+            let executable = bin.join("claude");
+            std::fs::write(
+                &executable,
+                format!("#!/bin/sh\nprintf '{version}%s\\n' \"${{HOME-}}\"\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let detected = AgentDetector::detect_by_command_with_environment(
+                "claude",
+                &HashMap::from([("PATH".into(), directory.into())]),
+                &["HOME".into()],
+                Some(temp.path()),
+            )
+            .expect("fixture CLI is detected");
+            assert_eq!(detected.version.as_deref(), Some(version));
+            assert_eq!(detected.path, executable);
+        }
     }
 
     #[cfg(windows)]
@@ -377,9 +457,15 @@ mod tests {
     fn detect_by_command_bounds_a_hanging_version_probe() {
         use std::os::unix::fs::PermissionsExt;
 
+        // Issue #4884: the fixture's sleep is what the assertion below reads as
+        // "the bound never engaged", so it is named rather than repeated.
+        const HANG_SECONDS: u64 = 30;
+        let hang = std::time::Duration::from_secs(HANG_SECONDS);
+
         let temp = tempfile::tempdir().expect("tempdir");
         let executable = temp.path().join("agy");
-        std::fs::write(&executable, "#!/bin/sh\nsleep 30\n").expect("write hanging fixture");
+        std::fs::write(&executable, format!("#!/bin/sh\nsleep {HANG_SECONDS}\n"))
+            .expect("write hanging fixture");
         let mut permissions = std::fs::metadata(&executable)
             .expect("fixture metadata")
             .permissions();
@@ -398,9 +484,21 @@ mod tests {
         assert_eq!(detected.agent_id, AgentId::Antigravity);
         assert_eq!(detected.path, executable);
         assert_eq!(detected.version, None);
+        // Issue #4884: assert the property, not the latency. What this test is
+        // for is that detection stops waiting on a probe that never returns —
+        // the bound engaged. `VERSION_PROBE_TIMEOUT + 3s` stood here, which
+        // measures how promptly the scheduler returned to this thread after the
+        // bound fired, so adding tests to this crate (PR #4851 added three)
+        // raised the parallel load until 3s of slack ran out roughly once in
+        // twenty runs. Raising that slack would only move the next failure.
+        //
+        // The two outcomes are 5s apart from 30s, so any threshold between them
+        // separates them with seconds of margin instead of milliseconds.
         assert!(
-            elapsed < VERSION_PROBE_TIMEOUT + std::time::Duration::from_secs(3),
-            "probe must be bounded by {VERSION_PROBE_TIMEOUT:?}, took {elapsed:?}"
+            elapsed < hang / 2,
+            "the probe must stop waiting on a child that never returns: \
+             took {elapsed:?}, bound is {VERSION_PROBE_TIMEOUT:?}, \
+             and the fixture would have hung for {hang:?}"
         );
     }
 

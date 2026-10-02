@@ -1108,7 +1108,7 @@ where
     };
     launch_env
         .with_project_root(&worktree_path)
-        .apply_to_parts(&mut config.env_vars, &mut config.remove_env);
+        .apply_to_config(&mut config);
     refresh_worktree_assets(&worktree_path)?;
 
     let fallback_executable =
@@ -1187,6 +1187,10 @@ fn finalize_and_persist_prepared_launch(
         session.bind_docker_runtime(runtime_worktree, &project_state_root)?;
     }
 
+    session.codex_auth_root = config
+        .working_dir
+        .as_deref()
+        .and_then(|cwd| config.validated_codex_auth_root_for_cwd(cwd));
     session
         .save(sessions_dir)
         .map_err(|error| error.to_string())?;
@@ -1438,6 +1442,54 @@ pub fn resolve_host_runner_health_checked_with_probe_and_repair<F, R>(
     config: &mut LaunchConfig,
     fallback_executable: String,
     npx_cache_base: Option<PathBuf>,
+    probe: F,
+    repair: R,
+) -> Result<HostRunnerHealthReport, String>
+where
+    F: FnMut(
+        HostRunnerProbeKind,
+        &str,
+        Vec<String>,
+        &HashMap<String, String>,
+        &[String],
+        Option<PathBuf>,
+    ) -> HostRunnerProbeOutcome,
+    R: FnMut(&WindowsNpxCacheRepairCandidate) -> Result<(), String>,
+{
+    let mut candidate = config.clone();
+    let report = resolve_host_runner_health_checked_inner(
+        &mut candidate,
+        fallback_executable,
+        npx_cache_base,
+        probe,
+        repair,
+    )?;
+    if candidate.runtime_target == LaunchRuntimeTarget::Host
+        && matches!(candidate.agent_id, AgentId::ClaudeCode | AgentId::Codex)
+    {
+        if candidate.agent_id == AgentId::ClaudeCode
+            && candidate.reasoning_level.as_deref() == Some("ultracode")
+            && !report.version_output.as_deref().is_some_and(|version| {
+                crate::claude_capabilities::supports_ultracode(version, true)
+            })
+        {
+            return Err(format!(
+                "Claude Code ultracode requires version >= 2.1.154; selected runner version: {}",
+                report.version_output.as_deref().unwrap_or("unknown"),
+            ));
+        }
+        if let Some(version) = &report.version_output {
+            candidate.tool_version = Some(version.clone());
+        }
+    }
+    *config = candidate;
+    Ok(report)
+}
+
+fn resolve_host_runner_health_checked_inner<F, R>(
+    config: &mut LaunchConfig,
+    fallback_executable: String,
+    npx_cache_base: Option<PathBuf>,
     mut probe: F,
     mut repair: R,
 ) -> Result<HostRunnerHealthReport, String>
@@ -1472,16 +1524,6 @@ where
         ) {
             config.command = rebound;
         }
-    }
-    if is_targeted_windows_host_package_launch(config) && config.tool_runtime_provenance.is_some() {
-        return resolve_targeted_windows_host_package_plan(
-            config,
-            fallback_executable,
-            npx_cache_base,
-            None,
-            &mut probe,
-            &mut repair,
-        );
     }
     if !is_host_builtin_direct_runner(config) {
         if is_targeted_windows_host_package_launch(config) {
@@ -1531,6 +1573,7 @@ where
         };
         let mut candidate = config.clone();
         candidate.command = direct_command.expect("successful probe has a resolved command");
+        candidate.tool_runtime_provenance = None;
         *config = candidate;
         return Ok(report);
     }
@@ -1538,11 +1581,21 @@ where
     let direct_diagnostic = direct_probe.diagnostic(&config.env_vars);
     let agent_name = config.agent_id.display_name().to_string();
     if is_targeted_windows_host_package_launch(config) {
+        let requested_selector = config
+            .tool_version_selector
+            .clone()
+            .or_else(|| {
+                config
+                    .tool_runtime_provenance
+                    .as_ref()
+                    .map(|provenance| provenance.requested_selector.clone())
+            })
+            .unwrap_or_else(|| "installed".into());
         let mut report = resolve_targeted_windows_host_package_plan(
             config,
             fallback_executable,
             npx_cache_base,
-            Some("installed"),
+            Some(&requested_selector),
             &mut probe,
             &mut repair,
         )
@@ -1675,6 +1728,7 @@ where
 
     let requested_selector = requested_selector_override
         .map(str::to_string)
+        .or_else(|| config.tool_version_selector.clone())
         .or_else(|| {
             config
                 .tool_runtime_provenance
@@ -5600,6 +5654,31 @@ mod tests {
         assert!(error.contains("15 seconds"));
     }
 
+    #[test]
+    fn exact_package_plan_rejects_changed_selector_before_metadata_or_probe() {
+        let temp = tempdir().expect("tempdir");
+        let mut config = sample_direct_codex_launch_config(temp.path());
+        config.tool_version_selector = Some("0.117.0".into());
+        config.tool_runtime_provenance = Some(ToolRuntimeProvenance {
+            schema_version: ToolRuntimeProvenance::CURRENT_SCHEMA_VERSION,
+            official_package: "@openai/codex".into(),
+            requested_selector: "latest".into(),
+            resolved_exact_version: "0.116.0".into(),
+            runner_kind: ToolRuntimeRunnerKind::Npx,
+            resolution_reason: ToolRuntimeResolutionReason::RequestedSelector,
+        });
+        let error = resolve_targeted_windows_host_package_plan(
+            &mut config,
+            "npx.cmd".into(),
+            None,
+            None,
+            &mut |_, _, _, _, _, _| panic!("selector mismatch must fail before probing"),
+            &mut |_| Ok(()),
+        )
+        .expect_err("changed selector must not reuse stale provenance");
+        assert!(error.contains("persisted tool runtime provenance is invalid"));
+    }
+
     #[cfg(windows)]
     #[test]
     fn windows_invalid_persisted_provenance_fails_before_any_probe() {
@@ -5690,19 +5769,19 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_persisted_installed_fallback_resumes_exact_without_direct_reprobe() {
+    fn windows_persisted_fallback_reprobes_direct_then_reuses_exact_package() {
         let temp = tempdir().expect("tempdir");
         let provenance = ToolRuntimeProvenance {
             schema_version: ToolRuntimeProvenance::CURRENT_SCHEMA_VERSION,
             official_package: "@openai/codex".to_string(),
-            requested_selector: "installed".to_string(),
+            requested_selector: "latest".to_string(),
             resolved_exact_version: "0.116.0".to_string(),
             runner_kind: ToolRuntimeRunnerKind::Npx,
             resolution_reason: ToolRuntimeResolutionReason::InstalledFallback,
         };
         let mut config = AgentLaunchBuilder::new(AgentId::Codex)
             .working_dir(temp.path())
-            .version("installed")
+            .version("latest")
             .tool_runtime_provenance(provenance.clone())
             .build();
         config.command = temp.path().join("codex.exe").display().to_string();
@@ -5716,6 +5795,9 @@ mod tests {
             |kind, _command, args, _env, _remove_env, _cwd| {
                 calls.push((kind, args));
                 match kind {
+                    HostRunnerProbeKind::Direct => {
+                        HostRunnerProbeOutcome::failure_with_stderr("installed runner unavailable")
+                    }
                     HostRunnerProbeKind::Package => HostRunnerProbeOutcome::success(),
                     _ => panic!("persisted installed fallback must reuse exact package directly"),
                 }
@@ -5724,8 +5806,9 @@ mod tests {
         )
         .expect("persisted installed fallback exact plan");
 
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, HostRunnerProbeKind::Package);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, HostRunnerProbeKind::Direct);
+        assert_eq!(calls[1].0, HostRunnerProbeKind::Package);
         assert_eq!(
             report.resolved_package_plan.expect("plan").provenance,
             provenance
@@ -6769,6 +6852,14 @@ mod tests {
         const SECRET: &str = "version-output-secret-sentinel-95173";
         let temp = tempdir().expect("tempdir");
         let mut config = sample_direct_codex_launch_config(temp.path());
+        config.tool_runtime_provenance = Some(ToolRuntimeProvenance {
+            schema_version: ToolRuntimeProvenance::CURRENT_SCHEMA_VERSION,
+            official_package: "@openai/codex".into(),
+            requested_selector: "installed".into(),
+            resolved_exact_version: "0.116.0".into(),
+            runner_kind: ToolRuntimeRunnerKind::Npx,
+            resolution_reason: ToolRuntimeResolutionReason::InstalledFallback,
+        });
         config
             .env_vars
             .insert("RUNNER_API_TOKEN".to_string(), SECRET.to_string());
@@ -6794,16 +6885,45 @@ mod tests {
         .expect("healthy direct runner");
 
         assert_eq!(probe_calls, 1);
+        assert!(config.tool_runtime_provenance.is_none());
         let version_output = report.version_output.expect("version output evidence");
         assert_eq!(version_output, "0.133.0");
+        assert_eq!(config.tool_version.as_deref(), Some("0.133.0"));
         assert!(!version_output.contains(SECRET));
     }
 
-    /// Issue #3481 AC-1/AC-2: `codex@latest` resolves through the package
-    /// runner, so the runner probe is the only discovery of the executable that
-    /// will actually be spawned. Its version evidence must reach the report
-    /// instead of being discarded, otherwise downstream readiness decisions
-    /// fall back to the alias string.
+    #[test]
+    fn claude_ultracode_rejects_the_actual_old_runner_version() {
+        let temp = tempdir().expect("tempdir");
+        let mut config = sample_direct_codex_launch_config(temp.path());
+        config.agent_id = AgentId::ClaudeCode;
+        config.command = "/opt/homebrew/bin/claude".into();
+        config.reasoning_level = Some("ultracode".into());
+        let original = config.clone();
+        let result = resolve_host_runner_health_checked_with_probe_and_repair(
+            &mut config,
+            "npx".into(),
+            None,
+            |kind, _, _, _, _, _| {
+                assert_eq!(kind, HostRunnerProbeKind::Direct);
+                HostRunnerProbeOutcome {
+                    stdout: "2.1.153 (Claude Code)".into(),
+                    ..HostRunnerProbeOutcome::success()
+                }
+            },
+            |_| Ok(()),
+        );
+        assert!(result
+            .expect_err("old actual binary cannot use ultracode")
+            .contains("2.1.153"));
+        assert_eq!(config.command, original.command);
+        assert_eq!(config.tool_version, original.tool_version);
+    }
+
+    /// Issue #3481 AC-1/AC-2: this fixture explicitly constructs a package
+    /// runner launch (the fallback route after installed-runner discovery).
+    /// Its probe must carry the actual executable version to the report so
+    /// downstream readiness decisions do not rely on the `latest` alias.
     #[test]
     fn healthy_latest_package_runner_report_carries_probe_version_evidence() {
         const SECRET: &str = "latest-package-version-sentinel-31481";
@@ -6838,6 +6958,7 @@ mod tests {
         assert!(!report.switched_to_fallback);
         let version_output = report.version_output.expect("version output evidence");
         assert_eq!(version_output, "0.130.0");
+        assert_eq!(config.tool_version.as_deref(), Some("0.130.0"));
         assert!(!version_output.contains(SECRET));
     }
 

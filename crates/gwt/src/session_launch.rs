@@ -15,6 +15,7 @@ pub fn initialize_launch_session(
     ));
     session.display_name = config.display_name.clone();
     session.tool_version = config.tool_version.clone();
+    session.tool_version_selector = config.tool_version_selector.clone();
     session.model = config.model.clone();
     session.reasoning_level = config.reasoning_level.clone();
     session.session_mode = config.session_mode;
@@ -28,6 +29,7 @@ pub fn initialize_launch_session(
     session.launch_route = config.launch_route;
     session.launch_command = durable_command.unwrap_or_else(|| config.command.clone());
     session.launch_args = config.args.clone();
+    session.codex_auth_root = config.validated_codex_auth_root_for_cwd(worktree);
     session.windows_shell = config.windows_shell;
     session.tool_runtime_provenance = config.tool_runtime_provenance.clone();
     apply_resume_identity_to_session(&mut session, config);
@@ -184,6 +186,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _home = gwt_core::test_support::ScopedGwtHome::set(tmp.path());
         let mut config = gwt_agent::AgentLaunchBuilder::new(gwt_agent::AgentId::ClaudeCode).build();
+        config.tool_version = Some("2.1.156".into());
+        config.tool_version_selector = Some("latest".into());
         config.session_mode = gwt_agent::SessionMode::Resume;
         config.resume_session_id = Some("conversation".to_string());
         config.branch = Some("work/example".to_string());
@@ -206,6 +210,9 @@ mod tests {
             .expect("load session");
         assert_eq!(saved.status, gwt_agent::AgentStatus::Running);
         assert_eq!(saved.exact_resume_session_id(), Some("conversation"));
+        assert_eq!(saved.tool_version.as_deref(), Some("2.1.156"));
+        assert_eq!(saved.tool_version_selector.as_deref(), Some("latest"));
+        assert_eq!(saved.launch_tool_version().as_deref(), Some("latest"));
         assert!(runtime.exists());
     }
     #[test]

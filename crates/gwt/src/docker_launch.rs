@@ -982,7 +982,7 @@ pub fn docker_compose_files_for_launch(
     Ok(compose_files)
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn docker_compose_file_for_launch(
     project_root: &Path,
     files: &gwt_docker::DockerFiles,

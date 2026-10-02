@@ -1,7 +1,7 @@
 #![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     io,
     path::{Path, PathBuf},
     sync::{mpsc as std_mpsc, Arc, Mutex, OnceLock, RwLock},
@@ -689,6 +689,21 @@ fn request_gui_shutdown(
     GuiShutdownOutcome::Started
 }
 
+/// Preserve evidence when the GUI loop closes before an update handoff arrives.
+fn record_update_dispatch_result(
+    result: Result<(), tao::event_loop::EventLoopClosed<UserEvent>>,
+    stage: &str,
+) -> bool {
+    if let Err(error) = result {
+        gwt_core::update::log_update_event(
+            "fail",
+            &[("stage", stage), ("reason", &error.to_string())],
+        );
+        return false;
+    }
+    true
+}
+
 /// Issue #4038 (AC-1 / AC-2): resolve the payload to commit for an update
 /// apply on a worker thread — the persisted manifest when there is one,
 /// otherwise a download that is then persisted — and hand the manifest back
@@ -711,25 +726,30 @@ fn spawn_update_apply_resolution(
         };
         match resolved {
             Ok(manifest) => {
-                let _ = proxy.send_event(UserEvent::ApplyUpdateGraceful {
-                    manifest,
-                    client_id,
-                });
+                record_update_dispatch_result(
+                    proxy.send_event(UserEvent::ApplyUpdateGraceful {
+                        manifest,
+                        client_id,
+                    }),
+                    "dispatch_apply_update_graceful",
+                );
             }
             Err(message) => {
                 gwt_core::update::log_update_event(
                     "fail",
                     &[("stage", log_stage), ("reason", &message)],
                 );
-                let _ = proxy.send_event(UserEvent::Dispatch(vec![OutboundEvent::reply(
-                    client_id,
-                    BackendEvent::UpdateApplyError {
-                        message: Some(message.clone()),
-                        stage: Some(stage.to_string()),
-                        reason: Some(message),
-                        log_path: Some(log_path),
-                    },
-                )]));
+                let _ = proxy.send_event(UserEvent::UpdateApplyResolutionFailed(
+                    OutboundEvent::reply(
+                        client_id,
+                        BackendEvent::UpdateApplyError {
+                            message: Some(message.clone()),
+                            stage: Some(stage.to_string()),
+                            reason: Some(message),
+                            log_path: Some(log_path),
+                        },
+                    ),
+                ));
             }
         }
     });
@@ -1592,6 +1612,7 @@ pub(crate) struct DockerBundleMounts {
 pub(crate) struct PtyWriterEntry {
     pub(crate) project_key: gwt_core::repo_hash::ProjectKey,
     pub(crate) handle: Arc<PtyHandle>,
+    pub(crate) monitor_runtime: Option<gwt::monitor_duplicate_runtime::MonitorRuntimeRegistration>,
 }
 
 type PtyWriterRegistry = Arc<RwLock<HashMap<String, Arc<PtyWriterEntry>>>>;
@@ -2064,6 +2085,8 @@ enum UserEvent {
         state: gwt_core::update::UpdateState,
         client_id: ClientId,
     },
+    /// Payload resolution failed; release apply admission before reporting it.
+    UpdateApplyResolutionFailed(OutboundEvent),
     /// Issue #4038 (AC-1): commit a persisted update manifest gracefully on
     /// the event-loop thread: write the resume marker, spawn the helper
     /// once, clear the manifest, then quit through `QuitApp` with
@@ -2136,6 +2159,26 @@ enum UserEvent {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     include!("project_refresh_generation_tests.rs");
+
+    #[test]
+    fn update_dispatch_closed_loop_records_stage_and_reason_without_restart() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = gwt_core::test_support::ScopedGwtHome::set(temp.path());
+        assert!(!super::record_update_dispatch_result(
+            Err(tao::event_loop::EventLoopClosed(
+                super::UserEvent::Dispatch(vec![])
+            )),
+            "dispatch_update_prepared",
+        ));
+        let log = std::fs::read_to_string(gwt_core::update::update_log_path()).unwrap();
+        let entry: serde_json::Value = serde_json::from_str(log.trim()).unwrap();
+        assert_eq!(entry["stage"], "dispatch_update_prepared");
+        assert_eq!(entry["reason"], "Tried to wake up a closed `EventLoop`");
+        assert!(super::record_update_dispatch_result(
+            Ok(()),
+            "dispatch_quit_update"
+        ));
+    }
 
     #[test]
     fn tray_error_icon_changes_and_recovers_original_pixels() {
@@ -10057,6 +10100,22 @@ fn main() -> std::io::Result<()> {
     );
     #[cfg(windows)]
     verification_cap_relief::spawn(pty_writers.clone());
+    let monitor_projects = Arc::new(RwLock::new(BTreeMap::new()));
+    let monitor_writers = pty_writers.clone();
+    gwt::monitor_duplicate_runtime::spawn(monitor_projects.clone(), move || {
+        let writers = monitor_writers.read().ok()?;
+        Some(
+            writers
+                .values()
+                .filter_map(|entry| {
+                    Some(gwt::monitor_duplicate_runtime::RegisteredMonitorRuntime {
+                        registration: entry.monitor_runtime.clone()?,
+                        handle: entry.handle.clone(),
+                    })
+                })
+                .collect(),
+        )
+    });
     runtime_health_poller::spawn_runtime_health_poller(&runtime, clients.clone(), pty_writers);
     eprintln!("gwt browser URL: {browser_url}");
     // SPEC-1939 T-IDX-109/110 / Issue #2584 — Playwright e2e seam.
@@ -10198,6 +10257,7 @@ fn main() -> std::io::Result<()> {
     // so always arm it (the legacy headless-only gate is gone).
     let is_headless = false;
     let mut gui_shutdown = GuiShutdownCoordinator::default();
+    let mut update_apply_admission = update_front_door::UpdateApplyAdmission::default();
     let mut agent_self_close_quit_deferred = false;
     // Issue #4038: the reason a deferred quit (waiting for agent self-close
     // ACKs) must resume with, so an update apply is not downgraded to a
@@ -10266,6 +10326,11 @@ fn main() -> std::io::Result<()> {
                     ready.set_agent_capability_issuer(server.agent_capability_issuer());
                     ready.set_server_url(browser_url.clone());
                     ready.set_usage_refresh(usage_refresh.clone());
+                    if let Ok(mut projects) = monitor_projects.write() {
+                        for context in ready.project_contexts() {
+                            projects.insert(context.project_root, ready.sessions_dir.clone());
+                        }
+                    }
                     board_projection_watchers.sync(&ready, proxy.clone());
                     workspace_projection_watchers.sync(&ready, proxy.clone());
                     board_daemon_subscribers.sync(&ready, proxy.clone());
@@ -11042,6 +11107,9 @@ fn main() -> std::io::Result<()> {
                 clients.dispatch(record_update_available(app, state));
             }
             Event::UserEvent(UserEvent::ApplyUpdate { state, client_id }) => {
+                if !update_apply_admission.begin_resolution() {
+                    return;
+                }
                 // Issue #4038 (AC-1): the legacy toast click no longer exits
                 // from a worker thread. Resolve the payload off-thread, then
                 // commit through the graceful route.
@@ -11157,10 +11225,10 @@ fn main() -> std::io::Result<()> {
 
                             let asset_path = prepared.payload_path();
                             let version = prepared.latest;
-                            let _ = apply_proxy.send_event(UserEvent::UpdatePrepared {
-                                version,
-                                asset_path,
-                            });
+                            record_update_dispatch_result(
+                                apply_proxy.send_event(UserEvent::UpdatePrepared { version, asset_path }),
+                                "dispatch_update_prepared",
+                            );
                         }
                         Err(message) => {
                             gwt_core::update::log_update_event(
@@ -11197,6 +11265,9 @@ fn main() -> std::io::Result<()> {
                 clients.dispatch(events);
             }
             Event::UserEvent(UserEvent::ApplyUpdateDrained { version }) => {
+                if !update_apply_admission.begin_resolution() {
+                    return;
+                }
                 // Issue #3906 AC-2 / AC-10: the drained apply commits the
                 // manifest the staging persisted, through the same graceful
                 // route as Restart now. A manifest that vanished (cleared by
@@ -11208,12 +11279,18 @@ fn main() -> std::io::Result<()> {
                 );
                 match gwt_core::update::load_pending_update_manifest() {
                     Some(manifest) if manifest.version == version => {
-                        let _ = proxy.send_event(UserEvent::ApplyUpdateGraceful {
-                            manifest,
-                            client_id: app_runtime::UPDATE_AUTO_APPLY_CLIENT_ID.to_string(),
-                        });
+                        if !record_update_dispatch_result(
+                            proxy.send_event(UserEvent::ApplyUpdateGraceful {
+                                manifest,
+                                client_id: app_runtime::UPDATE_AUTO_APPLY_CLIENT_ID.to_string(),
+                            }),
+                            "dispatch_auto_apply_graceful",
+                        ) {
+                            update_apply_admission.failed();
+                        }
                     }
                     _ => {
+                        update_apply_admission.failed();
                         let events = app.release_update_auto_apply_events(
                             &version,
                             app_runtime::UpdateAutoApplyRelease::PayloadMissing,
@@ -11223,6 +11300,9 @@ fn main() -> std::io::Result<()> {
                 }
             }
             Event::UserEvent(UserEvent::ApplyUpdateRestartNow { state, client_id }) => {
+                if !update_apply_admission.begin_resolution() {
+                    return;
+                }
                 gwt_core::update::log_update_event("restart_now_requested", &[]);
                 // SPEC-2041 Phase 19 (T-130/T-133) + Issue #4038 (AC-2):
                 // consume the persisted manifest if it exists so we don't
@@ -11237,10 +11317,22 @@ fn main() -> std::io::Result<()> {
                     "restart_now",
                 );
             }
+            Event::UserEvent(UserEvent::UpdateApplyResolutionFailed(failure)) => {
+                update_apply_admission.failed();
+                clients.dispatch(vec![failure]);
+            }
             Event::UserEvent(UserEvent::ApplyUpdateGraceful {
                 manifest,
                 client_id,
             }) => {
+                if !update_apply_admission.begin_commit() {
+                    return;
+                }
+                app.record_update_apply_observation(
+                    &manifest.version,
+                    "pending_applying",
+                    "graceful apply commit started",
+                );
                 let log_path = gwt_core::update::update_log_path()
                     .to_string_lossy()
                     .to_string();
@@ -11258,11 +11350,20 @@ fn main() -> std::io::Result<()> {
                             "graceful_apply_committed",
                             &[("version", &version)],
                         );
-                        let _ = proxy.send_event(UserEvent::QuitApp {
-                            reason: GuiShutdownReason::ApplyUpdate { version },
-                        });
+                        record_update_dispatch_result(
+                            proxy.send_event(UserEvent::QuitApp {
+                                reason: GuiShutdownReason::ApplyUpdate { version },
+                            }),
+                            "dispatch_quit_update",
+                        );
                     }
                     Err(message) => {
+                        update_apply_admission.failed();
+                        app.record_update_apply_observation(
+                            &marker.to_version,
+                            "pending_failed",
+                            &message,
+                        );
                         gwt_core::update::log_update_event(
                             "fail",
                             &[("stage", "graceful_apply"), ("reason", &message)],
@@ -11394,6 +11495,13 @@ fn main() -> std::io::Result<()> {
                 }
             }
             Event::MainEventsCleared => {
+                // Publish project membership even before a Monitor PTY exists.
+                // The worker retains it and needs no GUI round trip per census.
+                if let Ok(mut projects) = monitor_projects.write() {
+                    for context in app.project_contexts() {
+                        projects.insert(context.project_root, app.sessions_dir.clone());
+                    }
+                }
                 clients.dispatch(app.refresh_project_aggregates());
                 if let Some(tray_icon) = &tray_icon_handle {
                     let snapshot = app.tray_snapshot();

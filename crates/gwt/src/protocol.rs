@@ -1271,11 +1271,6 @@ fn default_board_history_limit() -> usize {
     50
 }
 
-#[allow(dead_code)]
-fn default_newline() -> Newline {
-    Newline::Lf
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkspaceView {
     pub viewport: CanvasViewport,
@@ -2110,7 +2105,6 @@ pub enum BackendEvent {
         mtime: u64,
         #[serde(default)]
         has_bom: bool,
-        #[serde(default = "default_newline")]
         newline: Newline,
         #[serde(default)]
         read_only: bool,

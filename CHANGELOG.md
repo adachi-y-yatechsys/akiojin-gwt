@@ -1,6 +1,91 @@
 # Changelog
 
 All notable changes to this project will be documented in this file.
+## [9.108.0] - 2026-10-02
+
+### Bug Fixes
+
+- **test:** Daemon起動予算とatomic公開テストの負荷依存を除く
+- 更新待機の診断と適用要求の重複防止を追加
+- **pr:** PR が開いてからの経過時間を age_hours として出す (#4836 AC-2)
+- **ci:** Rust 1.99 で既存コードが必須 Clippy を落とすのを直す (#4868)
+- **launch-wizard:** Codex v0.159.2のモデルカタログと既定値に追従
+- **reset:** 対象窓の認証証跡と監査結果を保持する
+- **reset:** Linuxテストで承認ラベルの未使用警告を防ぐ
+- **reset:** Windows承認ダイアログの共通コントロール依存を宣言する
+- **verify:** 横断プロジェクトの検証holderを保護する
+- **codex:** フック信頼のパスとハッシュを一致させ旧登録を回収する
+- **monitor:** 重複窓の revoke が作業中の窓を孤児にするのを直す (#4862 AC-1〜4)
+- **test:** Codex hook trust の鍵導出を 1 箇所に寄せ、期待値が古い規則を restate できないようにする
+- **test:** Hanging probe のテストを遅延ではなく性質で測る
+- **hooks:** Branch 操作の判定を git サブコマンド位置で行う
+- **test:** 非通常ファイルの fixture を FIFO にしてパス長から外す
+- **verify:** 検証runnerの外部中断を記録し未実行と区別する
+- **ci:** Apt中断後のdpkg状態を修復して再試行を回復する
+- **ci:** Apt状態拒否を時間に依存せず判定して終了コードを記録
+- **session:** Resume の binding 欠落から監査付きで復旧する
+- **launch:** 親Claudeセッションの環境変数が子へ漏れる問題を修正
+- **gui:** タイル操作をエージェントのフォーカスへ接続する
+- **gui:** Issueメニューの開閉状態を再描画後も保持する
+- **test:** フォーカス応答の描画完了を待って通知の再計上を防ぐ
+- **issue-monitor:** Queue.push が拒否した Issue を名指しし、期限切れ claim でブロックしない
+- **runtime:** 再起動時に Monitor が停止/保留した終端 Work を復元せず、terminal 世代を continue で再活性化しない (#4783)
+- **hooks:** Codex hook生成設定をリポジトリの追跡対象から外す
+- **monitor:** 失敗した review window を SHA ごとに attempt/backoff で抑え、3 回で停止して理由を status に出す (#4815)
+- **monitor:** 重複実装プロセスを実数計上し非保持側だけを回収する
+- **verify:** 更新中holderを保護し外部終了の再試行を制限する
+- **verify:** 先行runnerの通常待機を維持する
+- **launch:** ClaudeとCodexのインストール済みCLIを優先する
+- **monitor:** 部分 PR の merge で生存中の launch を再キューせず、自ホストの claim を foreign 扱いしない (#4852)
+- **terminal:** Pane への入力注入を bracketed paste で囲み、Codex の入力欄が検索状態にならないようにする (#4909)
+
+### Documentation
+
+- **monitor:** Rustdoc の private 項目への intra-doc link を外す (#4852)
+
+### Features
+
+- **gui:** 2面分割で独立した画面選択と復元を追加
+- **gui:** 上部ウィンドウタブを撤去しレールと解除操作を維持
+- 無料Codexリセットの検証用実装を追加
+- **pr:** Auto-merge が armed なのに着地しない状態を pr.list に出す (#4836 AC-2/3/4)
+- **gui:** エージェントを列数指定のタイル面で操作する
+
+### Miscellaneous Tasks
+
+- **work:** 優先テスト修正の配送引継ぎを記録
+- **work:** T-2検証中の実行記録を配送する
+- **work:** 更新診断PRの作成履歴を記録
+- **work:** モデルカタログ更新の最終作業記録を保存
+- **work:** PR #4874の配送記録を反映する
+- **work:** PR #4865 の配送記録を保存する
+- **work:** PR #4890の配送記録を反映する
+- **cleanup:** 未使用のTauri生成Windowsスキーマを削除
+- **work:** 先行PRのマージ記録を同期
+
+### Performance
+
+- **build:** 計測に基づき開発デバッグ情報とWindowsリンカーを最適化
+
+### Refactor
+
+- **cleanup:** 未使用APIと不要なlint抑制を削除
+
+### Testing
+
+- **gui:** 状態通知後のfocus応答でfixtureの状態を保持
+- **launch-wizard:** 初期読み込み完了後にモデル選択を検証
+- **launch:** 認証環境適用の契約テストを新しい入口に合わせる
+- **launch:** Codexの発見経路と信頼登録鍵の一致を固定する
+- **monitor:** 検証用プロセス生成を共通ヘルパーに揃える
+- **daemon:** #4815 の review ladder 契約に daemon server tests を合わせる
+- **launch:** Setupのrunner検証でPATHの並列変更を防ぐ
+- **launch:** Installed優先に伴う既存検証と環境隔離を修正
+
+### Ci
+
+- **windows:** 追加した回帰を事前ビルド済みバイナリで実行する
+
 ## [9.107.0] - 2026-10-01
 
 ### Bug Fixes

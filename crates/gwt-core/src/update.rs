@@ -259,11 +259,6 @@ pub fn update_resume_dir() -> PathBuf {
     crate::paths::gwt_home().join("update-resume")
 }
 
-/// `~/.gwt/update-resume/marker.json`.
-pub fn update_resume_marker_path() -> PathBuf {
-    update_resume_dir().join("marker.json")
-}
-
 /// Atomically write the resume marker.
 pub fn persist_update_resume_marker(marker: &UpdateResumeMarker) -> Result<(), String> {
     persist_update_resume_marker_in(&update_resume_dir(), marker)
@@ -565,6 +560,63 @@ where
     crate::paths::gwt_logs_dir().join(format!("update-{date}.log"))
 }
 
+/// Latest project-local observation of a staged update. This is diagnostic
+/// information, never authority to apply an update or a liveness guarantee.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateWaitObservation {
+    pub version: String,
+    pub stage: String,
+    pub reason: String,
+    pub observed_at: String,
+    pub next_evaluation_at: Option<String>,
+}
+
+pub fn load_update_wait_observation(project_root: &Path) -> Option<UpdateWaitObservation> {
+    let path = crate::paths::gwt_project_dir_for_repo_path(project_root).join("update-wait.json");
+    serde_json::from_slice(&fs::read(path).ok()?).ok()
+}
+
+/// Refresh the snapshot on every evaluation, but keep unchanged reasons out
+/// of the daily log. Different projects never overwrite each other's state.
+fn record_wait_observation(entry: &serde_json::Map<String, serde_json::Value>) -> bool {
+    let string = |key: &str| entry.get(key).and_then(serde_json::Value::as_str);
+    let (Some(project), Some(version), Some(stage), Some(reason)) = (
+        string("project_root"),
+        string("version"),
+        string("stage"),
+        string("reason"),
+    ) else {
+        return false;
+    };
+    if !stage.starts_with("pending_") {
+        return false;
+    }
+    let project = Path::new(project);
+    let observation = UpdateWaitObservation {
+        version: version.to_owned(),
+        stage: stage.to_owned(),
+        reason: reason.to_owned(),
+        observed_at: string("observed_at")
+            .or_else(|| string("ts"))
+            .unwrap_or_default()
+            .to_owned(),
+        next_evaluation_at: string("next_evaluation_at").map(str::to_owned),
+    };
+    let unchanged = load_update_wait_observation(project).is_some_and(|prior| {
+        prior.version == observation.version
+            && prior.stage == observation.stage
+            && prior.reason == observation.reason
+    });
+    let dir = crate::paths::gwt_project_dir_for_repo_path(project);
+    let written = serde_json::to_vec(&observation).ok().is_some_and(|bytes| {
+        fs::create_dir_all(&dir)
+            .and_then(|()| crate::atomic_file::write_atomic(&dir.join("update-wait.json"), &bytes))
+            .is_ok()
+    });
+    // A failed diagnostic write must not suppress the only remaining log.
+    unchanged && written
+}
+
 /// SPEC-2041 Phase 19 (FR-065): append a structured stage entry to the
 /// per-day update log. Failures are silently dropped because logging must
 /// never block the apply path. Each line is a JSON object so downstream
@@ -588,6 +640,9 @@ pub fn log_update_event(stage: &str, fields: &[(&str, &str)]) {
             (*k).to_string(),
             serde_json::Value::String((*v).to_string()),
         );
+    }
+    if record_wait_observation(&entry) {
+        return;
     }
     let line = match serde_json::to_string(&entry) {
         Ok(s) => format!("{s}\n"),
@@ -2518,6 +2573,33 @@ fn replace_paths(target_exe: &Path, backup_path: &Path, tmp_path: &Path) -> io::
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pending_wait_log_retains_project_diagnostic_for_status() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::ScopedGwtHome::set(temp.path());
+        let project = temp.path().join("repo");
+        std::fs::create_dir_all(&project).unwrap();
+        super::log_update_event(
+            "pending_waiting",
+            &[
+                ("project_root", project.to_str().unwrap()),
+                ("version", "9.106.0"),
+                ("reason", "active agents"),
+                ("next_evaluation_at", "2026-10-01T12:00:15Z"),
+            ],
+        );
+        let path = crate::paths::gwt_project_dir_for_repo_path(&project).join("update-wait.json");
+        assert!(
+            path.exists(),
+            "status needs the latest project wait observation"
+        );
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(value["reason"], "active agents");
+        assert_eq!(value["next_evaluation_at"], "2026-10-01T12:00:15Z");
+        assert_eq!(value["version"], "9.106.0");
+        assert!(value["observed_at"].as_str().is_some());
+    }
     use chrono::TimeZone;
     use std::{
         io::{Cursor, Read, Write},

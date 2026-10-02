@@ -821,3 +821,28 @@ function blocksFor(css, selector) {
   }
   return blocks;
 }
+
+// Issue #4886: a cache refresh must preserve only still-present open menus.
+test("Issue menu disclosure survives row replacement without retaining removed rows", async (t) => {
+  const fixture = await makeFixture({ workspaceWindows: [agentWindow("agent-41", 41), agentWindow("agent-42", 42)] });
+  t.after(() => fixture.surface.clearKnowledgeBridgeState("win-1"));
+  const entries = [41, 42].map(number => knowledgeEntry(number, { monitor_state: "launched" }));
+  const refresh = rows => applyEntries(fixture.surface, fixture.load, rows);
+  const menu = number => fixture.body.querySelector(`.knowledge-list [data-issue-number="${number}"] .knowledge-row-menu`);
+  refresh(entries);
+  const original = menu(41);
+  original.setAttribute("open", "");
+  refresh(entries);
+  assert.notEqual(menu(41), original, "the row really was replaced");
+  assert.equal(menu(41).hasAttribute("open"), true);
+  assert.equal(menu(42).hasAttribute("open"), false);
+  fixture.body.querySelector('[data-issue-view="split"]').click();
+  assert.equal(menu(41).hasAttribute("open"), true, "split rows retain the same Issue disclosure");
+  refresh(entries);
+  assert.equal(menu(41).hasAttribute("open"), true);
+  assert.equal(menu(42).hasAttribute("open"), false);
+  refresh([entries[1]]);
+  assert.equal(menu(41), null);
+  refresh(entries);
+  assert.equal(menu(41).hasAttribute("open"), false, "a returning row has no stale disclosure state");
+});

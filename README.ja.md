@@ -111,7 +111,7 @@ curl -fsSL https://raw.githubusercontent.com/akiojin/gwt/main/installers/macos/u
   - `GOOGLE_API_KEY` または `GEMINI_API_KEY`
   - `XAI_API_KEY`
 - shared project index runtime の bootstrap / repair が必要な場合は
-  Python 3.9+ が使えること
+  Python 3.10+ が使えること
 
 Linux デスクトップ版のビルドには WebKitGTK 系の依存が必要です。CI と同じ依存は
 [docs/docker-usage.md](docs/docker-usage.md) を参照してください。
@@ -431,6 +431,31 @@ Workspace パネルの `Clean Up Ready` 件数も、worktree 単位で同じ考�
 `.codex/hooks.json` / `.claude/settings.local.json`）だけであれば cleanup-ready のまま
 数えられます。それ以外の未コミット変更があれば、その Workspace は件数から外れます。
 
+### プロバイダの無料リセット
+
+`provider.reset.proposals` は provider hold を読み、残り待機時間が
+`min_reset_wait_secs`（既定: 86400 秒）以上なら Codex の無料リセット枠の確認を
+提案します。Claude の上限時は別プロバイダへの切替を提案します。
+**Claude の追加利用は課金を伴うため gwt からは実行しない**方針です。
+
+`provider.reset` に `provider: "codex"` と `pane.list` の正確な `window_id` を
+指定すると、無料枠を確認した後に OS の確認ダイアログを表示します。
+**Redeem free reset** を選ぶと、そのアカウントの無料リセットを1回消費します。
+既定は Cancel で、autonomous モードでも確認を省略しません。
+JSON の承認フラグや過去の承認は利用できません。canvas 上にある、直接インストールした
+Host Codex と既定プロバイダの window に対応し、Docker・package runner・独自 backend は拒否します。
+確認画面には対象窓の起動時に記録した認証ルートと由来（host・profile・caller environment）を
+表示し、ヘルパーも同じルートを使用します。証跡のない古い窓は再起動してください。
+認証環境を解決できない場合は実行を拒否します。
+Windows では対象窓を起動する前に `CODEX_HOME` を明示してください。
+
+成功後はアカウントの利用再開を再確認し、provider hold を自動解除します。
+失敗や結果不明の場合は hold を保持します。承認・実行・結果は
+`~/.gwt/provider-resets/<request_id>.jsonl` に保存し、operation はそのパスと失敗理由を
+返します。リセットと hold 解除の成功後に最終監査の書き込みだけが失敗した場合は、
+成功結果を維持し、`audit_warning` を別に返します。クレジット購入や有料追加利用への切替は行いません。
+引数の詳細は `gwtd --help provider` を参照してください。
+
 ### Autonomous モード（opt-in）
 
 Autonomous モードはループ全体を無人で実行します: 適格 Issue → 自動起動 → 実装 →
@@ -553,6 +578,10 @@ Board reminders、discussion/plan/build Stop checks、coordination-event summari
 - `.codex/hooks.json` を version 管理するかどうかはリポジトリ側の決定です。
   ファイルが既に存在する場合、gwt は gwt-managed hook エントリだけを差し替え、
   user hook と無関係な top-level 設定は保持します。
+- gwt リポジトリ自身では `.codex/hooks.json` を Git 除外し、gwt がエージェント
+  セッションを準備するときにローカルで生成します。Windows は PowerShell の
+  EncodedCommand、macOS / Linux は POSIX shell のコマンドを使用します。
+  この生成ファイルを追跡しないことで、OS による違いが作業ツリーの差分に残るのを防ぎます。
 - version 管理する場合は移植可能な `gwtd` fallback を維持し、マシンローカルの
   絶対パスをコミットしないでください。再生成は
   `GWT_HOOK_BIN=gwtd cargo run -p gwt-skills --example regenerate_hook_settings -- worktree-local`
@@ -1006,6 +1035,28 @@ Spotlight のインデックス処理そのものは Issue Monitor の snapshot 
 そうでなければ「ホストが重い」としか観測できません。Spotlight の無い
 プラットフォームでは、プロセスも警告も無い状態でこのブロックを返します。
 
+## アプリ更新の適用待ち
+
+ダウンロード済みの更新は、エージェントの作業が終わるまで適用待ちになることがあります。
+既存の drain は terminal convergence の15秒周期で安全条件を評価し、2回連続で静止を
+確認した後、60秒の猶予を置いて適用します。
+`autonomous_tuning.update_drain_notify_after_secs` は待機通知の繰り返し間隔です
+（既定1800秒）。強制再起動の期限ではなく、時間経過だけでエージェントを終了しません。
+
+`~/.gwt/logs/update-YYYY-MM-DD.log` に stage、待機・拒否理由、次の自動評価がある場合は
+`next_evaluation_at` を記録します。同じ理由を毎 tick ログへ繰り返さず、プロジェクト別の
+最新観測を評価ごとに更新します。観測時刻はアプリの生存保証ではありません。
+アプリが停止した場合、記録された次評価時刻どおりに評価されるとは限りません。
+
+JSON operation `release.status` の `pending_update_version` は保存済みローカルmanifestの版です。`pending_version`（remote release branchの未配信bump）とは
+別の値です。payloadが消失した場合、`update_stage` は `payload_missing` となり再ダウンロードを案内します。
+`update_wait` は対象版と一致する最新の待機観測、`last_apply_result` と
+`last_apply_failure` は直近の適用結果を返します。`attempt` はresume marker内の回数であり、
+通算試行回数ではありません。成功すると以前の失敗結果は置き換わります。
+インストール失敗時には旧版のまま再起動することがあるため、再起動だけで成功と判断せず、
+案内された回復操作と `observed_version` を確認してください。
+適用処理中の重複要求は1回にまとめ、失敗後は明示的に再試行できます。
+
 ## 開発
 
 ### ビルド
@@ -1058,6 +1109,28 @@ lint、coverage、直接の headed browser 確認、pre-push 確認は verificat
 lease なしでそのまま実行します。完了判定には引き続き canonical な検証証跡が
 必要です。
 
+`verify.lease.status` は `holder_project_relation`（`same_project` /
+`other_project` / `unknown`）、`holder_reclaim_candidate`、
+`holder_intervention` を判定として返します。他プロジェクトの holder、所有者を
+特定できない holder、活動を判定できない holder は
+`holder_intervention: forbidden` として保護されます。観測回数を増やしても
+`unknown` の holder を停止する根拠にはなりません。同一プロジェクトの回収候補または
+旧 control channel だけが `canonical_release_only` になり、canonical release が状態を確認します。
+他プロジェクトからの release は拒否されます。拒否を `kill` / `pkill` で迂回しないでください。
+
+ETA には `estimated_remaining_ms_uncertain: true` が併記されます。これはバッチの
+推定時間または lease TTL で、現在の進捗を測るカウンターではありません。値が不変でも
+固着の証拠にはなりません。`waiter_action: wait` は canonical admission を待つのが
+正しい挙動だと示します。待機列に並んでいることは holder を停止する権限になりません。
+
+`verify.run` はコマンド開始前に未完了の記録を保存します。本体が外部終了すると、
+監視プロセスが中断理由、最後に実行中だったコマンド、完了したコマンドの結果を
+記録します。`execution.status` は `running`・`interrupted`・`missing_record`
+を区別します。中断記録では完了や PR 作成を許可せず、再実行が必要です。
+診断用の `.gwt/tmp/verify-run.json` は原子的に書き込み、マシンローカルの
+trusted record を引き続き正本とします。正確な終了シグナルを観測できない場合は、
+理由に `signal unknown` と記録します。
+
 `pre-push` hook は、ワークスペースをコンパイルしない検査だけを実行します
 （`cargo fmt --all -- --check`、Markdownlint、SKILL.md frontmatter の検証）。
 Git hook は `gwtd` ではなく `git push` の配下で動くため verification lease を
@@ -1070,7 +1143,7 @@ Git hook は `gwtd` ではなく `git push` の配下で動くため verificatio
 `verify.lease.extend` は holder や予約を作らずエラーを返すようになりました。
 canonical 検証を囲む手動取得は `verify.run` に置き換え、通常の Cargo 操作を
 囲む手動取得は削除してください。既存の旧 holder はプロセスを kill せず、
-明示的に解放できます。
+所有プロジェクトから明示的に解放できます。
 
 ```bash
 gwtd <<'JSON'
