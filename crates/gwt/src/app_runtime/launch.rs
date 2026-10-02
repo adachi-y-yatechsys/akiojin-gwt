@@ -1958,7 +1958,7 @@ pub(super) fn launch_config_from_persisted_session(
     if let Some(model) = session.model.clone() {
         builder = builder.model(model);
     }
-    if let Some(version) = session.tool_version.clone() {
+    if let Some(version) = session.launch_tool_version() {
         builder = builder.version(version);
     }
     if let Some(level) = session.reasoning_level.clone() {
@@ -2023,7 +2023,7 @@ pub(super) fn launch_config_from_persisted_session(
     }
 
     let mut config = builder.build();
-    if let Some(version) = session.tool_version.clone() {
+    if let Some(version) = session.launch_tool_version() {
         config.tool_version = Some(version);
     }
     if !session.display_name.is_empty() {

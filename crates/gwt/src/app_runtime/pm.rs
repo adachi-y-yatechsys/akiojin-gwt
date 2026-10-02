@@ -964,7 +964,7 @@ impl AppRuntime {
     /// wake re-arms the loop so the next tick inside the interval is quiet-
     /// gated out. A busy PM pane (Issue #4258) holds the tick without
     /// stamping the wake clock, so the first tick after it is Idle fires.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(crate) fn pm_periodic_wake_decision_at(
         &mut self,
         project_root: &Path,
