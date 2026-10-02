@@ -3,6 +3,14 @@ name: Test
 on:
   pull_request:
     branches: [develop, main]
+  # Issue #4872: develop lands through a GitHub merge queue. The queue re-tests
+  # each pull request on the latest base under this event, and a required
+  # check nobody reports for it stays pending forever, so every job here runs
+  # for the queue exactly as it does for a pull request. Pinned by
+  # crates/gwt/tests/ci_concurrency_contract_test.rs; the settings this pairs
+  # with are recorded in AGENTS.md ("Merge queue").
+  merge_group:
+    types: [checks_requested]
 
 # Issue #4119: one run per PR. A develop merge turns every open PR BEHIND, the
 # update-branch `synchronize` starts a fresh run, and without this group the
@@ -36,14 +44,29 @@ jobs:
       # cost model is per target ("#4550 は 54 テスト 0.53 秒で、20 回でも 11 秒").
       flake_targets: ${{ steps.classify.outputs.flake_targets }}
     steps:
+      # Issue #4872: a merge group has no pull request number to ask the API
+      # about, so its files come from its own diff against the commit it was
+      # built on. `blob:none` keeps the full-history fetch to commits and
+      # trees, which is all `--name-only` reads.
+      - uses: actions/checkout@v7
+        if: github.event_name == 'merge_group'
+        with:
+          fetch-depth: 0
+          filter: blob:none
       - name: Classify changed files
         id: classify
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          MERGE_GROUP_BASE: ${{ github.event.merge_group.base_sha }}
+          MERGE_GROUP_HEAD: ${{ github.event.merge_group.head_sha }}
         run: |
-          files=$(gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename')
+          if [ "$GITHUB_EVENT_NAME" = merge_group ]; then
+            files=$(git diff --name-only --no-renames "$MERGE_GROUP_BASE" "$MERGE_GROUP_HEAD")
+          else
+            files=$(gh api "repos/$REPO/pulls/$PR_NUMBER/files" --paginate --jq '.[].filename')
+          fi
           # Documentation is Markdown anywhere plus docs/. Markdown the binaries
           # embed is code: CHANGELOG.md (include_str! in gwt-core) and
           # .claude/ + .codex/ (include_dir! in gwt-skills).
