@@ -5323,7 +5323,7 @@ impl AppRuntime {
                                 };
                                 let issue_number = issue_number_hint.or_else(|| monitor.launched_window_issue(window_id));
                                 if let Some(issue_number) = issue_number {
-                                    monitor.record_agent_issue_failed_classified(issue_number, message.to_string(), classification);
+                                    monitor.record_agent_window_issue_failed_classified(issue_number, window_id, message.to_string(), classification);
                                 }
                                 IssueMonitorFailureCommit::Committed(issue_number)
                             }
