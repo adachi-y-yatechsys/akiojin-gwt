@@ -1742,6 +1742,11 @@ mod tests {
 
     #[test]
     fn run_opencode_setup_yields_shell_completion_with_auth_login_command() {
+        // Keep both runner lookups on the same PATH while detection fixtures
+        // temporarily replace the process environment in parallel tests.
+        let _env = gwt_core::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // SPEC-3151 FR-010 / SPEC-3864 FR-006: the generic in-pane setup
         // launcher produces a Host shell launch running
         // `<opencode runner> auth login` from the descriptor's setup args.
