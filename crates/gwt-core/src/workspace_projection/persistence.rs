@@ -892,12 +892,28 @@ fn persist_container_detachments_locked(
     if healed.is_empty() {
         return Ok(healed);
     }
+    let removed = candidates
+        .into_iter()
+        .filter(|(id, _)| healed.contains(id))
+        .collect();
+    record_container_detachments_locked(works_path, &removed)?;
+    save_workspace_work_items_projection_to_path(works_path, &projection)?;
+    Ok(healed)
+}
+
+fn record_container_detachments_locked(
+    works_path: &Path,
+    removed: &ContainerDetachments,
+) -> Result<()> {
+    if removed.is_empty() {
+        return Ok(());
+    }
     let mut detachments = load_container_detachments(works_path)?;
-    for id in &healed {
-        let removed = detachments.entry(id.clone()).or_default();
-        for container in &candidates[id] {
-            if !removed.contains(container) {
-                removed.push(container.clone());
+    for (id, containers) in removed {
+        let recorded = detachments.entry(id.clone()).or_default();
+        for container in containers {
+            if !recorded.contains(container) {
+                recorded.push(container.clone());
             }
         }
     }
@@ -907,9 +923,97 @@ fn persist_container_detachments_locked(
         &container_detachments_path(works_path),
         &serde_json::to_vec_pretty(&detachments)
             .map_err(|error| GwtError::Other(format!("container detachments json: {error}")))?,
-    )?;
-    save_workspace_work_items_projection_to_path(works_path, &projection)?;
-    Ok(healed)
+    )
+}
+
+/// An explicit launch establishes ownership; the location of a shared event
+/// never does. Record the repair before saving Works, under the same lock and
+/// pending transaction as launch publication, so interrupted publication and
+/// later intake both keep inactive foreign references detached (Issue #4739).
+fn record_launch_container_detachments_locked(
+    transaction: &PendingWorkspaceStateTransaction,
+    work_items: &WorkItemsProjection,
+) -> Result<()> {
+    let projection = &transaction.projection;
+    let mut removed = ContainerDetachments::new();
+    for event in &transaction.events {
+        if !matches!(event.kind, WorkEventKind::Start | WorkEventKind::Resume) {
+            continue;
+        }
+        let (Some(container), Some(session_id)) = (
+            event.execution_container.as_ref(),
+            event.agent_session_id.as_deref(),
+        ) else {
+            continue;
+        };
+        let (Some(branch), Some(path)) = (
+            container.branch.as_deref(),
+            container.worktree_path.as_deref(),
+        ) else {
+            continue;
+        };
+        if current_work_id(
+            work_items,
+            &projection.project_root,
+            Some(branch),
+            Some(path),
+        )
+        .as_deref()
+            != Some(event.work_item_id.as_str())
+            || !work_items
+                .work_items
+                .iter()
+                .any(|item| item.id == event.work_item_id && item.is_incomplete())
+        {
+            continue;
+        }
+        let Some(agent) = projection
+            .latest_agent_for_session(session_id)
+            .filter(|agent| {
+                agent.affiliation_status == WorkspaceAgentAffiliationStatus::Assigned
+                    && agent.workspace_id.as_deref() == Some(event.work_item_id.as_str())
+                    && canonical_session_bound_branch(agent.branch.as_deref().unwrap_or_default())
+                        == canonical_session_bound_branch(branch)
+            })
+        else {
+            continue;
+        };
+        let Some(authority_path) = resolved_session_bound_path(path)? else {
+            continue;
+        };
+        if !session_bound_candidate_path_matches(agent.worktree_path.as_deref(), &authority_path)? {
+            continue;
+        }
+        for item in &work_items.work_items {
+            if item.id == event.work_item_id
+                || item.discarded
+                || projection.agents.iter().any(|agent| {
+                    agent.workspace_id.as_deref() == Some(item.id.as_str())
+                        || item
+                            .agents
+                            .iter()
+                            .any(|old| old.session_id == agent.session_id)
+                })
+            {
+                continue;
+            }
+            for candidate in &item.execution_containers {
+                if canonical_session_bound_branch(candidate.branch.as_deref().unwrap_or_default())
+                    == canonical_session_bound_branch(branch)
+                    && session_bound_candidate_path_matches(
+                        candidate.worktree_path.as_deref(),
+                        &authority_path,
+                    )?
+                {
+                    removed
+                        .entry(item.id.clone())
+                        .or_default()
+                        .push(candidate.clone());
+                }
+            }
+        }
+    }
+    record_container_detachments_locked(&transaction.work_items_path, &removed)
 }
 
 /// Recover an interrupted Workspace state transaction without synthesizing or
@@ -4980,6 +5084,11 @@ fn apply_workspace_state_transaction_locked(
             append_workspace_work_events_to_path(events_path, &transaction.events)?;
         }
     }
+    let may_write_current = !recovering
+        || workspace_state_snapshot_matches_precondition(
+            current_path,
+            transaction.current_precondition.as_deref(),
+        )?;
     if let Some(work_items) = transaction.work_items.as_ref() {
         let may_write = !recovering
             || workspace_state_snapshot_matches_precondition(
@@ -4987,15 +5096,16 @@ fn apply_workspace_state_transaction_locked(
                 transaction.work_items_precondition.as_deref(),
             )?;
         if may_write {
+            // A newer current snapshot may have attached a live Session to a
+            // foreign Work. Its authority cannot be repaired from this older
+            // transaction's liveness view, even when Works itself is unchanged.
+            if may_write_current {
+                record_launch_container_detachments_locked(transaction, work_items)?;
+            }
             save_workspace_work_items_projection_to_path(&transaction.work_items_path, work_items)?;
         }
     }
-    if !recovering
-        || workspace_state_snapshot_matches_precondition(
-            current_path,
-            transaction.current_precondition.as_deref(),
-        )?
-    {
+    if may_write_current {
         save_workspace_projection_to_path_unlocked(current_path, &transaction.projection)?;
     }
     let coordinator_path = pending_workspace_state_transaction_coordinator_path(transaction);
