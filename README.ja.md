@@ -393,9 +393,15 @@ idle になったエージェント窓はスロットを自動的に解放しま
 または全 idle 行に対して手動実行し、`dry_run: true` は対象の報告だけを行います。
 `issue.monitor.profiles` は起動候補プールを返し、`issue.monitor.profiles.set` は
 プールを置き換えます。候補が 2 件以上あると、Monitor は各 Issue を最初の適格な候補
-で起動する（rate limit の hold・使用率しきい値・`prefer_for` routing が適格性を決め、
+で起動する（rate limit の hold と `prefer_for` routing が適格性を決め、provider は
+使用率の読み値による予測ではなく、起動を拒否した時点でプールから外れる。
 詳細な規則は SPEC [#3914](https://github.com/akiojin/gwt/issues/3914) に定義）
-ため、1 つの provider が rate limit に入ってもキューは止まりません。GUI の Agent
+ため、1 つの provider が rate limit に入ってもキューは止まりません。
+`issue.monitor.status` は provider ごとの最新の使用率の読み値を `provider_usage` に
+返し、読み値が無い場合はその理由を返します。レートリミットの初回拒否で provider を
+hold し、全候補が hold 中なら最も早い既知の reset 時刻に自動再開します。
+reset がすべて不明なら定期再試行せず、`needs_human_fleet` の
+`launch_candidates_exhausted` として通知します。GUI の Agent
 settings で別 provider を保存すると同じプールに追加されます。各 operation
 は省略可能な `project_root` を受け取り、省略時は現在の worktree を対象にします。
 Priority の変更と daemon 不在時の設定変更は、実行中 instance の next scan/rebase で

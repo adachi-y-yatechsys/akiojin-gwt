@@ -7088,6 +7088,42 @@ button.workspace-board-ref:focus-visible {
 .agent-tile__input textarea { flex: 1; width: 0; min-width: 0; resize: none; }
 .agent-tile__input [role="status"] { width: 100%; font-size: var(--type-xs); }
 .agents-empty { padding: var(--space-3); color: var(--color-text-muted); }
+
+/* Keep persistence diagnostics in the shell layout, above every workspace surface. */
+#app:has(> .workspace-state-notice) {
+  grid-template-rows: 44px auto 1fr 28px;
+  grid-template-areas: "projectbar projectbar" "notice notice" "rail canvas" "strip strip";
+}
+.workspace-state-notice {
+  grid-area: notice;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  background: var(--color-surface-elevated);
+  color: var(--color-text);
+  border-bottom: 1px solid var(--color-border-strong);
+  font-size: var(--type-sm);
+  overflow-wrap: anywhere;
+}
+.workspace-state-notice span { flex: 1; min-width: 0; }
+.workspace-state-notice button {
+  flex-shrink: 0;
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+  color: var(--color-text);
+  font: inherit;
+  cursor: pointer;
+}
+.workspace-state-notice button:focus-visible { outline: 2px solid var(--color-focus-ring); }
+@media (max-width: 860px) {
+  #app:has(> .workspace-state-notice) {
+    grid-template-rows: 44px auto auto minmax(0, 1fr) 28px;
+    grid-template-areas: "projectbar" "notice" "rail" "canvas" "strip";
+  }
+}
 .terminal-text-preview { margin: 0; padding: var(--space-2); overflow: auto; height: 100%; white-space: pre; font-family: var(--font-mono); color: var(--color-text); background: var(--color-surface); }
 
 .issue-split-terminal .terminal-text-preview::before {

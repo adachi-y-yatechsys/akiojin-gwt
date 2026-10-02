@@ -1294,6 +1294,7 @@ mod tests {
     fn sample_exact_windows_npx_launch_config() -> gwt_agent::LaunchConfig {
         let mut config = sample_versioned_launch_config();
         config.tool_version = Some("2.1.210".to_string());
+        config.tool_version_selector = Some("2.1.210".to_string());
         config.args = vec![
             "@anthropic-ai/claude-code@2.1.210".to_string(),
             "--print".to_string(),

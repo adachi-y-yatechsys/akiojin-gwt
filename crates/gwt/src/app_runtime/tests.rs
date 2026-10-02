@@ -35231,6 +35231,9 @@ fn provider_usage_limit_keeps_the_pane_out_of_the_done_state() {
         "session-1",
     ));
 
+    // Refusal evidence also wins when usage telemetry still reads healthy.
+    runtime.set_provider_usage_accounts(vec![codex_usage_account(26.0, false)]);
+
     let _ = runtime.handle_runtime_status_with_exit_confirmation(
         window_id.clone(),
         WindowProcessStatus::Stopped,
@@ -38081,6 +38084,16 @@ fn bootstrap_hands_its_worktree_inventory_to_the_startup_ingest() {
         sample_runtime_with_events(temp.path(), vec![tab], Some("tab-repo"));
     let (spawner, _tasks) = BlockingTaskSpawner::queued();
     runtime.blocking_tasks = spawner;
+    // Startup performs retained legacy import before the asynchronous watcher
+    // can see it, so startup itself must publish the informational notice.
+    let legacy_path =
+        gwt_core::paths::gwt_project_dir_for_repo_path(&repo).join("workspace/current.json");
+    let legacy = serde_json::to_vec(
+        &gwt_core::workspace_projection::WorkspaceProjection::default_for_project(&repo),
+    )
+    .unwrap();
+    fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+    fs::write(&legacy_path, &legacy).unwrap();
 
     runtime.bootstrap();
 
@@ -38111,6 +38124,11 @@ fn bootstrap_hands_its_worktree_inventory_to_the_startup_ingest() {
         !local_branches.is_empty(),
         "the reconcile ran on the worker from the bootstrap listing: {local_branches:?}"
     );
+    assert!(events.lock().unwrap().iter().any(|event| matches!(
+        recorded_project_payload(event),
+        UserEvent::WorkspaceProjectionLoaded { imported_from: Some(path), .. } if path == &legacy_path
+    )), "startup import must reach the common notice delivery path");
+    assert_eq!(fs::read(&legacy_path).unwrap(), legacy);
 }
 
 thread_local! {
@@ -47391,6 +47409,7 @@ fn agent_launch_purpose_title_reads_detached_issue_cache_for_non_repo_root() {
             Some("work/issue-3426"),
             temp.path(),
         )
+        .expect("healthy workspace state")
         .as_deref(),
         Some("fix(launch): stranded Active generation recovery"),
     );
@@ -56058,53 +56077,58 @@ fn app_runtime_issue_monitor_auto_launch_prefers_saved_profile() {
 }
 
 #[test]
-fn app_runtime_issue_monitor_auto_tiers_do_not_force_a_held_head() {
+fn app_runtime_issue_monitor_does_not_force_a_held_head() {
     let _env_lock = env_test_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let temp = tempdir().expect("tempdir");
-    let _home = ScopedEnvVar::set("HOME", temp.path());
-    let _userprofile = ScopedEnvVar::set("USERPROFILE", temp.path());
-    let repo = temp.path().join("repo");
-    fs::create_dir_all(&repo).expect("create repo");
-    init_repo_with_initial_commit(&repo);
-    let mut prefs = gwt::IssueMonitorPrefs {
-        launch_profile: Some(codex_issue_monitor_launch_profile()),
-        provider_quota_holds: std::collections::BTreeMap::from([
-            ("codex".to_string(), "2999-01-01T04:00:00Z".to_string()),
-            ("claude".to_string(), "2999-01-01T04:00:00Z".to_string()),
-        ]),
-        ..Default::default()
-    };
-    let mut value = serde_json::to_value(&prefs).expect("serialize prefs");
-    value["launch_auto"] = serde_json::json!(true);
-    prefs = serde_json::from_value(value).expect("auto prefs");
-    gwt::save_issue_monitor_prefs(&gwt::issue_monitor_prefs_path_for_repo_path(&repo), &prefs)
-        .expect("save prefs");
-    let tab = sample_project_tab("tab-1", "Repo", repo.clone(), ProjectKind::Git, &[]);
-    let (mut runtime, recorded_events) =
-        sample_runtime_with_events(temp.path(), vec![tab], Some("tab-1"));
-    let (spawner, queued) = BlockingTaskSpawner::queued();
-    runtime.blocking_tasks = spawner;
-    runtime.auto_launch_issue_monitor_delivery_events_for_project(
-        &repo,
-        4774,
-        LinkedIssueKind::Issue,
-        None,
-        gwt::IssueMonitorLaunchSessionStrategy::FreshRequired,
-    );
-    drain_queued_blocking_tasks(&queued);
-    runtime
-        .handle_issue_monitor_launch_prepared(take_issue4803_monitor_preparation(&recorded_events));
-    assert!(
-        runtime.tabs[0]
-            .workspace
-            .persisted()
-            .windows
-            .iter()
-            .all(|window| window.preset != WindowPreset::Agent),
-        "auto tiers must refuse when every provider is held"
-    );
+    for automatic in [true, false] {
+        let temp = tempdir().expect("tempdir");
+        let _home = ScopedEnvVar::set("HOME", temp.path());
+        let _userprofile = ScopedEnvVar::set("USERPROFILE", temp.path());
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("create repo");
+        init_repo_with_initial_commit(&repo);
+        let mut prefs = gwt::IssueMonitorPrefs {
+            launch_profile: Some(codex_issue_monitor_launch_profile()),
+            provider_quota_holds: std::collections::BTreeMap::from([
+                ("codex".to_string(), "2999-01-01T04:00:00Z".to_string()),
+                ("claude".to_string(), "2999-01-01T04:00:00Z".to_string()),
+            ]),
+            ..Default::default()
+        };
+        prefs.set_launch_profile_pool(vec![
+            codex_issue_monitor_launch_profile(),
+            claude_issue_monitor_launch_profile(),
+        ]);
+        prefs.launch_auto = automatic;
+        gwt::save_issue_monitor_prefs(&gwt::issue_monitor_prefs_path_for_repo_path(&repo), &prefs)
+            .expect("save prefs");
+        let tab = sample_project_tab("tab-1", "Repo", repo.clone(), ProjectKind::Git, &[]);
+        let (mut runtime, recorded_events) =
+            sample_runtime_with_events(temp.path(), vec![tab], Some("tab-1"));
+        let (spawner, queued) = BlockingTaskSpawner::queued();
+        runtime.blocking_tasks = spawner;
+        runtime.auto_launch_issue_monitor_delivery_events_for_project(
+            &repo,
+            4774,
+            LinkedIssueKind::Issue,
+            None,
+            gwt::IssueMonitorLaunchSessionStrategy::FreshRequired,
+        );
+        drain_queued_blocking_tasks(&queued);
+        runtime.handle_issue_monitor_launch_prepared(take_issue4803_monitor_preparation(
+            &recorded_events,
+        ));
+        assert!(
+            runtime.tabs[0]
+                .workspace
+                .persisted()
+                .windows
+                .iter()
+                .all(|window| window.preset != WindowPreset::Agent),
+            "automatic={automatic}: every held pool must refuse"
+        );
+    }
 }
 
 #[test]
@@ -59292,6 +59316,84 @@ fn background_work_scan_results_refresh_active_work_off_the_gui_event_loop() {
         "the merge scan result reached the row"
     );
     assert_eq!(row.work_summary.as_deref(), Some("tip subject"));
+}
+
+#[test]
+fn workspace_state_load_failure_keeps_rail_and_replays_until_recovery() {
+    let _env_lock = env_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().unwrap();
+    let _gwt_home = gwt_core::test_support::ScopedGwtHome::set(temp.path());
+    let _home = ScopedEnvVar::set("HOME", temp.path());
+    let _userprofile = ScopedEnvVar::set("USERPROFILE", temp.path());
+    let repo = temp.path().join("repo");
+    let (mut runtime, _, _) = active_work_off_loop_setup(temp.path(), &repo);
+    gwt_core::workspace_projection::save_workspace_projection(
+        &repo,
+        &gwt_core::workspace_projection::WorkspaceProjection::default_for_project(&repo),
+    )
+    .unwrap();
+    drain_active_work_projection_refresh(&mut runtime, &repo);
+    let cached = || {
+        runtime
+            .project_state_for_tab("tab-1")
+            .unwrap()
+            .active_work_projection_cache
+            .borrow()
+            .get("tab-1")
+            .cloned()
+    };
+    let before = serde_json::to_value(cached()).unwrap();
+    let path = gwt_core::paths::gwt_workspace_projection_path_for_repo_path(&repo);
+    let original = fs::read(&path).unwrap();
+    fs::write(&path, b"{broken workspace").unwrap();
+
+    let events = drain_active_work_projection_refresh(&mut runtime, &repo);
+    assert!(events
+        .iter()
+        .any(|event| event.event.event_kind() == "workspace_state_notice"));
+    assert_eq!(
+        serde_json::to_value(
+            runtime
+                .project_state_for_tab("tab-1")
+                .unwrap()
+                .active_work_projection_cache
+                .borrow()
+                .get("tab-1")
+        )
+        .unwrap(),
+        before
+    );
+    let context = runtime.project_context_for_root(&repo).unwrap();
+    let replay = runtime.frontend_project_sync_events("reconnected", &context);
+    assert!(replay
+        .iter()
+        .any(|event| event.event.event_kind() == "workspace_state_notice"));
+    assert_eq!(fs::read(&path).unwrap(), b"{broken workspace");
+
+    fs::write(&path, original).unwrap();
+    let cached_refresh = drain_active_work_projection_refresh(&mut runtime, &repo);
+    assert!(
+        !cached_refresh.iter().any(|event| {
+            matches!(
+                &event.event,
+                BackendEvent::WorkspaceStateNotice { notice: None }
+            )
+        }),
+        "a cache hit must not clear the notice before a fresh load"
+    );
+    let Some(UserEvent::WorkspaceProjectionLoaded { imported_from, .. }) =
+        crate::load_workspace_projection_user_event(&repo)
+    else {
+        panic!("repaired canonical files must load successfully");
+    };
+    let recovered = runtime.handle_workspace_state_loaded(&repo, imported_from);
+    let notice = recovered
+        .iter()
+        .find(|event| event.event.event_kind() == "workspace_state_notice")
+        .expect("clear the pending load notice");
+    assert!(serde_json::to_value(&notice.event).unwrap()["notice"].is_null());
 }
 
 #[test]
@@ -77145,11 +77247,9 @@ fn account_switch_releases_pane_quota_without_relatching_the_old_notice() {
     assert!(!runtime.provider_quota_holds.contains_key(&window_id));
 }
 
-/// Issue #3923 AC-3: the incident was a Codex pane whose tail still showed an
-/// old limit notice while the poller read the account at 26% — the screen text
-/// alone must not hold the provider for the rest of the billing week.
+/// Issue #4908: a settled refusal forms a hold even while telemetry reads healthy.
 #[test]
-fn a_settled_screen_notice_does_not_become_a_hold_while_the_poller_reads_the_account_healthy() {
+fn a_settled_screen_refusal_holds_even_while_usage_reads_healthy() {
     let _env_lock = env_test_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -77164,31 +77264,18 @@ fn a_settled_screen_notice_does_not_become_a_hold_while_the_poller_reads_the_acc
         Some(CODEX_USAGE_LIMIT_SCREEN),
         instant("2026-09-02T09:00:00Z"),
     );
+    assert!(!runtime.provider_quota_holds.contains_key(&window_id));
+    assert!(runtime.provider_quota_candidates.contains_key(&window_id));
     let _ = runtime.observe_provider_quota_notice(
         &window_id,
         Some(CODEX_USAGE_LIMIT_SCREEN),
         instant("2026-09-02T09:05:00Z"),
     );
-
-    assert!(
-        !runtime.provider_quota_holds.contains_key(&window_id),
-        "a healthy poller reading contradicts the screen, so the settle window must not promote it"
-    );
-    assert!(
-        runtime.provider_quota_candidates.contains_key(&window_id),
-        "the candidate stays pending so a later poller reading can still corroborate it"
-    );
-
-    runtime.set_provider_usage_accounts(vec![codex_usage_account(100.0, true)]);
-    let _ = runtime.observe_provider_quota_notice(
-        &window_id,
-        Some(CODEX_USAGE_LIMIT_SCREEN),
-        instant("2026-09-02T09:06:00Z"),
-    );
     assert!(
         runtime.provider_quota_holds.contains_key(&window_id),
-        "once the poller agrees the account is out, the same notice is a block"
+        "the settled refusal overrides usage telemetry on the first launch"
     );
+    assert!(!runtime.provider_quota_candidates.contains_key(&window_id));
 }
 
 /// Issue #3923 AC-2: a hold records what it was formed from — the matched

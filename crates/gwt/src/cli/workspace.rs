@@ -1759,7 +1759,8 @@ fn run_projection_list_with_scan_root<F>(
 where
     F: Fn(&WorkspaceProjection) -> bool,
 {
-    let plan = classify_workspace_projections(scan_root, config, now, is_active_session);
+    let plan = classify_workspace_projections(scan_root, config, now, is_active_session)
+        .map_err(core_error)?;
     let filtered = filter_projection_list(&plan, stale, all);
     out.push_str(&format!(
         "# workspace projection list (mode: {}, count: {})\n",
@@ -1800,7 +1801,8 @@ fn run_projection_prune_with_scan_root<F>(
 where
     F: Fn(&WorkspaceProjection) -> bool,
 {
-    let plan = classify_workspace_projections(scan_root, config, now, is_active_session);
+    let plan = classify_workspace_projections(scan_root, config, now, is_active_session)
+        .map_err(core_error)?;
     let filtered: Vec<ClassifiedProjection> = if ids.is_empty() {
         plan
     } else {
