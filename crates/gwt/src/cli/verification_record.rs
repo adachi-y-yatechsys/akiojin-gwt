@@ -3532,6 +3532,17 @@ where
     {
         return Err("headed_e2e_commands must name exact entries in commands".to_string());
     }
+    let started_at = Utc::now();
+    // Admit before the strict snapshot check so a live same-worktree runner
+    // follows the normal wait/deferred path. Never wait under the write lease.
+    // A first-command timeout still writes no record.
+    let mut first_admission = match (commands.first(), options.admit_command.as_mut()) {
+        (Some(command), Some(admit)) => admit(command)?,
+        _ => None,
+    };
+    if let Some(admission) = &first_admission {
+        options.lease_id = admission.lease_id().map(str::to_owned);
+    }
     // Snapshot owner, plan, and worktree together. Commands deliberately run
     // outside the lease; the final commit reacquires it and rejects any
     // interleaving writer by invalidating the evidence snapshot.
@@ -3577,16 +3588,6 @@ where
         return Err(
             "verify.run with no commands requires a canonical trivial derived plan".to_string(),
         );
-    }
-    let started_at = Utc::now();
-    // Preserve the no-record contract when the very first command defers.
-    // Later deferrals keep the already executed commands in an unfinished record.
-    let mut first_admission = match (commands.first(), options.admit_command.as_mut()) {
-        (Some(command), Some(admit)) => admit(command)?,
-        _ => None,
-    };
-    if let Some(admission) = &first_admission {
-        options.lease_id = admission.lease_id().map(str::to_owned);
     }
     let record_id = format!("vrr-{}", uuid::Uuid::new_v4().simple());
     let watchdog_token = uuid::Uuid::new_v4().simple().to_string();
