@@ -42,6 +42,14 @@ use serde::{Deserialize, Serialize};
 
 use super::CliEnv;
 
+mod monitor_duplicate;
+#[cfg(all(test, unix))]
+pub(crate) use monitor_duplicate::seed_monitor_pair_for_test;
+pub use monitor_duplicate::{
+    monitor_runtime_uncertainty_affects_issue, stop_monitor_duplicate,
+    MonitorDuplicateRuntimeProof, MonitorDuplicateStopOutcome,
+};
+
 /// Worktree-relative path of the Execution Control Record's mirror (the
 /// authoritative copy lives in the repo-scoped trusted store, P9b).
 pub const EXECUTION_CONTROL_STATE_RELATIVE: &str = ".gwt/skill-state/execution-control.json";
@@ -2064,7 +2072,7 @@ impl LaunchGenerationReleaseAuthority {
 
     fn missing_verification(self) -> &'static str {
         match self {
-            Self::Revoked => "revoked launch settlement",
+            Self::Revoked => REVOKED_LAUNCH_MISSING_VERIFICATION,
             Self::Unstarted => "unstarted launch settlement",
         }
     }
@@ -2076,6 +2084,13 @@ impl LaunchGenerationReleaseAuthority {
         }
     }
 }
+
+/// The `missing_verification` a revoked-launch release stamps on the Blocked
+/// generation (Issue #4200). Issue #4783 AC-1 reads it back from the
+/// diagnosis: a generation Blocked this way was stopped through the Monitor,
+/// and a restart must not restore its agent window even when the Monitor
+/// prefs no longer carry the hold.
+pub const REVOKED_LAUNCH_MISSING_VERIFICATION: &str = "revoked launch settlement";
 
 /// What a launch-generation release did to an owner's generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16905,7 +16920,7 @@ mod tests {
         content_hash: String,
     }
 
-    fn active_record(session: &str) -> ExecutionControlRecord {
+    pub(super) fn active_record(session: &str) -> ExecutionControlRecord {
         ExecutionControlRecord {
             owner_kind: ExecutionOwnerKind::Spec,
             owner_number: 3248,
@@ -20722,7 +20737,7 @@ mod tests {
         generation_authority_bytes(worktree, owner)
     }
 
-    fn persist_generation_session_binding(
+    pub(super) fn persist_generation_session_binding(
         worktree: &Path,
         owner: ExecutionOwnerKey,
         session_id: &str,
@@ -20779,7 +20794,7 @@ mod tests {
         session
     }
 
-    fn unset_live_session_env() -> Vec<ScopedEnvVar> {
+    pub(super) fn unset_live_session_env() -> Vec<ScopedEnvVar> {
         vec![
             ScopedEnvVar::unset(gwt_agent::GWT_SESSION_ID_ENV),
             ScopedEnvVar::unset(gwt_agent::GWT_SESSION_RUNTIME_PATH_ENV),

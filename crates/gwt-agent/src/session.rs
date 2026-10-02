@@ -1387,6 +1387,120 @@ where
     })
 }
 
+/// Lease two distinct Sessions in lexical order under an already-held owner
+/// lease. A single thread guard covers the pair; ordinary nested Session
+/// leases remain forbidden. The callback receives Sessions in caller order.
+pub fn with_session_pair_lease<T>(
+    sessions_dir: &Path,
+    session_ids: [&str; 2],
+    operation: impl FnOnce([Session; 2]) -> io::Result<T>,
+) -> io::Result<T> {
+    let _thread_guard = SessionLeaseThreadGuard::enter()?;
+    if session_ids[0] == session_ids[1] {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Session pair must be distinct",
+        ));
+    }
+    for id in session_ids {
+        validate_session_id_path_component(id)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    }
+    fs::create_dir_all(sessions_dir)?;
+    let mut ordered = session_ids;
+    ordered.sort_unstable();
+    let deadline = Instant::now() + SESSION_LEASE_WAIT;
+    let mut locks = Vec::with_capacity(2);
+    for id in ordered {
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(session_lock_path(sessions_dir, id))?;
+        loop {
+            match file.try_lock_exclusive() {
+                Ok(()) => break,
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock
+                        || error.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
+                {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "Session pair lease is held; retry after it settles",
+                        ));
+                    }
+                    std::thread::sleep(
+                        SESSION_LEASE_POLL.min(deadline.saturating_duration_since(now)),
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        locks.push(file);
+    }
+    let sessions = [
+        Session::load(&session_file_path(sessions_dir, session_ids[0]))?,
+        Session::load(&session_file_path(sessions_dir, session_ids[1]))?,
+    ];
+    let result = operation(sessions);
+    // File ownership is the RAII lock guard, including every early error.
+    drop(locks);
+    result
+}
+
+/// Finalize an exact observed runtime after its child exit was proved by the
+/// caller. Supports unbound duplicate Sessions as well as bound ones. Both
+/// durable snapshots must still match under the caller's Session lease.
+pub fn persist_observed_session_runtime_stopped_under_lease(
+    sessions_dir: &Path,
+    expected: &Session,
+    host_pid: u32,
+    expected_runtime: &SessionRuntimeState,
+) -> io::Result<bool> {
+    require_current_thread_session_lease()?;
+    validate_session_id_path_component(&expected.id)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    if host_pid == 0
+        || expected_runtime
+            .runtime_incarnation
+            .is_none_or(|value| value == 0)
+        || expected_runtime
+            .host_started_at
+            .is_none_or(|value| value == 0)
+        || expected_runtime.child_pid.is_none_or(|value| value == 0)
+        || expected_runtime
+            .child_started_at
+            .is_none_or(|value| value == 0)
+    {
+        return Ok(false);
+    }
+    let path = session_file_path(sessions_dir, &expected.id);
+    let mut current = Session::load(&path)?;
+    if serialize_session_toml(&current)? != serialize_session_toml(expected)? {
+        return Ok(false);
+    }
+    let runtime_path = runtime_state_path_for_pid(sessions_dir, host_pid, &expected.id);
+    let mut runtime = SessionRuntimeState::load(&runtime_path)?;
+    if runtime.execution_identity != expected_runtime.execution_identity
+        || runtime.runtime_incarnation != expected_runtime.runtime_incarnation
+        || runtime.host_started_at != expected_runtime.host_started_at
+        || runtime.child_pid != expected_runtime.child_pid
+        || runtime.child_started_at != expected_runtime.child_started_at
+    {
+        return Ok(false);
+    }
+    current.update_status(AgentStatus::Stopped);
+    current.restore_window_on_startup = false;
+    runtime.status = AgentStatus::Stopped;
+    runtime.updated_at = Utc::now();
+    write_session_toml_atomic(&path, &serialize_session_toml(&current)?)?;
+    runtime.save(&runtime_path)?;
+    Ok(true)
+}
+
 fn write_session_toml_atomic(path: &Path, content: &str) -> io::Result<()> {
     write_session_toml_atomic_with_replace(path, content, |temporary, destination| {
         fs::rename(temporary, destination)
