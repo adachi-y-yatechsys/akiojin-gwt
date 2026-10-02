@@ -14936,6 +14936,51 @@ impl IssueMonitorState {
         );
     }
 
+    /// Issue #4815: an agent failure reported with the window it came from.
+    /// The bound implementation window's failure is the implementation's,
+    /// whatever phase the record is in; any other window (the independent
+    /// review pane, an unmapped pane named only by its Issue hint) follows
+    /// the phase-based routing, so a failure during `Reviewing` lands on the
+    /// review ladder.
+    pub fn record_agent_window_issue_failed_classified(
+        &mut self,
+        issue_number: u64,
+        window_id: &str,
+        message: impl Into<String>,
+        classification: IssueMonitorFailureClass,
+    ) {
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        self.record_agent_window_issue_failed_classified_at(
+            issue_number,
+            window_id,
+            message,
+            classification,
+            &now,
+        );
+    }
+
+    pub(crate) fn record_agent_window_issue_failed_classified_at(
+        &mut self,
+        issue_number: u64,
+        window_id: &str,
+        message: impl Into<String>,
+        classification: IssueMonitorFailureClass,
+        now: &str,
+    ) {
+        let bound_window_failure = self
+            .launched_windows
+            .get(&issue_number)
+            .is_some_and(|bound| issue_monitor_window_ids_match(bound, window_id));
+        self.record_failed_issue_routed_at(
+            issue_number,
+            message,
+            MonitorInboxState::AgentFailed,
+            classification,
+            now,
+            bound_window_failure,
+        );
+    }
+
     pub(crate) fn record_agent_issue_failed_at(
         &mut self,
         issue_number: u64,
@@ -18237,6 +18282,28 @@ impl IssueMonitorState {
         classification: IssueMonitorFailureClass,
         now: &str,
     ) {
+        self.record_failed_issue_routed_at(
+            issue_number,
+            message,
+            state,
+            classification,
+            now,
+            false,
+        );
+    }
+
+    /// `bound_window_failure` (Issue #4815): the caller proved the failure
+    /// came from the Issue's bound implementation window, so it is never
+    /// read as the review's.
+    fn record_failed_issue_routed_at(
+        &mut self,
+        issue_number: u64,
+        message: impl Into<String>,
+        state: MonitorInboxState,
+        classification: IssueMonitorFailureClass,
+        now: &str,
+        bound_window_failure: bool,
+    ) {
         let message = message.into();
         // Issue #4862: revoking one window must not revoke the Issue. Closing a
         // duplicate window (#4804) failed the row, which dropped the window that
@@ -18268,7 +18335,10 @@ impl IssueMonitorState {
         // without a verdict, is a failed review — not a failed implementation.
         // It spends the review ladder, keeps the implementation's slot, and
         // returns the record to Implementing for the backed-off re-dispatch.
-        if self.autonomous_mode && self.review_failure_applies(issue_number, state, now) {
+        if self.autonomous_mode
+            && !bound_window_failure
+            && self.review_failure_applies(issue_number, state, now)
+        {
             self.record_review_failure(issue_number, message, now);
             return;
         }
@@ -37114,5 +37184,52 @@ mod tests {
             1,
             "the implementation ladder took it"
         );
+    }
+
+    /// Issue #4815: the daemon reports agent failures with their window. The
+    /// bound implementation window's failure is the implementation's even
+    /// with no canvas snapshot; the review pane's (or an unmapped pane named
+    /// by its Issue hint) is the review's while the record is `Reviewing`.
+    #[test]
+    fn issue_4815_agent_failure_routing_follows_the_reporting_window() {
+        for (window_id, review_failure) in [
+            ("tab-1::impl-41", false),
+            ("tab-1::review-41", true),
+            ("tab-1::agent-unmapped", true),
+        ] {
+            let mut monitor = autonomous_launched_cohort(&[(41, "tab-1::impl-41")]);
+            monitor.set_max_active_agents(3);
+            monitor
+                .dispatch_review(review_dispatch_for(41, 410), IDLE_NOW)
+                .expect("dispatch admitted");
+            monitor.record_agent_window_issue_failed_classified_at(
+                41,
+                window_id,
+                "agent exited",
+                IssueMonitorFailureClass::Agent,
+                "2026-09-07T04:00:40Z",
+            );
+            if review_failure {
+                assert_eq!(
+                    review_attempts_of(&monitor, 41).map(|attempts| attempts.count),
+                    Some(1),
+                    "{window_id}"
+                );
+                assert_eq!(monitor.attempt_count(41), 0, "{window_id}");
+                assert_eq!(
+                    monitor.inbox_item(41).map(|item| item.state),
+                    Some(MonitorInboxState::Launched),
+                    "{window_id}"
+                );
+            } else {
+                assert_eq!(review_attempts_of(&monitor, 41), None, "{window_id}");
+                assert_eq!(monitor.attempt_count(41), 1, "{window_id}");
+                assert_eq!(
+                    monitor.inbox_item(41).map(|item| item.state),
+                    Some(MonitorInboxState::Queued),
+                    "{window_id}"
+                );
+            }
+        }
     }
 }
