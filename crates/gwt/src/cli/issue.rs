@@ -1101,6 +1101,25 @@ fn run_monitor_queue_list<E: CliEnv>(
     Ok(0)
 }
 
+/// Push Issues onto this host's terminal queue, naming every number it would
+/// not add.
+///
+/// Issue #4819: this operation used to answer `ok: true` with the whole queue
+/// whatever happened, so a caller could not tell "queued" from "declined".
+/// It now reports one result per number and refuses the call as a whole when
+/// any of them is declined:
+///
+/// - `claimed_by_other_owner` — another owner holds a live `Active` / `Queued`
+///   claim on the Issue. `force: true` takes it over.
+/// - `not_in_queue_after_write` — the number was accepted but is absent from
+///   the queue that was written. Nothing is known to produce this; it exists so
+///   a future silent drop is named rather than swallowed.
+///
+/// `launch_now` deliberately does not apply the claim guard: it is the explicit
+/// "do this now" override, and the Issue it is pointed at is named by a person.
+/// That asymmetry is why a stale claim could make `queue.push` look broken while
+/// `launch_now` kept working on the same Issue. An expired claim lease is not a
+/// refusal on either path.
 fn run_monitor_queue_push<E: CliEnv>(
     env: &E,
     project_root: Option<&std::path::Path>,
@@ -1114,6 +1133,7 @@ fn run_monitor_queue_push<E: CliEnv>(
     let now = chrono::Utc::now().to_rfc3339();
     let queued_expires_at = (chrono::Utc::now() + chrono::Duration::minutes(15)).to_rfc3339();
     let mut accepted_numbers = Vec::new();
+    let mut outcomes: Vec<QueuePushOutcome> = Vec::new();
     // Queue claims are advisory: a GitHub outage must not make the local
     // queue unusable. Active claims remain authoritative and are left alone.
     for number in numbers {
@@ -1128,8 +1148,21 @@ fn run_monitor_queue_push<E: CliEnv>(
                 } else {
                     Vec::new()
                 };
-            if !force
-                && claims.iter().any(|claim| {
+            // Issue #4819: a live claim from another owner is a real refusal,
+            // so it is named instead of skipped. A bare `continue` here dropped
+            // the number from `accepted_numbers` while the operation still
+            // answered `ok: true` with the whole queue, so three retries looked
+            // exactly like three successes.
+            //
+            // An *expired* claim is not a refusal. The queue claim carries the
+            // 15-minute lease written as `queued_expires_at` below, and a lease
+            // nobody renewed used to block `queue.push` forever while
+            // `launch_now` kept admitting the same Issue — the asymmetry that
+            // made this look like a defect in the queue store.
+            let blocking = if force {
+                None
+            } else {
+                claims.iter().find(|claim| {
                     claim.issue_number == *number
                         && matches!(
                             claim.status,
@@ -1137,8 +1170,22 @@ fn run_monitor_queue_push<E: CliEnv>(
                                 | gwt_github::issue_auto_claim::ClaimStatus::Queued
                         )
                         && claim.owner != crate::process::current_claim_owner()
+                        && !queue_claim_lease_expired(&claim.expires_at, &now)
                 })
-            {
+            };
+            if let Some(blocking) = blocking {
+                outcomes.push(QueuePushOutcome {
+                    number: *number,
+                    accepted: false,
+                    refusal_code: Some(QUEUE_PUSH_REFUSAL_CLAIMED_BY_OTHER_OWNER),
+                    refusal_detail: Some(format!(
+                        "issue #{number} is claimed by {} ({} claim, lease expires {}); \
+                         pass force: true to take it over",
+                        blocking.owner,
+                        claim_status_word(&blocking.status),
+                        blocking.expires_at
+                    )),
+                });
                 continue;
             }
             let claim = gwt_github::issue_auto_claim::ClaimComment {
@@ -1170,8 +1217,10 @@ fn run_monitor_queue_push<E: CliEnv>(
                 );
             }
             accepted_numbers.push(*number);
+            outcomes.push(QueuePushOutcome::accepted(*number));
         } else {
             accepted_numbers.push(*number);
+            outcomes.push(QueuePushOutcome::accepted(*number));
         }
     }
     let (prefs, _) = crate::try_mutate_issue_monitor_prefs(&path, |prefs| {
@@ -1205,9 +1254,108 @@ fn run_monitor_queue_push<E: CliEnv>(
         Ok(())
     })
     .map_err(io_as_api_error)?;
-    out.push_str(&serde_json::to_string(&prefs.terminal_queues).expect("queue serializes"));
+    // Issue #4819 AC-1: the written queue is the only proof that a number was
+    // added, so every accepted number is read back out of it. This keeps the
+    // invariant a property of the operation rather than a patch over the one
+    // guard that was known to drop silently.
+    let written = prefs
+        .terminal_queues
+        .get(&crate::process::current_hostname())
+        .map(|queue| {
+            queue
+                .entries
+                .iter()
+                .map(|entry| entry.number)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for outcome in outcomes.iter_mut().filter(|outcome| outcome.accepted) {
+        if !written.contains(&outcome.number) {
+            outcome.accepted = false;
+            outcome.refusal_code = Some(QUEUE_PUSH_REFUSAL_NOT_IN_QUEUE_AFTER_WRITE);
+            outcome.refusal_detail = Some(format!(
+                "issue #{} was accepted but is absent from the {} queue after the write",
+                outcome.number,
+                crate::process::current_hostname()
+            ));
+        }
+    }
+    let refused = outcomes
+        .iter()
+        .filter(|outcome| !outcome.accepted)
+        .map(|outcome| outcome.number)
+        .collect::<Vec<_>>();
+    let payload = serde_json::json!({
+        "terminal_queues": prefs.terminal_queues,
+        "results": outcomes,
+        "accepted": outcomes
+            .iter()
+            .filter(|outcome| outcome.accepted)
+            .map(|outcome| outcome.number)
+            .collect::<Vec<_>>(),
+        "refused": refused,
+    });
+    out.push_str(&serde_json::to_string(&payload).expect("queue push result serializes"));
     out.push('\n');
-    Ok(0)
+    // Issue #4819 AC-3: one refused number means the call did not do what it
+    // was asked, so the envelope must not report `ok: true`.
+    if refused.is_empty() {
+        Ok(0)
+    } else {
+        Ok(1)
+    }
+}
+
+/// Per-number outcome of `issue.monitor.queue.push` (Issue #4819).
+#[derive(serde::Serialize)]
+struct QueuePushOutcome {
+    number: u64,
+    accepted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refusal_code: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refusal_detail: Option<String>,
+}
+
+impl QueuePushOutcome {
+    fn accepted(number: u64) -> Self {
+        QueuePushOutcome {
+            number,
+            accepted: true,
+            refusal_code: None,
+            refusal_detail: None,
+        }
+    }
+}
+
+/// Refusal codes `issue.monitor.queue.push` can return, one per branch that
+/// declines a number (Issue #4819 AC-2).
+const QUEUE_PUSH_REFUSAL_CLAIMED_BY_OTHER_OWNER: &str = "claimed_by_other_owner";
+const QUEUE_PUSH_REFUSAL_NOT_IN_QUEUE_AFTER_WRITE: &str = "not_in_queue_after_write";
+
+/// Render a claim status as the word the refusal detail names it by.
+fn claim_status_word(status: &gwt_github::issue_auto_claim::ClaimStatus) -> &'static str {
+    match status {
+        gwt_github::issue_auto_claim::ClaimStatus::Active => "active",
+        gwt_github::issue_auto_claim::ClaimStatus::Queued => "queued",
+        gwt_github::issue_auto_claim::ClaimStatus::Released => "released",
+        gwt_github::issue_auto_claim::ClaimStatus::Completed => "completed",
+        gwt_github::issue_auto_claim::ClaimStatus::Lost => "lost",
+    }
+}
+
+/// Whether a queue claim's lease has run out by `now`.
+///
+/// Issue #4819: an unparseable deadline counts as live, so a malformed claim
+/// refuses loudly rather than being waved through.
+fn queue_claim_lease_expired(expires_at: &str, now: &str) -> bool {
+    match (
+        chrono::DateTime::parse_from_rfc3339(expires_at),
+        chrono::DateTime::parse_from_rfc3339(now),
+    ) {
+        (Ok(expires), Ok(now)) => expires <= now,
+        _ => false,
+    }
 }
 
 fn run_monitor_queue_remove<E: CliEnv>(
@@ -6912,6 +7060,168 @@ mod tests {
         );
         assert_eq!(prefs.priority_order, vec![42, 7, 99]);
         assert!(prefs.enabled);
+    }
+
+    // ---- Issue #4819: `queue.push` must never refuse silently ----
+
+    /// Seed one open Issue carrying the queue label and, optionally, a claim
+    /// comment owned by somebody other than this process.
+    fn queue_push_issue(
+        env: &mut crate::cli::TestEnv,
+        number: u64,
+        foreign_claim_expires_at: Option<&str>,
+    ) {
+        let updated_at = UpdatedAt::new("2026-09-30T09:00:00Z");
+        let comments = foreign_claim_expires_at
+            .map(|expires_at| {
+                let claim = gwt_github::issue_auto_claim::ClaimComment {
+                    comment_id: None,
+                    claim_id: format!("gwt-queue:{number}:seeded"),
+                    // current_claim_owner() embeds this process id, so any
+                    // literal owner here is a different owner.
+                    owner: "other-host:other-user:1".to_string(),
+                    issue_number: number,
+                    status: gwt_github::issue_auto_claim::ClaimStatus::Queued,
+                    heartbeat_at: "2026-09-30T09:00:00Z".to_string(),
+                    expires_at: expires_at.to_string(),
+                    launched_work_id: None,
+                };
+                vec![CommentSnapshot {
+                    id: CommentId(9100 + number),
+                    body: gwt_github::issue_auto_claim::render_claim_comment(&claim),
+                    updated_at: updated_at.clone(),
+                }]
+            })
+            .unwrap_or_default();
+        env.client.seed(gwt_github::IssueSnapshot {
+            number: IssueNumber(number),
+            title: format!("issue {number}"),
+            body: String::new(),
+            labels: vec![gwt_github::issue_auto_claim::QUEUED_LABEL.to_string()],
+            state: IssueState::Open,
+            updated_at,
+            comments,
+        });
+    }
+
+    fn run_queue_push(
+        env: &mut crate::cli::TestEnv,
+        numbers: Vec<u64>,
+        force: bool,
+    ) -> (i32, serde_json::Value) {
+        let mut out = String::new();
+        let code = run(
+            env,
+            IssueCommand::MonitorQueuePush {
+                project_root: None,
+                issue_numbers: numbers,
+                position: None,
+                force,
+            },
+            &mut out,
+        )
+        .expect("queue push answers");
+        let payload =
+            serde_json::from_str::<serde_json::Value>(out.trim()).expect("queue push payload");
+        (code, payload)
+    }
+
+    fn queued_numbers(repo: &std::path::Path) -> Vec<u64> {
+        let path = crate::issue_monitor_prefs_path_for_repo_path(repo);
+        let prefs = crate::load_issue_monitor_prefs(&path).expect("prefs");
+        prefs
+            .terminal_queues
+            .get(&crate::process::current_hostname())
+            .map(|queue| {
+                queue
+                    .entries
+                    .iter()
+                    .map(|entry| entry.number)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Issue #4819 AC-4 / AC-1 / AC-3: the 2026-09-30 observation. #4803 and
+    /// #4812 were pushed in one call; #4803 landed in the queue and #4812 did
+    /// not, and the operation answered `ok: true` with no reason either time.
+    /// Before the fix this test sees exit code 0 and no mention of #4812.
+    #[test]
+    fn queue_push_names_the_issue_a_live_foreign_claim_refused() {
+        let tmp = TempDir::new().expect("tempdir");
+        let _home = ScopedGwtHome::set(tmp.path().join("home"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        let mut env = crate::cli::TestEnv::new(repo.clone());
+        queue_push_issue(&mut env, 4803, None);
+        queue_push_issue(&mut env, 4812, Some("2999-01-01T00:00:00Z"));
+
+        let (code, payload) = run_queue_push(&mut env, vec![4812, 4803], false);
+
+        assert_eq!(code, 1, "a refused number must not answer ok: true");
+        assert_eq!(payload["refused"], serde_json::json!([4812]));
+        assert_eq!(payload["accepted"], serde_json::json!([4803]));
+        let refusal = payload["results"]
+            .as_array()
+            .expect("results array")
+            .iter()
+            .find(|result| result["number"] == 4812)
+            .expect("the refused number is named in results")
+            .clone();
+        assert_eq!(refusal["accepted"], serde_json::json!(false));
+        assert_eq!(
+            refusal["refusal_code"],
+            serde_json::json!("claimed_by_other_owner")
+        );
+        let detail = refusal["refusal_detail"]
+            .as_str()
+            .expect("a refusal carries its reason");
+        assert!(
+            detail.contains("other-host:other-user:1") && detail.contains("force: true"),
+            "the reason names the holder and the override: {detail}"
+        );
+        assert_eq!(
+            queued_numbers(&repo),
+            vec![4803],
+            "the accepted number is queued and the refused one is not"
+        );
+    }
+
+    /// Issue #4819 AC-5: the queue claim carries a 15-minute lease, so an
+    /// expired one is not a refusal. This is the asymmetry that made
+    /// `launch_now` admit an Issue `queue.push` kept declining.
+    #[test]
+    fn queue_push_admits_an_issue_whose_foreign_claim_lease_ran_out() {
+        let tmp = TempDir::new().expect("tempdir");
+        let _home = ScopedGwtHome::set(tmp.path().join("home"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        let mut env = crate::cli::TestEnv::new(repo.clone());
+        queue_push_issue(&mut env, 4812, Some("2020-01-01T00:00:00Z"));
+
+        let (code, payload) = run_queue_push(&mut env, vec![4812], false);
+
+        assert_eq!(code, 0, "an expired lease blocks nothing");
+        assert_eq!(payload["refused"], serde_json::json!([]));
+        assert_eq!(queued_numbers(&repo), vec![4812]);
+    }
+
+    /// Issue #4819 AC-2: `force` is the documented override, and taking the
+    /// Issue over is an acceptance, not a refusal.
+    #[test]
+    fn queue_push_with_force_takes_over_a_live_foreign_claim() {
+        let tmp = TempDir::new().expect("tempdir");
+        let _home = ScopedGwtHome::set(tmp.path().join("home"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        let mut env = crate::cli::TestEnv::new(repo.clone());
+        queue_push_issue(&mut env, 4812, Some("2999-01-01T00:00:00Z"));
+
+        let (code, payload) = run_queue_push(&mut env, vec![4812], true);
+
+        assert_eq!(code, 0);
+        assert_eq!(payload["refused"], serde_json::json!([]));
+        assert_eq!(queued_numbers(&repo), vec![4812]);
     }
 
     /// SPEC #4093 AC-8 (Issue #3737 AC-4): `launch_now` inside a GitHub
