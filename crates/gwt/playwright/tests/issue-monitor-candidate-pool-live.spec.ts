@@ -165,7 +165,7 @@ test.describe("Issue Monitor candidate pool", () => {
           ...prefs, enabled: false, launch_auto: false,
           launch_profile: profiles[0], launch_profiles: profiles,
           provider_quota_holds: { codex: "2099-01-01T00:00:00Z" },
-          provider_quota_hold_releases: {},
+          provider_quota_hold_releases: prefs.provider_quota_hold_releases ?? {},
           provider_quota_hold_evidence: {
             codex: {
               recorded_at: new Date(refusedAt).toISOString(), source: "launch_attempts",
