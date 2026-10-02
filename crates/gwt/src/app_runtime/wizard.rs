@@ -2722,14 +2722,8 @@ impl AppRuntime {
             .unwrap_or_default()
     }
 
-    /// SPEC #3914 FR-007: choose the launch candidate for one Issue Monitor
-    /// launch. A non-empty pool goes through [`gwt::select_launch_profile`]
-    /// (usage telemetry arrives in Phase 2); an empty pool keeps the
-    /// pre-#3914 Last-settings fallback from the Launch Wizard cache.
-    ///
-    /// When every candidate is held the head still launches: the daemon gate
-    /// already withholds launch requests in that state, so this only happens
-    /// on a race, and the existing limit-notice path re-holds the provider.
+    /// Preview saved profiles, retaining the head when every candidate is
+    /// held. Actual owner launches use the fallible owner selector below.
     fn issue_monitor_launch_profile_choice(
         &self,
         project_root: &Path,
@@ -2743,8 +2737,8 @@ impl AppRuntime {
         )
     }
 
-    /// Select automatic tiers only when an owner is known. Settings previews
-    /// and manually configured pools retain their existing selection behavior.
+    /// Select an eligible candidate for an owner, rejecting all-held pools
+    /// for both automatic tiers and manually configured candidates.
     fn issue_monitor_owner_launch_profile_choice(
         &self,
         project_root: &Path,
@@ -6409,6 +6403,29 @@ fn issue_monitor_owner_launch_profile_choice(
     let prefs_path = gwt::issue_monitor_prefs_path_for_repo_path(project_root);
     let prefs = gwt::load_issue_monitor_prefs(&prefs_path).map_err(|error| error.to_string())?;
     if !prefs.launch_auto {
+        let pool = prefs.launch_profile_pool();
+        if !pool.is_empty() {
+            let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            let selection = gwt::select_launch_profile(
+                &pool,
+                &prefs.launch_admission_provider_quota_holds(),
+                &[],
+                None,
+                &now,
+            );
+            let index = selection.selected.ok_or_else(|| {
+                "No eligible Issue Monitor launch candidate: every provider is held".to_string()
+            })?;
+            let profile = pool[index].clone();
+            return Ok(IssueMonitorLaunchProfileChoice {
+                profiles: gwt::LaunchWizardPreviousProfiles::from_profile(Some(
+                    profile.clone().into(),
+                )),
+                selected_agent_id: Some(profile.agent_id),
+                skipped: selection.skipped,
+                tier: None,
+            });
+        }
         return Ok(issue_monitor_launch_profile_choice(
             cache,
             provider_usage_accounts,
@@ -6423,9 +6440,7 @@ fn issue_monitor_owner_launch_profile_choice(
         .map(|option| option.id)
         .collect::<Vec<_>>();
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let holds = prefs.launch_admission_provider_quota_holds(&now, |provider| {
-        gwt::issue_monitor::provider_reports_healthy_for_agent(provider, provider_usage_accounts)
-    });
+    let holds = prefs.launch_admission_provider_quota_holds();
     let work_tags = vec![if linked_issue_kind == gwt::LinkedIssueKind::Spec {
         "kind:spec".to_string()
     } else {
@@ -6436,17 +6451,7 @@ fn issue_monitor_owner_launch_profile_choice(
             issue_number,
             linked_issue_kind == gwt::LinkedIssueKind::Spec,
             Some(&available),
-            |pool| {
-                gwt::select_launch_profile(
-                    pool,
-                    &holds,
-                    provider_usage_accounts,
-                    prefs.launch_usage_threshold_percent,
-                    &work_tags,
-                    None,
-                    &now,
-                )
-            },
+            |pool| gwt::select_launch_profile(pool, &holds, &work_tags, None, &now),
         )
         .ok_or_else(|| "No eligible Issue Monitor automatic tier candidate".to_string())?;
     Ok(IssueMonitorLaunchProfileChoice {
@@ -6461,7 +6466,7 @@ fn issue_monitor_owner_launch_profile_choice(
 
 fn issue_monitor_launch_profile_choice(
     cache: &LaunchWizardMemoryCache,
-    provider_usage_accounts: &[gwt_core::usage::ProviderUsage],
+    _provider_usage_accounts: &[gwt_core::usage::ProviderUsage],
     project_root: &Path,
     avoid_provider: Option<&str>,
 ) -> IssueMonitorLaunchProfileChoice {
@@ -6472,18 +6477,7 @@ fn issue_monitor_launch_profile_choice(
             let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
             let selection = gwt::select_launch_profile(
                 &pool,
-                // Issue #4366 AC-4: a held provider due its
-                // re-verification is selectable for that one launch —
-                // over a free candidate only while the poller reads it
-                // as usable (Issue #4636 AC-1).
-                &prefs.launch_admission_provider_quota_holds(&now, |provider| {
-                    gwt::issue_monitor::provider_reports_healthy_for_agent(
-                        provider,
-                        provider_usage_accounts,
-                    )
-                }),
-                &[],
-                prefs.launch_usage_threshold_percent,
+                &prefs.launch_admission_provider_quota_holds(),
                 &[],
                 avoid_provider,
                 &now,
@@ -6494,7 +6488,7 @@ fn issue_monitor_launch_profile_choice(
                     tracing::warn!(
                         project_root = %project_root.display(),
                         skipped = ?selection.skipped,
-                        "every Issue Monitor launch candidate is held; launching the pool head"
+                        "every Issue Monitor launch candidate is held; previewing the saved pool head"
                     );
                     (0, Vec::new())
                 }

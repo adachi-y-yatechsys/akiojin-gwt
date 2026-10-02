@@ -1460,6 +1460,12 @@ pub(super) fn render_pr_inventory(out: &mut String, read: &gwt_git::PrInventoryR
             if let Some(blocker) = &item.ready_to_promote_blocker {
                 row["ready_to_promote_blocker"] = serde_json::json!(blocker);
             }
+            // Issue #4872 AC-4: what the merge queue is doing with a row that
+            // is, or may be held as, `BEHIND`. Probed for those rows only, so
+            // the key is absent — unknown, not "no queue" — everywhere else.
+            if let Some(queue) = &item.merge_queue {
+                row["merge_queue"] = serde_json::json!(queue);
+            }
             row
         })
         .collect();
@@ -1623,6 +1629,7 @@ mod tests {
             created_at: None,
             age_hours: None,
             auto_merge_enabled: false,
+            merge_queue: None,
             check_counts: None,
             conflict: None,
             unresolved_review_threads: None,
@@ -3670,6 +3677,7 @@ mod tests {
         assert!(out.contains("\"count\": 1"), "{out}");
         assert!(!out.contains("CLI family split body"), "{out}");
         assert!(!out.contains("deferred_user_verification"), "{out}");
+        assert!(!out.contains("merge_queue"), "{out}");
         // Issue #3891 AC-1 / AC-4: where the rows came from and what the read
         // cost are part of every answer, so a throttled or cached read is
         // observable by the PM.
@@ -3703,6 +3711,36 @@ mod tests {
         assert_eq!(
             env.pr_list_options,
             Some(gwt_git::PrInventoryOptions::default())
+        );
+    }
+
+    /// Issue #4872 AC-4: a probed row carries the merge queue's view, so the
+    /// PM can tell a `BEHIND` the queue resolves from one that needs a redo.
+    #[test]
+    fn pr_list_renders_the_merge_queue_state_of_a_probed_row() {
+        let mut item = seeded_inventory_item();
+        item.merge_queue = Some(gwt_git::PrMergeQueueState {
+            enabled: true,
+            position: Some(2),
+            state: Some("AWAITING_CHECKS".to_string()),
+        });
+        let read = gwt_git::PrInventoryRead {
+            items: vec![item],
+            source: "github",
+            fetched_at: None,
+            cache_age_secs: Some(0),
+            throttled: None,
+            github_calls: 2,
+            hydrated: 0,
+            skipped_unchanged: 0,
+            unlanded_branches: Vec::new(),
+        };
+        let mut out = String::new();
+        render_pr_inventory(&mut out, &read);
+        let payload: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            payload["pull_requests"][0]["merge_queue"],
+            serde_json::json!({"enabled": true, "position": 2, "state": "AWAITING_CHECKS"})
         );
     }
 
