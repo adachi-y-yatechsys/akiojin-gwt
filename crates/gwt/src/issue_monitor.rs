@@ -889,6 +889,8 @@ pub struct IssueMonitorPrefs {
     pub max_active_agents: usize,
     pub priority_order: Vec<u64>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub monitor_runtime_counts: BTreeMap<String, IssueMonitorRuntimeCounts>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub terminal_queues: BTreeMap<String, IssueMonitorTerminalQueue>,
     #[serde(default)]
     pub terminal_queue_auto_refill: bool,
@@ -1114,6 +1116,16 @@ pub struct IssueMonitorPrefs {
     pub agent_blackout_since: Option<String>,
 }
 
+/// Physical implementation processes observed by one exact GUI host runtime.
+/// Empty counts are a durable tombstone; unknown observations must not publish emptiness.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueMonitorRuntimeCounts {
+    pub host_pid: u32,
+    pub host_started_at: u64,
+    pub counts: BTreeMap<u64, usize>,
+    pub observed_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssueMonitorTerminalQueueEntry {
     pub number: u64,
@@ -1136,6 +1148,7 @@ impl Default for IssueMonitorPrefs {
             enabled: false,
             max_active_agents: 1,
             priority_order: Vec::new(),
+            monitor_runtime_counts: BTreeMap::new(),
             terminal_queues: BTreeMap::new(),
             terminal_queue_auto_refill: false,
             terminal_queue_exclusions: BTreeMap::new(),
@@ -3424,6 +3437,8 @@ pub struct IssueMonitorAgentStatus {
     #[serde(default)]
     pub source: IssueMonitorStatusSource,
     pub queue: Vec<u64>,
+    /// Physical implementation count with pending launch reservations retained;
+    /// repeated Issue numbers represent distinct observed processes.
     pub active_launches: Vec<u64>,
     /// Admission occupancy: active_launches plus review_windows. Physical
     /// active_sessions are observations, not a second admission counter.
@@ -4268,6 +4283,8 @@ pub struct IssueMonitorState {
     last_error: Option<String>,
     launch_auth_required: bool,
     active_launches: Vec<u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    monitor_runtime_counts: BTreeMap<String, IssueMonitorRuntimeCounts>,
     priority_order: Vec<u64>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     terminal_queues: BTreeMap<String, IssueMonitorTerminalQueue>,
@@ -6549,6 +6566,7 @@ impl IssueMonitorState {
             launch_auth_required: false,
             active_launches: Vec::new(),
             priority_order: Vec::new(),
+            monitor_runtime_counts: BTreeMap::new(),
             terminal_queues: BTreeMap::new(),
             terminal_queue_retirements: BTreeMap::new(),
             terminal_queue_auto_refill: false,
@@ -6627,6 +6645,7 @@ impl IssueMonitorState {
         state.tier_overrides = prefs.tier_overrides.clone();
         state.launch_usage_threshold_percent = prefs.launch_usage_threshold_percent;
         state.priority_order = prefs.priority_order;
+        state.monitor_runtime_counts = prefs.monitor_runtime_counts;
         state.terminal_queues = prefs.terminal_queues;
         state.terminal_queue_auto_refill = prefs.terminal_queue_auto_refill;
         state.terminal_queue_exclusions = prefs.terminal_queue_exclusions;
@@ -6784,6 +6803,7 @@ impl IssueMonitorState {
             enabled: self.config.enabled,
             max_active_agents: self.config.max_active.max(1),
             priority_order: self.priority_order.clone(),
+            monitor_runtime_counts: self.monitor_runtime_counts.clone(),
             terminal_queues: self.terminal_queues.clone(),
             terminal_queue_auto_refill: self.terminal_queue_auto_refill,
             terminal_queue_exclusions: self.terminal_queue_exclusions.clone(),
@@ -9181,11 +9201,32 @@ impl IssueMonitorState {
     }
 
     pub fn active_issue_number(&self) -> Option<u64> {
-        self.active_launches.first().copied()
+        self.active_issue_numbers().first().copied()
     }
 
+    /// Reservations remain present before materialization. Once observed, each
+    /// physical implementation process consumes a slot, including duplicate
+    /// Issue numbers and processes missing from the launch-tracking projection.
+    /// Review processes are accounted for separately by `review_windows`.
     pub fn active_issue_numbers(&self) -> Vec<u64> {
-        self.active_launches.clone()
+        let mut active = self.active_launches.clone();
+        let mut physical = BTreeMap::<u64, usize>::new();
+        for observation in self.monitor_runtime_counts.values() {
+            for (&issue, &count) in &observation.counts {
+                *physical.entry(issue).or_default() += count;
+            }
+        }
+        for (issue, count) in physical {
+            let reserved = usize::from(active.contains(&issue));
+            active.extend(std::iter::repeat_n(issue, count.saturating_sub(reserved)));
+        }
+        active
+    }
+
+    fn has_observed_monitor_runtime(&self, issue_number: u64) -> bool {
+        self.monitor_runtime_counts
+            .values()
+            .any(|observation| observation.counts.get(&issue_number).copied().unwrap_or(0) > 0)
     }
 
     /// Include untracked Launched rows whose execution may have been interrupted.
@@ -9209,8 +9250,102 @@ impl IssueMonitorState {
             .collect()
     }
 
+    /// Repair window projections before attempting to stop an exact duplicate.
+    /// The caller verifies the holder under the execution/session guards. This
+    /// makes late exit events harmless but does not claim that a process exited:
+    /// physical counts remain until a successful census observes its absence.
+    /// Neither the claim nor execution authority is released or replaced.
+    pub fn bind_duplicate_runtime_holder(
+        &mut self,
+        issue_number: u64,
+        target_window_id: &str,
+        holder_window_id: &str,
+    ) -> bool {
+        if target_window_id.is_empty()
+            || holder_window_id.is_empty()
+            || target_window_id == holder_window_id
+            || self
+                .launched_windows
+                .get(&issue_number)
+                .is_some_and(|bound| bound != target_window_id && bound != holder_window_id)
+            || [target_window_id, holder_window_id].iter().any(|window| {
+                self.launch_bindings
+                    .get(*window)
+                    .is_some_and(|issue| *issue != issue_number)
+            })
+        {
+            return false;
+        }
+        self.launch_bindings.remove(target_window_id);
+        self.launch_bindings
+            .insert(holder_window_id.to_string(), issue_number);
+        self.launched_windows
+            .insert(issue_number, holder_window_id.to_string());
+        if self
+            .launch_confirmations
+            .get(&issue_number)
+            .is_some_and(|ack| ack.window_id == target_window_id)
+        {
+            self.launch_confirmations.remove(&issue_number);
+        }
+        if !self.active_launches.contains(&issue_number) {
+            self.active_launches.push(issue_number);
+        }
+        self.queue.retain(|queued| *queued != issue_number);
+        if let Some(item) = self
+            .inbox
+            .iter_mut()
+            .find(|item| item.issue.number == issue_number)
+        {
+            item.launched_window_id = Some(holder_window_id.to_string());
+            item.state = MonitorInboxState::Launched;
+        }
+        self.record_launch_binding_replacement(issue_number, target_window_id, holder_window_id);
+        true
+    }
+
+    /// Record a complete successful census from an exact host runtime. A failed
+    /// or unknown census must leave the previous projection intact. Host death
+    /// is represented by a newer empty census, preserving the rebase fence.
+    pub fn record_monitor_runtime_counts(
+        &mut self,
+        host_pid: u32,
+        host_started_at: u64,
+        mut counts: BTreeMap<u64, usize>,
+        observed_at: impl Into<String>,
+    ) -> bool {
+        let observed_at = observed_at.into();
+        let Some(observed) = parse_rfc3339_utc(&observed_at) else {
+            return false;
+        };
+        if host_pid == 0 || host_started_at == 0 {
+            return false;
+        }
+        let key = format!("{host_pid}:{host_started_at}");
+        if self
+            .monitor_runtime_counts
+            .get(&key)
+            .is_some_and(|previous| {
+                parse_rfc3339_utc(&previous.observed_at).is_some_and(|at| at >= observed)
+            })
+        {
+            return false;
+        }
+        counts.retain(|_, count| *count > 0);
+        self.monitor_runtime_counts.insert(
+            key,
+            IssueMonitorRuntimeCounts {
+                host_pid,
+                host_started_at,
+                counts,
+                observed_at,
+            },
+        );
+        true
+    }
+
     pub fn active_count(&self) -> usize {
-        self.active_launches.len()
+        self.active_issue_numbers().len()
     }
 
     pub fn has_launch_profile(&self) -> bool {
@@ -10132,6 +10267,14 @@ impl IssueMonitorState {
         disk: &IssueMonitorPrefs,
         autonomous_policy: AutonomousRecordRebasePolicy,
     ) {
+        for observation in disk.monitor_runtime_counts.values() {
+            self.record_monitor_runtime_counts(
+                observation.host_pid,
+                observation.host_started_at,
+                observation.counts.clone(),
+                observation.observed_at.clone(),
+            );
+        }
         // An exact failover committed elsewhere revokes the old launch. An
         // epoch alone is global; require the issue's explicit fresh-session
         // marker and absence of a successor before undoing local accounting.
@@ -11206,7 +11349,7 @@ impl IssueMonitorState {
                 "quota_hold".to_string()
             } else if self.update_drain.is_some() {
                 "update_drain".to_string()
-            } else if !self.active_launches.is_empty() {
+            } else if self.active_count() > 0 {
                 if self
                     .active_launches
                     .iter()
@@ -11218,7 +11361,7 @@ impl IssueMonitorState {
                 }
             } else if !self.has_launch_profile()
                 && !self.queue.is_empty()
-                && self.active_launches.is_empty()
+                && self.active_count() == 0
             {
                 "settings_required".to_string()
             } else {
@@ -11235,7 +11378,7 @@ impl IssueMonitorState {
             terminal_queue_auto_refill_limit: self.terminal_queue_auto_refill_limit,
             unqueued_open_count,
             other_terminal_queue_count,
-            active_count: self.active_launches.len(),
+            active_count: self.active_count(),
             max_active_agents: self.config.max_active,
             total_candidates: self.inbox.len(),
             active_issue_number: self.active_issue_number(),
@@ -11661,7 +11804,7 @@ impl IssueMonitorState {
     /// durable fact about the fleet, and the reader that needs it is typically
     /// a different process from the one that watched the fleet go quiet.
     fn observe_agent_blackout(&mut self, now: &str) {
-        let fleet_idle = self.active_launches.is_empty()
+        let fleet_idle = self.active_count() == 0
             && self.launched_windows.is_empty()
             && self.pending_launch_deliveries.is_empty()
             && self.pending_launches.is_empty();
@@ -12357,7 +12500,7 @@ impl IssueMonitorState {
     /// Issue #4117 AC-2: `max_active` slots in use — implementation launches
     /// plus live review windows, which run their own agent each.
     fn occupied_slot_count(&self) -> usize {
-        self.active_launches.len() + self.review_windows.len()
+        self.active_count() + self.review_windows.len()
     }
 
     fn forget_review_window(&mut self, issue_number: u64) {
@@ -12400,7 +12543,7 @@ impl IssueMonitorState {
             }
             format!(
                 "max_active reached ({occupied}/{max_active}: {} implementation launches + {} review windows)",
-                self.active_launches.len(),
+                self.active_count(),
                 self.review_windows.len()
             )
         };
@@ -13630,7 +13773,11 @@ impl IssueMonitorState {
             return None;
         }
         self.reconcile_terminal_queue();
-        let issue_number = self.queue.pop_front()?;
+        let position = self
+            .queue
+            .iter()
+            .position(|issue| !self.has_observed_monitor_runtime(*issue))?;
+        let issue_number = self.queue.remove(position)?;
         if !self.active_launches.contains(&issue_number) {
             self.active_launches.push(issue_number);
         }
@@ -13766,6 +13913,7 @@ impl IssueMonitorState {
             .copied()
             .filter(|issue_number| {
                 self.terminal_queue_contains(*issue_number)
+                    && !self.has_observed_monitor_runtime(*issue_number)
                     && !pending_claims.contains(issue_number)
                     && !settling.contains(issue_number)
             })
@@ -13912,6 +14060,7 @@ impl IssueMonitorState {
         while self.config.enabled && self.gui_connected && self.occupied_slot_count() < max_active {
             let Some(issue_number) = self.queue.iter().copied().find(|issue_number| {
                 self.terminal_queue_contains(*issue_number)
+                    && !self.has_observed_monitor_runtime(*issue_number)
                     && self.retry_ready_for_saved_profile(*issue_number, now)
             }) else {
                 break;
@@ -14219,6 +14368,7 @@ impl IssueMonitorState {
             .filter(|item| {
                 item.state == MonitorInboxState::Queued
                     && self.terminal_queue_contains(issue_number)
+                    && !self.has_observed_monitor_runtime(issue_number)
                     && self.occupied_slot_count() < self.config.max_active.max(1)
             })
             .map(|item| item.issue.clone())
@@ -28433,6 +28583,140 @@ mod tests {
         assert!(
             prefs.pending_effects.contains(&compensation),
             "a newer ON authority cannot erase an unfinished safety disarm"
+        );
+    }
+
+    #[test]
+    fn duplicate_runtime_revoke_preserves_holder_against_late_window_events() {
+        let mut monitor = launched_monitor(42, "tab-1::duplicate");
+        let claim = monitor.live_claim_id(42);
+        let before = monitor.prefs();
+        assert!(!monitor.bind_duplicate_runtime_holder(42, "tab-1::unrelated", "tab-1::holder"));
+        assert_eq!(
+            monitor.prefs(),
+            before,
+            "unrelated primary binding is not overwritten"
+        );
+        monitor.record_monitor_runtime_counts(
+            101,
+            1001,
+            BTreeMap::from([(42, 2)]),
+            "2026-10-02T00:00:02Z",
+        );
+        assert!(monitor.bind_duplicate_runtime_holder(42, "tab-1::duplicate", "tab-1::holder"));
+        assert_eq!(
+            monitor.launched_window_id(42).as_deref(),
+            Some("tab-1::holder")
+        );
+        assert_eq!(monitor.live_claim_id(42), claim);
+        assert_eq!(monitor.launched_window_issue("tab-1::duplicate"), None);
+        assert_eq!(
+            monitor.record_agent_window_failed("tab-1::duplicate", "late exit"),
+            None
+        );
+        assert_eq!(
+            monitor.requeue_window_at("tab-1::duplicate", "2026-10-02T00:00:03Z"),
+            None
+        );
+        assert_eq!(
+            monitor.active_count(),
+            2,
+            "binding repair does not assert a process exit"
+        );
+        assert!(monitor.queued_issue_numbers().is_empty());
+    }
+
+    #[test]
+    fn runtime_process_counts_include_duplicates_and_untracked_launches_in_admission() {
+        let mut monitor = IssueMonitorState::new(IssueMonitorConfig {
+            enabled: true,
+            max_active: 3,
+            ..IssueMonitorConfig::default()
+        });
+        monitor.set_gui_connected(true);
+        scan_queued_candidates(
+            &mut monitor,
+            &[issue(42), issue(43), issue(44)],
+            "2026-10-02T00:00:00Z",
+        );
+        assert!(monitor
+            .next_launch_request("2026-10-02T00:00:01Z")
+            .is_some());
+        monitor.record_monitor_runtime_counts(
+            101,
+            1001,
+            BTreeMap::from([(42, 2), (43, 1)]),
+            "2026-10-02T00:00:02Z",
+        );
+        assert_eq!(monitor.active_issue_numbers(), vec![42, 42, 43]);
+        assert_eq!(monitor.active_count(), 3);
+        assert_eq!(
+            monitor
+                .agent_status_at("2026-10-02T00:00:02Z")
+                .occupied_slot_count,
+            Some(3)
+        );
+        assert_eq!(monitor.claim_probe_plan(3).0, 0);
+        assert!(monitor
+            .next_launch_request("2026-10-02T00:00:03Z")
+            .is_none());
+        monitor.config.max_active = 4;
+        assert_eq!(monitor.claim_probe_plan(4).1, vec![44]);
+        assert!(!monitor.apply_confirmed_claim(
+            43,
+            "claim",
+            "owner",
+            "effect",
+            "2026-10-02T00:00:03Z"
+        ));
+        assert_eq!(
+            monitor
+                .next_launch_request("2026-10-02T00:00:03Z")
+                .unwrap()
+                .issue_number,
+            44
+        );
+    }
+
+    #[test]
+    fn runtime_process_counts_survive_reload_and_stale_rebase_until_a_new_observation() {
+        let mut monitor = IssueMonitorState::new(IssueMonitorConfig::default());
+        let stale = monitor.prefs();
+        monitor.record_monitor_runtime_counts(
+            101,
+            1001,
+            BTreeMap::from([(42, 2)]),
+            "2026-10-02T00:00:02Z",
+        );
+        monitor.rebase_daemon_driver_prefs(&stale);
+        assert_eq!(monitor.active_count(), 2);
+        let mut restored =
+            IssueMonitorState::with_prefs(IssueMonitorConfig::default(), monitor.prefs());
+        assert_eq!(restored.active_count(), 2);
+        assert!(!restored.record_monitor_runtime_counts(
+            101,
+            1001,
+            BTreeMap::new(),
+            "2026-10-02T00:00:01Z"
+        ));
+        assert_eq!(restored.active_count(), 2);
+        restored.record_monitor_runtime_counts(
+            202,
+            2002,
+            BTreeMap::from([(42, 1)]),
+            "2026-10-02T00:00:02Z",
+        );
+        assert_eq!(
+            restored.active_count(),
+            3,
+            "distinct live hosts add their process counts"
+        );
+        restored.record_monitor_runtime_counts(101, 1001, BTreeMap::new(), "2026-10-02T00:00:03Z");
+        monitor.rebase_gui_observer_prefs(&restored.prefs());
+        assert_eq!(
+            monitor.active_count(),
+            1,
+            "empty census releases only its exact host"
         );
     }
 

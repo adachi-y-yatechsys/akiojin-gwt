@@ -4262,6 +4262,7 @@ mod tests {
             Arc::new(crate::PtyWriterEntry {
                 project_key: project_a(),
                 handle: handle.clone(),
+                monitor_runtime: None,
             }),
         );
         state.clients.register_scoped(
@@ -4375,6 +4376,7 @@ mod tests {
             Arc::new(crate::PtyWriterEntry {
                 project_key: project_a(),
                 handle: stale_generation,
+                monitor_runtime: None,
             }),
         );
 
@@ -4432,6 +4434,7 @@ mod tests {
             Arc::new(crate::PtyWriterEntry {
                 project_key: project_a(),
                 handle: pane.shared_pty(),
+                monitor_runtime: None,
             }),
         );
 
@@ -4500,6 +4503,7 @@ mod tests {
             Arc::new(crate::PtyWriterEntry {
                 project_key: project_a(),
                 handle: pane.shared_pty(),
+                monitor_runtime: None,
             }),
         );
 

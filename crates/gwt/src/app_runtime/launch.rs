@@ -4769,13 +4769,11 @@ impl AppRuntime {
             );
         }
         self.window_details.remove(id);
-        // Publish the PTY handle to the WebSocket fast-path registry BEFORE
-        // inserting the runtime so that the first `terminal_input` from the
-        // frontend (which can arrive immediately after `TerminalStatus`) has a
-        // target to write to. Registry holds a cloned `Arc<PtyHandle>`; the
-        // real owner remains the `Mutex<Pane>` in `WindowRuntime`.
-        self.register_pty_writer(id, &pane);
+        // Publish the handle with its exact runtime incarnation before any
+        // status event exposes the pane. The registry owns only a cloned Arc;
+        // the process owner remains WindowRuntime.
         self.runtimes.insert(id.to_string(), runtime);
+        self.register_pty_writer(id, &pane);
         // Issue #4143 (AC-3): the PTY is live, so this restore no longer needs
         // the pre-PTY failure guard.
         self.restore_launch_windows.remove(id);
