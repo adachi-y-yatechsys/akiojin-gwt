@@ -629,6 +629,29 @@ impl AppRuntime {
         };
         let pty = pane_guard.shared_pty();
         drop(pane_guard);
+        let monitor_runtime = self.active_agent_sessions.get(id).and_then(|active| {
+            if gwt::cli::execution_state::session_launch_route(Some(&active.session_id))
+                != Some(gwt_agent::LaunchRoute::Autonomous)
+            {
+                return None;
+            }
+            let session = gwt_agent::Session::load(
+                &self
+                    .sessions_dir
+                    .join(format!("{}.toml", active.session_id)),
+            )
+            .ok()?;
+            Some(gwt::monitor_duplicate_runtime::MonitorRuntimeRegistration {
+                window_id: id.to_string(),
+                session_id: active.session_id.clone(),
+                issue_number: session.linked_issue_number?,
+                worktree_path: active.worktree_path.clone(),
+                project_root: self.tab(&active.tab_id)?.project_root.clone(),
+                sessions_dir: self.sessions_dir.clone(),
+                incarnation: self.runtimes.get(id)?.incarnation,
+                review_dispatch: self.issue_monitor_review_dispatch_windows.contains(id),
+            })
+        });
         match self.pty_writers.write() {
             Ok(mut guard) => {
                 let previous = guard.insert(
@@ -636,6 +659,7 @@ impl AppRuntime {
                     Arc::new(crate::PtyWriterEntry {
                         project_key,
                         handle: Arc::clone(&pty),
+                        monitor_runtime,
                     }),
                 );
                 drop(guard);
