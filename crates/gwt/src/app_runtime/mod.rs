@@ -63,6 +63,8 @@ pub(crate) enum UpdateAutoApplyRelease {
     Cancelled,
     /// The persisted manifest for the drained version is gone.
     PayloadMissing,
+    /// A newer release invalidated this staged version.
+    Superseded,
 }
 
 /// A notification-center record about the self-update (AC-12), broadcast to
@@ -8122,13 +8124,17 @@ impl AppRuntime {
                     "Update v{version} is no longer staged on disk — the drain was released; download it again from the update button."
                 ),
             ),
+            UpdateAutoApplyRelease::Superseded => (
+                "info",
+                format!("Update v{version} was replaced by a newer release; its automatic apply was cancelled."),
+            ),
         };
         self.record_update_apply_observation(
             version,
-            if release == UpdateAutoApplyRelease::Cancelled {
-                "pending_refused"
-            } else {
-                "pending_failed"
+            match release {
+                UpdateAutoApplyRelease::Cancelled => "pending_refused",
+                UpdateAutoApplyRelease::PayloadMissing => "pending_failed",
+                UpdateAutoApplyRelease::Superseded => "pending_superseded",
             },
             &message,
         );
