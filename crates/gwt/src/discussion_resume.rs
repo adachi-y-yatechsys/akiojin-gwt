@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::{
     io,
     path::{Path, PathBuf},
@@ -26,15 +24,6 @@ struct DiscussionDocument {
     source: DiscussionSource,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ResumePromptSessionState {
-    pub last_source_event: Option<String>,
-    pub saw_session_start: bool,
-    pub fallback_armed: bool,
-    pub prompt_pending: bool,
-    pub last_handled_proposal: Option<String>,
-}
-
 pub fn load_pending_resume(worktree: &Path) -> io::Result<Option<PendingDiscussionResume>> {
     for document in read_discussion_documents(worktree, None)? {
         let proposals = parse_document_proposals(&document, None);
@@ -45,6 +34,7 @@ pub fn load_pending_resume(worktree: &Path) -> io::Result<Option<PendingDiscussi
     Ok(None)
 }
 
+#[cfg(test)]
 pub fn park_pending_resume(worktree: &Path, pending: &PendingDiscussionResume) -> io::Result<bool> {
     crate::work_notes::with_work_notes_lock(worktree, || {
         let Some(document) = read_mutable_discussion_document(worktree)? else {
@@ -179,6 +169,7 @@ pub fn clear_proposal_next_question(worktree: &Path, label: &str) -> io::Result<
     })
 }
 
+#[cfg(test)]
 pub fn build_resume_prompt(pending: &PendingDiscussionResume) -> String {
     let next_question = pending
         .next_question
@@ -411,12 +402,6 @@ fn parse_active_canonical_proposals(
             })
         })
         .collect()
-}
-
-fn active_discussion_entry_ranges(content: &str) -> Vec<(usize, usize)> {
-    let lines = content.lines().collect::<Vec<_>>();
-    let headings = discussion_entry_heading_indices(&lines);
-    active_discussion_entry_ranges_from_headings(&lines, &headings, None)
 }
 
 fn active_discussion_entry_ranges_from_headings(

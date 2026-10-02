@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    IssueMonitorCandidateSource, IssueMonitorExecutionSettlement, IssueMonitorInboxItem,
-    IssueMonitorIssue, IssueMonitorIssueState, IssueMonitorReadiness, IssueMonitorScanSummary,
-    IssueMonitorState, IssueReadinessFailure, MonitorInboxState,
+    IssueMonitorCandidateSource, IssueMonitorExecutionSettlement, IssueMonitorIssue,
+    IssueMonitorIssueState, IssueMonitorReadiness, IssueMonitorScanSummary, IssueMonitorState,
+    IssueReadinessFailure, MonitorInboxState,
 };
 use gwt_github::{Cache, CacheEntry, IssueNumber, IssueState, SectionName};
 
@@ -464,17 +464,6 @@ pub fn issue_monitor_read_only_daemon_payloads(
     ]
 }
 
-pub fn load_open_issue_monitor_candidates(
-    owner: &str,
-    repo: &str,
-) -> Result<Vec<IssueMonitorIssue>, String> {
-    let issues = gwt_git::issue::fetch_issues(owner, repo).map_err(|error| error.to_string())?;
-    Ok(issues
-        .into_iter()
-        .map(|issue| issue_monitor_candidate(issue, IssueMonitorReadiness::NotApplicable))
-        .collect())
-}
-
 fn issue_monitor_candidate(
     issue: gwt_git::issue::Issue,
     readiness: IssueMonitorReadiness,
@@ -719,18 +708,8 @@ where
     (candidates, errors)
 }
 
-pub fn load_open_issue_monitor_candidates_for_repo_path(
-    repo_path: &Path,
-    owner: &str,
-    repo: &str,
-) -> Result<Vec<IssueMonitorIssue>, String> {
-    load_open_issue_monitor_candidates_for_repo_path_with_provenance(repo_path, owner, repo)
-        .map(|loaded| loaded.issues)
-}
-
 /// Load live candidates when available, retaining typed provenance for capped
-/// (therefore incomplete) live lists and cache fallbacks. The existing
-/// Vec-returning API above remains a compatibility wrapper.
+/// (therefore incomplete) live lists and cache fallbacks.
 pub fn load_open_issue_monitor_candidates_for_repo_path_with_provenance(
     repo_path: &Path,
     owner: &str,
@@ -983,25 +962,6 @@ pub fn try_refresh_issue_monitor_candidate(
         updated_at: Some(entry.snapshot.updated_at.0),
         ..issue.clone()
     })
-}
-
-/// Issue #3225 / #3832: GitHub-derived completion probe for the claim loop.
-/// Ordinary Issues are terminal only when GitHub reports `Closed`; linked PR
-/// evidence remains delivery evidence and cannot suppress an Open Issue.
-/// SPECs retain their structured-task plus merged-PR gate. Fails open (false)
-/// on remote errors so a transient gh failure never blocks real work.
-pub fn issue_completed_by_merged_pr(owner: &str, repo: &str, issue: &IssueMonitorIssue) -> bool {
-    match try_issue_completed_by_merged_pr(owner, repo, issue) {
-        Ok(completed) => completed,
-        Err(error) => {
-            tracing::debug!(
-                issue = issue.number,
-                error = %error,
-                "issue monitor completion probe failed (fail-open)"
-            );
-            false
-        }
-    }
 }
 
 /// Checked completion probe used by scan proposal transactions.
@@ -2254,9 +2214,6 @@ fn has_supported_github_remote_prefix(remote_url: &str) -> bool {
     .iter()
     .any(|prefix| remote_url.starts_with(prefix))
 }
-
-#[allow(dead_code)]
-fn _assert_inbox_item_is_send_sync(_: IssueMonitorInboxItem) {}
 
 #[cfg(test)]
 mod linked_pr_batch_tests {
