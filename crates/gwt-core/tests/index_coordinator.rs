@@ -700,6 +700,7 @@ fn write_stale_ticket(path: &Path, target: &TargetKey, pid: u32, start_id: &str)
         acquired_at_ms: 0,
         lease_id: None,
         expires_at_ms: None,
+        ttl_renewed: None,
         holder_nice: None,
         holder_spawn_host: None,
     };
@@ -1329,6 +1330,7 @@ fn write_verification_ticket(
         acquired_at_ms,
         lease_id: Some("lease-4470".to_string()),
         expires_at_ms: Some(acquired_at_ms.saturating_add(ttl.as_millis() as u64)),
+        ttl_renewed: None,
         holder_nice: None,
         holder_spawn_host: None,
     };

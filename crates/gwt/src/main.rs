@@ -1,7 +1,7 @@
 #![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     io,
     path::{Path, PathBuf},
     sync::{mpsc as std_mpsc, Arc, Mutex, OnceLock, RwLock},
@@ -1612,6 +1612,7 @@ pub(crate) struct DockerBundleMounts {
 pub(crate) struct PtyWriterEntry {
     pub(crate) project_key: gwt_core::repo_hash::ProjectKey,
     pub(crate) handle: Arc<PtyHandle>,
+    pub(crate) monitor_runtime: Option<gwt::monitor_duplicate_runtime::MonitorRuntimeRegistration>,
 }
 
 type PtyWriterRegistry = Arc<RwLock<HashMap<String, Arc<PtyWriterEntry>>>>;
@@ -10099,6 +10100,22 @@ fn main() -> std::io::Result<()> {
     );
     #[cfg(windows)]
     verification_cap_relief::spawn(pty_writers.clone());
+    let monitor_projects = Arc::new(RwLock::new(BTreeMap::new()));
+    let monitor_writers = pty_writers.clone();
+    gwt::monitor_duplicate_runtime::spawn(monitor_projects.clone(), move || {
+        let writers = monitor_writers.read().ok()?;
+        Some(
+            writers
+                .values()
+                .filter_map(|entry| {
+                    Some(gwt::monitor_duplicate_runtime::RegisteredMonitorRuntime {
+                        registration: entry.monitor_runtime.clone()?,
+                        handle: entry.handle.clone(),
+                    })
+                })
+                .collect(),
+        )
+    });
     runtime_health_poller::spawn_runtime_health_poller(&runtime, clients.clone(), pty_writers);
     eprintln!("gwt browser URL: {browser_url}");
     // SPEC-1939 T-IDX-109/110 / Issue #2584 — Playwright e2e seam.
@@ -10309,6 +10326,11 @@ fn main() -> std::io::Result<()> {
                     ready.set_agent_capability_issuer(server.agent_capability_issuer());
                     ready.set_server_url(browser_url.clone());
                     ready.set_usage_refresh(usage_refresh.clone());
+                    if let Ok(mut projects) = monitor_projects.write() {
+                        for context in ready.project_contexts() {
+                            projects.insert(context.project_root, ready.sessions_dir.clone());
+                        }
+                    }
                     board_projection_watchers.sync(&ready, proxy.clone());
                     workspace_projection_watchers.sync(&ready, proxy.clone());
                     board_daemon_subscribers.sync(&ready, proxy.clone());
@@ -11473,6 +11495,13 @@ fn main() -> std::io::Result<()> {
                 }
             }
             Event::MainEventsCleared => {
+                // Publish project membership even before a Monitor PTY exists.
+                // The worker retains it and needs no GUI round trip per census.
+                if let Ok(mut projects) = monitor_projects.write() {
+                    for context in app.project_contexts() {
+                        projects.insert(context.project_root, app.sessions_dir.clone());
+                    }
+                }
                 clients.dispatch(app.refresh_project_aggregates());
                 if let Some(tray_icon) = &tray_icon_handle {
                     let snapshot = app.tray_snapshot();
