@@ -55,6 +55,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
       // Issue #3365 — render-key exception safety + degradation visibility.
       import { createWorkspaceRenderSync } from "/issue-render-sync.js";
       import { createRenderDegradationBanner } from "/render-degradation-banner.js";
+      import { createWorkspaceStateNotice } from "/workspace-state-notice.js";
       import { createUpdateCtaController } from "/update-cta.js";
       // SPEC-2356 Anshin Addendum (FR-040): the in-app attention toaster ships
       // alongside the away-only desktop notifier in the same module.
@@ -1175,6 +1176,7 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
       // sync isolation). Console-only reporting left the user with a silently
       // stale minimap / window list until reload.
       const renderDegradationBanner = createRenderDegradationBanner({ document });
+      const workspaceStateNotice = createWorkspaceStateNotice({ document, send });
 
       // Issue #3365 — owns renderedWorkspaceWindowsKey's lifecycle: the key is
       // committed only after a fully clean per-window sync, so a degraded
@@ -6214,6 +6216,9 @@ import { createCloseProjectController } from "/close-project-confirm-modal.js";
             projectPageMetadata.update(event.aggregate);
             break;
           }
+          case "workspace_state_notice":
+            workspaceStateNotice.receive(event.notice);
+            break;
           case "workspace_state": {
             projectError = "";
             frontendUnits.projectWorkspaceShell.renderAppState(event.workspace);

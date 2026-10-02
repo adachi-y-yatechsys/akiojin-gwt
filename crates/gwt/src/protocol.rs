@@ -326,6 +326,7 @@ impl AgentResourceSettings {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FrontendEvent {
     FrontendReady,
+    RetryWorkspaceStateLoad,
     ProjectAggregateAck {
         revision: u64,
         visible: bool,
@@ -1871,9 +1872,26 @@ pub struct ProjectAgentAggregate {
     pub revision: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceStateNoticeKind {
+    LoadError,
+    LegacyImported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WorkspaceStateNoticeView {
+    pub path: String,
+    pub message: String,
+    pub kind: WorkspaceStateNoticeKind,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BackendEvent {
+    WorkspaceStateNotice {
+        notice: Option<WorkspaceStateNoticeView>,
+    },
     CloseProjectPreview {
         token: CloseProjectToken,
         title: String,
@@ -2765,6 +2783,11 @@ impl BackendEventPolicy {
 
 pub const BACKEND_EVENT_POLICIES: &[BackendEventPolicy] = &[
     BackendEventPolicy::new(
+        "workspace_state_notice",
+        BackendEventDeliveryClass::Snapshot,
+        BackendEventBackpressurePolicy::PreserveOrder,
+    ),
+    BackendEventPolicy::new(
         "close_project_preview",
         BackendEventDeliveryClass::Snapshot,
         BackendEventBackpressurePolicy::ClientScopedSnapshot,
@@ -3310,6 +3333,7 @@ pub fn backend_event_policy(kind: &str) -> Option<BackendEventPolicy> {
 impl BackendEvent {
     pub fn event_kind(&self) -> &'static str {
         match self {
+            BackendEvent::WorkspaceStateNotice { .. } => "workspace_state_notice",
             BackendEvent::CloseProjectPreview { .. } => "close_project_preview",
             BackendEvent::CloseProjectError { .. } => "close_project_error",
             BackendEvent::ProjectClosed { .. } => "project_closed",
