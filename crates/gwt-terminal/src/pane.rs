@@ -313,6 +313,10 @@ impl Pane {
     pub fn process_bytes(&mut self, data: &[u8]) {
         // Update vt100 screen state
         self.parser.process(data);
+        // Issue #4909: publish the child's bracketed-paste mode on the shared
+        // PTY handle, where prompt injection reads it without the pane lock.
+        self.pty
+            .set_bracketed_paste(self.parser.screen().bracketed_paste());
         self.output_seq = NEXT_OUTPUT_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
         self.incomplete_escape_tail = if self.incomplete_escape_tail.is_empty() {
             incomplete_escape_suffix(data).to_vec()
@@ -331,6 +335,15 @@ impl Pane {
     /// Get the current vt100 screen.
     pub fn screen(&self) -> &vt100::Screen {
         self.parser.screen()
+    }
+
+    /// Issue #4909: whether the child has bracketed-paste mode on, as the
+    /// last processed output left it (`CSI ? 2004 h` sets, `CSI ? 2004 l`
+    /// clears). Claude Code and Codex both turn it on at startup; a body
+    /// injected while it is on must be wrapped as a paste so the composer
+    /// reads `@`, a leading `/`, and newlines as text rather than as keys.
+    pub fn bracketed_paste_enabled(&self) -> bool {
+        self.parser.screen().bracketed_paste()
     }
 
     /// Stream position of the parsed screen: the position of the last PTY
@@ -714,6 +727,34 @@ mod tests {
 
         assert_eq!(pane.id(), "test-1");
         assert_eq!(pane.status(), &PaneStatus::Running);
+    }
+
+    /// Issue #4909: the bracketed-paste mode is tracked off the pane's output
+    /// and published on the shared PTY handle for the injection path.
+    #[test]
+    fn bracketed_paste_mode_is_tracked_from_output_and_published_on_the_pty() {
+        let _pty_guard = lock_pty_test();
+        let mut pane = test_pane("test-bracketed-paste", sleep_command("60"));
+        let pty = pane.shared_pty();
+        assert!(!pane.bracketed_paste_enabled());
+        assert!(!pty.bracketed_paste_enabled());
+
+        pane.process_bytes(b"\x1b[?1h\x1b[?2004h\x1b[?25l$ ");
+        assert!(
+            pane.bracketed_paste_enabled(),
+            "CSI ? 2004 h turns the mode on"
+        );
+        assert!(pty.bracketed_paste_enabled());
+
+        // A sequence split across two PTY chunks is still one sequence.
+        pane.process_bytes(b"\x1b[?20");
+        pane.process_bytes(b"04l");
+        assert!(!pane.bracketed_paste_enabled(), "CSI ? 2004 l turns it off");
+        assert!(!pty.bracketed_paste_enabled());
+
+        pane.process_bytes(b"\x1b[?2004h");
+        assert!(pty.bracketed_paste_enabled());
+        let _ = pane.kill();
     }
 
     #[test]
