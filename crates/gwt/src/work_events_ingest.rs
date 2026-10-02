@@ -840,6 +840,23 @@ where
                         );
                         return Err(error.into());
                     }
+                    // Local lifecycle writers hold this same Works lock, so
+                    // validate their discovered snapshot here before the core
+                    // rebuild reads it under the still-held lock.
+                    if let (Some(path), Some((_, expected))) =
+                        (close_path.as_ref(), pending_local_lifecycle.as_ref())
+                    {
+                        let actual = std::fs::read_to_string(path)
+                            .map(|content| content_fingerprint(&content))
+                            .map_err(|cause| gwt_core::WorkspaceStateLoadError::io(path, cause))?;
+                        if &actual != expected {
+                            let mut error = error.clone();
+                            error.message.push_str(
+                                "; recovery refused: local lifecycle history changed before intake",
+                            );
+                            return Err(error.into());
+                        }
+                    }
                 }
                 Ok(loaded)
             },
@@ -3132,6 +3149,41 @@ mod tests {
         // The subsequent pass must also refuse a source already absent at discovery.
         let retry = ingest_project_work_events_paths(&repo, &works, &state);
         assert!(!retry.projection_rebuilt);
+        assert_eq!(std::fs::read(&works).unwrap(), corrupt);
+        assert_eq!(load_work_events_intake_state(&state), intake_before);
+    }
+
+    #[test]
+    fn corrupt_projection_is_not_rebuilt_after_local_lifecycle_disappears_before_lock() {
+        use gwt_core::workspace_projection::{WorkEvent, WorkEventKind};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _gwt_home = gwt_core::test_support::ScopedGwtHome::set(temp.path());
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        init_repo(&repo);
+        write_shard(&repo, "evt-kept", "work-kept");
+        let works = temp.path().join("state/works.json");
+        let state = works.with_file_name("work-events-intake.json");
+        let close_path = works.with_file_name("work-events-closed.jsonl");
+        std::fs::create_dir_all(works.parent().unwrap()).unwrap();
+        let done = WorkEvent::new(WorkEventKind::Done, "work-kept", chrono::Utc::now());
+        std::fs::write(&close_path, serde_json::to_vec(&done).unwrap()).unwrap();
+        assert!(ingest_project_work_events_paths(&repo, &works, &state).projection_rebuilt);
+        let intake_before = load_work_events_intake_state(&state);
+        let corrupt = b"{\"work_items\":";
+        std::fs::write(&works, corrupt).unwrap();
+
+        let result =
+            ingest_project_work_events_paths_with_before_intake(&repo, &works, &state, || {
+                std::fs::remove_file(&close_path).unwrap();
+            });
+
+        assert!(
+            !result.projection_rebuilt,
+            "partial history is not recovery"
+        );
+        assert!(result.load_error.is_some());
         assert_eq!(std::fs::read(&works).unwrap(), corrupt);
         assert_eq!(load_work_events_intake_state(&state), intake_before);
     }

@@ -8625,7 +8625,7 @@ pub fn classify_workspace_projections<F>(
     config: &WorkspaceRetentionConfig,
     now: DateTime<Utc>,
     is_active_session: F,
-) -> Vec<ClassifiedProjection>
+) -> Result<Vec<ClassifiedProjection>>
 where
     F: Fn(&WorkspaceProjection) -> bool,
 {
@@ -8633,28 +8633,31 @@ where
 
     let entries = match fs::read_dir(scan_root) {
         Ok(entries) => entries,
-        Err(_) => return results,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(results),
+        Err(error) => return Err(WorkspaceStateLoadError::io(scan_root, error).into()),
     };
 
-    for entry in entries.flatten() {
+    for entry in entries {
+        let entry = entry.map_err(|error| WorkspaceStateLoadError::io(scan_root, error))?;
         let project_dir = entry.path();
-        if !project_dir.is_dir() {
+        if !fs::metadata(&project_dir)
+            .map_err(|error| WorkspaceStateLoadError::io(&project_dir, error))?
+            .is_dir()
+        {
             continue;
         }
         let state_dir = project_dir.join("project-state");
         let legacy_dir = project_dir.join("workspace");
-        let workspace_dir = if state_dir.join("current.json").is_file() {
-            state_dir
-        } else if legacy_dir.join("current.json").is_file() {
-            legacy_dir
-        } else {
-            continue;
-        };
-        let current_json = workspace_dir.join("current.json");
-        let projection = match load_workspace_projection_from_path(&current_json) {
-            Ok(Some(p)) => p,
-            _ => continue,
-        };
+        let (workspace_dir, projection) =
+            match load_workspace_projection_from_path(&state_dir.join("current.json"))? {
+                Some(projection) => (state_dir, projection),
+                None => {
+                    match load_workspace_projection_from_path(&legacy_dir.join("current.json"))? {
+                        Some(projection) => (legacy_dir, projection),
+                        None => continue,
+                    }
+                }
+            };
 
         let stale_reason = workspace_projection_stale_reason(&projection, config, now);
 
@@ -8701,7 +8704,7 @@ where
         });
     }
 
-    results
+    Ok(results)
 }
 
 fn workspace_projection_is_empty_default(projection: &WorkspaceProjection) -> bool {
@@ -8750,17 +8753,25 @@ fn workspace_agent_is_empty_stub(agent: &WorkspaceAgentSummary) -> bool {
 pub fn apply_prune_plan(plan: &[ClassifiedProjection], dry_run: bool) -> Result<PruneSummary> {
     let mut summary = PruneSummary::default();
     for item in plan {
+        let current_json = item.workspace_dir.join("current.json");
+        let work_items_path =
+            item.workspace_dir
+                .join(if item.workspace_dir.ends_with("workspace") {
+                    "work_items.json"
+                } else {
+                    "works.json"
+                });
         match &item.action {
             PruneAction::Skip { .. } => {
                 summary.skipped += 1;
             }
             PruneAction::Archive => {
                 if !dry_run {
-                    let current_json = item.workspace_dir.join("current.json");
-                    let work_items_path = current_json.with_file_name("works.json");
-                    with_workspace_work_items_lock(&work_items_path, || {
-                        if let Ok(Some(mut projection)) =
-                            load_workspace_projection_from_path(&current_json)
+                    let lock_target = current_json.with_file_name("works.json");
+                    with_workspace_work_items_lock(&lock_target, || {
+                        validate_existing_workspace_state::<WorkItemsProjection>(&work_items_path)?;
+                        if let Some(mut projection) =
+                            load_workspace_projection_from_path(&current_json)?
                         {
                             projection.lifecycle_stage = WorkspaceLifecycleStage::Archived;
                             projection.updated_at = Utc::now();
@@ -8773,6 +8784,10 @@ pub fn apply_prune_plan(plan: &[ClassifiedProjection], dry_run: bool) -> Result<
             }
             PruneAction::Delete => {
                 if !dry_run {
+                    // Validate immediately before removal. Holding works.lock
+                    // inside this directory prevents its deletion on Windows.
+                    validate_existing_workspace_state::<WorkspaceProjection>(&current_json)?;
+                    validate_existing_workspace_state::<WorkItemsProjection>(&work_items_path)?;
                     remove_workspace_dir_and_empty_project_dir(&item.workspace_dir)?;
                 }
                 summary.deleted += 1;

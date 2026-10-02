@@ -3738,7 +3738,18 @@ impl AppRuntime {
                     .iter()
                     .any(|agent| live_session_ids.contains(&agent.session_id))
             };
-        let plan = classify_workspace_projections(&scan_root, &config, now, is_active_session);
+        let plan = match classify_workspace_projections(&scan_root, &config, now, is_active_session)
+        {
+            Ok(plan) => plan,
+            Err(error) => {
+                return vec![OutboundEvent::reply(
+                    client_id,
+                    BackendEvent::WorkspaceProjectionPruneError {
+                        message: error.to_string(),
+                    },
+                )]
+            }
+        };
         let filtered: Vec<_> = if ids.is_empty() {
             plan
         } else {

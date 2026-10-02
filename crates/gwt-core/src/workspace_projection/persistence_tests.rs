@@ -7935,7 +7935,8 @@ fn classify_workspace_projections_deletes_empty_default_projection() {
         &WorkspaceRetentionConfig::default(),
         Utc::now(),
         |_| false,
-    );
+    )
+    .expect("classify projections");
 
     assert_eq!(plan.len(), 1);
     assert_eq!(plan[0].workspace_id, projection.id);
@@ -7960,7 +7961,8 @@ fn classify_workspace_projections_deletes_empty_projection_with_agent_stub() {
         &WorkspaceRetentionConfig::default(),
         Utc::now(),
         |_| false,
-    );
+    )
+    .expect("classify projections");
 
     assert_eq!(plan.len(), 1);
     assert_eq!(plan[0].stale_reason, Some(StaleReason::EmptyProjection));
@@ -7985,7 +7987,8 @@ fn classify_workspace_projections_keeps_projection_with_agent_worktree() {
         &WorkspaceRetentionConfig::default(),
         Utc::now(),
         |_| false,
-    );
+    )
+    .expect("classify projections");
 
     assert_eq!(plan.len(), 1);
     assert_eq!(plan[0].stale_reason, None);
@@ -8012,7 +8015,8 @@ fn apply_prune_plan_removes_empty_project_dir_after_projection_delete() {
         &WorkspaceRetentionConfig::default(),
         Utc::now(),
         |_| false,
-    );
+    )
+    .expect("classify projections");
 
     let summary = apply_prune_plan(&plan, false).expect("apply prune");
 
@@ -9518,6 +9522,34 @@ fn make_classify_projection(
 }
 
 #[test]
+fn classify_workspace_projections_rejects_invalid_canonical_before_legacy() {
+    for unreadable_directory in [false, true] {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("project");
+        let canonical = project_dir.join("project-state/current.json");
+        std::fs::create_dir_all(canonical.parent().unwrap()).unwrap();
+        if unreadable_directory {
+            std::fs::create_dir(&canonical).unwrap();
+        } else {
+            std::fs::write(&canonical, b"{broken canonical").unwrap();
+        }
+        write_projection_at(
+            &project_dir.join("workspace"),
+            &WorkspaceProjection::default_for_project(&project_dir),
+        );
+
+        let error = classify_workspace_projections(
+            tmp.path(),
+            &WorkspaceRetentionConfig::default(),
+            Utc::now(),
+            |_| false,
+        )
+        .expect_err("an existing invalid canonical file must not be skipped or replaced by legacy");
+        assert!(matches!(error, GwtError::WorkspaceStateLoad(error) if error.path == canonical));
+    }
+}
+
+#[test]
 fn classify_workspace_projections_returns_empty_for_missing_scan_root() {
     let scan_root = PathBuf::from("/nonexistent/projects/scan-root-xyz");
     let now = Utc::now();
@@ -9526,7 +9558,8 @@ fn classify_workspace_projections_returns_empty_for_missing_scan_root() {
         &WorkspaceRetentionConfig::default(),
         now,
         |_| false,
-    );
+    )
+    .expect("classify projections");
     assert!(result.is_empty());
 }
 
@@ -9550,7 +9583,8 @@ fn classify_workspace_projections_classifies_stale_active_as_archive() {
         &WorkspaceRetentionConfig::default(),
         now,
         |_| false,
-    );
+    )
+    .expect("classify projections");
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].workspace_id, "ws-archive-me");
     assert_eq!(result[0].action, PruneAction::Archive);
@@ -9577,7 +9611,8 @@ fn classify_workspace_projections_classifies_archived_beyond_threshold_as_delete
         &WorkspaceRetentionConfig::default(),
         now,
         |_| false,
-    );
+    )
+    .expect("classify projections");
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].action, PruneAction::Delete);
 }
@@ -9602,7 +9637,8 @@ fn classify_workspace_projections_skips_archived_too_soon() {
         &WorkspaceRetentionConfig::default(),
         now,
         |_| false,
-    );
+    )
+    .expect("classify projections");
     assert_eq!(result.len(), 1);
     assert_eq!(
         result[0].action,
@@ -9632,7 +9668,8 @@ fn classify_workspace_projections_skips_active_session() {
         &WorkspaceRetentionConfig::default(),
         now,
         |_| true, // every workspace has an active session
-    );
+    )
+    .expect("classify projections");
     assert_eq!(result.len(), 1);
     assert_eq!(
         result[0].action,
@@ -9640,6 +9677,38 @@ fn classify_workspace_projections_skips_active_session() {
             reason: PruneSkipReason::ActiveAgent,
         }
     );
+}
+
+#[test]
+fn apply_prune_plan_refuses_corrupt_state_after_planning() {
+    for action in [PruneAction::Archive, PruneAction::Delete] {
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("project");
+        let state_dir = project_dir.join("project-state");
+        write_projection_at(
+            &state_dir,
+            &WorkspaceProjection::default_for_project(&project_dir),
+        );
+        let mut plan = classify_workspace_projections(
+            tmp.path(),
+            &WorkspaceRetentionConfig::default(),
+            Utc::now(),
+            |_| false,
+        )
+        .unwrap();
+        plan[0].action = action;
+        let current = state_dir.join("current.json");
+        let before = std::fs::read(&current).unwrap();
+        let works = state_dir.join("works.json");
+        let broken = b"{broken works after classification";
+        std::fs::write(&works, broken).unwrap();
+
+        let error =
+            apply_prune_plan(&plan, false).expect_err("prune must revalidate before writing");
+        assert!(matches!(error, GwtError::WorkspaceStateLoad(error) if error.path == works));
+        assert_eq!(std::fs::read(&current).unwrap(), before);
+        assert_eq!(std::fs::read(&works).unwrap(), broken);
+    }
 }
 
 #[test]
@@ -9662,7 +9731,8 @@ fn apply_prune_plan_dry_run_counts_without_filesystem_change() {
         &WorkspaceRetentionConfig::default(),
         now,
         |_| false,
-    );
+    )
+    .expect("classify projections");
     let summary = apply_prune_plan(&plan, true).expect("dry run summary");
     assert_eq!(summary.archived, 1);
     assert_eq!(summary.deleted, 0);
@@ -9707,7 +9777,8 @@ fn apply_prune_plan_archives_then_deletes() {
         &WorkspaceRetentionConfig::default(),
         now,
         |_| false,
-    );
+    )
+    .expect("classify projections");
     let summary = apply_prune_plan(&plan, false).expect("apply prune");
     assert_eq!(summary.archived, 1);
     assert_eq!(summary.deleted, 1);
