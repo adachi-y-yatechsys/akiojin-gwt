@@ -89,8 +89,8 @@ pub(crate) use attachment_upload::{AttachmentUploadStore, UploadedAttachment};
 pub(crate) use docker_launch::{
     compose_workspace_mount_target, docker_bundle_mounts_for_home, docker_bundle_override_content,
     docker_compose_file_for_launch, docker_devcontainer_defaults, is_valid_docker_env_key,
-    mount_source_matches_project_root, normalize_docker_launch_action, package_runner_version_spec,
-    resolved_test_docker_runtime, strip_package_runner_args, DockerLaunchServiceAction,
+    mount_source_matches_project_root, normalize_docker_launch_action,
+    resolved_test_docker_runtime, DockerLaunchServiceAction,
 };
 pub(crate) use docker_launch::{
     detect_wizard_docker_context_and_status, docker_binary_for_launch,
@@ -4288,7 +4288,6 @@ mod tests {
             name: "Codex".to_string(),
             available: true,
             installed_version: Some("0.110.0".to_string()),
-            versions: vec!["0.110.0".to_string()],
             custom_agent: None,
         }]
     }
@@ -4308,7 +4307,6 @@ mod tests {
                 name: "Claude Code".to_string(),
                 available: false,
                 installed_version: None,
-                versions: Vec::new(),
                 custom_agent: None,
             },
             AgentOption {
@@ -4316,7 +4314,6 @@ mod tests {
                 name: "Echo Agent".to_string(),
                 available: true,
                 installed_version: Some("test".to_string()),
-                versions: Vec::new(),
                 custom_agent: Some(gwt_agent::CustomCodingAgent {
                     id: "echo-agent".to_string(),
                     display_name: "Echo Agent".to_string(),
@@ -4339,7 +4336,6 @@ mod tests {
             tool_label: "Codex".to_string(),
             model: Some("gpt-5.5".to_string()),
             reasoning: Some("high".to_string()),
-            version: Some("0.110.0".to_string()),
             resume_session_id: Some("resume-1".to_string()),
             live_window_id: live_window_id.map(str::to_string),
             skip_permissions: true,
@@ -7874,22 +7870,6 @@ mod tests {
         assert_eq!(branch.scope, BranchScope::Local);
         assert!(!branch.is_head);
 
-        let config = sample_versioned_launch_config();
-        assert_eq!(
-            super::package_runner_version_spec(&config),
-            Some("@anthropic-ai/claude-code@latest".to_string())
-        );
-        assert_eq!(
-            super::strip_package_runner_args(
-                &[
-                    "--yes".to_string(),
-                    "@anthropic-ai/claude-code@latest".to_string(),
-                    "--print".to_string(),
-                ],
-                "@anthropic-ai/claude-code@latest",
-            ),
-            vec!["--print".to_string()]
-        );
         assert!(super::command_matches_runner(
             "C:/Users/test/bunx.cmd",
             "bunx"
@@ -9139,32 +9119,6 @@ mod tests {
         );
         assert!(super::command_matches_runner("C:/tools/bunx.cmd", "bunx"));
         assert!(!super::command_matches_runner("C:/tools/node.exe", "bunx"));
-
-        let version_spec = super::package_runner_version_spec(&sample_versioned_launch_config())
-            .expect("version spec");
-        assert_eq!(version_spec, "@anthropic-ai/claude-code@latest");
-        assert_eq!(
-            super::strip_package_runner_args(
-                &[
-                    "--yes".to_string(),
-                    version_spec.clone(),
-                    "--print".to_string(),
-                ],
-                &version_spec,
-            ),
-            vec!["--print".to_string()]
-        );
-        assert_eq!(
-            super::strip_package_runner_args(
-                &[version_spec.clone(), "--print".to_string()],
-                &version_spec,
-            ),
-            vec!["--print".to_string()]
-        );
-        assert_eq!(
-            super::strip_package_runner_args(&["--print".to_string()], &version_spec),
-            vec!["--print".to_string()]
-        );
 
         let old_docker_bin = std::env::var_os("GWT_DOCKER_BIN");
         std::env::set_var("GWT_DOCKER_BIN", "podman");

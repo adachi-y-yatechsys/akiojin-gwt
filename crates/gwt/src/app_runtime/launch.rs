@@ -1958,9 +1958,6 @@ pub(super) fn launch_config_from_persisted_session(
     if let Some(model) = session.model.clone() {
         builder = builder.model(model);
     }
-    if let Some(version) = session.launch_tool_version() {
-        builder = builder.version(version);
-    }
     if let Some(level) = session.reasoning_level.clone() {
         builder = builder.reasoning_level(level);
     }
@@ -2023,9 +2020,6 @@ pub(super) fn launch_config_from_persisted_session(
     }
 
     let mut config = builder.build();
-    if let Some(version) = session.launch_tool_version() {
-        config.tool_version = Some(version);
-    }
     if !session.display_name.is_empty() {
         config.display_name = session.display_name.clone();
     }
@@ -2377,9 +2371,7 @@ impl LaunchWizardMemoryCache {
     }
 
     fn load_agent_options() -> Vec<gwt::AgentOption> {
-        gwt::load_agent_options(&gwt_agent::VersionCache::load(
-            &gwt::default_wizard_version_cache_path(),
-        ))
+        gwt::load_agent_options()
     }
 
     /// Start install detection on a background thread so `load` (and thus

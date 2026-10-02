@@ -1880,7 +1880,8 @@ impl From<IssueMonitorLaunchProfile> for LaunchWizardPreviousProfile {
             agent_id: profile.agent_id,
             model: profile.model,
             reasoning: profile.reasoning,
-            version: profile.version,
+            // SPEC-1921 FR-1921-L8: `profile.version` stays in the saved pool
+            // but is not read. Every launch uses the resolved executable.
             session_mode: profile.session_mode,
             skip_permissions: profile.skip_permissions,
             fast_mode: profile.fast_mode,
@@ -30485,7 +30486,8 @@ mod tests {
         assert_eq!(previous.agent_id, "codex");
         assert_eq!(previous.model.as_deref(), Some("gpt-5.5"));
         assert_eq!(previous.reasoning.as_deref(), Some("high"));
-        assert_eq!(previous.version.as_deref(), Some("0.121.0"));
+        // SPEC-1921 FR-1921-L8: the stored `version` round-trips above and is
+        // not handed to the wizard. Launches use the resolved executable.
         assert_eq!(previous.session_mode, gwt_agent::SessionMode::Resume);
         assert!(previous.skip_permissions);
         assert!(previous.fast_mode);

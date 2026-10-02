@@ -62,7 +62,6 @@ impl LaunchWizardState {
             model: String::new(),
             reasoning: String::new(),
             reasoning_explicit: false,
-            version: String::new(),
             mode: "normal".to_string(),
             resume_session_id: None,
             runtime_target,
@@ -252,8 +251,8 @@ impl LaunchWizardState {
         )
     }
 
-    pub fn open(context: LaunchWizardContext, sessions_dir: &Path, cache_path: &Path) -> Self {
-        let agent_options = load_agent_options(&gwt_agent::VersionCache::load(cache_path));
+    pub fn open(context: LaunchWizardContext, sessions_dir: &Path) -> Self {
+        let agent_options = load_agent_options();
         let quick_start_entries = load_quick_start_entries(
             &context.quick_start_root,
             sessions_dir,
@@ -507,9 +506,6 @@ impl LaunchWizardState {
             LaunchWizardAction::SetDockerLifecycle { intent } => {
                 self.set_docker_lifecycle(intent);
             }
-            LaunchWizardAction::SetVersion { version } => {
-                self.set_version(&version);
-            }
             LaunchWizardAction::SetExecutionMode { mode } => {
                 self.set_execution_mode(&mode);
             }
@@ -683,11 +679,6 @@ impl LaunchWizardState {
             LaunchWizardStep::DockerLifecycle => {
                 if let Some(option) = self.docker_lifecycle_options().get(self.selected) {
                     self.docker_lifecycle_intent = option.intent;
-                }
-            }
-            LaunchWizardStep::VersionSelect => {
-                if let Some(option) = self.current_version_options().get(self.selected) {
-                    self.version = option.value.clone();
                 }
             }
             LaunchWizardStep::ExecutionMode => {
@@ -951,9 +942,6 @@ impl LaunchWizardState {
         self.apply_quick_start_runtime_selection(&entry);
         self.apply_saved_model(entry.model.as_deref());
         self.apply_restored_reasoning(entry.reasoning.clone());
-        if let Some(version) = entry.version.clone() {
-            self.version = self.preferred_host_version(&version).to_string();
-        }
         self.skip_permissions = entry.skip_permissions;
         self.codex_fast_mode = self.restored_fast_mode(&entry.agent_id, entry.codex_fast_mode);
         if let Some(resume_session_id) = entry.resume_session_id.clone() {
@@ -1017,9 +1005,6 @@ impl LaunchWizardState {
         }
         self.apply_saved_model(entry.model.as_deref());
         self.apply_restored_reasoning(entry.reasoning);
-        if let Some(version) = entry.version {
-            self.version = self.preferred_host_version(&version).to_string();
-        }
         self.skip_permissions = entry.skip_permissions;
         self.codex_fast_mode = self.restored_fast_mode(&entry.agent_id, entry.codex_fast_mode);
         match mode {
@@ -1079,16 +1064,6 @@ impl LaunchWizardState {
         self.apply_saved_model(profile.model.as_deref());
         self.apply_restored_reasoning(profile.reasoning.clone());
         self.sync_reasoning_state();
-        if let Some(version) = profile.version.as_deref() {
-            let version = self.preferred_host_version(version);
-            if self
-                .current_version_options()
-                .iter()
-                .any(|option| option.value == version)
-            {
-                self.version = version.to_string();
-            }
-        }
         self.mode = execution_mode_value_from_session_mode(profile.session_mode).to_string();
         self.resume_session_id = None;
         self.skip_permissions = profile.skip_permissions;
@@ -1353,16 +1328,7 @@ impl LaunchWizardState {
     }
 
     pub(super) fn set_runtime_target(&mut self, target: gwt_agent::LaunchRuntimeTarget) {
-        // A Host preference does not prove the CLI exists inside Docker.
-        // Restored Docker selections and explicit pins retain their intent.
-        if target == gwt_agent::LaunchRuntimeTarget::Docker
-            && self.prefers_installed_host_agent(&self.agent_id)
-            && self.version == "installed"
-        {
-            self.version = "latest".to_string();
-        }
         self.runtime_target = target;
-        self.version = self.preferred_host_version(&self.version).to_string();
         if self.runtime_target == gwt_agent::LaunchRuntimeTarget::Host {
             self.docker_service = None;
         } else if self.docker_service.is_none() {
@@ -1393,19 +1359,6 @@ impl LaunchWizardState {
             self.docker_lifecycle_intent = intent;
         } else {
             self.error = Some("Docker lifecycle option is unavailable".to_string());
-        }
-    }
-
-    pub(super) fn set_version(&mut self, version: &str) {
-        let version = self.preferred_host_version(version);
-        if self
-            .current_version_options()
-            .iter()
-            .any(|option| option.value == version)
-        {
-            self.version = version.to_string();
-        } else {
-            self.error = Some("Version option is unavailable".to_string());
         }
     }
 
@@ -1468,24 +1421,6 @@ impl LaunchWizardState {
             }
         } else if self.model.is_empty() || !models.iter().any(|model| model == &self.model) {
             self.model = models[0].to_string();
-        }
-
-        self.version = self.preferred_host_version(&self.version).to_string();
-        let version_options = self.current_version_options_for(&agent);
-        if version_options.is_empty() {
-            self.version.clear();
-        } else if self.version.is_empty()
-            || !version_options
-                .iter()
-                .any(|option| option.value == self.version)
-        {
-            self.version = if self.prefers_installed_host_agent(&agent.id) {
-                "installed".to_string()
-            } else if agent_has_npm_package(&agent.id) {
-                "latest".to_string()
-            } else {
-                "installed".to_string()
-            };
         }
 
         if !self.current_agent_supports_fast_mode() {
@@ -1793,17 +1728,14 @@ impl LaunchWizardState {
                 };
                 (shell.to_string(), vec![flag.to_string(), install_command])
             }
-            AgentSetupKind::Configure => {
-                let version = if self.version.is_empty() {
-                    "latest"
-                } else {
-                    self.version.as_str()
-                };
-                let runner = gwt_agent::launch::resolve_runner(&agent_id, version);
-                let mut args = runner.base_args.clone();
-                args.extend(descriptor.setup_args.iter().map(|arg| (*arg).to_string()));
-                (runner.executable, args)
-            }
+            AgentSetupKind::Configure => (
+                agent_id.command().to_string(),
+                descriptor
+                    .setup_args
+                    .iter()
+                    .map(|arg| (*arg).to_string())
+                    .collect(),
+            ),
         };
 
         self.launch_target = LaunchTargetKind::Shell;
@@ -2002,62 +1934,6 @@ impl LaunchWizardState {
         }
     }
 
-    pub(super) fn current_version_options_for(
-        &self,
-        agent: &AgentOption,
-    ) -> Vec<gwt_agent::VersionOption> {
-        let prefer_installed = self.prefers_installed_host_agent(&agent.id);
-        let mut options = gwt_agent::build_version_options(
-            agent.available || prefer_installed,
-            agent.installed_version.as_deref(),
-            agent_has_npm_package(&agent.id),
-            &agent.versions,
-        );
-        if prefer_installed {
-            options.retain(|option| option.value != "latest");
-            for option in &mut options {
-                if option.value == "installed" {
-                    option.label = if agent.available {
-                        format!(
-                            "Installed ({}; PATH; package fallback if unhealthy)",
-                            agent
-                                .installed_version
-                                .as_deref()
-                                .unwrap_or("version unknown")
-                        )
-                    } else {
-                        "Installed (not found; package fallback)".to_string()
-                    };
-                } else {
-                    option.label = format!("{} (package runner)", option.value);
-                }
-            }
-        }
-        options
-    }
-
-    fn prefers_installed_host_agent(&self, agent_id: &str) -> bool {
-        self.runtime_target == gwt_agent::LaunchRuntimeTarget::Host
-            && matches!(agent_id, "claude" | "codex")
-            && self
-                .selected_agent()
-                .is_some_and(|agent| agent.custom_agent.is_none())
-    }
-
-    fn preferred_host_version<'a>(&self, version: &'a str) -> &'a str {
-        if self.prefers_installed_host_agent(&self.agent_id) && matches!(version, "" | "latest") {
-            "installed"
-        } else {
-            version
-        }
-    }
-
-    pub(super) fn current_version_options(&self) -> Vec<gwt_agent::VersionOption> {
-        self.selected_agent()
-            .map(|agent| self.current_version_options_for(agent))
-            .unwrap_or_default()
-    }
-
     fn current_agent_draft_key(&self) -> Option<String> {
         if !self.launch_target_is_agent() {
             return None;
@@ -2078,7 +1954,6 @@ impl LaunchWizardState {
                 model: self.model.clone(),
                 reasoning: self.reasoning.clone(),
                 reasoning_explicit: self.reasoning_explicit,
-                version: self.version.clone(),
                 mode: self.mode.clone(),
                 resume_session_id: self.resume_session_id.clone(),
                 skip_permissions: self.skip_permissions,
@@ -2111,7 +1986,6 @@ impl LaunchWizardState {
         self.model = draft.model;
         self.reasoning = draft.reasoning;
         self.reasoning_explicit = draft.reasoning_explicit;
-        self.version = draft.version;
         self.mode = draft.mode;
         self.resume_session_id = draft.resume_session_id;
         // The draft map is keyed by agent, so the key this draft was read under
@@ -2125,7 +1999,6 @@ impl LaunchWizardState {
         self.model.clear();
         self.reasoning.clear();
         self.reasoning_explicit = false;
-        self.version.clear();
         self.mode = "normal".to_string();
         self.resume_session_id = None;
         self.skip_permissions = false;
@@ -2180,18 +2053,12 @@ impl LaunchWizardState {
     }
 
     fn current_claude_ultracode_supported(&self) -> bool {
-        if !self.context.claude_workflows_enabled {
-            return false;
-        }
-        match self.version.as_str() {
-            "latest" if self.runtime_target == gwt_agent::LaunchRuntimeTarget::Docker => true,
-            "installed" | "latest" | "" => self
+        self.context.claude_workflows_enabled
+            && self
                 .selected_agent()
                 .filter(|agent| agent.available)
                 .and_then(|agent| agent.installed_version.as_deref())
-                .is_some_and(|version| gwt_agent::supports_ultracode(version, true)),
-            version => gwt_agent::supports_ultracode(version, true),
-        }
+                .is_some_and(|version| gwt_agent::supports_ultracode(version, true))
     }
 
     pub(super) fn selected_quick_start_action(&self) -> QuickStartAction {
@@ -2269,9 +2136,6 @@ impl LaunchWizardState {
         self.apply_quick_start_runtime_selection(&entry);
         self.apply_saved_model(entry.model.as_deref());
         self.apply_restored_reasoning(entry.reasoning);
-        if let Some(version) = entry.version {
-            self.version = self.preferred_host_version(&version).to_string();
-        }
         self.skip_permissions = entry.skip_permissions;
         self.codex_fast_mode = self.restored_fast_mode(&entry.agent_id, entry.codex_fast_mode);
 
@@ -2311,7 +2175,6 @@ mod tests {
             name: "Grok Build".to_string(),
             available: true,
             installed_version: Some("1.0.3".to_string()),
-            versions: vec!["1.0.3".to_string()],
             custom_agent: None,
         });
         let mut state = LaunchWizardState::open_with(
@@ -2380,7 +2243,6 @@ mod tests {
                 tool_label: "Codex".to_string(),
                 model: Some("gpt-5.5".to_string()),
                 reasoning: Some("high".to_string()),
-                version: Some("0.110.0".to_string()),
                 resume_session_id: Some("resume-1".to_string()),
                 live_window_id: None,
                 skip_permissions: true,
@@ -2434,7 +2296,6 @@ mod tests {
             name: "Grok Build".to_string(),
             available: true,
             installed_version: Some("1.0.3".to_string()),
-            versions: vec!["1.0.3".to_string()],
             custom_agent: None,
         });
         let mut state = LaunchWizardState::open_with(
@@ -2447,7 +2308,6 @@ mod tests {
                 tool_label: "Grok Build".to_string(),
                 model: Some("grok-4.20-beta".to_string()),
                 reasoning: Some("provider-experimental".to_string()),
-                version: Some("installed".to_string()),
                 resume_session_id: None,
                 live_window_id: None,
                 skip_permissions: false,
@@ -2498,7 +2358,6 @@ mod tests {
             name: "Grok Build".to_string(),
             available: true,
             installed_version: Some("1.0.3".to_string()),
-            versions: vec!["1.0.3".to_string()],
             custom_agent: None,
         });
         let mut state = LaunchWizardState::open_with(
@@ -2511,7 +2370,6 @@ mod tests {
                 tool_label: "Grok Build".to_string(),
                 model: None,
                 reasoning: None,
-                version: Some("installed".to_string()),
                 resume_session_id: None,
                 live_window_id: None,
                 skip_permissions: false,
@@ -2674,7 +2532,6 @@ mod tests {
                 agent_id: "codex".to_string(),
                 model: Some(retired.to_string()),
                 reasoning: None,
-                version: Some("0.110.0".to_string()),
                 session_mode: gwt_agent::SessionMode::Normal,
                 skip_permissions: false,
                 fast_mode: false,
@@ -2786,7 +2643,6 @@ mod tests {
                 tool_label: "Codex".to_string(),
                 model: Some("gpt-5.5".to_string()),
                 reasoning: None,
-                version: Some("0.110.0".to_string()),
                 resume_session_id: None,
                 live_window_id: None,
                 skip_permissions: false,
@@ -2838,7 +2694,6 @@ mod tests {
                 tool_label: "Codex".to_string(),
                 model: Some("gpt-5.5".to_string()),
                 reasoning: Some("ultra".to_string()),
-                version: Some("0.110.0".to_string()),
                 resume_session_id: None,
                 live_window_id: None,
                 skip_permissions: false,
@@ -2875,7 +2730,6 @@ mod tests {
             agent_id: "hermes".to_string(),
             model: Some("qwen3.5".to_string()),
             reasoning: None,
-            version: Some("installed".to_string()),
             session_mode: gwt_agent::SessionMode::Normal,
             skip_permissions: false,
             fast_mode: false,
@@ -2897,7 +2751,6 @@ mod tests {
             name: "Hermes Agent".to_string(),
             available: true,
             installed_version: Some("1.0.0".to_string()),
-            versions: Vec::new(),
             custom_agent: None,
         });
         let mut state = LaunchWizardState::open_with_previous_profiles(
@@ -2935,7 +2788,6 @@ mod tests {
             agent_id: "codex".to_string(),
             model: Some("gpt-5.5".to_string()),
             reasoning: Some("ultra".to_string()),
-            version: Some("0.110.0".to_string()),
             session_mode: gwt_agent::SessionMode::Normal,
             skip_permissions: false,
             fast_mode: false,
@@ -3115,7 +2967,6 @@ mod tests {
                 agent_id: "codex".to_string(),
                 model: Some("gpt-6-astra".to_string()),
                 reasoning: Some("high".to_string()),
-                version: Some("0.110.0".to_string()),
                 session_mode: gwt_agent::SessionMode::Continue,
                 skip_permissions: true,
                 fast_mode: true,
@@ -3134,7 +2985,6 @@ mod tests {
         assert_eq!(view.selected_model, "gpt-6-astra");
         assert!(view.model_fallback_notice.is_none());
         assert_eq!(view.selected_reasoning, "high");
-        assert_eq!(view.selected_version, "0.110.0");
         assert_eq!(view.selected_execution_mode, "continue");
         assert_eq!(view.selected_runtime_target, "docker");
         // SPEC-2014 FR-034: saved docker_service が現 context にあれば saved を採用する。
@@ -3176,7 +3026,6 @@ mod tests {
                 agent_id: "codex".to_string(),
                 model: None,
                 reasoning: None,
-                version: None,
                 session_mode: gwt_agent::SessionMode::Normal,
                 skip_permissions: false,
                 fast_mode: false,
@@ -3226,7 +3075,6 @@ mod tests {
                 agent_id: "codex".to_string(),
                 model: None,
                 reasoning: None,
-                version: None,
                 session_mode: gwt_agent::SessionMode::Normal,
                 skip_permissions: false,
                 fast_mode: false,
@@ -3260,7 +3108,6 @@ mod tests {
                 agent_id: "codex".to_string(),
                 model: Some("gpt-5.5".to_string()),
                 reasoning: Some("high".to_string()),
-                version: Some("0.110.0".to_string()),
                 session_mode: gwt_agent::SessionMode::Normal,
                 skip_permissions: false,
                 fast_mode: false,
@@ -3297,7 +3144,6 @@ mod tests {
                 agent_id: "codex".to_string(),
                 model: Some("gpt-5.5".to_string()),
                 reasoning: Some("high".to_string()),
-                version: Some("0.110.0".to_string()),
                 session_mode: gwt_agent::SessionMode::Normal,
                 skip_permissions: false,
                 fast_mode: false,
@@ -3484,7 +3330,6 @@ mod tests {
                 agent_id: "codex".to_string(),
                 model: Some("gpt-5.5".to_string()),
                 reasoning: Some("high".to_string()),
-                version: Some("0.110.0".to_string()),
                 session_mode: gwt_agent::SessionMode::Normal,
                 skip_permissions: true,
                 fast_mode: true,
@@ -3511,7 +3356,6 @@ mod tests {
                 agent_id: "codex".to_string(),
                 model: Some("gpt-5.5".to_string()),
                 reasoning: Some("high".to_string()),
-                version: Some("0.110.0".to_string()),
                 session_mode: gwt_agent::SessionMode::Normal,
                 skip_permissions: true,
                 fast_mode: true,
@@ -3545,7 +3389,6 @@ mod tests {
                 agent_id: "codex".to_string(),
                 model: Some("gpt-5.5".to_string()),
                 reasoning: Some("high".to_string()),
-                version: Some("0.110.0".to_string()),
                 session_mode: gwt_agent::SessionMode::Normal,
                 skip_permissions: true,
                 fast_mode: true,
@@ -3576,7 +3419,6 @@ mod tests {
                 agent_id: "codex".to_string(),
                 model: Some("gpt-5.5".to_string()),
                 reasoning: Some("high".to_string()),
-                version: Some("0.110.0".to_string()),
                 session_mode: gwt_agent::SessionMode::Normal,
                 skip_permissions: true,
                 fast_mode: true,
@@ -3642,7 +3484,6 @@ mod tests {
                     agent_id: "missing-agent".to_string(),
                     model: None,
                     reasoning: None,
-                    version: None,
                     session_mode: gwt_agent::SessionMode::Normal,
                     skip_permissions: false,
                     fast_mode: false,
@@ -3706,7 +3547,6 @@ mod tests {
         assert_eq!(view.selected_agent_id, "codex");
         assert_eq!(view.selected_model, "gpt-5.5");
         assert_eq!(view.selected_reasoning, "medium");
-        assert_eq!(view.selected_version, "0.110.0");
         assert_eq!(view.selected_execution_mode, "continue");
         // Issue #3462: the preserved preference is advertised on Continue.
         assert!(
@@ -3924,8 +3764,8 @@ mod tests {
     }
 
     #[test]
-    fn quick_start_start_new_latest_does_not_reuse_tool_runtime_source() {
-        let mut entry = quick_start_entry(
+    fn quick_start_start_new_does_not_reuse_tool_runtime_source() {
+        let entry = quick_start_entry(
             "session-saved",
             "codex",
             Some("resume-saved"),
@@ -3933,7 +3773,6 @@ mod tests {
             gwt_agent::LaunchRuntimeTarget::Host,
             None,
         );
-        entry.version = Some("latest".to_string());
         let mut state = LaunchWizardState::open_with(
             context(branch("feature/current"), "feature/current"),
             sample_agent_options(),
@@ -3948,10 +3787,10 @@ mod tests {
         match state.completion.as_ref() {
             Some(LaunchWizardCompletion::Launch(config)) => match config.as_ref() {
                 LaunchWizardLaunchRequest::Agent(config) => {
-                    assert_eq!(config.tool_version.as_deref(), Some("installed"));
+                    assert_eq!(config.tool_version, None);
                     assert!(
                         config.tool_runtime_source_session_id.is_none(),
-                        "StartNew must re-resolve the latest requested selector"
+                        "StartNew must not inherit the saved Session's runtime provenance"
                     );
                 }
                 other => panic!("expected agent launch request, got {other:?}"),
@@ -4007,7 +3846,6 @@ mod tests {
                 name: "OpenClaw".to_string(),
                 available: true,
                 installed_version: Some("1.0.0".to_string()),
-                versions: vec!["1.0.0".to_string()],
                 custom_agent: None,
             }],
             vec![quick_start_entry(
@@ -4057,7 +3895,6 @@ mod tests {
                 name: "OpenClaw".to_string(),
                 available: true,
                 installed_version: Some("1.0.0".to_string()),
-                versions: vec!["1.0.0".to_string()],
                 custom_agent: None,
             }],
             vec![quick_start_entry(
@@ -4224,7 +4061,6 @@ mod tests {
             name: "Aider".to_string(),
             available: true,
             installed_version: None,
-            versions: Vec::new(),
             custom_agent: None,
         });
         let mut state = LaunchWizardState::open_with(
@@ -4270,9 +4106,6 @@ mod tests {
         state.apply(LaunchWizardAction::SetReasoning {
             reasoning: "high".to_string(),
         });
-        state.apply(LaunchWizardAction::SetVersion {
-            version: "0.110.0".to_string(),
-        });
         state.apply(LaunchWizardAction::SetExecutionMode {
             mode: "continue".to_string(),
         });
@@ -4288,9 +4121,6 @@ mod tests {
         state.apply(LaunchWizardAction::SetReasoning {
             reasoning: "low".to_string(),
         });
-        state.apply(LaunchWizardAction::SetVersion {
-            version: "installed".to_string(),
-        });
         state.apply(LaunchWizardAction::SetExecutionMode {
             mode: "normal".to_string(),
         });
@@ -4300,7 +4130,6 @@ mod tests {
         assert_eq!(claude_view.selected_agent_id, "claude");
         assert_eq!(claude_view.selected_model, "sonnet");
         assert_eq!(claude_view.selected_reasoning, "low");
-        assert_eq!(claude_view.selected_version, "installed");
         assert_eq!(claude_view.selected_execution_mode, "normal");
         assert!(!claude_view.skip_permissions);
         assert!(!claude_view.show_codex_fast_mode);
@@ -4314,7 +4143,6 @@ mod tests {
         assert_eq!(codex_view.selected_agent_id, "codex");
         assert_eq!(codex_view.selected_model, "gpt-5.5");
         assert_eq!(codex_view.selected_reasoning, "high");
-        assert_eq!(codex_view.selected_version, "0.110.0");
         assert_eq!(codex_view.selected_execution_mode, "continue");
         // Issue #3462: the Codex draft's preference is advertised on Continue.
         assert!(
@@ -4373,7 +4201,6 @@ mod tests {
                 tool_label: "Codex".to_string(),
                 model: Some("gpt-5.5".to_string()),
                 reasoning: Some("high".to_string()),
-                version: Some("0.110.0".to_string()),
                 resume_session_id: Some("resume-1".to_string()),
                 live_window_id: None,
                 skip_permissions: true,

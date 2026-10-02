@@ -1359,9 +1359,6 @@ impl AppRuntime {
         if let Some(model) = session.model.clone() {
             builder = builder.model(model);
         }
-        if let Some(version) = session.launch_tool_version() {
-            builder = builder.version(version);
-        }
         if let Some(level) = session.reasoning_level.clone() {
             builder = builder.reasoning_level(level);
         }
@@ -1408,11 +1405,7 @@ impl AppRuntime {
         }
 
         let mut config = builder.build();
-        // Preserve the requested selector and display name when resuming.
-        // The observed runtime version must not become a package pin.
-        if let Some(version) = session.launch_tool_version() {
-            config.tool_version = Some(version);
-        }
+        // Preserve the display name when resuming.
         if !session.display_name.is_empty() {
             config.display_name = session.display_name.clone();
         }

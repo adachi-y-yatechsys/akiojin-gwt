@@ -212,7 +212,6 @@ mod tests {
         assert_eq!(saved.exact_resume_session_id(), Some("conversation"));
         assert_eq!(saved.tool_version.as_deref(), Some("2.1.156"));
         assert_eq!(saved.tool_version_selector.as_deref(), Some("latest"));
-        assert_eq!(saved.launch_tool_version().as_deref(), Some("latest"));
         assert!(runtime.exists());
     }
     #[test]

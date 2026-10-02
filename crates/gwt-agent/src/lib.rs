@@ -24,7 +24,6 @@ pub use session_bridge::{
 };
 pub mod store;
 pub mod types;
-pub mod version_cache;
 
 #[cfg(test)]
 pub(crate) mod test_capture;
@@ -124,4 +123,3 @@ pub use types::{
     DockerLifecycleIntent, LaunchRoute, LaunchRuntimeTarget, SessionMode, WindowsShellKind,
     WorkflowBypass,
 };
-pub use version_cache::{build_version_options, VersionCache, VersionOption};

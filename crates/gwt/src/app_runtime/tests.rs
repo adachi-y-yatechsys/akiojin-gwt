@@ -8579,7 +8579,6 @@ fn sample_agent_options() -> Vec<gwt::AgentOption> {
         name: "Codex".to_string(),
         available: true,
         installed_version: Some("latest".to_string()),
-        versions: vec!["latest".to_string()],
         custom_agent: None,
     }]
 }
@@ -13691,7 +13690,6 @@ fn app_runtime_open_launch_wizard_uses_cached_previous_profile_without_hydrating
     assert_eq!(view.selected_agent_id, "codex");
     assert_eq!(view.selected_model, "gpt-5.5");
     assert_eq!(view.selected_reasoning, "high");
-    assert_eq!(view.selected_version, "installed");
     assert_eq!(view.selected_execution_mode, "continue");
     // Issue #3462: Continue inherits the persisted Skip Permissions preference.
     assert!(view.skip_permissions);
@@ -18429,6 +18427,60 @@ fn persisted_direct_session_observed_version_does_not_pin_restore() {
     let config = super::launch_config_from_persisted_session(&session);
     assert_eq!(config.command, "claude");
     assert_eq!(config.tool_version.as_deref(), Some("installed"));
+}
+
+/// SPEC-1921 AS-1921-D (AC-1921-L6): a Session saved while a version could
+/// still be selected restores onto the resolved executable. The stored
+/// selector is not read, so `latest` and pinned versions cannot bring the
+/// package runner back.
+#[test]
+fn persisted_session_with_legacy_version_selector_restores_the_resolved_executable() {
+    let temp = tempdir().expect("tempdir");
+    let _gwt_home = ScopedGwtHome::set(temp.path());
+    let cases = [
+        (
+            gwt_agent::AgentId::Codex,
+            gwt_agent::LaunchRuntimeTarget::Docker,
+            "latest",
+            "bunx",
+            vec!["@openai/codex@latest"],
+            "codex",
+        ),
+        (
+            gwt_agent::AgentId::OpenCode,
+            gwt_agent::LaunchRuntimeTarget::Host,
+            "1.4.0",
+            "npx",
+            vec!["--yes", "opencode-ai@1.4.0"],
+            "opencode",
+        ),
+        (
+            gwt_agent::AgentId::ClaudeCode,
+            gwt_agent::LaunchRuntimeTarget::Host,
+            "2.1.156",
+            "npx",
+            vec!["--yes", "@anthropic-ai/claude-code@2.1.156"],
+            "claude",
+        ),
+    ];
+    for (agent_id, runtime_target, selector, launch_command, launch_args, command) in cases {
+        let mut session = gwt_agent::Session::new(temp.path(), "work/issue-1921", agent_id);
+        session.runtime_target = runtime_target;
+        session.tool_version = Some(selector.to_string());
+        session.tool_version_selector = Some(selector.to_string());
+        session.launch_command = launch_command.to_string();
+        session.launch_args = launch_args.into_iter().map(str::to_string).collect();
+
+        let config = super::launch_config_from_persisted_session(&session);
+
+        assert_eq!(config.command, command, "{:?}", config.args);
+        assert!(
+            config.args.iter().all(|arg| !arg.contains(selector)),
+            "the stored selector must not reach the launch: {:?}",
+            config.args
+        );
+        assert_eq!(config.tool_version, None, "{command}");
+    }
 }
 
 #[test]
@@ -45710,7 +45762,6 @@ fn app_runtime_select_and_save_profile_broadcasts_snapshot_to_profile_windows() 
             name: "Stale detection".into(),
             available: false,
             installed_version: None,
-            versions: Vec::new(),
             custom_agent: None,
         }],
     );
@@ -53022,7 +53073,6 @@ fn monitor_relaunch_fixture_with_settlement(
         name: "Claude Code".to_string(),
         available: true,
         installed_version: Some("latest".to_string()),
-        versions: vec!["latest".to_string()],
         custom_agent: None,
     });
     runtime.launch_wizard_cache =
@@ -53148,7 +53198,6 @@ fn convert_monitor_relaunch_fixture_to_grok(
             name: "Claude Code".to_string(),
             available: true,
             installed_version: Some("latest".to_string()),
-            versions: vec!["latest".to_string()],
             custom_agent: None,
         },
         gwt::AgentOption {
@@ -53156,7 +53205,6 @@ fn convert_monitor_relaunch_fixture_to_grok(
             name: "Grok Build".to_string(),
             available: true,
             installed_version: Some("latest".to_string()),
-            versions: vec!["latest".to_string()],
             custom_agent: None,
         },
     ]);
@@ -55987,7 +56035,6 @@ fn app_runtime_issue_monitor_auto_launch_prefers_saved_profile() {
         name: "Claude Code".to_string(),
         available: true,
         installed_version: Some("latest".to_string()),
-        versions: vec!["latest".to_string()],
         custom_agent: None,
     });
     runtime.launch_wizard_cache = LaunchWizardMemoryCache::load_with_agent_options(
@@ -56117,7 +56164,6 @@ fn app_runtime_issue_monitor_auto_launch_skips_a_held_candidate_and_reports_why(
         name: "Claude Code".to_string(),
         available: true,
         installed_version: Some("latest".to_string()),
-        versions: vec!["latest".to_string()],
         custom_agent: None,
     });
     runtime.launch_wizard_cache = LaunchWizardMemoryCache::load_with_agent_options(
@@ -70468,6 +70514,39 @@ fn pm_process_launch_isolates_discovery_and_keeps_project_data_readable() {
         session.agent_session_id = Some("pm-isolation-resume".into());
         session.save(&sessions).unwrap();
         previous = Some(session);
+    }
+}
+
+/// SPEC-1921 AS-1921-D (AC-1921-L6): a PM profile saved with a version
+/// selector still starts the PM, on the resolved executable. The stored value
+/// is left in the profile and is not read at launch.
+#[test]
+fn pm_launch_config_reads_a_stored_version_selector_as_installed() {
+    let worktree = std::path::Path::new("/tmp/pm-worktree");
+    for (agent_id, version, command) in [
+        ("grok", "latest", "grok"),
+        ("grok", "1.0.3", "grok"),
+        ("codex", "0.121.0", "codex"),
+    ] {
+        let config = AppRuntime::pm_launch_config(
+            worktree,
+            &gwt::pm_registry::PmLaunchProfile {
+                agent_id: agent_id.to_string(),
+                model: None,
+                reasoning: None,
+                version: Some(version.to_string()),
+            },
+        );
+        assert_eq!(config.command, command, "{:?}", config.args);
+        assert!(
+            config
+                .args
+                .iter()
+                .all(|arg| !arg.ends_with(&format!("@{version}"))),
+            "the stored selector must not reach the launch: {:?}",
+            config.args
+        );
+        assert_eq!(config.tool_version, None, "{agent_id}@{version}");
     }
 }
 

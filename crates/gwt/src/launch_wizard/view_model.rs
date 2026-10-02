@@ -74,8 +74,6 @@ impl LaunchWizardState {
             docker_lifecycle_options: self.docker_lifecycle_options_view(),
             selected_docker_lifecycle: docker_lifecycle_value(self.docker_lifecycle_intent)
                 .to_string(),
-            version_options: self.version_options_view(),
-            selected_version: self.version.clone(),
             execution_mode_options: execution_mode_options_view(
                 self.current_agent_supports_resume_picker(),
             ),
@@ -94,9 +92,6 @@ impl LaunchWizardState {
                 && self.docker_service_prompt_required(),
             show_docker_lifecycle: self.runtime_target == gwt_agent::LaunchRuntimeTarget::Docker
                 && show_runtime_confirmation,
-            show_version: show_manual_setup
-                && self.launch_target_is_agent()
-                && agent_has_npm_package(self.effective_agent_id()),
             show_execution_mode: false,
             // Issue #3462: the toggle stays visible for Resume / Continue so
             // the inherited preference is both editable and honored.
@@ -339,7 +334,12 @@ impl LaunchWizardState {
         if !show_manual_setup || !self.launch_target_is_agent() {
             return None;
         }
-        let agent = self.selected_agent()?;
+        let Some(agent) = self.selected_agent() else {
+            return self
+                .detected_agents
+                .is_empty()
+                .then(no_detected_agent_setup_view);
+        };
         let affordance = self.agent_setup_affordance_for(agent)?;
         Some(LaunchWizardAgentSetupView {
             agent_id: agent.id.clone(),
@@ -420,18 +420,6 @@ impl LaunchWizardState {
             .collect()
     }
 
-    fn version_options_view(&self) -> Vec<LaunchWizardOptionView> {
-        self.current_version_options()
-            .into_iter()
-            .map(|option| LaunchWizardOptionView {
-                value: option.value,
-                label: option.label,
-                description: Some("Tool version".to_string()),
-                color: None,
-            })
-            .collect()
-    }
-
     fn launch_summary_view(&self) -> Vec<LaunchWizardSummaryView> {
         let mut summary = if self.wizard_mode == LaunchWizardMode::StartWork {
             vec![LaunchWizardSummaryView {
@@ -476,10 +464,15 @@ impl LaunchWizardState {
                     value: reasoning.to_string(),
                 });
             }
-            if !self.version.is_empty() {
+            // The wizard launches the resolved executable, so the row names
+            // the version detected for it rather than a selectable choice.
+            if let Some(version) = self
+                .selected_agent()
+                .and_then(|agent| agent.installed_version.as_deref())
+            {
                 summary.push(LaunchWizardSummaryView {
                     label: "Version".to_string(),
-                    value: self.version.clone(),
+                    value: version.to_string(),
                 });
             }
         }
@@ -835,16 +828,6 @@ impl LaunchWizardState {
                     color: None,
                 })
                 .collect(),
-            LaunchWizardStep::VersionSelect => self
-                .current_version_options()
-                .into_iter()
-                .map(|option| LaunchWizardOptionView {
-                    value: option.value,
-                    label: option.label,
-                    description: Some("Tool version".to_string()),
-                    color: None,
-                })
-                .collect(),
             LaunchWizardStep::ExecutionMode => {
                 execution_mode_options_view(self.current_agent_supports_resume_picker())
             }
@@ -887,7 +870,6 @@ mod tests {
             name: "Grok Build".to_string(),
             available: true,
             installed_version: Some("1.0.3".to_string()),
-            versions: vec!["1.0.3".to_string()],
             custom_agent: None,
         });
         let mut state = LaunchWizardState::open_with(
@@ -1265,10 +1247,6 @@ mod tests {
         let view = state.view();
         assert!(!view.show_execution_mode);
         assert!(!view.launch_summary.iter().any(|item| item.label == "Mode"));
-        assert_eq!(
-            next_step(LaunchWizardStep::VersionSelect, &state),
-            Some(LaunchWizardStep::SkipPermissions)
-        );
 
         // Legacy protocol input may still arrive from an old frontend or a
         // persisted draft, but Manual setup is a new-session path.
@@ -1312,7 +1290,6 @@ mod tests {
             name: "Proxy Agent".to_string(),
             available: true,
             installed_version: Some("1.0.0".to_string()),
-            versions: Vec::new(),
             custom_agent: Some(sample_custom_agent(
                 "proxy-agent",
                 "Proxy Agent",
@@ -1534,7 +1511,6 @@ mod tests {
             agent_id: "claude".to_string(),
             model: Some("Default (Opus 4.8)".to_string()),
             reasoning: Some("max".to_string()),
-            version: Some("latest".to_string()),
             session_mode: gwt_agent::SessionMode::Normal,
             skip_permissions: true,
             fast_mode: false,
@@ -1614,7 +1590,6 @@ mod tests {
                 tool_label: "Codex".to_string(),
                 model: Some("gpt-5.5".to_string()),
                 reasoning: Some("high".to_string()),
-                version: Some("0.110.0".to_string()),
                 resume_session_id: Some("resume-1".to_string()),
                 live_window_id: None,
                 skip_permissions: true,
@@ -1633,7 +1608,6 @@ mod tests {
         assert_eq!(state.agent_id, "codex");
         assert_eq!(state.model, "gpt-5.5");
         assert_eq!(state.reasoning, "high");
-        assert_eq!(state.version, "0.110.0");
         assert_eq!(state.mode, "resume");
         assert_eq!(state.resume_session_id.as_deref(), Some("resume-1"));
         assert_eq!(state.runtime_target, gwt_agent::LaunchRuntimeTarget::Docker);
@@ -1654,7 +1628,6 @@ mod tests {
                 tool_label: "Codex".to_string(),
                 model: Some("gpt-5.2-codex".to_string()),
                 reasoning: Some("high".to_string()),
-                version: Some("0.110.0".to_string()),
                 resume_session_id: Some("resume-1".to_string()),
                 live_window_id: None,
                 skip_permissions: true,
@@ -1715,7 +1688,6 @@ mod tests {
                 tool_label: "Codex".to_string(),
                 model: Some("gpt-5.5".to_string()),
                 reasoning: Some("high".to_string()),
-                version: Some("0.110.0".to_string()),
                 resume_session_id: Some("resume-1".to_string()),
                 live_window_id: None,
                 skip_permissions: true,
@@ -1790,7 +1762,6 @@ mod tests {
                 tool_label: "Codex".to_string(),
                 model: Some("gpt-5.5".to_string()),
                 reasoning: Some("high".to_string()),
-                version: Some("0.110.0".to_string()),
                 resume_session_id: Some("resume-1".to_string()),
                 live_window_id: None,
                 skip_permissions: true,
@@ -1832,7 +1803,6 @@ mod tests {
                 tool_label: "Codex".to_string(),
                 model: Some("gpt-5.5".to_string()),
                 reasoning: Some("high".to_string()),
-                version: Some("0.110.0".to_string()),
                 resume_session_id: None,
                 live_window_id: None,
                 skip_permissions: true,
@@ -1890,9 +1860,6 @@ mod tests {
         state.apply(LaunchWizardAction::SetRuntimeTarget {
             target: gwt_agent::LaunchRuntimeTarget::Host,
         });
-        state.apply(LaunchWizardAction::SetVersion {
-            version: "0.110.0".to_string(),
-        });
         state.apply(LaunchWizardAction::SetSkipPermissions { enabled: true });
         state.apply(LaunchWizardAction::SetCodexFastMode { enabled: true });
 
@@ -1903,9 +1870,7 @@ mod tests {
         assert_eq!(view.selected_model, "gpt-5.5");
         assert_eq!(view.selected_reasoning, "high");
         assert_eq!(view.selected_runtime_target, "host");
-        assert_eq!(view.selected_version, "0.110.0");
         assert!(view.show_reasoning);
-        assert!(view.show_version);
         assert!(view.show_codex_fast_mode);
         assert!(view
             .launch_summary
@@ -1988,15 +1953,6 @@ mod tests {
         assert_eq!(
             state.error.as_deref(),
             Some("Docker lifecycle option is unavailable")
-        );
-
-        state.error = None;
-        state.set_version("0.110.0");
-        assert_eq!(state.version, "0.110.0");
-        state.set_version("definitely-missing");
-        assert_eq!(
-            state.error.as_deref(),
-            Some("Version option is unavailable")
         );
 
         state.resume_session_id = Some("resume-2".to_string());
@@ -2093,11 +2049,6 @@ mod tests {
         state.step = LaunchWizardStep::DockerLifecycle;
         state.selected = 0;
         state.apply_selection();
-
-        state.step = LaunchWizardStep::VersionSelect;
-        state.selected = 0;
-        state.apply_selection();
-        assert!(!state.version.is_empty());
 
         state.step = LaunchWizardStep::ExecutionMode;
         state.selected = 1;
@@ -2213,7 +2164,6 @@ mod tests {
             context(branch("feature/gui"), "feature/gui"),
             build_agent_options(
                 Vec::new(),
-                &gwt_agent::VersionCache::new(),
                 vec![sample_custom_agent(
                     "proxy-agent",
                     "Claude Proxy",
@@ -2228,7 +2178,6 @@ mod tests {
                 tool_label: "Claude Proxy".to_string(),
                 model: None,
                 reasoning: None,
-                version: None,
                 resume_session_id: Some("resume-1".to_string()),
                 live_window_id: None,
                 skip_permissions: true,
@@ -2924,16 +2873,7 @@ mod tests {
         assert_eq!(state.current_options()[0].value, "create_and_start");
 
         state.context.docker_service_status = gwt_docker::ComposeServiceStatus::Running;
-        state.agent_id = "missing".to_string();
-        state.step = LaunchWizardStep::VersionSelect;
-        assert!(state.current_options().is_empty());
-
         state.agent_id = "codex".to_string();
-        state.version = "0.110.0".to_string();
-        assert!(state
-            .current_options()
-            .iter()
-            .any(|option| option.value == "0.110.0" || option.value == "latest"));
 
         state.step = LaunchWizardStep::ExecutionMode;
         assert!(state
@@ -3107,7 +3047,6 @@ mod tests {
             agent_id: "claude".to_string(),
             model: Some(model.to_string()),
             reasoning: None,
-            version: Some("latest".to_string()),
             session_mode: gwt_agent::SessionMode::Normal,
             skip_permissions: false,
             fast_mode: false,
@@ -3167,5 +3106,36 @@ mod tests {
                 "fallback notice must name the Default row: {notice}"
             );
         }
+    }
+
+    /// SPEC-1921 AS-1921-A (AC-1921-L1): the view carries no version choice.
+    /// The summary still names the detected version, so the operator can read
+    /// which version starts before launching.
+    #[test]
+    fn view_offers_no_version_choice_and_reports_the_detected_version() {
+        let mut state = LaunchWizardState::open_with(
+            context(branch("feature/gui"), "feature/gui"),
+            sample_agent_options(),
+            Vec::new(),
+        );
+        state.mark_runtime_context_unresolved();
+        state.apply(LaunchWizardAction::UseStartMethod {
+            method: LaunchWizardStartMethodKind::ConfigureAndStart,
+        });
+        state.apply(LaunchWizardAction::SetAgent {
+            agent_id: "codex".to_string(),
+        });
+
+        let view = state.view();
+        let wire = serde_json::to_value(&view).expect("serialize view");
+        for key in ["version_options", "selected_version", "show_version"] {
+            assert!(wire.get(key).is_none(), "{key} must not be sent");
+        }
+        let version = view
+            .launch_summary
+            .iter()
+            .find(|entry| entry.label == "Version")
+            .expect("detected version row");
+        assert_eq!(version.value, "0.110.0");
     }
 }
