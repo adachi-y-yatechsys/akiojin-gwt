@@ -87,6 +87,24 @@ download marker、Windows Installer の `msiexec` verbose log、インストー�
 curl -fsSL https://raw.githubusercontent.com/akiojin/gwt/main/installers/macos/uninstall.sh | bash
 ```
 
+### アップグレード下限
+
+一回限りの移行処理を廃止する際の upgrade floor は **v9.72.1** です。
+2026-10-02 の変更日から60日前、2026-08-03 UTC 時点の最新リリースを基準にしています。
+それより古い環境では、先に [v9.106.0](https://github.com/akiojin/gwt/releases/tag/v9.106.0)
+をインストールし、各プロジェクトを開いて既存の移行を実行してから新しい版に更新してください。
+更新前に gwt の設定とプロジェクト状態をバックアップしてください。
+
+旧 Claude Code backend 行は例外で、公開版の起動経路から自動移行が呼ばれていませんでした。
+**旧 backend 設定は自動移行されません。Settings で provider を再登録してください**
+Settings → Agent Backends で旧設定の endpoint・API key・model を再登録し、
+組み込みの Claude Code と登録した backend を選択してください。
+旧設定は引き続き読み取り可能で、起動時に書き換えたり削除したりしません。
+
+floor 以降に追加された Session schema 5、PM scratch の移行は維持します。
+usage の `window_minutes` 契約と、未完了の SPEC #2359 に属する Workspace projection
+backfill も維持します。
+
 ## 前提
 
 - `PATH` 上で `git` が使えること

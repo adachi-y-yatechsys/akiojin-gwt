@@ -3,6 +3,10 @@
 All notable changes to this project will be documented in this file.
 ## [9.107.0] - 2026-10-01
 
+### Upgrade Notes
+
+- **migration:** 一回限り移行の upgrade floor は v9.72.1（2026-08-03 UTC、変更日の60日前）。古い環境は先に v9.106.0 で各プロジェクトを開いてから更新してください。旧 Claude Code backend 行の未使用の自動移行は廃止しました。旧 backend 設定は自動移行されません。Settings で provider を再登録してください。旧設定は保持されます。
+
 ### Bug Fixes
 
 - **startup:** 更新再開時の重複Gitと同期起動準備を削減
