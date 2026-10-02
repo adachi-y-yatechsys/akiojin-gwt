@@ -652,6 +652,10 @@ and coordination-event summaries.
 - Whether `.codex/hooks.json` is version-controlled is a repository decision.
   When the file already exists, gwt replaces only gwt-managed hook entries and
   keeps user hooks plus unrelated top-level settings.
+- The gwt repository itself ignores `.codex/hooks.json` and generates it locally
+  when gwt prepares an agent session. Windows uses a PowerShell EncodedCommand;
+  macOS and Linux use a POSIX shell command. Keeping this generated file untracked
+  prevents platform-specific changes from dirtying the checkout.
 - A version-controlled `.codex/hooks.json` should keep the portable `gwtd`
   fallback so a machine-local absolute path is never committed. Regenerate it
   with

@@ -113,6 +113,8 @@ pub struct ManagedHookRepairOutcome {
 struct RuntimeStateReadModel {
     pub status: String,
     pub updated_at: String,
+    // Keep the required string in the input contract even though health does not
+    // read it; removing it would accept missing or incorrectly typed runtime state.
     #[allow(dead_code)]
     pub last_activity_at: String,
     #[serde(default)]

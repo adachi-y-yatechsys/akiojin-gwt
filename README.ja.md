@@ -596,6 +596,10 @@ Board reminders、discussion/plan/build Stop checks、coordination-event summari
 - `.codex/hooks.json` を version 管理するかどうかはリポジトリ側の決定です。
   ファイルが既に存在する場合、gwt は gwt-managed hook エントリだけを差し替え、
   user hook と無関係な top-level 設定は保持します。
+- gwt リポジトリ自身では `.codex/hooks.json` を Git 除外し、gwt がエージェント
+  セッションを準備するときにローカルで生成します。Windows は PowerShell の
+  EncodedCommand、macOS / Linux は POSIX shell のコマンドを使用します。
+  この生成ファイルを追跡しないことで、OS による違いが作業ツリーの差分に残るのを防ぎます。
 - version 管理する場合は移植可能な `gwtd` fallback を維持し、マシンローカルの
   絶対パスをコミットしないでください。再生成は
   `GWT_HOOK_BIN=gwtd cargo run -p gwt-skills --example regenerate_hook_settings -- worktree-local`

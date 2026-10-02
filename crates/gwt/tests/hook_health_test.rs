@@ -1222,60 +1222,45 @@ fn managed_hook_health_resolves_bare_fallback_without_the_process_path() {
     );
 }
 
-/// #3474 root cause 1: `.codex/hooks.json` is version-controlled in THIS repo
-/// (a repository decision gwt deliberately leaves to the project — see the
-/// README "Hook file ownership" contract), so the committed copy is the one a
-/// fresh clone and any gwt-external Codex run uses. It must stay on the guarded
-/// template and must never pin a machine-local build output.
+/// #3810 AC-6: this repository keeps host-specific Codex hooks local.
+/// Other projects remain free to track their own hook configuration.
 #[test]
-fn committed_codex_hooks_stay_guarded_and_portable() {
+fn repo_codex_hooks_are_untracked_and_ignored() {
+    let _env_lock = env_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
         .expect("repo root")
         .to_path_buf();
-    let hooks_path = repo_root.join(".codex/hooks.json");
-    let rendered = fs::read_to_string(&hooks_path).expect("read committed codex hooks");
-    let root: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
-
-    let mut managed = 0usize;
-    for (event, groups) in root["hooks"].as_object().expect("hooks object") {
-        for command in groups
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|group| group.get("hooks").and_then(|hooks| hooks.as_array()))
-            .flatten()
-            .filter_map(|hook| hook.get("command").and_then(|command| command.as_str()))
-        {
-            if !command.contains(&format!("hook event {event}")) {
-                continue;
-            }
-            managed += 1;
-            assert!(
-                command.contains("command -v"),
-                "{event} still uses the unguarded legacy template: {command}"
-            );
-            // #4044 (AC-3): the committed fallback must be the canonical bare
-            // `gwtd`. Any absolute path — a worktree build output OR an
-            // installed `/Applications/GWT.app/...` (PR #4005) — exists on one
-            // machine only, and the generator rewrites a tracked config to the
-            // canonical form, so a committed absolute path leaves every other
-            // checkout permanently dirty after its first materialization.
-            assert!(
-                command.contains("gwt_bin='gwtd'"),
-                "{event} must commit the canonical `gwtd` fallback, not an absolute path: {command}"
-            );
-        }
-    }
-    assert_eq!(managed, 5, "every managed event must be committed");
+    let tracked = gwt_core::process::hidden_command("git")
+        .arg("-C")
+        .arg(&repo_root)
+        .args(["ls-files", "--", ".codex/hooks.json"])
+        .output()
+        .expect("inspect tracked hook configuration");
+    assert!(tracked.status.success(), "{tracked:?}");
     assert!(
-        !rendered.contains("/target/debug/") && !rendered.contains("\\\\target\\\\debug\\\\"),
-        "a machine-local build output must never be committed: {rendered}"
+        tracked.stdout.is_empty(),
+        "host-specific .codex/hooks.json must not be tracked"
     );
+    let ignored = gwt_core::process::hidden_command("git")
+        .arg("-C")
+        .arg(&repo_root)
+        .args([
+            "check-ignore",
+            "--no-index",
+            "-v",
+            "--",
+            ".codex/hooks.json",
+        ])
+        .output()
+        .expect("inspect repository hook exclusion");
+    assert!(ignored.status.success(), "{ignored:?}");
     assert!(
-        !rendered.contains("/Applications/") && !rendered.contains("gwt_bin='/"),
-        "an absolute install path must never be committed: {rendered}"
+        String::from_utf8_lossy(&ignored.stdout).starts_with(".gitignore:"),
+        "the repository must ignore generated hooks without machine-local exclusions: {ignored:?}"
     );
 }
 
