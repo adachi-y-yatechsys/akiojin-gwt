@@ -1550,7 +1550,7 @@ fn autonomous_eligibility_candidates<'a>(
                 .inbox_item(issue.number)
                 .is_some_and(|item| item.state == MonitorInboxState::Queued)
         })
-        .filter(|issue| monitor.retry_ready(issue.number, now))
+        .filter(|issue| monitor.retry_ready_for_saved_profile(issue.number, now))
         .collect()
 }
 

@@ -2531,14 +2531,14 @@ fn apply_routine_issue_monitor_control(
             agent_id,
         } => {
             monitor.record_autonomous_heartbeat(issue_number, &at);
-            // Issue #4366 AC-4: activity on a held provider can release it,
-            // and a released hold readmits Issues, so that case scans.
-            agent_id.is_some_and(|agent_id| {
-                monitor.record_provider_activity(issue_number, &agent_id, &at)
-            })
+            // Heartbeats are liveness evidence, not provider quota recovery.
+            let _ = agent_id;
+            false
         }
         IssueMonitorControl::QuotaHoldReverify { provider, at } => {
-            monitor.hasten_provider_quota_reverification(&provider, &at)
+            // Accept messages from older GUIs without reopening quota holds.
+            tracing::debug!(%provider, %at, "ignored retired quota re-verification request");
+            false
         }
         IssueMonitorControl::WaitDeclared {
             issue_number,
@@ -9758,7 +9758,6 @@ exit 0
     /// human handoff.
     #[test]
     fn a_provider_usage_limit_control_holds_the_issue_instead_of_failing_it() {
-        let _quota_hold = crate::issue_monitor::hold_provider_quota_on_first_failure_in_this_test();
         let mut monitor = crate::IssueMonitorState::with_prefs(
             crate::IssueMonitorConfig {
                 enabled: true,
@@ -9843,7 +9842,6 @@ exit 0
     /// after reset.
     #[test]
     fn a_provider_usage_limit_control_gates_claim_planning_until_reset() {
-        let _quota_hold = crate::issue_monitor::hold_provider_quota_on_first_failure_in_this_test();
         let mut profile = sample_issue_monitor_profile();
         profile.agent_id = "codex".to_string();
         let mut monitor = crate::IssueMonitorState::with_prefs(
@@ -9963,7 +9961,6 @@ exit 0
 
     #[test]
     fn typed_provider_usage_limit_primary_path_preserves_the_reported_provider() {
-        let _quota_hold = crate::issue_monitor::hold_provider_quota_on_first_failure_in_this_test();
         let mut monitor = crate::IssueMonitorState::with_prefs(
             crate::IssueMonitorConfig {
                 enabled: true,
@@ -10031,7 +10028,6 @@ exit 0
 
     #[test]
     fn typed_provider_usage_limit_routine_defense_preserves_the_reported_provider() {
-        let _quota_hold = crate::issue_monitor::hold_provider_quota_on_first_failure_in_this_test();
         let mut monitor = crate::IssueMonitorState::with_prefs(
             crate::IssueMonitorConfig {
                 enabled: true,
