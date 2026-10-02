@@ -1,6 +1,7 @@
 //! Agent detection: discover installed coding agents via PATH lookup.
 
 use std::{
+    collections::HashMap,
     ffi::OsStr,
     io::Read,
     path::{Path, PathBuf},
@@ -113,6 +114,41 @@ impl AgentDetector {
         })
     }
 
+    /// Probe the executable selected by the final Host launch environment.
+    /// Environment overrides/removals and relative PATH entries affect only
+    /// this child; the process-global environment is never changed.
+    pub fn detect_by_command_with_environment(
+        command: &str,
+        env: &HashMap<String, String>,
+        remove_env: &[String],
+        cwd: Option<&Path>,
+    ) -> Option<DetectedAgent> {
+        let executable =
+            crate::launch::resolve_direct_runner_with_effective_env(command, env, remove_env, cwd)?;
+        let descriptor = builtin_agent_descriptor_for_command(command);
+        let env: Vec<_> = env
+            .iter()
+            .map(|(key, value)| (key.as_str(), OsStr::new(value)))
+            .collect();
+        let (version, resolved_path) = Self::fetch_version_with_environment(
+            &executable,
+            descriptor.map_or("--version", |descriptor| descriptor.version_flag),
+            descriptor.map_or(&[], |descriptor| descriptor.version_prefix_args),
+            &env,
+            remove_env,
+            cwd,
+        )
+        .ok()?;
+        Some(DetectedAgent {
+            agent_id: descriptor.map_or_else(
+                || AgentId::Custom(command.into()),
+                |descriptor| descriptor.id.clone(),
+            ),
+            version,
+            path: resolved_path,
+        })
+    }
+
     fn detect_one(probe: &AgentProbe) -> Option<DetectedAgent> {
         let (version, resolved_path) =
             Self::fetch_version(probe.command, probe.version_flag, probe.prefix_args, &[]).ok()?;
@@ -139,12 +175,29 @@ impl AgentDetector {
         prefix_args: &[&str],
         env: &[(&str, &OsStr)],
     ) -> Result<(Option<String>, PathBuf), String> {
-        let request = env.iter().fold(
+        Self::fetch_version_with_environment(command, version_flag, prefix_args, env, &[], None)
+    }
+
+    fn fetch_version_with_environment(
+        command: &str,
+        version_flag: &str,
+        prefix_args: &[&str],
+        env: &[(&str, &OsStr)],
+        remove_env: &[String],
+        cwd: Option<&Path>,
+    ) -> Result<(Option<String>, PathBuf), String> {
+        let mut request = env.iter().fold(
             gwt_core::process::ProcessPlanRequest::new(command)
                 .args(prefix_args)
                 .arg(version_flag),
             |request, (key, value)| request.env(key, value),
         );
+        for key in remove_env {
+            request = request.env_remove(key);
+        }
+        if let Some(cwd) = cwd {
+            request = request.current_dir(cwd);
+        }
         let mut cmd = gwt_core::process::resolved_command(request).map_err(|error| {
             debug!(command, error = %error, "Agent version probe resolution failed");
             error.to_string()
@@ -247,6 +300,33 @@ mod tests {
     #[test]
     fn detect_by_command_nonexistent() {
         assert!(AgentDetector::detect_by_command("gwt_nonexistent_agent_xyz").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detection_uses_launch_path_cwd_and_environment_removals() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        for (directory, version) in [("old", "2.1.153"), ("new", "2.1.156")] {
+            let bin = temp.path().join(directory);
+            std::fs::create_dir(&bin).unwrap();
+            let executable = bin.join("claude");
+            std::fs::write(
+                &executable,
+                format!("#!/bin/sh\nprintf '{version}%s\\n' \"${{HOME-}}\"\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let detected = AgentDetector::detect_by_command_with_environment(
+                "claude",
+                &HashMap::from([("PATH".into(), directory.into())]),
+                &["HOME".into()],
+                Some(temp.path()),
+            )
+            .expect("fixture CLI is detected");
+            assert_eq!(detected.version.as_deref(), Some(version));
+            assert_eq!(detected.path, executable);
+        }
     }
 
     #[cfg(windows)]
