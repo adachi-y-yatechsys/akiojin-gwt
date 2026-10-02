@@ -434,8 +434,10 @@ provider's latest usage reading under `provider_usage`, or why there is none.
 Every rate-limit refusal immediately holds its provider. If all candidates
 are held, the queue resumes at the earliest known reset; if every reset is
 unknown, `needs_human_fleet` reports `launch_candidates_exhausted` instead
-of periodically retrying. Saving Agent settings for a second provider
-in the GUI appends it to the same pool. All operations accept an optional
+of periodically retrying. In the GUI, the Issue Monitor settings form
+(`⚙ Settings`) lists the same pool as Agent Settings sets: `＋` adds a set, `−`
+removes one, the arrows reorder them, and the saved order is the launch order.
+All operations accept an optional
 `project_root` and otherwise target the current worktree. Priority and
 daemon-absent configuration changes become visible to running instances on the
 next scan/rebase.
