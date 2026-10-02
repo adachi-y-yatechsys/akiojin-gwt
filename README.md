@@ -406,8 +406,10 @@ candidates the Monitor launches each Issue with the first eligible candidate
 (rate-limit holds, the usage threshold, and `prefer_for` routing decide
 eligibility; the exact rules are specified in SPEC
 [#3914](https://github.com/akiojin/gwt/issues/3914)), so one rate-limited
-provider no longer stops the queue. Saving Agent settings for a second provider
-in the GUI appends it to the same pool. All operations accept an optional
+provider no longer stops the queue. In the GUI, the Issue Monitor settings form
+(`⚙ Settings`) lists the same pool as Agent Settings sets: `＋` adds a set, `−`
+removes one, the arrows reorder them, and the saved order is the launch order.
+All operations accept an optional
 `project_root` and otherwise target the current worktree. Priority and
 daemon-absent configuration changes become visible to running instances on the
 next scan/rebase.

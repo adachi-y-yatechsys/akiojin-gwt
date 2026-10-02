@@ -55445,6 +55445,7 @@ fn app_runtime_issue_monitor_profile_save_switches_the_pool_head() {
             client_id: "client-1".to_string(),
             issue_number: None,
             pool: seeded.launch_profile_pool(),
+            sets: None,
         },
         request,
     );
@@ -55467,10 +55468,12 @@ fn app_runtime_issue_monitor_profile_save_switches_the_pool_head() {
 }
 
 #[test]
-fn app_runtime_issue_monitor_configure_profile_previews_the_pool_head_replacement() {
-    // Issue #4079 AC-2: with more than one provider in the pool the form must
-    // say which candidate the save writes, and its preview of the resulting
-    // pool summary must be what the Monitor reports afterwards.
+fn app_runtime_issue_monitor_configure_issue_previews_the_pool_head_replacement() {
+    // Issue #4079 AC-2: with more than one provider in the pool the per-Issue
+    // form must say which candidate the save writes, and its preview of the
+    // resulting pool summary must be what the Monitor reports afterwards.
+    // (Issue #4911: the settings form edits every set instead; this form still
+    // switches the head.)
     let _env_lock = env_test_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -55479,7 +55482,7 @@ fn app_runtime_issue_monitor_configure_profile_previews_the_pool_head_replacemen
     let _userprofile = ScopedEnvVar::set("USERPROFILE", temp.path());
     let repo = temp.path().join("repo");
     fs::create_dir_all(&repo).expect("create repo");
-    init_repo(&repo);
+    init_repo_with_initial_commit(&repo);
     let prefs_path = gwt::issue_monitor_prefs_path_for_repo_path(&repo);
     let mut seeded = gwt::IssueMonitorPrefs::default();
     seeded.set_launch_profile_pool(vec![pool_profile("claude"), pool_profile("codex")]);
@@ -55490,7 +55493,10 @@ fn app_runtime_issue_monitor_configure_profile_previews_the_pool_head_replacemen
 
     let events = runtime.handle_frontend_event(
         "client-1".to_string(),
-        FrontendEvent::IssueMonitorConfigureProfile,
+        FrontendEvent::IssueMonitorConfigureIssue {
+            issue_number: 3165,
+            linked_issue_kind: Some(LinkedIssueKind::Spec),
+        },
     );
     let view = events
         .iter()
@@ -55606,17 +55612,22 @@ fn app_runtime_issue_monitor_configure_profile_shows_the_saved_head_while_it_is_
             _ => None,
         })
         .expect("launch wizard view");
-    let impact = view
-        .issue_monitor_pool_impact
+    let pool = view
+        .issue_monitor_pool
         .as_ref()
-        .expect("Agent Settings previews its effect on the candidate pool");
+        .expect("Agent Settings lists the saved candidates as its sets");
+    assert_eq!(pool.active_index, 0);
     assert_eq!(
-        impact.agent_id, "codex",
-        "the form opens on the saved head, not on the held fallback: {impact:?}"
+        view.selected_agent_id, "codex",
+        "the form opens on the saved head, not on the held fallback: {pool:?}"
     );
     assert_eq!(
-        impact.replaced_agent_id, None,
-        "saving the form unchanged must not switch the saved head to the fallback: {impact:?}"
+        pool.sets
+            .iter()
+            .map(|set| set.agent_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["codex", "claude"],
+        "saving the form unchanged must not switch the saved head to the fallback: {pool:?}"
     );
     // The agent picker follows the installed agents in this environment, so
     // the profile the form was filled from shows in what the save would
@@ -55626,8 +55637,8 @@ fn app_runtime_issue_monitor_configure_profile_shows_the_saved_head_while_it_is_
             .status_view()
             .launch_profile_summary;
     assert_eq!(
-        impact.resulting_summary, saved_summary,
-        "the form must open on the saved head's own model and reasoning: {impact:?}"
+        pool.resulting_summary, saved_summary,
+        "the form must open on the saved head's own model and reasoning: {pool:?}"
     );
 }
 
@@ -55790,6 +55801,382 @@ fn app_runtime_issue_monitor_configure_profile_saves_global_profile_without_laun
     );
 }
 
+fn agent_settings_option(id: &str, name: &str) -> gwt::AgentOption {
+    gwt::AgentOption {
+        id: id.to_string(),
+        name: name.to_string(),
+        available: true,
+        installed_version: Some("latest".to_string()),
+        versions: vec!["latest".to_string()],
+        custom_agent: None,
+    }
+}
+
+/// Issue #4911: a runtime whose Launch Wizard offers three agents, with the
+/// Agent Settings form opened on the seeded candidate pool.
+fn open_agent_settings_sets(
+    temp: &Path,
+    repo: &Path,
+    pool: Vec<gwt::IssueMonitorLaunchProfile>,
+) -> (AppRuntime, Arc<Mutex<Vec<UserEvent>>>, Vec<OutboundEvent>) {
+    let mut seeded = gwt::IssueMonitorPrefs::default();
+    seeded.set_launch_profile_pool(pool);
+    gwt::save_issue_monitor_prefs(&gwt::issue_monitor_prefs_path_for_repo_path(repo), &seeded)
+        .expect("seed pool");
+    let tab = sample_project_tab("tab-1", "Repo", repo.to_path_buf(), ProjectKind::Git, &[]);
+    let (mut runtime, recorded_events) = sample_runtime_with_events(temp, vec![tab], Some("tab-1"));
+    runtime.launch_wizard_cache = LaunchWizardMemoryCache::load_with_agent_options(
+        &temp.join("sessions"),
+        vec![
+            agent_settings_option("codex", "Codex"),
+            agent_settings_option("claude", "Claude Code"),
+            agent_settings_option("grok", "Grok Build"),
+        ],
+    );
+    let events = runtime.handle_frontend_event(
+        "client-1".to_string(),
+        FrontendEvent::IssueMonitorConfigureProfile,
+    );
+    (runtime, recorded_events, events)
+}
+
+fn agent_settings_view(events: &[OutboundEvent]) -> &gwt::LaunchWizardView {
+    events
+        .iter()
+        .find_map(|event| match &event.event {
+            BackendEvent::LaunchWizardState {
+                wizard: Some(wizard),
+            } => Some(wizard.as_ref()),
+            _ => None,
+        })
+        .expect("launch wizard view")
+}
+
+fn agent_settings_set_agents(view: &gwt::LaunchWizardView) -> Vec<String> {
+    view.issue_monitor_pool
+        .as_ref()
+        .expect("Agent Settings must list its sets")
+        .sets
+        .iter()
+        .map(|set| set.agent_id.clone())
+        .collect()
+}
+
+/// Settings → Runtime → Confirm → Save, as the operator drives it.
+fn save_agent_settings_sets(
+    runtime: &mut AppRuntime,
+    recorded_events: &Arc<Mutex<Vec<UserEvent>>>,
+) -> Vec<OutboundEvent> {
+    runtime.handle_launch_wizard_action(&runtime.test_context(), LaunchWizardAction::Submit, None);
+    wait_for_recorded_event(
+        "agent settings runtime resolution",
+        recorded_events,
+        |events| {
+            events.iter().any(|event| {
+                matches!(
+                    recorded_project_payload(event),
+                    UserEvent::LaunchWizardRuntimeResolved { .. }
+                )
+            })
+        },
+    );
+    let resolved_event = {
+        let mut events = recorded_events.lock().expect("event log");
+        events
+            .iter()
+            .position(|event| {
+                matches!(
+                    recorded_project_payload(event),
+                    UserEvent::LaunchWizardRuntimeResolved { .. }
+                )
+            })
+            .map(|index| events.remove(index))
+            .expect("runtime resolved event")
+    };
+    let UserEvent::LaunchWizardRuntimeResolved { wizard_id, result } = resolved_event else {
+        unreachable!("matched above")
+    };
+    runtime.handle_launch_wizard_runtime_resolved(wizard_id, *result);
+    runtime.handle_launch_wizard_action(&runtime.test_context(), LaunchWizardAction::Submit, None);
+    runtime.handle_launch_wizard_action(&runtime.test_context(), LaunchWizardAction::Submit, None)
+}
+
+#[test]
+fn app_runtime_issue_monitor_agent_settings_sets_are_added_reordered_and_saved_in_order() {
+    // Issue #4911 AC-1/AC-3/AC-5/AC-7: `＋` adds a set edited through the same
+    // form, a set can be moved to the front, an agent cannot appear twice, and
+    // the save writes the sets in the order `issue.monitor.profiles` reports.
+    let _env_lock = env_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().expect("tempdir");
+    let _home = ScopedEnvVar::set("HOME", temp.path());
+    let _userprofile = ScopedEnvVar::set("USERPROFILE", temp.path());
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    init_repo(&repo);
+    let mut codex = pool_profile("codex");
+    codex.prefer_for = vec!["type:fix".to_string()];
+    let mut claude = pool_profile("claude");
+    claude.skip_permissions = true;
+    let (mut runtime, recorded_events, events) =
+        open_agent_settings_sets(temp.path(), &repo, vec![codex, claude.clone()]);
+
+    let view = agent_settings_view(&events);
+    assert_eq!(agent_settings_set_agents(view), vec!["codex", "claude"]);
+    let pool = view.issue_monitor_pool.as_ref().expect("pool view");
+    assert_eq!(pool.active_index, 0);
+    assert!(pool.remove_disabled_reason.is_none());
+    assert!(pool.add_disabled_reason.is_none());
+
+    // An edit to the open set survives opening another one.
+    runtime.handle_launch_wizard_action(
+        &runtime.test_context(),
+        LaunchWizardAction::SetReasoning {
+            reasoning: "high".to_string(),
+        },
+        None,
+    );
+    let events = runtime.handle_launch_wizard_action(
+        &runtime.test_context(),
+        LaunchWizardAction::AddAgentSettingsSet,
+        None,
+    );
+    let view = agent_settings_view(&events);
+    assert_eq!(
+        agent_settings_set_agents(view),
+        vec!["codex", "claude", "grok"],
+        "the new set takes the first agent no other set uses"
+    );
+    let pool = view.issue_monitor_pool.as_ref().expect("pool view");
+    assert_eq!(pool.active_index, 2, "the new set opens for editing");
+    assert_eq!(view.selected_agent_id, "grok");
+    assert!(
+        pool.add_disabled_reason.is_some(),
+        "every offered agent now has a set: {pool:?}"
+    );
+
+    let events = runtime.handle_launch_wizard_action(
+        &runtime.test_context(),
+        LaunchWizardAction::SetAgent {
+            agent_id: "codex".to_string(),
+        },
+        None,
+    );
+    let view = agent_settings_view(&events);
+    assert!(
+        view.error
+            .as_deref()
+            .is_some_and(|error| error.contains("Agent Settings 1")),
+        "a second set for the same agent is refused and names the set that has it: {:?}",
+        view.error
+    );
+    assert_eq!(view.selected_agent_id, "grok");
+
+    let events = runtime.handle_launch_wizard_action(
+        &runtime.test_context(),
+        LaunchWizardAction::MoveAgentSettingsSet { index: 2, to: 0 },
+        None,
+    );
+    let view = agent_settings_view(&events);
+    assert_eq!(
+        agent_settings_set_agents(view),
+        vec!["grok", "codex", "claude"]
+    );
+    let pool = view.issue_monitor_pool.as_ref().expect("pool view");
+    assert_eq!(pool.active_index, 0, "the open set moves with its form");
+    let previewed_summary = pool.resulting_summary.clone();
+
+    let saved_events = save_agent_settings_sets(&mut runtime, &recorded_events);
+    assert!(saved_events.iter().any(|event| matches!(
+        &event.event,
+        BackendEvent::IssueMonitorToast { message, .. } if message == "Issue Monitor settings saved"
+    )));
+
+    let prefs = gwt::load_issue_monitor_prefs(&gwt::issue_monitor_prefs_path_for_repo_path(&repo))
+        .expect("load prefs");
+    let saved = prefs.launch_profile_pool();
+    assert_eq!(
+        saved
+            .iter()
+            .map(|profile| profile.agent_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["grok", "codex", "claude"],
+        "the set order is the launch candidate order"
+    );
+    assert_eq!(
+        prefs.launch_profile.as_ref().map(|p| p.agent_id.as_str()),
+        Some("grok"),
+        "the first set is what the next launch uses"
+    );
+    assert_eq!(saved[1].reasoning.as_deref(), Some("high"));
+    assert_eq!(
+        saved[1].prefer_for,
+        vec!["type:fix".to_string()],
+        "routing tags stay with the set whose agent did not change"
+    );
+    assert_eq!(saved[2], claude, "a set that was never opened is untouched");
+    let status =
+        gwt::IssueMonitorState::with_prefs(gwt::IssueMonitorConfig::default(), prefs).status_view();
+    assert_eq!(
+        status.launch_profile_summary, previewed_summary,
+        "the form previews the summary the Monitor reports after the save"
+    );
+    assert_eq!(
+        status
+            .launch_profile_candidates
+            .iter()
+            .map(|candidate| candidate.agent_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["grok", "codex", "claude"]
+    );
+}
+
+#[test]
+fn app_runtime_issue_monitor_agent_settings_keeps_a_runtime_the_form_was_not_asked_about() {
+    // Issue #4911 AC-5: the form only asks where a set runs in its Runtime
+    // step and reads Host before that, so leaving a set for another one must
+    // not turn a saved Docker candidate into a Host one.
+    let _env_lock = env_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().expect("tempdir");
+    let _home = ScopedEnvVar::set("HOME", temp.path());
+    let _userprofile = ScopedEnvVar::set("USERPROFILE", temp.path());
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    init_repo(&repo);
+    let mut codex = pool_profile("codex");
+    codex.runtime_target = gwt_agent::LaunchRuntimeTarget::Docker;
+    codex.docker_service = Some("gwt".to_string());
+    codex.docker_lifecycle_intent = gwt_agent::DockerLifecycleIntent::Restart;
+    let (mut runtime, recorded_events, _events) = open_agent_settings_sets(
+        temp.path(),
+        &repo,
+        vec![codex.clone(), pool_profile("claude")],
+    );
+
+    let events = runtime.handle_launch_wizard_action(
+        &runtime.test_context(),
+        LaunchWizardAction::SelectAgentSettingsSet { index: 1 },
+        None,
+    );
+    let view = agent_settings_view(&events);
+    assert_eq!(view.selected_agent_id, "claude");
+    let pool = view.issue_monitor_pool.as_ref().expect("pool view");
+    assert!(
+        pool.sets[0]
+            .summary
+            .iter()
+            .any(|row| row.label == "Runtime" && row.value == "docker:gwt"),
+        "the set that was left still runs where it was saved to run: {pool:?}"
+    );
+
+    save_agent_settings_sets(&mut runtime, &recorded_events);
+
+    let saved = gwt::load_issue_monitor_prefs(&gwt::issue_monitor_prefs_path_for_repo_path(&repo))
+        .expect("load prefs")
+        .launch_profile_pool();
+    assert_eq!(
+        saved[0], codex,
+        "opening a set and leaving it unedited changes nothing about it"
+    );
+}
+
+#[test]
+fn app_runtime_issue_monitor_agent_settings_keeps_at_least_one_set() {
+    // Issue #4911 AC-2/AC-6: `−` removes a set, but the last one stays and the
+    // form says why.
+    let _env_lock = env_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().expect("tempdir");
+    let _home = ScopedEnvVar::set("HOME", temp.path());
+    let _userprofile = ScopedEnvVar::set("USERPROFILE", temp.path());
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    init_repo(&repo);
+    let (mut runtime, _recorded_events, _events) = open_agent_settings_sets(
+        temp.path(),
+        &repo,
+        vec![pool_profile("codex"), pool_profile("claude")],
+    );
+
+    let events = runtime.handle_launch_wizard_action(
+        &runtime.test_context(),
+        LaunchWizardAction::RemoveAgentSettingsSet { index: 0 },
+        None,
+    );
+    let view = agent_settings_view(&events);
+    assert_eq!(agent_settings_set_agents(view), vec!["claude"]);
+    assert_eq!(
+        view.selected_agent_id, "claude",
+        "removing the open set opens the one that took its place"
+    );
+    let reason = view
+        .issue_monitor_pool
+        .as_ref()
+        .and_then(|pool| pool.remove_disabled_reason.clone())
+        .expect("the last set says why it cannot be removed");
+
+    let events = runtime.handle_launch_wizard_action(
+        &runtime.test_context(),
+        LaunchWizardAction::RemoveAgentSettingsSet { index: 0 },
+        None,
+    );
+    let view = agent_settings_view(&events);
+    assert_eq!(agent_settings_set_agents(view), vec!["claude"]);
+    assert_eq!(view.error.as_deref(), Some(reason.as_str()));
+}
+
+#[test]
+fn app_runtime_issue_monitor_agent_settings_save_refuses_a_pool_changed_elsewhere() {
+    // Issue #4911 AC-8: the form saves the whole pool, so a pool another
+    // window or `issue.monitor.profiles.set` changed meanwhile must not be
+    // overwritten silently.
+    let _env_lock = env_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().expect("tempdir");
+    let _home = ScopedEnvVar::set("HOME", temp.path());
+    let _userprofile = ScopedEnvVar::set("USERPROFILE", temp.path());
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    init_repo(&repo);
+    let (mut runtime, recorded_events, _events) =
+        open_agent_settings_sets(temp.path(), &repo, vec![pool_profile("codex")]);
+
+    let prefs_path = gwt::issue_monitor_prefs_path_for_repo_path(&repo);
+    let mut elsewhere = gwt::load_issue_monitor_prefs(&prefs_path).expect("load prefs");
+    elsewhere.set_launch_profile_pool(vec![pool_profile("claude"), pool_profile("codex")]);
+    gwt::save_issue_monitor_prefs(&prefs_path, &elsewhere).expect("concurrent profiles.set");
+
+    let events = save_agent_settings_sets(&mut runtime, &recorded_events);
+
+    assert!(!events.iter().any(|event| matches!(
+        &event.event,
+        BackendEvent::IssueMonitorToast { message, .. } if message == "Issue Monitor settings saved"
+    )));
+    let view = agent_settings_view(&events);
+    assert!(
+        view.error
+            .as_deref()
+            .is_some_and(|error| error.contains("changed") && error.contains("Nothing was saved")),
+        "the refusal says what happened: {:?}",
+        view.error
+    );
+    let prefs = gwt::load_issue_monitor_prefs(&prefs_path).expect("reload prefs");
+    assert_eq!(
+        prefs
+            .launch_profile_pool()
+            .iter()
+            .map(|profile| profile.agent_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["claude", "codex"],
+        "the concurrent write survives"
+    );
+}
+
 #[test]
 fn app_runtime_issue_monitor_profile_save_reports_authority_epoch_overflow() {
     let _env_lock = env_test_lock()
@@ -55825,6 +56212,7 @@ fn app_runtime_issue_monitor_profile_save_reports_authority_epoch_overflow() {
             client_id: "client-1".to_string(),
             issue_number: None,
             pool: Vec::new(),
+            sets: None,
         },
         request,
     );
@@ -56366,6 +56754,7 @@ fn app_runtime_issue_monitor_profile_save_switches_the_head_to_a_second_provider
             client_id: "client-1".to_string(),
             issue_number: None,
             pool: Vec::new(),
+            sets: None,
         },
         request,
     );
