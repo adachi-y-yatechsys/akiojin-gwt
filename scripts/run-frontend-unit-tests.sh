@@ -72,6 +72,7 @@ bash scripts/run-node-tests-with-linkedom.sh \
   crates/gwt/web/__tests__/socket-receive-dispatcher.test.mjs \
   crates/gwt/web/__tests__/issue-render-sync.test.mjs \
   crates/gwt/web/__tests__/render-degradation-banner.test.mjs \
+  crates/gwt/web/__tests__/workspace-state-notice.test.mjs \
   crates/gwt/web/__tests__/ui-trace-profiler.test.mjs \
   crates/gwt/web/__tests__/ui-trace-wiring.test.mjs \
   crates/gwt/web/__tests__/interaction-guard.test.mjs \
