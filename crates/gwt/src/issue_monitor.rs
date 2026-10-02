@@ -15174,7 +15174,7 @@ impl IssueMonitorState {
     /// started is that launch's delivery. Issue #4852 AC-3: a delivery that
     /// lands while the launch's pane is still running is a partial merge of a
     /// live launch; the slot is kept (see
-    /// [`Self::record_issue_completion_with_live_pane`]). The returned list
+    /// `record_issue_completion_with_live_pane`). The returned list
     /// names the launches whose slots were actually freed or settled.
     pub fn reconcile_merged_branches_at(
         &mut self,
