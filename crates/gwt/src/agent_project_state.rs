@@ -505,20 +505,12 @@ pub fn probe_authenticated_prepared_execution_binding(
 pub fn prepare_resume_producing_authority(
     project_root: &Path,
     predecessor_session_id: &str,
+    automatic_restore: bool,
 ) -> Option<(AgentExecutionContinuationReceipt, SessionExecutionBinding)> {
-    let request = AgentExecutionContinuationRequest {
-        readiness_nonce: None,
-        schema_version: AGENT_EXECUTION_CONTINUATION_SCHEMA_VERSION,
-        operation_id: format!("resume-producing-{}", uuid::Uuid::new_v4()),
-    };
-    // Launch consumes success as Active producing authority. A Blocked Resume
-    // must instead recover through an explicit execution.continue invocation
-    // and verify/reopen; preparation must leave its durable state untouched.
-    match continue_authenticated_execution_inner(
+    match try_prepare_resume_producing_authority(
         project_root,
         predecessor_session_id,
-        request,
-        false,
+        automatic_restore,
     ) {
         Ok(result) => {
             tracing::info!(
@@ -531,6 +523,7 @@ pub fn prepare_resume_producing_authority(
         Err(error) => {
             tracing::warn!(
                 session_id = predecessor_session_id,
+                automatic_restore,
                 code = ?error.code,
                 message = %error.message,
                 "resume launch stays observation-only"
@@ -538,6 +531,53 @@ pub fn prepare_resume_producing_authority(
             None
         }
     }
+}
+
+/// [`prepare_resume_producing_authority`] with the coordinator's refusal.
+///
+/// `automatic_restore` is Issue #4783 AC-2: a startup / Open Project restore
+/// of a Session whose generation already reached Completed must not mint and
+/// activate a successor generation under `execution.continue` — that is the
+/// finished Issue's agent coming back as an active execution. The explicit
+/// relaunch of a settled Session (#4207) keeps its successor; a restore
+/// degrades to observation-only like a Blocked resume does.
+pub fn try_prepare_resume_producing_authority(
+    project_root: &Path,
+    predecessor_session_id: &str,
+    automatic_restore: bool,
+) -> std::result::Result<
+    (AgentExecutionContinuationReceipt, SessionExecutionBinding),
+    AgentWorkspaceUpdateError,
+> {
+    let request = AgentExecutionContinuationRequest {
+        readiness_nonce: None,
+        schema_version: AGENT_EXECUTION_CONTINUATION_SCHEMA_VERSION,
+        operation_id: format!("resume-producing-{}", uuid::Uuid::new_v4()),
+    };
+    // Launch consumes success as Active producing authority. A Blocked Resume
+    // must instead recover through an explicit execution.continue invocation
+    // and verify/reopen; preparation must leave its durable state untouched.
+    let policy = if automatic_restore {
+        ContinuationPolicy::AutomaticRestore
+    } else {
+        ContinuationPolicy::ResumeLaunch
+    };
+    continue_authenticated_execution_inner(project_root, predecessor_session_id, request, policy)
+}
+
+/// Who is asking the continuation coordinator, and therefore which terminal
+/// predecessor states it may act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContinuationPolicy {
+    /// An explicit `execution.continue`: recovers a Blocked generation and
+    /// mints a successor for a Completed one.
+    Explicit,
+    /// A Resume / Continue launch: never recovers Blocked, mints a successor
+    /// for Completed (#4207).
+    ResumeLaunch,
+    /// Issue #4783 AC-2: an automatic restore: neither Blocked nor Completed
+    /// is reactivated; the terminal generation stays as it is.
+    AutomaticRestore,
 }
 
 struct ExecutionContinuationAuthority {
@@ -955,7 +995,7 @@ pub fn continue_authenticated_execution(
         authenticated_project_root,
         authenticated_session_id,
         request,
-        true,
+        ContinuationPolicy::Explicit,
     )
 }
 
@@ -963,11 +1003,12 @@ fn continue_authenticated_execution_inner(
     authenticated_project_root: &Path,
     authenticated_session_id: &str,
     request: AgentExecutionContinuationRequest,
-    recover_blocked: bool,
+    policy: ContinuationPolicy,
 ) -> std::result::Result<
     (AgentExecutionContinuationReceipt, SessionExecutionBinding),
     AgentWorkspaceUpdateError,
 > {
+    let recover_blocked = policy == ContinuationPolicy::Explicit;
     request.validate()?;
     let authority = evaluate_authenticated_execution_continuation(
         authenticated_project_root,
@@ -982,6 +1023,20 @@ fn continue_authenticated_execution_inner(
         exact_unbound,
         current_binding,
     } = authority;
+    // Issue #4783 AC-2: an automatic restore of a Session whose generation
+    // is Completed used to fall through to the successor arm below and come
+    // back as an Active generation whose entrypoint reads `execution.continue`
+    // — the finished Issue's agent, re-armed by a gwt restart. The restore
+    // keeps the pane observation-only; only an explicit relaunch or
+    // `execution.continue` may open follow-up work on a settled owner.
+    if policy == ContinuationPolicy::AutomaticRestore
+        && record.status == crate::cli::execution_state::ExecutionControlStatus::Completed
+    {
+        return Err(AgentWorkspaceUpdateError::new(
+            AgentWorkspaceUpdateErrorCode::RelaunchRequired,
+            "automatic restore does not reactivate a Completed execution generation; relaunch the owner explicitly to start follow-up work",
+        ));
+    }
     if record.status == crate::cli::execution_state::ExecutionControlStatus::Blocked {
         if !recover_blocked {
             return Err(AgentWorkspaceUpdateError::new(
@@ -6409,7 +6464,7 @@ mod tests {
                     &resumed.id,
                 );
                 assert!(
-                    prepare_resume_producing_authority(project_state_root, &resumed.id).is_none(),
+                    prepare_resume_producing_authority(project_state_root, &resumed.id, false).is_none(),
                     "launch preparation must not present Blocked recovery as Active producing authority"
                 );
                 assert_eq!(
@@ -7810,7 +7865,7 @@ mod tests {
     fn resume_producing_helper_recovers_authority_for_linked_session() {
         with_strict_target_fixture(|repo, session| {
             let (session, binding) = bind_session_to_current_execution(repo, session);
-            let (receipt, rebound) = prepare_resume_producing_authority(repo, &session.id)
+            let (receipt, rebound) = prepare_resume_producing_authority(repo, &session.id, false)
                 .expect("linked durable session must recover producing authority");
             assert_eq!(
                 receipt.outcome,
@@ -7820,11 +7875,91 @@ mod tests {
         });
     }
 
+    /// Issue #4783 AC-2 / AC-3: an automatic restore of a Session whose
+    /// generation is Completed is refused with a reason and leaves the
+    /// terminal generation untouched; the explicit relaunch of the same
+    /// Session keeps the #4207 successor.
+    #[test]
+    fn automatic_restore_never_reactivates_a_completed_generation() {
+        with_strict_target_fixture(|repo, session| {
+            let (session, binding) = bind_session_to_current_execution(repo, session);
+            let owner = crate::cli::execution_state::ExecutionOwnerKey {
+                kind: crate::cli::execution_state::ExecutionOwnerKind::Issue,
+                number: binding.owner_number,
+            };
+            assert!(matches!(
+                crate::cli::execution_state::settle(
+                    repo,
+                    &session.id,
+                    crate::cli::execution_state::ExecutionSettlement::Completed,
+                )
+                .expect("settle the predecessor generation"),
+                crate::cli::execution_state::SettleResult::Settled(_)
+            ));
+            let ledger_before = crate::cli::execution_state::load_generation_ledger(repo, owner)
+                .expect("read ledger before the restore");
+            // Settling appended its lifecycle event, so the head hash moved;
+            // the generation is what must not change from here on.
+            let terminal_identity =
+                crate::cli::execution_state::current_execution_binding(repo, owner)
+                    .expect("read terminal generation")
+                    .expect("terminal generation");
+            assert_eq!(
+                terminal_identity.generation_id,
+                binding.identity.generation_id
+            );
+
+            let refusal = try_prepare_resume_producing_authority(repo, &session.id, true)
+                .expect_err("a restore must not continue a Completed generation");
+            assert_eq!(
+                refusal.code,
+                AgentWorkspaceUpdateErrorCode::RelaunchRequired
+            );
+            assert!(
+                refusal.message.contains(
+                    "automatic restore does not reactivate a Completed execution generation"
+                ),
+                "the refusal names its reason: {}",
+                refusal.message
+            );
+            assert!(prepare_resume_producing_authority(repo, &session.id, true).is_none());
+            assert_eq!(
+                crate::cli::execution_state::current_execution_binding(repo, owner)
+                    .expect("read current generation"),
+                Some(terminal_identity.clone()),
+                "no successor generation was activated"
+            );
+            assert_eq!(
+                crate::cli::execution_state::load_generation_ledger(repo, owner)
+                    .expect("read ledger after the restore"),
+                ledger_before,
+                "the refused restore leaves the ledger byte-identical"
+            );
+            assert_eq!(
+                crate::cli::execution_state::diagnose(repo, Some(session.id.as_str())).ecr_status,
+                crate::cli::execution_state::ExecutionDiagnosisState::Completed
+            );
+
+            // Issue #4207: an explicit relaunch of the settled Session still
+            // mints its successor.
+            let (receipt, successor) = prepare_resume_producing_authority(repo, &session.id, false)
+                .expect("an explicit relaunch recovers producing authority");
+            assert_eq!(
+                receipt.outcome,
+                AgentExecutionContinuationOutcome::SuccessorCreated
+            );
+            assert_ne!(
+                successor.identity.generation_id,
+                terminal_identity.generation_id
+            );
+        });
+    }
+
     #[test]
     fn resume_producing_helper_returns_none_without_durable_linkage() {
         with_strict_target_fixture(|repo, _session| {
             assert!(
-                prepare_resume_producing_authority(repo, "session-unknown").is_none(),
+                prepare_resume_producing_authority(repo, "session-unknown", false).is_none(),
                 "unknown durable session must stay observation-only"
             );
         });
