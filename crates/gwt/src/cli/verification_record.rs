@@ -5136,10 +5136,16 @@ pub(super) fn run<E: CliEnv>(
             // a watchdog. The runner checks again under its write lease.
             crate::cli::trusted_store::with_write_lease(&worktree, || {
                 revalidate_verification_caller_authority(&worktree, &session_id, &authority)?;
-                interruption::previous_external_terminations(
+                match interruption::previous_external_terminations(
                     &worktree,
                     current_head_sha(&worktree).ok().as_deref(),
-                )
+                ) {
+                    // A live predecessor must reach normal admission so heavy
+                    // runs retain their deferred/wait semantics. The runner
+                    // still refuses to overwrite it under the write lease.
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+                    result => result,
+                }
             })
             .map_err(|error| SpecOpsError::from(ApiError::Unexpected(error.to_string())))?;
             if let Some(refusal) = user_verification_result
