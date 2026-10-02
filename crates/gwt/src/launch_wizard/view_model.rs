@@ -115,6 +115,7 @@ impl LaunchWizardState {
             // pool, so it fills this in when the wizard is the Issue Monitor
             // Agent Settings form.
             issue_monitor_pool_impact: None,
+            issue_monitor_pool: None,
             hermes_provider: self.hermes_provider.clone(),
             hermes_provider_options: self.hermes_choices.providers.clone(),
             hermes_model_options: self.hermes_choices.models_for(&self.hermes_provider),

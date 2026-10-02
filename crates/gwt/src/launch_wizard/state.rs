@@ -583,6 +583,13 @@ impl LaunchWizardState {
                     self.advance_after_current_step();
                 }
             }
+            // Issue #4911: the Agent Settings set list belongs to the app
+            // runtime; a wizard that is not the Issue Monitor settings form
+            // has no sets to edit.
+            LaunchWizardAction::AddAgentSettingsSet
+            | LaunchWizardAction::RemoveAgentSettingsSet { .. }
+            | LaunchWizardAction::MoveAgentSettingsSet { .. }
+            | LaunchWizardAction::SelectAgentSettingsSet { .. } => {}
         }
     }
 

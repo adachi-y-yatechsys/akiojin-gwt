@@ -753,6 +753,28 @@ pub struct IssueMonitorProfileSaveContext {
     /// the wizard can say which candidate the save replaces without re-reading
     /// preferences on every keystroke.
     pub(crate) pool: Vec<gwt::IssueMonitorLaunchProfile>,
+    /// Issue #4911: the Agent Settings sets the settings form is editing.
+    /// `None` for the per-Issue form, which still switches the pool head.
+    pub(crate) sets: Option<IssueMonitorAgentSettingsSets>,
+}
+
+/// Issue #4911: the ordered Agent Settings sets of one open settings form,
+/// one per launch candidate.
+///
+/// Only the open set lives in the wizard, and the wizard cannot show a saved
+/// profile as it is: it fills an unset model or reasoning with its own default
+/// and holds no runtime choice before its Runtime step. So a set is changed
+/// only where the operator changed the form, and a set nobody touched is
+/// written back unchanged.
+#[derive(Debug, Clone)]
+pub struct IssueMonitorAgentSettingsSets {
+    /// Never empty. The entry at `active` is the open set as it was saved or
+    /// last left; the wizard holds the operator's edits to it.
+    pub(crate) profiles: Vec<gwt::IssueMonitorLaunchProfile>,
+    pub(crate) active: usize,
+    /// What the form read when the open set was opened, before any edit.
+    /// `None` when the form could not launch that set's agent at all.
+    pub(crate) opened_as: Option<gwt::IssueMonitorLaunchProfile>,
 }
 
 #[derive(Debug, Clone)]
