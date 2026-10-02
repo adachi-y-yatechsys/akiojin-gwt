@@ -5772,7 +5772,20 @@ impl AppRuntime {
             return Vec::new();
         }
         match result {
-            Ok(hydration) => {
+            Ok(mut hydration) => {
+                // Issue #4911: the Runtime step proposes where the open Agent
+                // Settings set runs, so it starts from that set's own saved
+                // runtime rather than from the last launch in this repository.
+                if let Some(open_set) = session
+                    .issue_monitor_profile_save
+                    .as_ref()
+                    .and_then(|save_context| save_context.sets.as_ref())
+                    .and_then(|sets| sets.profiles.get(sets.active))
+                {
+                    hydration.previous_profiles = hydration
+                        .previous_profiles
+                        .map(|profiles| profiles.with_repo_local(Some(open_set.clone().into())));
+                }
                 session.wizard.apply_runtime_context(hydration);
                 let auto_submit_bounds = session.auto_submit_after_runtime_resolution.take();
                 self.store_launch_wizard(session);

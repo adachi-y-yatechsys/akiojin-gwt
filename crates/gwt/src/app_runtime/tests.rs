@@ -55913,6 +55913,16 @@ fn save_agent_settings_sets(
     runtime: &mut AppRuntime,
     recorded_events: &Arc<Mutex<Vec<UserEvent>>>,
 ) -> Vec<OutboundEvent> {
+    save_agent_settings_sets_in(runtime, recorded_events, |_| {})
+}
+
+/// [`save_agent_settings_sets`] in a repository whose runtime context the
+/// test describes, e.g. one that has a Compose service.
+fn save_agent_settings_sets_in(
+    runtime: &mut AppRuntime,
+    recorded_events: &Arc<Mutex<Vec<UserEvent>>>,
+    describe_repository: impl FnOnce(&mut gwt::LaunchWizardHydration),
+) -> Vec<OutboundEvent> {
     runtime.handle_launch_wizard_action(&runtime.test_context(), LaunchWizardAction::Submit, None);
     wait_for_recorded_event(
         "agent settings runtime resolution",
@@ -55942,7 +55952,9 @@ fn save_agent_settings_sets(
     let UserEvent::LaunchWizardRuntimeResolved { wizard_id, result } = resolved_event else {
         unreachable!("matched above")
     };
-    runtime.handle_launch_wizard_runtime_resolved(wizard_id, *result);
+    let mut hydration = result.expect("runtime context resolves");
+    describe_repository(&mut hydration);
+    runtime.handle_launch_wizard_runtime_resolved(wizard_id, Ok(hydration));
     runtime.handle_launch_wizard_action(&runtime.test_context(), LaunchWizardAction::Submit, None);
     runtime.handle_launch_wizard_action(&runtime.test_context(), LaunchWizardAction::Submit, None)
 }
@@ -56127,6 +56139,42 @@ fn app_runtime_issue_monitor_agent_settings_keeps_a_runtime_the_form_was_not_ask
         saved[0], codex,
         "opening a set and leaving it unedited changes nothing about it"
     );
+}
+
+#[test]
+fn app_runtime_issue_monitor_agent_settings_runtime_step_starts_from_the_open_set() {
+    // Issue #4911 AC-5: the Runtime step proposes where the open set runs. It
+    // used to propose the repository's default — Docker wherever a Compose
+    // service exists — so saving a Host set unedited rewrote it to Docker.
+    let _env_lock = env_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().expect("tempdir");
+    let _home = ScopedEnvVar::set("HOME", temp.path());
+    let _userprofile = ScopedEnvVar::set("USERPROFILE", temp.path());
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    init_repo(&repo);
+    let (mut runtime, recorded_events, _events) =
+        open_agent_settings_sets(temp.path(), &repo, vec![pool_profile("codex")]);
+
+    save_agent_settings_sets_in(&mut runtime, &recorded_events, |hydration| {
+        hydration.docker_context = Some(gwt::DockerWizardContext {
+            services: vec!["app".to_string()],
+            suggested_service: Some("app".to_string()),
+        });
+    });
+
+    let saved = gwt::load_issue_monitor_prefs(&gwt::issue_monitor_prefs_path_for_repo_path(&repo))
+        .expect("load prefs")
+        .launch_profile_pool();
+    assert_eq!(saved[0].agent_id, "codex");
+    assert_eq!(
+        saved[0].runtime_target,
+        gwt_agent::LaunchRuntimeTarget::Host,
+        "a set saved to run on the host still does after an unedited save"
+    );
+    assert_eq!(saved[0].docker_service, None);
 }
 
 #[test]
