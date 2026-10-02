@@ -401,8 +401,10 @@ idle になったエージェント窓はスロットを自動的に解放しま
 返し、読み値が無い場合はその理由を返します。レートリミットの初回拒否で provider を
 hold し、全候補が hold 中なら最も早い既知の reset 時刻に自動再開します。
 reset がすべて不明なら定期再試行せず、`needs_human_fleet` の
-`launch_candidates_exhausted` として通知します。GUI の Agent
-settings で別 provider を保存すると同じプールに追加されます。各 operation
+`launch_candidates_exhausted` として通知します。GUI の Issue Monitor 設定フォーム
+（`⚙ Settings`）は同じプールを Agent Settings の組として並べ、`＋` で組を追加、
+`−` で削除、矢印で並べ替えができ、保存した並び順がそのまま起動候補の順序になります。
+各 operation
 は省略可能な `project_root` を受け取り、省略時は現在の worktree を対象にします。
 Priority の変更と daemon 不在時の設定変更は、実行中 instance の next scan/rebase で
 反映されます。
