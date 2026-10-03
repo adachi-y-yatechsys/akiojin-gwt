@@ -1747,11 +1747,8 @@ mod tests {
             .find(|item| item.id == "work-ref-bbbb2222")
             .expect("remote item");
         assert!(
-            remote_item
-                .execution_containers
-                .iter()
-                .any(|container| container.branch.as_deref() == Some("work/remote-side")),
-            "legacy branch-less events imported from a source ref keep that ref's branch"
+            remote_item.execution_containers.is_empty(),
+            "restoring legacy history must not grant ownership of its reader source"
         );
 
         // Second run: every source fingerprint is current — nothing re-reads.
@@ -2004,10 +2001,10 @@ mod tests {
             .iter()
             .find(|item| item.id == "work-remote-shard")
             .expect("ref shard Work restored");
-        assert!(item.execution_containers.iter().any(|container| {
-            container.branch.as_deref() == Some("work/remote-shard")
-                && container.worktree_path.is_none()
-        }));
+        assert!(
+            item.execution_containers.is_empty(),
+            "a fetched shard without an explicit container restores history only"
+        );
     }
 
     #[test]
@@ -3319,7 +3316,7 @@ mod tests {
     }
 
     #[test]
-    fn ingest_reprocesses_old_raw_fingerprint_state_to_repair_source_container() {
+    fn ingest_reprocesses_old_raw_fingerprint_state_without_inventing_source_container() {
         let temp = tempfile::tempdir().expect("tempdir");
         let _gwt_home = gwt_core::test_support::ScopedGwtHome::set(temp.path());
         let repo = temp.path().join("repo");
@@ -3386,7 +3383,7 @@ mod tests {
             legacy_projection.work_items[0]
                 .execution_containers
                 .is_empty(),
-            "pre-fix projection starts without branch context"
+            "legacy history has no explicit container"
         );
 
         let mut old_state = WorkEventsIntakeState::default();
@@ -3396,17 +3393,17 @@ mod tests {
         let repaired = ingest_project_work_events_paths(&repo, &work_items_path, &state_path);
         assert_eq!(
             repaired.events_applied, 1,
-            "old raw fingerprint cache must not skip source-context repair"
+            "old raw fingerprint cache must not skip history replay"
         );
 
         let projection =
             gwt_core::workspace_projection::load_workspace_work_items_from_path(&work_items_path)
                 .expect("load repaired")
                 .expect("repaired projection");
-        assert!(projection.work_items[0]
-            .execution_containers
-            .iter()
-            .any(|container| container.branch.as_deref() == Some("work/cache-repair")));
+        assert!(
+            projection.work_items[0].execution_containers.is_empty(),
+            "replaying legacy history must not infer reader-source ownership"
+        );
 
         let second = ingest_project_work_events_paths(&repo, &work_items_path, &state_path);
         assert_eq!(second.events_applied, 0);

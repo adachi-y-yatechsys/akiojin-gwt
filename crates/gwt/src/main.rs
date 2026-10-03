@@ -7977,59 +7977,6 @@ mod tests {
         );
         assert_eq!(knowledge_kind_for_preset(WindowPreset::Branches), None);
     }
-    #[test]
-    fn preferred_issue_launch_branch_prefers_develop_then_head_then_first_local() {
-        let entries = vec![
-            BranchListEntry {
-                name: "feature/demo".to_string(),
-                scope: BranchScope::Local,
-                is_head: true,
-                upstream: None,
-                ahead: 0,
-                behind: 0,
-                last_commit_date: None,
-                cleanup_ready: true,
-                cleanup: BranchCleanupInfo::default(),
-                resume: gwt::BranchResumeInfo::unavailable(),
-                start_work_eligibility: None,
-            },
-            BranchListEntry {
-                name: "develop".to_string(),
-                scope: BranchScope::Local,
-                is_head: false,
-                upstream: None,
-                ahead: 0,
-                behind: 0,
-                last_commit_date: None,
-                cleanup_ready: true,
-                cleanup: BranchCleanupInfo::default(),
-                resume: gwt::BranchResumeInfo::unavailable(),
-                start_work_eligibility: None,
-            },
-        ];
-        assert_eq!(
-            super::preferred_issue_launch_branch(&entries),
-            Some("develop".to_string())
-        );
-
-        let head_only = vec![BranchListEntry {
-            name: "feature/demo".to_string(),
-            scope: BranchScope::Local,
-            is_head: true,
-            upstream: None,
-            ahead: 0,
-            behind: 0,
-            last_commit_date: None,
-            cleanup_ready: true,
-            cleanup: BranchCleanupInfo::default(),
-            resume: gwt::BranchResumeInfo::unavailable(),
-            start_work_eligibility: None,
-        }];
-        assert_eq!(
-            super::preferred_issue_launch_branch(&head_only),
-            Some("feature/demo".to_string())
-        );
-    }
 
     #[test]
     fn normalize_active_tab_id_prefers_existing_selection_or_first_tab() {

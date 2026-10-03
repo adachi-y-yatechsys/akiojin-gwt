@@ -919,12 +919,28 @@ fn persist_container_detachments_locked(
     if healed.is_empty() {
         return Ok(healed);
     }
+    let removed = candidates
+        .into_iter()
+        .filter(|(id, _)| healed.contains(id))
+        .collect();
+    record_container_detachments_locked(works_path, &removed)?;
+    save_workspace_work_items_projection_to_path(works_path, &projection)?;
+    Ok(healed)
+}
+
+fn record_container_detachments_locked(
+    works_path: &Path,
+    removed: &ContainerDetachments,
+) -> Result<()> {
+    if removed.is_empty() {
+        return Ok(());
+    }
     let mut detachments = load_container_detachments(works_path)?;
-    for id in &healed {
-        let removed = detachments.entry(id.clone()).or_default();
-        for container in &candidates[id] {
-            if !removed.contains(container) {
-                removed.push(container.clone());
+    for (id, containers) in removed {
+        let recorded = detachments.entry(id.clone()).or_default();
+        for container in containers {
+            if !recorded.contains(container) {
+                recorded.push(container.clone());
             }
         }
     }
@@ -934,9 +950,97 @@ fn persist_container_detachments_locked(
         &container_detachments_path(works_path),
         &serde_json::to_vec_pretty(&detachments)
             .map_err(|error| GwtError::Other(format!("container detachments json: {error}")))?,
-    )?;
-    save_workspace_work_items_projection_to_path(works_path, &projection)?;
-    Ok(healed)
+    )
+}
+
+/// An explicit launch establishes ownership; the location of a shared event
+/// never does. Record the repair before saving Works, under the same lock and
+/// pending transaction as launch publication, so interrupted publication and
+/// later intake both keep inactive foreign references detached (Issue #4739).
+fn record_launch_container_detachments_locked(
+    transaction: &PendingWorkspaceStateTransaction,
+    work_items: &WorkItemsProjection,
+) -> Result<()> {
+    let projection = &transaction.projection;
+    let mut removed = ContainerDetachments::new();
+    for event in &transaction.events {
+        if !matches!(event.kind, WorkEventKind::Start | WorkEventKind::Resume) {
+            continue;
+        }
+        let (Some(container), Some(session_id)) = (
+            event.execution_container.as_ref(),
+            event.agent_session_id.as_deref(),
+        ) else {
+            continue;
+        };
+        let (Some(branch), Some(path)) = (
+            container.branch.as_deref(),
+            container.worktree_path.as_deref(),
+        ) else {
+            continue;
+        };
+        if current_work_id(
+            work_items,
+            &projection.project_root,
+            Some(branch),
+            Some(path),
+        )
+        .as_deref()
+            != Some(event.work_item_id.as_str())
+            || !work_items
+                .work_items
+                .iter()
+                .any(|item| item.id == event.work_item_id && item.is_incomplete())
+        {
+            continue;
+        }
+        let Some(agent) = projection
+            .latest_agent_for_session(session_id)
+            .filter(|agent| {
+                agent.affiliation_status == WorkspaceAgentAffiliationStatus::Assigned
+                    && agent.workspace_id.as_deref() == Some(event.work_item_id.as_str())
+                    && canonical_session_bound_branch(agent.branch.as_deref().unwrap_or_default())
+                        == canonical_session_bound_branch(branch)
+            })
+        else {
+            continue;
+        };
+        let Some(authority_path) = resolved_session_bound_path(path)? else {
+            continue;
+        };
+        if !session_bound_candidate_path_matches(agent.worktree_path.as_deref(), &authority_path)? {
+            continue;
+        }
+        for item in &work_items.work_items {
+            if item.id == event.work_item_id
+                || item.discarded
+                || projection.agents.iter().any(|agent| {
+                    agent.workspace_id.as_deref() == Some(item.id.as_str())
+                        || item
+                            .agents
+                            .iter()
+                            .any(|old| old.session_id == agent.session_id)
+                })
+            {
+                continue;
+            }
+            for candidate in &item.execution_containers {
+                if canonical_session_bound_branch(candidate.branch.as_deref().unwrap_or_default())
+                    == canonical_session_bound_branch(branch)
+                    && session_bound_candidate_path_matches(
+                        candidate.worktree_path.as_deref(),
+                        &authority_path,
+                    )?
+                {
+                    removed
+                        .entry(item.id.clone())
+                        .or_default()
+                        .push(candidate.clone());
+                }
+            }
+        }
+    }
+    record_container_detachments_locked(&transaction.work_items_path, &removed)
 }
 
 /// Recover an interrupted Workspace state transaction without synthesizing or
@@ -5038,6 +5142,11 @@ fn apply_workspace_state_transaction_locked(
             append_workspace_work_events_to_path(events_path, &transaction.events)?;
         }
     }
+    let may_write_current = !recovering
+        || workspace_state_snapshot_matches_precondition(
+            current_path,
+            transaction.current_precondition.as_deref(),
+        )?;
     if let Some(work_items) = transaction.work_items.as_ref() {
         let may_write = !recovering
             || workspace_state_snapshot_matches_precondition(
@@ -5045,15 +5154,16 @@ fn apply_workspace_state_transaction_locked(
                 transaction.work_items_precondition.as_deref(),
             )?;
         if may_write {
+            // A newer current snapshot may have attached a live Session to a
+            // foreign Work. Its authority cannot be repaired from this older
+            // transaction's liveness view, even when Works itself is unchanged.
+            if may_write_current {
+                record_launch_container_detachments_locked(transaction, work_items)?;
+            }
             save_workspace_work_items_projection_to_path(&transaction.work_items_path, work_items)?;
         }
     }
-    if !recovering
-        || workspace_state_snapshot_matches_precondition(
-            current_path,
-            transaction.current_precondition.as_deref(),
-        )?
-    {
+    if may_write_current {
         save_workspace_projection_to_path_unlocked(current_path, &transaction.projection)?;
     }
     let coordinator_path = pending_workspace_state_transaction_coordinator_path(transaction);
@@ -6789,98 +6899,6 @@ fn write_rebuild_marker(path: &Path) -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     write_atomic(path, &body)
-}
-
-/// SPEC-2359 Phase W-11 (US-58 / FR-346): schema version for the one-time
-/// agent identity reset. Bumping this re-runs [`reset_legacy_agent_identity_at`]
-/// on existing data. Version 1 clears `title_summary` / `current_focus`
-/// written by the legacy prompt-derivation hook so the display fallback and
-/// agent re-authoring take over.
-pub const WORKSPACE_AGENT_IDENTITY_RESET_VERSION: u32 = 1;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct AgentIdentityResetMarker {
-    version: u32,
-    #[serde(default)]
-    migrated_at: Option<DateTime<Utc>>,
-}
-
-fn agent_identity_reset_marker_path(current_path: &Path) -> PathBuf {
-    current_path
-        .parent()
-        .map(|dir| dir.join("agent_identity.migration.json"))
-        .unwrap_or_else(|| PathBuf::from("agent_identity.migration.json"))
-}
-
-fn agent_identity_reset_marker_at_or_above(path: &Path, required: u32) -> Result<bool> {
-    if !path.exists() {
-        return Ok(false);
-    }
-    let body = fs::read_to_string(path)?;
-    Ok(serde_json::from_str::<AgentIdentityResetMarker>(&body)
-        .map(|marker| marker.version >= required)
-        .unwrap_or(false))
-}
-
-fn write_agent_identity_reset_marker(path: &Path) -> Result<()> {
-    let marker = AgentIdentityResetMarker {
-        version: WORKSPACE_AGENT_IDENTITY_RESET_VERSION,
-        migrated_at: Some(chrono::Utc::now()),
-    };
-    let body = serde_json::to_vec_pretty(&marker)
-        .map_err(|error| GwtError::Other(format!("agent identity reset marker: {error}")))?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    write_atomic(path, &body)
-}
-
-/// SPEC-2359 Phase W-11 (US-58 / FR-346): clear legacy `title_summary` /
-/// `current_focus` from the canonical projection at `current_path` exactly
-/// once, guarded by a version marker. After this reset those fields are
-/// authored only by the agent (`workspace.update` / `board.post`),
-/// and empty values resolve through the display fallback chain. Returns
-/// `true` when the reset marker was newly written, `false` when the marker
-/// already records the current version (so agent-authored values written
-/// after the reset are never cleared again).
-pub fn reset_legacy_agent_identity_at(current_path: &Path) -> Result<bool> {
-    let work_items_path = current_path.with_file_name("works.json");
-    with_workspace_work_items_lock(&work_items_path, || {
-        let marker_path = agent_identity_reset_marker_path(current_path);
-        if agent_identity_reset_marker_at_or_above(
-            &marker_path,
-            WORKSPACE_AGENT_IDENTITY_RESET_VERSION,
-        )? {
-            return Ok(false);
-        }
-        if let Some(mut projection) = load_workspace_projection_from_path(current_path)? {
-            let mut changed = false;
-            for agent in &mut projection.agents {
-                if agent.title_summary.take().is_some() {
-                    changed = true;
-                }
-                if agent.current_focus.take().is_some() {
-                    changed = true;
-                }
-            }
-            if changed {
-                save_workspace_projection_to_path_unlocked(current_path, &projection)?;
-            }
-        }
-        write_agent_identity_reset_marker(&marker_path)?;
-        Ok(true)
-    })
-}
-
-/// SPEC-2359 Phase W-11 (US-58 / FR-346): repo-scoped convenience wrapper for
-/// the startup bootstrap. Resolves the canonical projection path and runs the
-/// version-guarded one-time legacy identity reset. Call this once at startup
-/// (alongside the work-items rebuild), not on every projection load, so a
-/// freshly agent-authored title is never cleared.
-pub fn reset_legacy_agent_identity_for_repo(repo_path: &Path) -> Result<bool> {
-    let current_path = gwt_workspace_projection_path_for_repo_path(repo_path);
-    let _ = migrate_legacy_workspace_projection(repo_path, &current_path)?;
-    reset_legacy_agent_identity_at(&current_path)
 }
 
 /// SPEC-2359 US-37 / FR-119: Convenience wrapper resolving the project-scoped
