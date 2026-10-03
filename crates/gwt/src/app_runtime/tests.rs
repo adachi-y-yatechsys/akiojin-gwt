@@ -13698,7 +13698,7 @@ fn app_runtime_open_launch_wizard_uses_cached_previous_profile_without_hydrating
     assert!(view.skip_permissions);
     // Toggle visibility still follows the manual-setup launch path.
     assert!(!view.show_skip_permissions);
-    assert!(view.codex_fast_mode);
+    assert!(view.fast_mode);
 }
 
 #[test]
@@ -34051,6 +34051,20 @@ fn direct_agent_presets_create_and_restart_are_observed_until_stopped() {
         .expect("retired Session");
         assert_eq!(session.status, gwt_agent::AgentStatus::Stopped);
     }
+    // `stop_window_runtime` kills without waiting (Issue #3705); Windows
+    // TerminateProcess is asynchronous, so the observed children may still be
+    // listed briefly. Wait for each exact child to exit before re-observing.
+    let deadline = Instant::now() + TEST_PTY_STOP_SETTLEMENT_TIMEOUT;
+    for row in &inventory.sessions {
+        while gwt::process::exact_pty_process_tree_is_alive(row.child_pid, row.child_started_at) {
+            assert!(
+                Instant::now() < deadline,
+                "stopped direct agent child {} did not exit before the deadline",
+                row.child_pid
+            );
+            thread::sleep(TEST_PTY_STOP_SETTLEMENT_POLL_INTERVAL);
+        }
+    }
     assert!(
         gwt::session_inventory::observe_sessions(&repo, &runtime.sessions_dir)
             .sessions
@@ -40459,7 +40473,7 @@ fn workspace_cleanup_failure_does_not_emit_done_work_item() {
         branch,
         false,
         false,
-        None,
+        "cleanup-op-1",
     );
 
     assert!(immediate_events.is_empty());
@@ -46089,7 +46103,7 @@ fn frontend_project_log_tab_id_routes_non_window_owners() {
                 branch: "work/example".into(),
                 delete_remote: false,
                 force_filesystem_delete: false,
-                operation_id: None,
+                operation_id: "cleanup-op-1".to_string(),
             },
             Some("tab-b"),
         ),
@@ -62285,11 +62299,24 @@ fn codex_hook_trust_launch_trusts_every_discovered_worktree_hook_file() {
     let fixture_root = tempdir().expect("fixture tempdir");
     let (repo, worktree) = codex_hook_trust_linked_worktree_fixture(fixture_root.path());
 
-    // Both copies exist on disk in a real worktree: the workspace-home copy is
-    // written by the launch refresh, the worktree-local copy is tracked content
-    // refreshed by the `Both`-mode managed-asset writers.
-    gwt_skills::generate_codex_hooks_for_mode(&worktree, gwt_skills::CodexHookDiscoveryMode::Both)
-        .expect("refresh managed codex hooks");
+    // A worktree created by an older launch keeps its portable local command
+    // while the current launch targets workspace-home discovery.
+    {
+        let _old_bin =
+            gwt_skills::settings_local::ScopedHookBin::set(gwt_skills::CANONICAL_HOOK_BIN);
+        gwt_skills::generate_codex_hooks_for_mode(
+            &worktree,
+            gwt_skills::CodexHookDiscoveryMode::WorktreeLocal,
+        )
+        .expect("seed old local hooks");
+    }
+    let materialization = gwt::refresh_managed_gwt_assets_for_agent_with_codex_hook_discovery_mode(
+        &worktree,
+        &gwt_agent::AgentId::Codex,
+        gwt_skills::CodexHookDiscoveryMode::WorkspaceHome,
+        false,
+    )
+    .expect("refresh launch assets");
 
     let mut launch_config = gwt_agent::AgentLaunchBuilder::new(gwt_agent::AgentId::Codex)
         .working_dir(&worktree)
@@ -62304,7 +62331,7 @@ fn codex_hook_trust_launch_trusts_every_discovered_worktree_hook_file() {
         &launch_config,
         None,
         gwt_skills::CodexHookDiscoveryMode::WorkspaceHome,
-        None,
+        materialization.hook_bin.as_deref(),
     )
     .expect("launch trust registration must succeed")
     .expect("Codex host launch registers trust");
