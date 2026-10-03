@@ -677,6 +677,7 @@ pub(crate) fn run_collect<E: CliEnv>(
             hook::append_codex_trust_health_for_doctor(&input, &mut health);
             let payload = serde_json::json!({
                 "repair": repair,
+                "repair_guarantee": "Regenerates managed hook configuration; trust registration and launch success require separate verification.",
                 "health": health,
             });
             out.push_str(&serde_json::to_string_pretty(&payload).map_err(serde_as_api_error)?);

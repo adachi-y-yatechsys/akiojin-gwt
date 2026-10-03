@@ -796,6 +796,12 @@ fn dispatch_json_envelope_hook_doctor_can_repair_missing_managed_configs() {
         serde_json::from_str(stdout["output"].as_str().expect("output string"))
             .expect("parse hook doctor output");
     assert_eq!(doctor["repair"]["repaired"].as_bool(), Some(true));
+    let guarantee = doctor["repair_guarantee"].as_str().unwrap_or_default();
+    assert!(
+        guarantee.contains("managed hook configuration")
+            && guarantee.contains("launch success require separate verification"),
+        "repair must state its configuration-only guarantee: {guarantee}"
+    );
     assert_eq!(doctor["health"]["status"].as_str(), Some("needs_attention"));
     assert!(doctor["health"]["issues"]
         .to_string()
