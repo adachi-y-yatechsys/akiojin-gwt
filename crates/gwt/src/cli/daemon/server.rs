@@ -13081,6 +13081,7 @@ exit 0
 
     #[test]
     fn scan_now_driver_persists_legacy_completion_recovery_for_launch_now() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let _env_lock = crate::env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -13136,6 +13137,7 @@ exit 0
 
     #[test]
     fn scan_now_driver_treats_closed_issue_as_terminal_negative_control() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let _env_lock = crate::env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -14992,6 +14994,7 @@ exit 1
 
     #[test]
     fn malformed_lifetime_authority_fence_blocks_ready_and_is_retained() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         crate::save_issue_monitor_prefs(
@@ -15351,6 +15354,7 @@ exit 1
 
     #[test]
     fn shutdown_fence_unlink_parent_sync_failure_keeps_drop_retry_armed() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let _env_lock = crate::env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -17649,6 +17653,7 @@ exit 1
     #[test]
     #[allow(clippy::await_holding_lock)]
     fn replayed_arm_with_advanced_head_compensates_before_settling() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let _env_lock = crate::env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -17839,6 +17844,7 @@ exit 1
 
     #[test]
     fn merged_before_disarm_is_needs_human_not_false_kill_switch_success() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let disarm = crate::PendingIssueMonitorEffect {
