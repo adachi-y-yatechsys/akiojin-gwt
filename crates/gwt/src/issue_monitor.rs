@@ -23,6 +23,11 @@ use crate::{
     LinkedIssueKind, WindowState,
 };
 
+mod urgent;
+pub use urgent::{
+    IssueMonitorUrgentGrant, IssueMonitorUrgentQueue, IssueMonitorUrgentQueueProjection,
+};
+
 mod tiers;
 pub(crate) use tiers::record_work_done_tier_landing;
 pub use tiers::{IssueMonitorTierLandingStats, IssueMonitorTierRecord, IssueMonitorTierSelection};
@@ -921,6 +926,8 @@ pub struct IssueMonitorPrefs {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub terminal_queues: BTreeMap<String, IssueMonitorTerminalQueue>,
     #[serde(default)]
+    pub urgent_queue: IssueMonitorUrgentQueue,
+    #[serde(default)]
     pub terminal_queue_auto_refill: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub terminal_queue_exclusions: BTreeMap<String, BTreeSet<u64>>,
@@ -1154,12 +1161,21 @@ pub struct IssueMonitorRuntimeCounts {
     pub observed_at: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssueMonitorTerminalQueueEntry {
     pub number: u64,
     pub queued_at: String,
     #[serde(default)]
     pub queued_by: String,
+    // Projection-only fields; stored membership keeps the normal order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assigned_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assigned_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -1178,6 +1194,7 @@ impl Default for IssueMonitorPrefs {
             priority_order: Vec::new(),
             monitor_runtime_counts: BTreeMap::new(),
             terminal_queues: BTreeMap::new(),
+            urgent_queue: IssueMonitorUrgentQueue::default(),
             terminal_queue_auto_refill: false,
             terminal_queue_exclusions: BTreeMap::new(),
             terminal_queue_auto_refill_limit: 0,
@@ -4193,6 +4210,7 @@ pub struct IssueMonitorState {
     priority_order: Vec<u64>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     terminal_queues: BTreeMap<String, IssueMonitorTerminalQueue>,
+    urgent_queue: IssueMonitorUrgentQueue,
     // Uncommitted scan retirement proposals; exact entry identity protects a
     // newer explicit admission during disk rebase.
     #[serde(skip)]
@@ -6468,6 +6486,7 @@ impl IssueMonitorState {
             priority_order: Vec::new(),
             monitor_runtime_counts: BTreeMap::new(),
             terminal_queues: BTreeMap::new(),
+            urgent_queue: IssueMonitorUrgentQueue::default(),
             terminal_queue_retirements: BTreeMap::new(),
             terminal_queue_auto_refill: false,
             terminal_queue_exclusions: BTreeMap::new(),
@@ -6546,6 +6565,7 @@ impl IssueMonitorState {
         state.priority_order = prefs.priority_order;
         state.monitor_runtime_counts = prefs.monitor_runtime_counts;
         state.terminal_queues = prefs.terminal_queues;
+        state.urgent_queue = prefs.urgent_queue;
         state.terminal_queue_auto_refill = prefs.terminal_queue_auto_refill;
         state.terminal_queue_exclusions = prefs.terminal_queue_exclusions;
         state.terminal_queue_auto_refill_limit = prefs.terminal_queue_auto_refill_limit;
@@ -6704,6 +6724,7 @@ impl IssueMonitorState {
             priority_order: self.priority_order.clone(),
             monitor_runtime_counts: self.monitor_runtime_counts.clone(),
             terminal_queues: self.terminal_queues.clone(),
+            urgent_queue: self.urgent_queue.clone(),
             terminal_queue_auto_refill: self.terminal_queue_auto_refill,
             terminal_queue_exclusions: self.terminal_queue_exclusions.clone(),
             terminal_queue_auto_refill_limit: self.terminal_queue_auto_refill_limit,
@@ -9273,6 +9294,18 @@ impl IssueMonitorState {
     /// Explicit GUI/control mutations run after rebase, so they still win their
     /// transaction while stale scan writers cannot roll a newer config back.
     fn refresh_disk_owned_prefs(&mut self, disk: &IssueMonitorPrefs) {
+        let urgent_proposals = self
+            .terminal_queues
+            .get(&crate::process::current_hostname())
+            .map(|queue| {
+                queue
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.queued_by == "urgent")
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         // Scans propose automatic additions before committing under the prefs
         // lock. Reapply only those proposals under the latest disk policy, so
         // concurrent manual removals, ordering and disabling refill still win.
@@ -9292,10 +9325,14 @@ impl IssueMonitorState {
         self.config.max_active = disk.max_active_agents.max(1);
         self.priority_order = disk.priority_order.clone();
         self.terminal_queues = disk.terminal_queues.clone();
+        self.urgent_queue.rebase(&disk.urgent_queue);
         self.terminal_queue_exclusions = disk.terminal_queue_exclusions.clone();
         self.terminal_queue_auto_refill = disk.terminal_queue_auto_refill;
         self.terminal_queue_auto_refill_limit = disk.terminal_queue_auto_refill_limit;
         self.apply_terminal_queue_retirements();
+        for entry in urgent_proposals {
+            self.admit_observed_urgent(entry.number, &entry.queued_at);
+        }
         for entry in refill_proposals {
             self.auto_refill_terminal_queue(&[entry.number], &entry.queued_at);
         }
@@ -11128,11 +11165,7 @@ impl IssueMonitorState {
             },
             queue_len: self.queue.len(),
             terminal_queue_len,
-            terminal_queue: self
-                .terminal_queues
-                .get(&host)
-                .map(|queue| queue.entries.clone())
-                .unwrap_or_default(),
+            terminal_queue: self.urgent_queue_projection(&host).entries,
             terminal_queue_auto_refill: self.terminal_queue_auto_refill,
             terminal_queue_auto_refill_limit: self.terminal_queue_auto_refill_limit,
             unqueued_open_count,
@@ -13259,10 +13292,11 @@ impl IssueMonitorState {
 
     /// Ordered membership used by every local launch admission path.
     pub fn local_terminal_queue_numbers(&self) -> Vec<u64> {
-        self.terminal_queues
-            .get(&crate::process::current_hostname())
-            .map(|queue| queue.entries.iter().map(|entry| entry.number).collect())
-            .unwrap_or_default()
+        self.urgent_queue_projection(&crate::process::current_hostname())
+            .entries
+            .iter()
+            .map(|entry| entry.number)
+            .collect()
     }
 
     fn terminal_queue_contains(&self, number: u64) -> bool {
@@ -13376,6 +13410,7 @@ impl IssueMonitorState {
                     number: *number,
                     queued_at: now.to_string(),
                     queued_by: queued_by.to_string(),
+                    ..Default::default()
                 });
             }
         }
@@ -13400,6 +13435,13 @@ impl IssueMonitorState {
 
     pub fn terminal_queue_move(&mut self, number: u64, position: usize, now: &str) -> bool {
         let host = crate::process::current_hostname();
+        let urgent_head = self
+            .urgent_queue_projection(&host)
+            .entries
+            .into_iter()
+            .filter(|entry| entry.priority.as_deref() == Some("urgent"))
+            .map(|entry| entry.number)
+            .collect::<BTreeSet<_>>();
         let Some(queue) = self.terminal_queues.get_mut(&host) else {
             return false;
         };
@@ -13411,6 +13453,20 @@ impl IssueMonitorState {
             return false;
         };
         let entry = queue.entries.remove(index);
+        // Clients send the displayed index. Translate its normal-order rank
+        // back into storage so an urgent head cannot swallow an Up/Down move.
+        let position = if urgent_head.contains(&number) {
+            position.min(queue.entries.len())
+        } else {
+            queue
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| !urgent_head.contains(&entry.number))
+                .nth(position.saturating_sub(urgent_head.len()))
+                .map(|(index, _)| index)
+                .unwrap_or(queue.entries.len())
+        };
         queue
             .entries
             .insert(position.min(queue.entries.len()), entry);
@@ -13493,6 +13549,7 @@ impl IssueMonitorState {
                     number: *number,
                     queued_at: now.to_string(),
                     queued_by: "auto-refill".to_string(),
+                    ..Default::default()
                 });
                 added += 1;
             }
@@ -18398,6 +18455,7 @@ pub fn scan_issue_monitor_candidates(
         })
         .map(|issue| issue.number)
         .collect::<Vec<_>>();
+    monitor.admit_urgent_candidates(issues, now);
     monitor.auto_refill_terminal_queue(&refill, now);
     monitor.reconcile_terminal_queue();
     let membership = monitor
@@ -32097,6 +32155,7 @@ mod tests {
                     number: 1,
                     queued_at: "2026-09-10T00:00:00Z".to_string(),
                     queued_by: "test".to_string(),
+                    ..Default::default()
                 }],
                 last_seen_at: None,
             },
@@ -32111,6 +32170,21 @@ mod tests {
         );
         assert!(monitor.inbox_item(1).is_some());
         assert!(monitor.inbox_item(2).is_none());
+    }
+
+    #[test]
+    fn urgent_queue_move_uses_displayed_positions_for_normal_entries() {
+        let now = "2026-10-03T00:00:00Z";
+        let mut monitor = IssueMonitorState::new(IssueMonitorConfig::default());
+        monitor.terminal_queue_push(&[1, 2, 3], "operator", now);
+        let mut urgent = issue(3);
+        urgent.labels.push("urgent".to_string());
+        scan_issue_monitor_candidates(&mut monitor, &[urgent], now);
+        assert_eq!(monitor.local_terminal_queue_numbers(), vec![3, 1, 2]);
+        monitor.terminal_queue_move(2, 1, now);
+        assert_eq!(monitor.local_terminal_queue_numbers(), vec![3, 2, 1]);
+        monitor.terminal_queue_move(2, 2, now);
+        assert_eq!(monitor.local_terminal_queue_numbers(), vec![3, 1, 2]);
     }
 
     #[test]
@@ -32177,6 +32251,90 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![2, 3]
         );
+    }
+
+    #[test]
+    fn urgent_queue_scan_uses_a_bounded_head_without_rewriting_normal_order() {
+        let now = "2026-10-03T00:00:00Z";
+        let mut monitor = IssueMonitorState::new(IssueMonitorConfig {
+            enabled: true,
+            max_active: 1,
+            ..Default::default()
+        });
+        monitor.terminal_queue_push(&[1, 2, 3, 4], "operator", now);
+        let mut third = issue(3);
+        third.labels.push("urgent".to_string());
+        let mut fourth = issue(4);
+        fourth.labels.push("URGENT".to_string());
+        scan_issue_monitor_candidates(
+            &mut monitor,
+            &[issue(1), issue(2), third.clone(), fourth.clone()],
+            now,
+        );
+        assert_eq!(monitor.local_terminal_queue_numbers(), vec![3, 4, 1, 2]);
+
+        let mut second = issue(2);
+        second.labels.push("urgent".to_string());
+        scan_issue_monitor_candidates(
+            &mut monitor,
+            &[issue(1), second, third, fourth],
+            "2026-10-03T00:01:00Z",
+        );
+        assert_eq!(monitor.local_terminal_queue_numbers(), vec![3, 4, 1, 2]);
+        let status = serde_json::to_value(monitor.status_view()).unwrap();
+        assert_eq!(
+            status["terminal_queue"][0]["priority_reason"],
+            "urgent_label"
+        );
+        assert_eq!(
+            status["terminal_queue"][3]["priority_reason"],
+            "urgent_limit_reached"
+        );
+        let saved = monitor.prefs();
+        let ordinary = &saved.terminal_queues[&crate::process::current_hostname()];
+        assert_eq!(
+            ordinary
+                .entries
+                .iter()
+                .map(|entry| entry.number)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert_eq!(monitor.claim_probe_plan(1).0, 1);
+        monitor.complete_active_launch_at(3, "tab::urgent", now);
+        assert_eq!(
+            monitor.claim_probe_plan(1).0,
+            0,
+            "urgent never bypasses max_active"
+        );
+    }
+
+    #[test]
+    fn urgent_queue_scan_admits_labels_with_refill_disabled_and_honours_demotion() {
+        let now = "2026-10-03T00:00:00Z";
+        let mut saved = serde_json::to_value(IssueMonitorPrefs::default()).unwrap();
+        saved["urgent_queue"] = serde_json::json!({"limit": 1, "demoted": [3]});
+        let mut monitor = IssueMonitorState::with_prefs(
+            IssueMonitorConfig::default(),
+            serde_json::from_value(saved).unwrap(),
+        );
+        monitor.terminal_queue_push(&[1, 3], "operator", now);
+        let mut second = issue(2);
+        second.labels.push("urgent".to_string());
+        let mut third = issue(3);
+        third.labels.push("urgent".to_string());
+        scan_issue_monitor_candidates(
+            &mut monitor,
+            &[issue(1), third.clone(), second.clone()],
+            now,
+        );
+        assert_eq!(monitor.local_terminal_queue_numbers(), vec![2, 1, 3]);
+        let prefs = monitor.prefs();
+        let mut resumed = IssueMonitorState::with_prefs(IssueMonitorConfig::default(), prefs);
+        scan_issue_monitor_candidates(&mut resumed, &[third, second], "2026-10-03T00:01:00Z");
+        assert_eq!(resumed.local_terminal_queue_numbers(), vec![2, 1, 3]);
+        let status = serde_json::to_value(resumed.status_view()).unwrap();
+        assert_eq!(status["terminal_queue"][2]["priority_reason"], "pm_demoted");
     }
 
     #[test]
@@ -32369,6 +32527,7 @@ mod tests {
                     number: 7,
                     queued_at: "2026-09-10T00:00:00Z".to_string(),
                     queued_by: "test".to_string(),
+                    ..Default::default()
                 }],
                 last_seen_at: Some("2026-09-10T00:01:00Z".to_string()),
             },
@@ -32415,6 +32574,7 @@ mod tests {
                     number: 9,
                     queued_at: "2026-09-10T00:00:00Z".to_string(),
                     queued_by: "test".to_string(),
+                    ..Default::default()
                 }],
                 last_seen_at: None,
             },
@@ -32439,6 +32599,7 @@ mod tests {
                     number: 7,
                     queued_at: "2026-09-10T00:00:00Z".to_string(),
                     queued_by: "test".to_string(),
+                    ..Default::default()
                 }],
                 last_seen_at: None,
             },
@@ -32465,11 +32626,13 @@ mod tests {
                         number: 7,
                         queued_at: "2026-09-09T23:00:00Z".to_string(),
                         queued_by: "retired".to_string(),
+                        ..Default::default()
                     },
                     IssueMonitorTerminalQueueEntry {
                         number: 8,
                         queued_at: "2026-09-09T23:01:00Z".to_string(),
                         queued_by: "retired".to_string(),
+                        ..Default::default()
                     },
                 ],
                 last_seen_at: Some("2026-09-09T23:01:00Z".to_string()),

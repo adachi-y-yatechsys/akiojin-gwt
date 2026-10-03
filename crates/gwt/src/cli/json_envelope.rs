@@ -710,6 +710,16 @@ fn parse(input: &str) -> Result<ParsedEnvelope, CliParseError> {
                 limit: required_usize(params, "limit")?,
             })
         }
+        "issue.monitor.queue.urgent_limit" => {
+            CliCommand::Issue(IssueCommand::MonitorQueueUrgentLimit {
+                project_root: optional_path(params, "project_root")?,
+                limit: required_usize(params, "limit")?,
+            })
+        }
+        "issue.monitor.queue.demote" => CliCommand::Issue(IssueCommand::MonitorQueueDemote {
+            project_root: optional_path(params, "project_root")?,
+            number: required_u64(params, "number")?,
+        }),
         "issue.monitor.config.set" | "issue.monitor.config-set" => {
             let enabled = optional_bool(params, "enabled")?;
             let autonomous_mode = optional_bool(params, "autonomous_mode")?;
