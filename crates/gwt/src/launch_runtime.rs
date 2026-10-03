@@ -1647,6 +1647,7 @@ mod tests {
                 std::time::Instant::now() < guard_expiry,
                 "resolver never reached the materialization lock"
             );
+            // test-hygiene: allow-short-duration polling interval; ordering comes from the contention event
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(
