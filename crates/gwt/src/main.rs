@@ -2138,6 +2138,12 @@ enum UserEvent {
         reply: app_runtime::ProjectOpenReply,
     },
     Dispatch(Vec<OutboundEvent>),
+    PmConversationLoaded {
+        client_id: ClientId,
+        window_id: String,
+        session_id: String,
+        snapshot: gwt::pm_conversation::PmConversationSnapshot,
+    },
     AgentBackendConnectionProbeComplete {
         client_id: ClientId,
         agent: gwt_agent::BuiltinAgentId,
@@ -5680,16 +5686,28 @@ mod tests {
                 if message == "Window is not a knowledge bridge"
         ));
 
-        let cleanup_missing =
-            runtime.run_branch_cleanup_events("client-1", "missing", &[], false, false, None);
+        let cleanup_missing = runtime.run_branch_cleanup_events(
+            "client-1",
+            "missing",
+            &[],
+            false,
+            false,
+            "cleanup-op-1",
+        );
         assert_eq!(cleanup_missing.len(), 1);
         assert!(matches!(
             cleanup_missing[0].event,
             BackendEvent::BranchError { ref message, .. } if message == "Window not found"
         ));
 
-        let cleanup_wrong =
-            runtime.run_branch_cleanup_events("client-1", &file_tree_id, &[], false, false, None);
+        let cleanup_wrong = runtime.run_branch_cleanup_events(
+            "client-1",
+            &file_tree_id,
+            &[],
+            false,
+            false,
+            "cleanup-op-1",
+        );
         assert_eq!(cleanup_wrong.len(), 1);
         assert!(matches!(
             cleanup_wrong[0].event,
@@ -6121,7 +6139,7 @@ mod tests {
             &[String::from("feature/prune-me")],
             false,
             false,
-            Some(cleanup_operation_id),
+            cleanup_operation_id,
         );
         assert!(cleanup_events.is_empty());
         wait_for_recorded_event("branch cleanup progress dispatch", &events, |events| {
@@ -6134,7 +6152,7 @@ mod tests {
                             (
                                 DispatchTarget::Project(_),
                                 BackendEvent::BranchCleanupProgress {
-                                    operation_id: Some(operation_id),
+                                    operation_id,
                                     ..
                                 },
                             ) if operation_id == cleanup_operation_id
@@ -6152,7 +6170,7 @@ mod tests {
                             (
                                 DispatchTarget::Project(_),
                                 BackendEvent::BranchCleanupResult {
-                                    operation_id: Some(operation_id),
+                                    operation_id,
                                     ..
                                 },
                             ) if operation_id == cleanup_operation_id
@@ -6175,7 +6193,7 @@ mod tests {
             (
                 DispatchTarget::Client(client_id),
                 BackendEvent::BranchCleanupResult {
-                    operation_id: Some(operation_id),
+                    operation_id,
                     ..
                 },
             ) if client_id == "client-2" && operation_id == cleanup_operation_id
@@ -6506,7 +6524,7 @@ mod tests {
                 branches: vec!["feature/missing".to_string()],
                 delete_remote: false,
                 force_filesystem_delete: false,
-                operation_id: None,
+                operation_id: "cleanup-op-1".to_string(),
             },
         );
         assert!(cleanup_events.is_empty());
@@ -11308,6 +11326,9 @@ fn main() -> std::io::Result<()> {
             Event::UserEvent(UserEvent::ControlProjectOpen { path, reply }) => {
                 let events = app.control_project_open_events(path, reply);
                 clients.dispatch(events);
+            }
+            Event::UserEvent(UserEvent::PmConversationLoaded { client_id, window_id, session_id, snapshot }) => {
+                clients.dispatch(app.pm_conversation_loaded_events(client_id, &window_id, &session_id, snapshot));
             }
             Event::UserEvent(UserEvent::Dispatch(events)) => {
                 clients.dispatch(events);

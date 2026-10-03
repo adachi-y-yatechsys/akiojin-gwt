@@ -277,6 +277,7 @@ mod migration;
 mod native_project_picker;
 pub(crate) mod persist_dispatcher;
 pub(crate) mod pm;
+mod pm_chat;
 mod profile;
 mod project_route;
 mod project_tabs;
@@ -1025,6 +1026,8 @@ pub(crate) struct ProjectRuntimeState {
     /// mark the PM window without touching disk on every render. Refreshed
     /// wherever the registration is read or written.
     pub(crate) pm_sessions: HashMap<PathBuf, String>,
+    /// One bounded append reader per Project; native file reads stay off tao.
+    pub(crate) pm_conversation_reader: Arc<Mutex<gwt::pm_conversation::PmConversationReader>>,
     /// SPEC-3431 T-093 (FR-012): per project, the monitor signal set the wake
     /// path has already seen. The first snapshot is a baseline; only signals
     /// beyond it can wake a quiet PM, so one event wakes at most once.
@@ -1074,6 +1077,7 @@ pub(crate) fn initial_project_states(
                     pending_pm_launches: Default::default(),
                     pending_pm_closes: Default::default(),
                     pm_sessions: Default::default(),
+                    pm_conversation_reader: Default::default(),
                     pm_wake_seen: Default::default(),
                     pending_pm_wakes: Default::default(),
                     pending_pm_worktree_preparations: Default::default(),
@@ -3015,6 +3019,7 @@ impl AppRuntime {
                     pending_pm_launches: Default::default(),
                     pending_pm_closes: Default::default(),
                     pm_sessions: Default::default(),
+                    pm_conversation_reader: Default::default(),
                     pm_wake_seen: Default::default(),
                     pending_pm_wakes: Default::default(),
                     pending_pm_worktree_preparations: Default::default(),
@@ -8338,6 +8343,7 @@ impl AppRuntime {
             | FrontendEvent::StopWindow { id, .. }
             | FrontendEvent::RestartWindow { id, .. }
             | FrontendEvent::TerminalInput { id, .. }
+            | FrontendEvent::LoadPmConversation { id }
             | FrontendEvent::PasteImage { id, .. }
             | FrontendEvent::PasteImageUploaded { id, .. }
             | FrontendEvent::AttachFiles { id, .. }
@@ -8668,6 +8674,7 @@ impl AppRuntime {
             | FrontendEvent::StopWindow { id, .. }
             | FrontendEvent::RestartWindow { id, .. }
             | FrontendEvent::TerminalInput { id, .. }
+            | FrontendEvent::LoadPmConversation { id }
             | FrontendEvent::PasteImage { id, .. }
             | FrontendEvent::PasteImageUploaded { id, .. }
             | FrontendEvent::AttachFiles { id, .. }
@@ -8928,6 +8935,9 @@ impl AppRuntime {
             FrontendEvent::StopAllWindows {} => self.stop_all_windows_events(context),
             FrontendEvent::RestartWindow { id } => self.restart_window_events(&id),
             FrontendEvent::TerminalInput { id, data } => self.terminal_input_events(&id, &data),
+            FrontendEvent::LoadPmConversation { id } => {
+                self.load_pm_conversation_events(context, client_id, &id)
+            }
             FrontendEvent::PaneSendInput { session_id, text } => {
                 self.pane_send_input_events(client_id, &session_id, &text)
             }
@@ -9176,7 +9186,7 @@ impl AppRuntime {
                 &branches,
                 delete_remote,
                 force_filesystem_delete,
-                operation_id.as_deref(),
+                &operation_id,
             ),
             FrontendEvent::RunWorkspaceCleanup {
                 branch,
@@ -9189,7 +9199,7 @@ impl AppRuntime {
                 &branch,
                 delete_remote,
                 force_filesystem_delete,
-                operation_id.as_deref(),
+                &operation_id,
             ),
             FrontendEvent::SyncBranchCleanup { id, operation_id } => {
                 self.sync_branch_cleanup_events(context, &client_id, &id, &operation_id)
