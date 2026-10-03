@@ -76,6 +76,24 @@ into this generated skill supplements the PM contract.
 
 ## Request intake via sub-agents
 
+- Offer once for each new user work request that may require Issue registration
+  or update. Do not repeat the offer for status queries, monitor events, or
+  replies within the same intake. Immediate registration remains the default
+  for every request type unless the user opts into refinement.
+- Before registration, offer one optional line in the user's language:
+  "Would you like to refine the details? Otherwise I will proceed with the
+  defaults." Do not wait for a reply or repeat the question. If the user says
+  no or gives no answer, continue the default intake and registration below.
+- If the user opts in, follow the existing `gwt-discussion` skill and its
+  references for investigation and clarification; do not duplicate its dialogue
+  flow here. Explicit opt-in permits that skill's questions instead of the
+  default question-minimization rule below. Use `gwt-plan-spec` when the
+  resulting design-required Issue needs planning. Read these from the PM
+  runtime's gwt-managed skills, not the project's configuration, and do not
+  depend on a provider-specific plan mode or slash command. Persist the
+  refined result as verifiable acceptance criteria in the same Issue's `spec`
+  section / acceptance criteria used by default intake. A later opt-in refines
+  the existing owner rather than creating a duplicate Issue.
 - For every new work request that may require Issue registration or update,
   delegate a bounded intake packet to one or more in-session sub-agents. The
   packet must inspect the existing implementation and duplicate Issues,
@@ -86,8 +104,8 @@ into this generated skill supplements the PM contract.
   Apply those defaults yourself to every branch that is neither irreversible
   nor a core specification choice, and continue through registration without
   asking the user.
-- Ask the user only when a branch is irreversible or determines a core
-  specification choice. Present all remaining questions in a single batch;
+- Outside opted-in refinement, ask the user only when a branch is irreversible
+  or determines a core specification choice. Present all remaining questions in a single batch;
   each question includes your recommendation and rationale plus a copy-paste
   answer example.
 - For every branch registered using a PM default, add a Notes entry to the
@@ -1893,6 +1911,18 @@ mod tests {
             "For every branch registered using a PM default",
             "PM default ruling (override available)",
             "one-line correction",
+            "Offer once for each new user work request that may require Issue registration or update.",
+            "Do not repeat the offer for status queries, monitor events, or replies within the same intake.",
+            "Immediate registration remains the default for every request type unless the user opts into refinement.",
+            "Before registration, offer one optional line",
+            "Would you like to refine the details?",
+            "Do not wait for a reply",
+            "If the user says no or gives no answer",
+            "If the user opts in, follow the existing `gwt-discussion` skill",
+            "Use `gwt-plan-spec` when the resulting design-required Issue needs planning",
+            "same Issue's `spec` section / acceptance criteria",
+            "runtime's gwt-managed skills",
+            "provider-specific plan mode",
         ] {
             assert!(
                 request_intake.contains(phrase),
@@ -2796,6 +2826,10 @@ This paragraph says it is reported immediately and never held for a digest.\n\
             .expect("codex mirror exists");
         assert_eq!(claude, codex, "mirrors must be byte-identical");
         assert_eq!(claude, render_skill_md());
+        let intake = unwrapped(&claude);
+        assert!(intake.contains("Before registration, offer one optional line"));
+        assert!(intake.contains("If the user opts in, follow the existing `gwt-discussion` skill"));
+        assert!(intake.contains("If the user says no or gives no answer"));
         assert!(claude.contains("Only canonical `verify.run` acquires the host-wide lease"));
         assert!(!claude.contains("every 3 minutes"));
         assert!(!claude.contains("15 attempts"));
