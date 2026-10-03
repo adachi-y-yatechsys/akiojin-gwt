@@ -2138,6 +2138,12 @@ enum UserEvent {
         reply: app_runtime::ProjectOpenReply,
     },
     Dispatch(Vec<OutboundEvent>),
+    PmConversationLoaded {
+        client_id: ClientId,
+        window_id: String,
+        session_id: String,
+        snapshot: gwt::pm_conversation::PmConversationSnapshot,
+    },
     AgentBackendConnectionProbeComplete {
         client_id: ClientId,
         agent: gwt_agent::BuiltinAgentId,
@@ -11320,6 +11326,9 @@ fn main() -> std::io::Result<()> {
             Event::UserEvent(UserEvent::ControlProjectOpen { path, reply }) => {
                 let events = app.control_project_open_events(path, reply);
                 clients.dispatch(events);
+            }
+            Event::UserEvent(UserEvent::PmConversationLoaded { client_id, window_id, session_id, snapshot }) => {
+                clients.dispatch(app.pm_conversation_loaded_events(client_id, &window_id, &session_id, snapshot));
             }
             Event::UserEvent(UserEvent::Dispatch(events)) => {
                 clients.dispatch(events);

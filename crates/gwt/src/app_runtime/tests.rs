@@ -48435,6 +48435,7 @@ fn app_runtime_issue_monitor_queue_push_adds_only_to_the_local_terminal_queue() 
                     number: *number,
                     queued_at: "2026-09-10T00:00:00Z".to_string(),
                     queued_by: "operator".to_string(),
+                    ..Default::default()
                 },
             )
             .collect(),
@@ -48505,6 +48506,7 @@ fn app_runtime_issue_monitor_queue_remove_drops_only_the_local_terminal_entry() 
                     number: *number,
                     queued_at: "2026-09-10T00:00:00Z".to_string(),
                     queued_by: "operator".to_string(),
+                    ..Default::default()
                 },
             )
             .collect(),
@@ -48594,6 +48596,7 @@ fn app_runtime_local_driver_locked_latest_state_preserves_proposal_fence_result_
         source: gwt::IssueMonitorCandidateSource::Live,
         live_error: None,
         readiness_failures: Vec::new(),
+        urgent_assignments: Default::default(),
     };
     let now = "2026-07-28T00:00:00Z";
     let mut stale = gwt::IssueMonitorState::new(gwt::IssueMonitorConfig::default());
@@ -48745,6 +48748,7 @@ fn app_runtime_local_driver_slow_persist_does_not_silently_drop_prepared_proposa
         source: gwt::IssueMonitorCandidateSource::Live,
         live_error: None,
         readiness_failures: Vec::new(),
+        urgent_assignments: Default::default(),
     };
     let now = "2026-07-28T00:00:00Z";
     let mut stale = gwt::IssueMonitorState::new(gwt::IssueMonitorConfig::default());
@@ -72258,7 +72262,18 @@ fn workspace_view_marks_only_the_registered_pm_window() {
         migration_pending: false,
         main_worktree_root_cache: std::sync::Arc::new(std::sync::OnceLock::new()),
     };
-    let mut runtime = sample_runtime(temp.path(), vec![tab], Some("tab-1"));
+    let foreign_repo = temp.path().join("foreign-repo");
+    fs::create_dir_all(&foreign_repo).expect("foreign repo");
+    init_repo(&foreign_repo);
+    let foreign_tab = sample_project_tab(
+        "tab-foreign",
+        "Foreign",
+        foreign_repo,
+        ProjectKind::Git,
+        &[],
+    );
+    let (mut runtime, recorded_events) =
+        sample_runtime_with_events(temp.path(), vec![tab, foreign_tab], Some("tab-1"));
 
     let before = runtime.workspace_view_for_tab(runtime.tab("tab-1").expect("tab"));
     assert!(
@@ -72284,6 +72299,135 @@ fn workspace_view_marks_only_the_registered_pm_window() {
         vec!["tab-1::agent-1"],
         "exactly the registered PM session's window is marked"
     );
+
+    // Chat projection must use the same registration as the role marker.
+    // A worker's transcript is never exposed through the PM endpoint.
+    for (id, availability) in [
+        ("tab-1::agent-1", "waiting"),
+        ("tab-1::agent-2", "unsupported"),
+    ] {
+        let request = serde_json::from_value(serde_json::json!({
+            "kind": "load_pm_conversation", "id": id
+        }))
+        .expect("PM conversation request");
+        let replies = runtime.handle_frontend_event("chat-client".to_string(), request);
+        assert_eq!(replies.len(), 1);
+        let reply = serde_json::to_value(&replies[0].event).unwrap();
+        assert_eq!(reply["kind"], "pm_conversation");
+        assert_eq!(reply["snapshot"]["availability"], availability);
+        assert_eq!(reply["snapshot"]["messages"], serde_json::json!([]));
+    }
+
+    let foreign_context = runtime
+        .project_context("tab-foreign")
+        .expect("foreign context");
+    assert!(
+        runtime
+            .handle_frontend_event_for_project(
+                &foreign_context,
+                "foreign-client".to_owned(),
+                FrontendEvent::LoadPmConversation {
+                    id: "tab-1::agent-1".to_owned()
+                },
+            )
+            .is_empty(),
+        "a project-scoped client cannot request another project's PM"
+    );
+
+    let native_home = temp.path().join("claude-home");
+    let _claude_home = ScopedEnvVar::set("CLAUDE_CONFIG_DIR", &native_home);
+    let native_dir = native_home.join("projects/project");
+    fs::create_dir_all(&native_dir).expect("native transcript directory");
+    fs::write(
+        native_dir.join("native-pm.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "type":"assistant", "uuid":"answer", "sessionId":"native-pm", "cwd":repo,
+                "message":{"role":"assistant","content":[{"type":"text","text":"PM answer"}]}
+            })
+        ),
+    )
+    .expect("native transcript");
+    let mut session = gwt_agent::Session::new(&repo, "pm", gwt_agent::AgentId::ClaudeCode);
+    session.id = "pm-session".to_owned();
+    session.agent_session_id = Some("native-pm".to_owned());
+    session.save(&runtime.sessions_dir).expect("PM session");
+    assert!(
+        runtime
+            .handle_frontend_event(
+                "chat-client".to_owned(),
+                FrontendEvent::LoadPmConversation {
+                    id: "tab-1::agent-1".to_owned()
+                },
+            )
+            .is_empty(),
+        "native reads return asynchronously"
+    );
+    wait_for_recorded_event("PM conversation read", &recorded_events, |events| {
+        events.iter().any(|event| {
+            matches!(
+                recorded_project_payload(event),
+                UserEvent::PmConversationLoaded { .. }
+            )
+        })
+    });
+    let completion = recorded_events
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|event| {
+            matches!(
+                recorded_project_payload(event),
+                UserEvent::PmConversationLoaded { .. }
+            )
+        })
+        .unwrap()
+        .clone();
+    let UserEvent::PmConversationLoaded {
+        client_id,
+        window_id,
+        session_id,
+        snapshot,
+    } = runtime
+        .accept_project_completion(completion)
+        .expect("current project completion")
+    else {
+        panic!("expected PM conversation completion");
+    };
+    assert_eq!(snapshot.messages.len(), 1);
+    assert_eq!(snapshot.messages[0].text, "PM answer");
+    let replies = runtime.pm_conversation_loaded_events(
+        client_id.clone(),
+        &window_id,
+        &session_id,
+        snapshot.clone(),
+    );
+    assert!(
+        matches!(replies.as_slice(), [OutboundEvent { target: DispatchTarget::Client(id), event: BackendEvent::PmConversation { .. }, .. }] if id == "chat-client")
+    );
+
+    // A native /clear may rotate the conversation without replacing the gwt
+    // Session. A queued old read must not overwrite that new conversation.
+    session.agent_session_id = Some("native-successor".to_owned());
+    session
+        .save(&runtime.sessions_dir)
+        .expect("rotated native conversation");
+    assert!(runtime
+        .pm_conversation_loaded_events(client_id.clone(), &window_id, &session_id, snapshot.clone())
+        .is_empty());
+    session.agent_session_id = Some("native-pm".to_owned());
+    session
+        .save(&runtime.sessions_dir)
+        .expect("original native identity");
+    runtime
+        .project_state_mut(&runtime.test_context())
+        .unwrap()
+        .pm_sessions
+        .insert(repo, "restarted-pm-session".to_owned());
+    assert!(runtime
+        .pm_conversation_loaded_events(client_id, &window_id, &session_id, snapshot)
+        .is_empty());
 }
 
 /// SPEC #3885 T-020 (Issue #4082 AC-1): the workspace view carries the moment
