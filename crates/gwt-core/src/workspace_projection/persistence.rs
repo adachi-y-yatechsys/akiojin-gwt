@@ -2156,6 +2156,8 @@ fn discover_pending_workspace_state_transaction_coordinators(
 /// schedule the atomic replace uses, so the marker resolves to gone (or to
 /// readable bytes) once the last handle closes, while a denial that persists
 /// past the budget is still reported.
+// Only the Windows build has a retrying arm; elsewhere every arm returns.
+#[cfg_attr(not(windows), allow(clippy::never_loop))]
 fn read_discovered_transaction_coordinator(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
     #[cfg(windows)]
     let mut delays =
