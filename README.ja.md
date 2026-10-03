@@ -107,6 +107,10 @@ usage の `window_minutes` 契約と、未完了の SPEC #2359 に属する Work
 backfill も維持します。旧 HOME / Workspace の `workspace/current.json` と
 `work_items.json` からの取り込みはデータ保護の例外として保持し、起動時に新しい状態を
 作る前に未対応の配置を安全に案内できるようになるまで削除しません。
+coordination のイベント取り込みと discussion の取り込みも、現用の回復処理と session 別
+Stop 契約が利用するため保持します。旧 agent identity reset は廃止し、起動時には保存済みの
+目的・進捗を保持します。`agent_identity.migration.json` は既存の内容を変更せず、
+未作成なら新たに作成しません。
 
 ## 前提
 
@@ -411,8 +415,10 @@ idle になったエージェント窓はスロットを自動的に解放しま
 返し、読み値が無い場合はその理由を返します。レートリミットの初回拒否で provider を
 hold し、全候補が hold 中なら最も早い既知の reset 時刻に自動再開します。
 reset がすべて不明なら定期再試行せず、`needs_human_fleet` の
-`launch_candidates_exhausted` として通知します。GUI の Agent
-settings で別 provider を保存すると同じプールに追加されます。各 operation
+`launch_candidates_exhausted` として通知します。GUI の Issue Monitor 設定フォーム
+（`⚙ Settings`）は同じプールを Agent Settings の組として並べ、`＋` で組を追加、
+`−` で削除、矢印で並べ替えができ、保存した並び順がそのまま起動候補の順序になります。
+各 operation
 は省略可能な `project_root` を受け取り、省略時は現在の worktree を対象にします。
 Priority の変更と daemon 不在時の設定変更は、実行中 instance の next scan/rebase で
 反映されます。

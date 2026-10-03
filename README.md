@@ -111,6 +111,10 @@ The usage `window_minutes` contract and the Workspace projection backfill associ
 with open SPEC #2359 are also retained. Importing old HOME / Workspace state from
 `workspace/current.json` and `work_items.json` remains a data-protection exception
 until startup can safely diagnose unsupported layouts before creating new state.
+The coordination event import and discussion import also remain supported: they
+serve the current recovery and session-specific Stop contracts. The obsolete agent
+identity reset is retired; startup preserves saved purpose and focus values and
+leaves `agent_identity.migration.json` unchanged (or absent).
 
 ## Requirements
 
@@ -445,8 +449,10 @@ provider's latest usage reading under `provider_usage`, or why there is none.
 Every rate-limit refusal immediately holds its provider. If all candidates
 are held, the queue resumes at the earliest known reset; if every reset is
 unknown, `needs_human_fleet` reports `launch_candidates_exhausted` instead
-of periodically retrying. Saving Agent settings for a second provider
-in the GUI appends it to the same pool. All operations accept an optional
+of periodically retrying. In the GUI, the Issue Monitor settings form
+(`⚙ Settings`) lists the same pool as Agent Settings sets: `＋` adds a set, `−`
+removes one, the arrows reorder them, and the saved order is the launch order.
+All operations accept an optional
 `project_root` and otherwise target the current worktree. Priority and
 daemon-absent configuration changes become visible to running instances on the
 next scan/rebase.
