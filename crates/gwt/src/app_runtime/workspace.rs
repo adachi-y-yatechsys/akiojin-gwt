@@ -475,7 +475,7 @@ pub(super) struct WorkspaceCleanupAsyncTask {
     pub(super) project_root: PathBuf,
     pub(super) active_session_branches: std::collections::HashSet<String>,
     pub(super) branch: String,
-    pub(super) operation_id: Option<String>,
+    pub(super) operation_id: String,
     pub(super) operations: Arc<BranchCleanupOperationStore>,
     pub(super) options: BranchCleanupOptions,
 }
@@ -488,7 +488,7 @@ struct BranchCleanupAsyncTask {
     project_root: PathBuf,
     active_session_branches: std::collections::HashSet<String>,
     branches: Vec<String>,
-    operation_id: Option<String>,
+    operation_id: String,
     operations: Arc<BranchCleanupOperationStore>,
     options: BranchCleanupOptions,
 }
@@ -522,7 +522,7 @@ pub(super) fn spawn_workspace_cleanup_async(proxy: AppEventProxy, task: Workspac
                             // reconnected mid-cleanup still receives progress.
                             progress_operations.record_progress(
                                 WORKSPACE_CLEANUP_EVENT_ID,
-                                progress_operation_id.as_deref(),
+                                &progress_operation_id,
                                 &progress,
                             );
                             progress_proxy.send(UserEvent::ProjectDispatch {
@@ -543,11 +543,7 @@ pub(super) fn spawn_workspace_cleanup_async(proxy: AppEventProxy, task: Workspac
                             });
                         },
                     );
-                    operations.record_result(
-                        WORKSPACE_CLEANUP_EVENT_ID,
-                        operation_id.as_deref(),
-                        &results,
-                    );
+                    operations.record_result(WORKSPACE_CLEANUP_EVENT_ID, &operation_id, &results);
                     let mut events = vec![OutboundEvent::project(
                         context.project_key.clone(),
                         BackendEvent::BranchCleanupResult {
@@ -665,7 +661,7 @@ fn branch_cleanup_snapshot_event(
         gwt::BranchCleanupOperationSnapshot::Progress(progress) => {
             BackendEvent::BranchCleanupProgress {
                 id: id.to_string(),
-                operation_id: Some(operation_id.to_string()),
+                operation_id: operation_id.to_string(),
                 branch: progress.branch,
                 execution_branch: progress.execution_branch,
                 index: progress.index,
@@ -676,7 +672,7 @@ fn branch_cleanup_snapshot_event(
         }
         gwt::BranchCleanupOperationSnapshot::Result(results) => BackendEvent::BranchCleanupResult {
             id: id.to_string(),
-            operation_id: Some(operation_id.to_string()),
+            operation_id: operation_id.to_string(),
             results,
         },
     }
@@ -713,7 +709,7 @@ fn spawn_branch_cleanup_async(proxy: AppEventProxy, task: BranchCleanupAsyncTask
                             // reconnected mid-cleanup still receives progress.
                             progress_operations.record_progress(
                                 &progress_window_id,
-                                progress_operation_id.as_deref(),
+                                &progress_operation_id,
                                 &progress,
                             );
                             progress_proxy.send(UserEvent::ProjectDispatch {
@@ -734,7 +730,7 @@ fn spawn_branch_cleanup_async(proxy: AppEventProxy, task: BranchCleanupAsyncTask
                             });
                         },
                     );
-                    operations.record_result(&window_id, operation_id.as_deref(), &results);
+                    operations.record_result(&window_id, &operation_id, &results);
                     let mut events = vec![OutboundEvent::project(
                         context.project_key.clone(),
                         BackendEvent::BranchCleanupResult {
@@ -874,7 +870,7 @@ impl AppRuntime {
         branches: &[String],
         delete_remote: bool,
         force_filesystem_delete: bool,
-        operation_id: Option<&str>,
+        operation_id: &str,
     ) -> Vec<OutboundEvent> {
         let Some(address) = self.window_lookup.get(id) else {
             return vec![OutboundEvent::reply(
@@ -928,7 +924,7 @@ impl AppRuntime {
                 project_root: tab.project_root.clone(),
                 active_session_branches: self.active_session_branches_for_tab(&address.tab_id),
                 branches: branches.to_vec(),
-                operation_id: operation_id.map(str::to_string),
+                operation_id: operation_id.to_string(),
                 operations: state.branch_cleanup_operations.clone(),
                 options: BranchCleanupOptions {
                     delete_remote,
@@ -946,7 +942,7 @@ impl AppRuntime {
         branch: &str,
         delete_remote: bool,
         force_filesystem_delete: bool,
-        operation_id: Option<&str>,
+        operation_id: &str,
     ) -> Vec<OutboundEvent> {
         let tab_id = &context.tab_id;
         let Some(tab) = self.tab(tab_id) else {
@@ -969,7 +965,7 @@ impl AppRuntime {
                 project_root: tab.project_root.clone(),
                 active_session_branches: self.active_session_branches_for_tab(tab_id),
                 branch: branch.to_string(),
-                operation_id: operation_id.map(str::to_string),
+                operation_id: operation_id.to_string(),
                 operations: state.branch_cleanup_operations.clone(),
                 options: BranchCleanupOptions {
                     delete_remote,
