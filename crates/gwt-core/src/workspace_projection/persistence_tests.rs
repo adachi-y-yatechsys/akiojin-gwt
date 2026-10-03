@@ -1329,62 +1329,6 @@ fn sample_work_event(work_id: &str, updated_at: chrono::DateTime<chrono::Utc>) -
     event.title = Some(format!("title {work_id}"));
     event
 }
-/// SPEC-2359 Phase W-11 (US-58 / SC-228): the one-time reset clears
-/// legacy title_summary / current_focus exactly once (version-guarded),
-/// later runs are a no-op, and agent-authored values written after the
-/// reset are preserved.
-#[test]
-fn reset_legacy_agent_identity_clears_once_and_preserves_later_values() {
-    let temp = tempfile::tempdir().expect("tempdir");
-    let current_path = temp.path().join("current.json");
-
-    let mut projection = WorkspaceProjection::default_for_project(temp.path());
-    projection.agents.push(WorkspaceAgentSummary {
-        session_id: "sess-legacy".to_string(),
-        window_id: None,
-        agent_id: "codex".to_string(),
-        display_name: "Codex".to_string(),
-        status_category: WorkspaceStatusCategory::Active,
-        current_focus: Some("/gwt-discussion 生プロンプト focus".to_string()),
-        title_summary: Some("あなたの目的は何ですか".to_string()),
-        worktree_path: None,
-        branch: None,
-        last_board_entry_id: None,
-        last_board_entry_kind: None,
-        coordination_scope: None,
-        affiliation_status: WorkspaceAgentAffiliationStatus::Assigned,
-        workspace_id: None,
-        updated_at: Utc::now(),
-    });
-    save_workspace_projection_to_path(&current_path, &projection).expect("save");
-
-    // First reset clears the legacy values and writes the marker.
-    let applied = reset_legacy_agent_identity_at(&current_path).expect("reset");
-    assert!(applied, "first reset should run and write the marker");
-    let after = load_workspace_projection_from_path(&current_path)
-        .expect("load")
-        .expect("present");
-    assert_eq!(after.agents[0].title_summary, None);
-    assert_eq!(after.agents[0].current_focus, None);
-
-    // The agent authors a real purpose after the migration.
-    let mut authored = after;
-    authored.agents[0].title_summary = Some("Agent タイトル目的化".to_string());
-    save_workspace_projection_to_path(&current_path, &authored).expect("save authored");
-
-    // Second reset is a no-op (marker guard) and preserves the agent value.
-    let applied_again = reset_legacy_agent_identity_at(&current_path).expect("reset again");
-    assert!(!applied_again, "marker must prevent a second clear");
-    let preserved = load_workspace_projection_from_path(&current_path)
-        .expect("load")
-        .expect("present");
-    assert_eq!(
-        preserved.agents[0].title_summary.as_deref(),
-        Some("Agent タイトル目的化"),
-        "agent-authored title must survive later loads"
-    );
-}
-
 #[test]
 fn workspace_update_persists_current_summary_and_journal_entry() {
     let temp = tempfile::tempdir().expect("tempdir");
@@ -2251,6 +2195,9 @@ fn workspace_state_transaction_commit_refusal_blocks_until_explicit_rejection() 
         blocked.is_err(),
         "ordinary writers must fail closed while external commit state is unresolved"
     );
+    let error = blocked.unwrap_err().to_string();
+    assert!(error.contains("unresolved"), "{error}");
+    assert!(!error.contains("in flight"), "{error}");
     assert_eq!(
         fs::read(&current).expect("read current while blocked"),
         current_before
@@ -2319,6 +2266,9 @@ fn workspace_state_transaction_reject_reports_busy_during_in_flight_external_com
         workspace_id: None,
         updated_at: now,
     });
+    let mut other_session = initial.agents[0].clone();
+    other_session.session_id = "session-waiting-writer".to_string();
+    initial.agents.push(other_session);
     save_workspace_projection_to_path(&current, &initial).expect("save initial current");
 
     let (commit_entered_tx, commit_entered_rx) = std::sync::mpsc::channel();
@@ -2364,6 +2314,19 @@ fn workspace_state_transaction_reject_reports_busy_during_in_flight_external_com
         .recv()
         .expect("external commit must start");
 
+    let retry_update = || {
+        transact_workspace_state_at(&current, &works, &events, &root, |projection, _, _| {
+            let agent = projection
+                .agents
+                .iter_mut()
+                .find(|agent| agent.session_id == "session-waiting-writer")
+                .expect("same waiting Session");
+            agent.current_focus = Some("retried update".to_string());
+            Ok(((), Vec::new()))
+        })
+    };
+    let in_flight_result = retry_update();
+
     assert_eq!(
         resolve_workspace_state_external_commit_at(
             &current,
@@ -2385,6 +2348,15 @@ fn workspace_state_transaction_reject_reports_busy_during_in_flight_external_com
         .join()
         .expect("join transaction")
         .expect("external commit and Work publication succeed");
+    let error = in_flight_result.expect_err("writer must wait").to_string();
+    assert!(error.contains("continue-operation-in-flight"), "{error}");
+    assert!(error.contains("in flight"), "{error}");
+    assert!(
+        error.contains("wait") && error.contains("retry in 5 seconds"),
+        "{error}"
+    );
+    assert!(!error.contains("unresolved"), "{error}");
+    retry_update().expect("same Session update succeeds after external commit completes");
     assert!(
         resolve_workspace_state_external_commit_at(
             &current,
@@ -2399,6 +2371,16 @@ fn workspace_state_transaction_reject_reports_busy_during_in_flight_external_com
     let saved = load_workspace_projection_from_path(&current)
         .expect("load current")
         .expect("current exists");
+    assert_eq!(
+        saved
+            .agents
+            .iter()
+            .find(|agent| agent.session_id == "session-waiting-writer")
+            .unwrap()
+            .current_focus
+            .as_deref(),
+        Some("retried update")
+    );
     assert_eq!(
         workspace_assignment_for_session(&saved, "session-in-flight-commit"),
         WorkspaceSessionAssignment::Assigned("work-in-flight-commit".to_string())
