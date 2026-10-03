@@ -34051,6 +34051,20 @@ fn direct_agent_presets_create_and_restart_are_observed_until_stopped() {
         .expect("retired Session");
         assert_eq!(session.status, gwt_agent::AgentStatus::Stopped);
     }
+    // `stop_window_runtime` kills without waiting (Issue #3705); Windows
+    // TerminateProcess is asynchronous, so the observed children may still be
+    // listed briefly. Wait for each exact child to exit before re-observing.
+    let deadline = Instant::now() + TEST_PTY_STOP_SETTLEMENT_TIMEOUT;
+    for row in &inventory.sessions {
+        while gwt::process::exact_pty_process_tree_is_alive(row.child_pid, row.child_started_at) {
+            assert!(
+                Instant::now() < deadline,
+                "stopped direct agent child {} did not exit before the deadline",
+                row.child_pid
+            );
+            thread::sleep(TEST_PTY_STOP_SETTLEMENT_POLL_INTERVAL);
+        }
+    }
     assert!(
         gwt::session_inventory::observe_sessions(&repo, &runtime.sessions_dir)
             .sessions
