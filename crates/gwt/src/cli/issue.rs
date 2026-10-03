@@ -125,7 +125,8 @@ pub(super) fn run<E: CliEnv>(
                 snapshot.number.0,
             );
             let renewal = Cache::new(env.cache_root()).write_snapshot_with_receipt(&snapshot)?;
-            finish_issue_create(&snapshot, renewal, out)
+            let code = finish_issue_create(&snapshot, renewal, out);
+            finish_urgent_issue_mutation(env, &snapshot, code, out)
         }
         IssueCommand::CreateBody {
             title,
@@ -141,7 +142,8 @@ pub(super) fn run<E: CliEnv>(
                 snapshot.number.0,
             );
             let renewal = Cache::new(env.cache_root()).write_snapshot_with_receipt(&snapshot)?;
-            finish_issue_create(&snapshot, renewal, out)
+            let code = finish_issue_create(&snapshot, renewal, out);
+            finish_urgent_issue_mutation(env, &snapshot, code, out)
         }
         IssueCommand::CacheRepair { number } => {
             run_issue_cache_repair(env, IssueNumber(number), out)?
@@ -256,6 +258,36 @@ pub(super) fn run<E: CliEnv>(
             enabled,
             limit,
         } => run_monitor_queue_auto_refill(env, project_root.as_deref(), enabled, limit, out)?,
+        IssueCommand::MonitorQueueUrgentLimit {
+            project_root,
+            limit,
+        } => {
+            let root = issue_monitor_project_root(env, project_root.as_deref())?;
+            crate::try_mutate_issue_monitor_prefs(
+                &crate::issue_monitor_prefs_path_for_repo_path(&root),
+                |prefs| {
+                    prefs.urgent_queue.limit = limit;
+                    Ok(())
+                },
+            )
+            .map_err(io_as_api_error)?;
+            run_monitor_queue_list(env, Some(&root), None, out)?
+        }
+        IssueCommand::MonitorQueueDemote {
+            project_root,
+            number,
+        } => {
+            let root = issue_monitor_project_root(env, project_root.as_deref())?;
+            crate::try_mutate_issue_monitor_prefs(
+                &crate::issue_monitor_prefs_path_for_repo_path(&root),
+                |prefs| {
+                    prefs.urgent_queue.demoted.insert(number);
+                    Ok(())
+                },
+            )
+            .map_err(io_as_api_error)?;
+            run_monitor_queue_list(env, Some(&root), None, out)?
+        }
         IssueCommand::MonitorLaunchNow {
             project_root,
             number,
@@ -690,6 +722,19 @@ fn run_monitor_status<E: CliEnv>(
     let mut output =
         serde_json::to_value(&status).map_err(|error| io_as_api_error(io::Error::other(error)))?;
     output["project_root"] = serde_json::json!(project_root);
+    let prefs = crate::load_issue_monitor_prefs(&crate::issue_monitor_prefs_path_for_repo_path(
+        &project_root,
+    ))
+    .map_err(io_as_api_error)?;
+    output["urgent_queue"] = serde_json::to_value(
+        prefs.urgent_queue.projection(
+            prefs
+                .terminal_queues
+                .get(&crate::process::current_hostname())
+                .unwrap_or(&crate::issue_monitor::IssueMonitorTerminalQueue::default()),
+        ),
+    )
+    .expect("urgent queue serializes");
     output["active_session_count"] = serde_json::json!(inventory.sessions.len());
     output["worktree_sessions"] = serde_json::json!(inventory.worktree_sessions());
     output["session_observation"] = serde_json::json!({
@@ -1111,7 +1156,9 @@ fn run_monitor_queue_list<E: CliEnv>(
         .unwrap_or(&crate::process::current_hostname())
         .to_string();
     let queue = prefs.terminal_queues.get(&key).cloned().unwrap_or_default();
-    out.push_str(&serde_json::to_string(&queue).expect("queue serializes"));
+    out.push_str(
+        &serde_json::to_string(&prefs.urgent_queue.projection(&queue)).expect("queue serializes"),
+    );
     out.push('\n');
     Ok(0)
 }
@@ -1149,6 +1196,7 @@ fn run_monitor_queue_push<E: CliEnv>(
     let queued_expires_at = (chrono::Utc::now() + chrono::Duration::minutes(15)).to_rfc3339();
     let mut accepted_numbers = Vec::new();
     let mut outcomes: Vec<QueuePushOutcome> = Vec::new();
+    let mut urgent_observations = Vec::new();
     // Queue claims are advisory: a GitHub outage must not make the local
     // queue unusable. Active claims remain authoritative and are left alone.
     for number in numbers {
@@ -1203,6 +1251,18 @@ fn run_monitor_queue_push<E: CliEnv>(
                 });
                 continue;
             }
+            if snapshot
+                .labels
+                .iter()
+                .any(|label| label.eq_ignore_ascii_case("urgent"))
+            {
+                let assignment = env.client().fetch_label_assignment(IssueNumber(*number), "urgent")
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(issue = *number, %error, "urgent label assignment unavailable");
+                        None
+                    });
+                urgent_observations.push((snapshot.clone(), assignment));
+            }
             let claim = gwt_github::issue_auto_claim::ClaimComment {
                 comment_id: None,
                 claim_id: format!("gwt-queue:{}:{}", number, uuid::Uuid::new_v4()),
@@ -1244,6 +1304,29 @@ fn run_monitor_queue_push<E: CliEnv>(
             prefs.clone(),
         );
         monitor.terminal_queue_push(&accepted_numbers, "operation", &now);
+        for (snapshot, assignment) in &urgent_observations {
+            let observed = crate::IssueMonitorIssue {
+                number: snapshot.number.0,
+                title: snapshot.title.clone(),
+                labels: snapshot.labels.clone(),
+                state: match snapshot.state {
+                    IssueState::Open => crate::IssueMonitorIssueState::Open,
+                    IssueState::Closed => crate::IssueMonitorIssueState::Closed,
+                },
+                body: None,
+                url: None,
+                readiness: crate::IssueMonitorReadiness::NotApplicable,
+                updated_at: Some(snapshot.updated_at.0.clone()),
+            };
+            monitor.observe_urgent_issue(&observed, &now);
+            if let Some(assignment) = assignment {
+                monitor.record_urgent_assignment(
+                    snapshot.number.0,
+                    observed.updated_at.as_deref(),
+                    assignment,
+                );
+            }
+        }
         if let Some(position) = position {
             let current = monitor.prefs();
             let queue = &current.terminal_queues[&crate::process::current_hostname()];
@@ -1261,9 +1344,16 @@ fn run_monitor_queue_push<E: CliEnv>(
             }
             let at = position.min(order.len());
             order.splice(at..at, selected);
-            for (index, number) in order.into_iter().enumerate() {
-                monitor.terminal_queue_move(number, index, &now);
-            }
+            // This is a complete stored-order edit, not a displayed row move.
+            // Replaying displayed indexes would subtract the urgent head twice.
+            let mut priority = order.clone();
+            priority.extend(
+                current
+                    .priority_order
+                    .into_iter()
+                    .filter(|number| !order.contains(number)),
+            );
+            monitor.set_priority_order(priority);
         }
         *prefs = monitor.prefs();
         Ok(())
@@ -1300,8 +1390,13 @@ fn run_monitor_queue_push<E: CliEnv>(
         .filter(|outcome| !outcome.accepted)
         .map(|outcome| outcome.number)
         .collect::<Vec<_>>();
+    let projected = prefs
+        .terminal_queues
+        .iter()
+        .map(|(host, queue)| (host.clone(), prefs.urgent_queue.projection(queue)))
+        .collect::<std::collections::BTreeMap<_, _>>();
     let payload = serde_json::json!({
-        "terminal_queues": prefs.terminal_queues,
+        "terminal_queues": projected,
         "results": outcomes,
         "accepted": outcomes
             .iter()
@@ -4156,8 +4251,12 @@ fn run_issue_label<E: CliEnv>(
         guard_autonomous_acceptance_block(&post_labels, &current.body)?;
     }
 
+    let grants_urgent = matches!(action, IssueLabelAction::Add)
+        && effective
+            .iter()
+            .any(|label| label.eq_ignore_ascii_case("urgent"));
     let expected_labels = effective.clone();
-    match action {
+    let code = match action {
         IssueLabelAction::Add => submit_and_verify_issue_lifecycle(
             env,
             "issue.label",
@@ -4192,7 +4291,20 @@ fn run_issue_label<E: CliEnv>(
                 out,
             )
         }
+    }?;
+    if code == 0 && grants_urgent {
+        let (queue_code, queue_result) = enqueue_urgent_after_mutation(env, number);
+        let mut result: serde_json::Value =
+            serde_json::from_str(out.trim()).expect("label lifecycle emits JSON");
+        result["urgent_queue"] = queue_result;
+        if queue_code != 0 {
+            result["status"] = serde_json::json!("queue_refused");
+            result["retry_operation"] = serde_json::json!("issue.monitor.queue.push");
+        }
+        *out = format!("{result}\n");
+        return Ok(queue_code);
     }
+    Ok(code)
 }
 
 /// Issue #3865: update a plain Issue's title / body / labels in place.
@@ -4768,6 +4880,48 @@ fn finish_issue_create(
         renewal.remedy()
     ));
     1
+}
+
+/// The remote mutation already succeeded. A local enqueue failure must name
+/// that Issue instead of inviting the caller to create it again (#4819).
+fn enqueue_urgent_after_mutation<E: CliEnv>(env: &E, number: u64) -> (i32, serde_json::Value) {
+    let mut queue_out = String::new();
+    match run_monitor_queue_push(env, None, &[number], None, false, &mut queue_out) {
+        Ok(code) => (
+            code,
+            serde_json::from_str(&queue_out).expect("queue push emits JSON"),
+        ),
+        Err(error) => (
+            1,
+            serde_json::json!({
+                "accepted": [], "refused": [number], "error": error.to_string(),
+                "issue_mutation_succeeded": true, "retry_operation": "issue.monitor.queue.push",
+            }),
+        ),
+    }
+}
+
+fn finish_urgent_issue_mutation<E: CliEnv>(
+    env: &E,
+    snapshot: &IssueSnapshot,
+    code: i32,
+    out: &mut String,
+) -> i32 {
+    if code != 0
+        || snapshot.state != IssueState::Open
+        || !snapshot
+            .labels
+            .iter()
+            .any(|label| label.eq_ignore_ascii_case("urgent"))
+    {
+        return code;
+    }
+    let (queue_code, result) = enqueue_urgent_after_mutation(env, snapshot.number.0);
+    out.push_str(&format!("urgent queue: {result}\n"));
+    if queue_code != 0 {
+        out.push_str("The Issue exists; retry issue.monitor.queue.push, not issue.create.\n");
+    }
+    queue_code
 }
 
 /// Rewrite an Issue's cache entry and republish its validation receipt.
@@ -7085,6 +7239,199 @@ mod tests {
 
     // ---- Issue #4819: `queue.push` must never refuse silently ----
 
+    #[test]
+    fn urgent_queue_controls_survive_a_stale_scan_and_do_not_rewrite_normal_order() {
+        let tmp = TempDir::new().unwrap();
+        let _home = ScopedGwtHome::set(tmp.path().join("home"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let mut env = crate::cli::TestEnv::new(repo.clone());
+        let mut monitor = crate::IssueMonitorState::new(crate::IssueMonitorConfig::default());
+        monitor.terminal_queue_push(&[1, 2], "operator", "2026-10-03T00:00:00Z");
+        let candidate = crate::IssueMonitorIssue {
+            number: 2,
+            title: "urgent".to_string(),
+            labels: vec!["urgent".to_string()],
+            state: crate::IssueMonitorIssueState::Open,
+            body: None,
+            url: None,
+            readiness: crate::IssueMonitorReadiness::NotApplicable,
+            updated_at: Some("2026-10-03T00:00:00Z".to_string()),
+        };
+        crate::scan_issue_monitor_candidates(
+            &mut monitor,
+            std::slice::from_ref(&candidate),
+            "2026-10-03T00:00:00Z",
+        );
+        let prefs_path = crate::issue_monitor_prefs_path_for_repo_path(&repo);
+        crate::save_issue_monitor_prefs(&prefs_path, &monitor.prefs()).unwrap();
+        for (operation, params) in [
+            (
+                "issue.monitor.queue.urgent_limit",
+                serde_json::json!({"limit": 0}),
+            ),
+            (
+                "issue.monitor.queue.demote",
+                serde_json::json!({"number": 2}),
+            ),
+            (
+                "issue.monitor.queue.urgent_limit",
+                serde_json::json!({"limit": 2}),
+            ),
+        ] {
+            env.stdin =
+                serde_json::json!({"schema_version":1,"operation":operation,"params":params})
+                    .to_string();
+            env.stdout.clear();
+            assert_eq!(
+                crate::cli::json_envelope::dispatch(&mut env, "gwtd"),
+                0,
+                "{operation}"
+            );
+        }
+        let disk = crate::load_issue_monitor_prefs(&prefs_path).unwrap();
+        monitor.rebase_daemon_driver_prefs(&disk);
+        crate::scan_issue_monitor_candidates(&mut monitor, &[candidate], "2026-10-03T00:01:00Z");
+        let view = monitor.urgent_queue_projection(&crate::process::current_hostname());
+        assert_eq!(
+            view.entries
+                .iter()
+                .map(|entry| entry.number)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(
+            view.entries[1].priority_reason.as_deref(),
+            Some("pm_demoted")
+        );
+        assert_eq!(view.urgent_count, 0);
+    }
+
+    #[test]
+    fn urgent_queue_positioned_push_preserves_other_normal_entries() {
+        let tmp = TempDir::new().unwrap();
+        let _home = ScopedGwtHome::set(tmp.path().join("home"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let mut env = crate::cli::TestEnv::new(repo.clone());
+        let mut monitor = crate::IssueMonitorState::new(Default::default());
+        monitor.terminal_queue_push(&[1, 2, 3], "operator", "2026-10-03T00:00:00Z");
+        let mut prefs = serde_json::to_value(monitor.prefs()).unwrap();
+        prefs["urgent_queue"]["grants"] = serde_json::json!({"3": {
+            "label_present": true, "observed_at": "2026-10-03T00:00:00Z",
+            "issue_updated_at": null, "assigned_by": null, "assigned_at": null
+        }});
+        crate::save_issue_monitor_prefs(
+            &crate::issue_monitor_prefs_path_for_repo_path(&repo),
+            &serde_json::from_value(prefs).unwrap(),
+        )
+        .unwrap();
+        let mut out = String::new();
+        assert_eq!(
+            run(
+                &mut env,
+                IssueCommand::MonitorQueuePush {
+                    project_root: None,
+                    issue_numbers: vec![4],
+                    position: Some(3),
+                    force: false,
+                },
+                &mut out
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(queued_numbers(&repo), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn urgent_queue_create_and_label_confirm_membership_and_github_assignment() {
+        let tmp = TempDir::new().unwrap();
+        let _home = ScopedGwtHome::set(tmp.path().join("home"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let mut env = crate::cli::TestEnv::new(repo);
+        for number in 1..=3 {
+            if number == 2 {
+                env.client.set_label_assignment(
+                    IssueNumber(number),
+                    "urgent",
+                    Some(gwt_github::client::LabelAssignment {
+                        actor: Some("alice".to_string()),
+                        created_at: "2026-10-03T00:00:00Z".to_string(),
+                    }),
+                );
+            }
+            let mut out = String::new();
+            assert_eq!(
+                run(
+                    &mut env,
+                    IssueCommand::CreateBody {
+                        title: format!("issue {number}"),
+                        body: String::new(),
+                        labels: if number == 2 {
+                            vec!["urgent".to_string()]
+                        } else {
+                            Vec::new()
+                        },
+                    },
+                    &mut out
+                )
+                .unwrap(),
+                0
+            );
+            if number == 1 {
+                assert_eq!(run_queue_push(&mut env, vec![1], false).0, 0);
+            }
+            if number == 2 {
+                assert!(
+                    out.contains("accepted"),
+                    "creation must confirm the urgent enqueue: {out}"
+                );
+            }
+        }
+        env.client.set_label_assignment(
+            IssueNumber(3),
+            "urgent",
+            Some(gwt_github::client::LabelAssignment {
+                actor: Some("bob".to_string()),
+                created_at: "2026-10-03T00:01:00Z".to_string(),
+            }),
+        );
+        let mut out = String::new();
+        assert_eq!(
+            run(
+                &mut env,
+                IssueCommand::Label {
+                    number: 3,
+                    action: IssueLabelAction::Add,
+                    labels: vec!["urgent".to_string()],
+                    confirm_queue: false,
+                    confirm_design_gate: false,
+                    confirm_auto_merge: false,
+                },
+                &mut out
+            )
+            .unwrap(),
+            0
+        );
+        let labeled: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(labeled["urgent_queue"]["accepted"], serde_json::json!([3]));
+        out.clear();
+        run_monitor_queue_list(&env, None, None, &mut out).unwrap();
+        let listed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(listed["entries"][0]["number"], 2);
+        assert_eq!(listed["entries"][0]["assigned_by"], "alice");
+        assert_eq!(listed["entries"][1]["assigned_at"], "2026-10-03T00:01:00Z");
+        out.clear();
+        run_monitor_status(&env, None, &mut out).unwrap();
+        let status: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            status["urgent_queue"], listed,
+            "both JSON surfaces share ordering and evidence"
+        );
+    }
+
     /// Seed one open Issue carrying the queue label and, optionally, a claim
     /// comment owned by somebody other than this process.
     fn queue_push_issue(
@@ -7206,6 +7553,30 @@ mod tests {
             vec![4803],
             "the accepted number is queued and the refused one is not"
         );
+        // #4831 AC-7: granting urgent succeeds remotely, but must not hide
+        // the same enqueue refusal or suggest recreating the Issue.
+        let mut out = String::new();
+        let code = run(
+            &mut env,
+            IssueCommand::Label {
+                number: 4812,
+                action: IssueLabelAction::Add,
+                labels: vec!["urgent".to_string()],
+                confirm_queue: false,
+                confirm_design_gate: false,
+                confirm_auto_merge: false,
+            },
+            &mut out,
+        )
+        .unwrap();
+        let labeled: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(code, 1);
+        assert_eq!(
+            labeled["urgent_queue"]["refused"],
+            serde_json::json!([4812])
+        );
+        assert_eq!(labeled["retry_operation"], "issue.monitor.queue.push");
+        assert_eq!(queued_numbers(&repo), vec![4803]);
     }
 
     /// Issue #4819 AC-5: the queue claim carries a 15-minute lease, so an

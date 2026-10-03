@@ -48379,6 +48379,7 @@ fn app_runtime_issue_monitor_queue_push_adds_only_to_the_local_terminal_queue() 
                     number: *number,
                     queued_at: "2026-09-10T00:00:00Z".to_string(),
                     queued_by: "operator".to_string(),
+                    ..Default::default()
                 },
             )
             .collect(),
@@ -48449,6 +48450,7 @@ fn app_runtime_issue_monitor_queue_remove_drops_only_the_local_terminal_entry() 
                     number: *number,
                     queued_at: "2026-09-10T00:00:00Z".to_string(),
                     queued_by: "operator".to_string(),
+                    ..Default::default()
                 },
             )
             .collect(),
@@ -48538,6 +48540,7 @@ fn app_runtime_local_driver_locked_latest_state_preserves_proposal_fence_result_
         source: gwt::IssueMonitorCandidateSource::Live,
         live_error: None,
         readiness_failures: Vec::new(),
+        urgent_assignments: Default::default(),
     };
     let now = "2026-07-28T00:00:00Z";
     let mut stale = gwt::IssueMonitorState::new(gwt::IssueMonitorConfig::default());
@@ -48689,6 +48692,7 @@ fn app_runtime_local_driver_slow_persist_does_not_silently_drop_prepared_proposa
         source: gwt::IssueMonitorCandidateSource::Live,
         live_error: None,
         readiness_failures: Vec::new(),
+        urgent_assignments: Default::default(),
     };
     let now = "2026-07-28T00:00:00Z";
     let mut stale = gwt::IssueMonitorState::new(gwt::IssueMonitorConfig::default());
