@@ -2029,6 +2029,7 @@ mod tests {
                 lease_id: None,
                 worktree_fingerprint: plan.worktree_fingerprint.clone(),
                 verified_head: None,
+                driver: None,
                 commands: vec![crate::cli::verification_record::VerificationCommandResult {
                     headed_e2e: None,
                     nextest: None,
