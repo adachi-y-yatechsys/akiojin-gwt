@@ -1206,6 +1206,27 @@ lease の遷移は
 従来どおり `~/.gwt/runtime/index-coordinator` 上で相互排他（model を load する
 runner は同時に 1 本）し、検証とは互いに待ち合いません。
 
+### PR HEAD の検証
+
+Ready PR の作成前に、`pr.create` は live remote branch と `verify.run` に記録された
+HEAD を比較します。応答と PR 本文には、両方の SHA、base の SHA、比較結果が残ります。
+`.gwt/` 内の bookkeeping と base 同期のみの先行は許可します。検証済み履歴と対象
+base に含まれない commit が product file を変更していれば、後で revert されていても
+拒否します。merge による追加の source 変更も拒否します。remote 履歴を取得できない
+場合や比較を証明できない場合は、Ready を許可しません。
+
+拒否文は product commit と file を列挙します。記載された remote branch を fetch し、
+`git merge --ff-only <remote-head-sha>` で local branch を FF した後、変更範囲に対応する
+検証行列を `verify.plan` に登録し、`verify.run` で再検証してください。PASS 後に
+`pr.create` を再試行します。local が分岐している場合は FF の前に履歴を整合させます。
+
+既存 PR の `pr.view` は、本文に保持された検証 SHA と現在の remote HEAD を比較し、
+drift を報告します。現在の branch に対応する旧 PR は PASS 済み local 検証記録を
+参照し、証跡がなければ unknown を表示します。診断を永続化するには、比較結果を
+`pr.comment`（`params.number` と
+`params.body`）または owner Issue の `issue.comment` に記録します。PR の表示だけでは
+本文を変更せず、現在の HEAD が検証済みであるとも認定しません。
+
 ### GitHub API 予算
 
 gwt が発行する `gh` 呼び出しは、全マシン・全 worktree・全エージェントで

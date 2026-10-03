@@ -1287,6 +1287,29 @@ has its own coordinator lane: semantic search and index builds keep excluding
 each other on `~/.gwt/runtime/index-coordinator` (one model-loaded runner at
 a time), and neither lane waits for the other.
 
+### PR head verification
+
+Before creating a Ready PR, `pr.create` compares the live remote branch with
+the HEAD recorded by `verify.run`. Its response and the PR body preserve both
+SHAs, the base SHA, and the comparison result. Bookkeeping under `.gwt/` and
+base synchronization alone are allowed. Commits outside the verified history
+and the target base that change product files, including changes later reverted,
+are refused; extra source changes introduced by a merge are also refused.
+Unavailable remote history or an ambiguous comparison cannot authorize Ready.
+
+The refusal lists the product commits and files. Fetch the named remote branch,
+fast-forward the local branch with `git merge --ff-only <remote-head-sha>`, then
+register the affected verification matrix with `verify.plan` and rerun it with
+`verify.run`. Retry `pr.create` after verification passes. A diverged local
+branch needs conflict resolution before that fast-forward can succeed.
+
+For an existing PR, `pr.view` compares its current remote head with the verified
+SHA retained in its body and reports drift. An older PR for the current branch
+can use its passing local verification record; missing evidence is unknown.
+To preserve the diagnostic, copy the reported head comparison into `pr.comment`
+(`params.number`, `params.body`) or `issue.comment` for the owning Issue. Viewing
+a PR does not change its body or confirm that its current head is verified.
+
 ### GitHub API budget
 
 Every `gh` call gwt makes shares one GitHub account budget across all
