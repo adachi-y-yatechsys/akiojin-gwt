@@ -116,6 +116,10 @@ serve the current recovery and session-specific Stop contracts. The obsolete age
 identity reset is retired; startup preserves saved purpose and focus values and
 leaves `agent_identity.migration.json` unchanged (or absent).
 
+The embedded frontend uses the current Fast mode fields and requires an operation
+ID for cleanup requests. Reload older open tabs after upgrading; saved Fast mode
+preferences are retained.
+
 ## Requirements
 
 - `git` available in `PATH`
@@ -396,12 +400,23 @@ between its body and acceptance criteria and its agent's read-only output.
 the board the full width or restores the detail pane; columns scroll horizontally
 instead of shrinking. The legacy `issue_monitor` preset opens this same Issue surface.
 
-Open GitHub Issues remain in Backlog until explicitly queued or added by enabled
-auto-refill. Queue membership authorizes the monitor to consider an Issue; normal
+Open GitHub Issues remain in Backlog until explicitly queued, added by enabled
+auto-refill, or admitted with an `urgent` label. Queue membership authorizes the monitor to consider an Issue; normal
 readiness, claim, and capacity checks still apply. `Launch now` on a row opens the
 launch flow, which creates the `work/issue-N` branch/worktree at launch time and
 starts the agent with `gwt-execute #N`. Failed launches remain visible on their
 Issue rows.
+
+Anyone can apply `urgent`. Eligible urgent Issues enter the queue automatically,
+even with Auto-refill off; an explicit queue removal still wins. Up to two urgent
+Issues lead the queue in assignment order by default, without changing the saved
+normal order or `max_active`. Set the head limit with
+`issue.monitor.queue.urgent_limit` (`limit: 0` disables priority, not membership).
+Overflow follows normal order. `issue.monitor.queue.demote` (`number`) persistently
+returns an Issue to normal priority, overriding its urgent label across scans and
+restarts. Queue cards and details distinguish urgent, overflow, and demotion;
+`issue.monitor.queue.list` and `issue.monitor.status` include the reason and
+observed GitHub label actor/time. Missing audit data is shown as unknown.
 
 Agents and automation can inspect the queue with `issue.monitor.status` and
 change membership/order with `issue.monitor.queue.push`,
