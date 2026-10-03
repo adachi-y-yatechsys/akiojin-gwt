@@ -1498,20 +1498,39 @@ impl TimeoutProcessTree {
 /// seconds under load) and snapshots the tree, so a grandchild created after
 /// the snapshot escapes and keeps the inherited pipe handles open. The child
 /// is instead spawned suspended into a kill-on-close Job: every descendant
-/// joins the Job, and closing it terminates them all in-process.
+/// joins the Job, and closing it terminates them all in-process. When no Job
+/// can be created the command spawns normally and the timeout path falls back
+/// to a `taskkill /T` snapshot kill, which still reaps every descendant that
+/// exists at the deadline.
 #[cfg(windows)]
 struct TimeoutProcessTree {
     job: Option<gwt_core::process_tree::WindowsJobObject>,
 }
 
+#[cfg(all(windows, test))]
+thread_local! {
+    /// Test-only seam that makes `TimeoutProcessTree::prepare` behave as if
+    /// Job creation failed, so the fallback tree kill can be exercised.
+    static FORCE_TIMEOUT_JOB_FALLBACK: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 #[cfg(windows)]
 impl TimeoutProcessTree {
     fn prepare(command: &mut Command) -> Self {
-        let job = gwt_core::process_tree::WindowsJobObject::new().ok();
+        let job = Self::new_job();
         if job.is_some() {
             gwt_core::process_tree::WindowsJobObject::configure_suspended(command);
         }
         Self { job }
+    }
+
+    fn new_job() -> Option<gwt_core::process_tree::WindowsJobObject> {
+        #[cfg(test)]
+        if FORCE_TIMEOUT_JOB_FALLBACK.with(std::cell::Cell::get) {
+            return None;
+        }
+        gwt_core::process_tree::WindowsJobObject::new().ok()
     }
 
     fn after_spawn(&mut self, child: &Child) -> std::io::Result<()> {
@@ -1532,8 +1551,22 @@ impl TimeoutProcessTree {
     }
 
     fn terminate(&mut self, child: &mut Child) {
-        if let Some(mut job) = self.job.take() {
-            job.terminate();
+        match self.job.take() {
+            Some(mut job) => {
+                job.terminate();
+            }
+            // No Job owns the tree: kill it by snapshot while the child is
+            // still alive to anchor it. Reader threads are abandoned by the
+            // caller, so a descendant that escapes the snapshot cannot block
+            // the timeout path.
+            None => {
+                let _ = gwt_core::process::hidden_command("taskkill")
+                    .args(["/PID", &child.id().to_string(), "/T", "/F"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
         }
         let _ = child.kill();
     }
@@ -3736,6 +3769,64 @@ prunable gitdir file points to non-existent location
         assert!(
             elapsed < Duration::from_secs(LINGERING_DESCENDANT_SECS),
             "timeout path waited for descendant pipe handles for {elapsed:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    fn windows_process_alive(pid: u32) -> bool {
+        let output = gwt_core::process::hidden_command("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
+            .output()
+            .expect("tasklist");
+        String::from_utf8_lossy(&output.stdout).contains(&format!(",\"{pid}\","))
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn run_command_with_timeout_kills_descendants_when_job_is_unavailable() {
+        struct ForceJobFallback;
+        impl Drop for ForceJobFallback {
+            fn drop(&mut self) {
+                FORCE_TIMEOUT_JOB_FALLBACK.with(|flag| flag.set(false));
+            }
+        }
+        FORCE_TIMEOUT_JOB_FALLBACK.with(|flag| flag.set(true));
+        let _fallback = ForceJobFallback;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_file = tmp.path().join("descendant.pid");
+        let pid_path = pid_file.display().to_string().replace('\'', "''");
+        let secs = LINGERING_DESCENDANT_SECS;
+        let mut command = gwt_core::process::hidden_command("powershell");
+        command.args([
+            "-NoProfile".to_string(),
+            "-Command".to_string(),
+            format!(
+                "$psi = [Diagnostics.ProcessStartInfo]::new('powershell'); $psi.Arguments = '-NoProfile -Command Start-Sleep -Seconds {secs}'; $psi.UseShellExecute = $false; $p = [Diagnostics.Process]::Start($psi); [IO.File]::WriteAllText('{pid_path}', [string]$p.Id); Start-Sleep -Seconds {secs}"
+            ),
+        ]);
+
+        // The deadline only has to outlast powershell startup so the
+        // descendant exists and its pid is recorded before the timeout fires.
+        let err = run_command_with_timeout(&mut command, "job fallback", Duration::from_secs(10))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("job fallback timed out"),
+            "unexpected timeout error: {err}"
+        );
+
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .expect("descendant pid must be recorded before the deadline")
+            .trim()
+            .parse()
+            .expect("descendant pid");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while windows_process_alive(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        assert!(
+            !windows_process_alive(pid),
+            "descendant {pid} survived the fallback timeout tree kill"
         );
     }
 
