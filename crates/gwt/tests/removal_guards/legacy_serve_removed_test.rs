@@ -3,9 +3,9 @@
 //! exit code 2. Also pins the runtime_support shape so the hint message
 //! and routing cannot drift apart silently.
 
-const RUNTIME_SUPPORT_SRC: &str = include_str!("../src/runtime_support.rs");
-const MAIN_SRC: &str = include_str!("../src/main.rs");
-const CLI_SRC: &str = include_str!("../src/cli.rs");
+const RUNTIME_SUPPORT_SRC: &str = include_str!("../../src/runtime_support.rs");
+const MAIN_SRC: &str = include_str!("../../src/main.rs");
+const CLI_SRC: &str = include_str!("../../src/cli.rs");
 
 #[test]
 fn front_door_route_defines_legacy_serve_usage_hint_variant() {
