@@ -5,6 +5,198 @@ use crate::paths::{gwt_repo_local_work_event_shard_path, gwt_repo_local_work_eve
 
 use super::*;
 
+/// Issue #4739: launch publication must repair the already-poisoned Work,
+/// not require a separate workspace.ensure before the first update.
+#[test]
+fn launch_transaction_repairs_inactive_foreign_container_before_update() {
+    let _guard = lock_test_env();
+    let temp = tempfile::tempdir().unwrap();
+    let _home = ScopedHome::set(&temp.path().join("home"));
+    let at = Utc.with_ymd_and_hms(2026, 9, 28, 0, 0, 0).unwrap();
+    for issue in [4595, 4558, 4557, 4554] {
+        let repo = temp.path().join(issue.to_string());
+        fs::create_dir_all(&repo).unwrap();
+        let branch = format!("work/issue-{issue}");
+        let work_id = canonical_work_id(&repo, Some(&branch), Some(&repo)).unwrap();
+        let old_id = "work-work-issue-2359-34a6ca7a";
+        let own = WorkspaceExecutionContainerRef {
+            branch: Some("work/issue-2359".into()),
+            worktree_path: Some(repo.join("old")),
+            pr_number: None,
+            pr_url: None,
+            pr_state: None,
+        };
+        let foreign = WorkspaceExecutionContainerRef {
+            branch: Some(branch.clone()),
+            worktree_path: Some(repo.clone()),
+            ..own.clone()
+        };
+        let mut old = WorkEvent::new(WorkEventKind::Update, old_id, at);
+        old.owner = Some("Issue #2359".into());
+        old.status_category = Some(WorkspaceStatusCategory::Active);
+        old.execution_container = Some(own.clone());
+        let mut items = WorkItemsProjection::empty(at);
+        items.apply_event(old.clone());
+        old.id = Uuid::new_v4().to_string();
+        old.execution_container = Some(foreign.clone());
+        items.apply_event(old);
+        let works_path = gwt_workspace_work_items_path_for_repo_path(&repo);
+        save_workspace_work_items_projection_to_path(&works_path, &items).unwrap();
+
+        transact_workspace_state(&repo, |projection, _, _| {
+            projection.id = work_id.clone();
+            projection.owner = Some(format!("Issue #{issue}"));
+            let mut agent = assigned_agent("new-session", "codex", &work_id);
+            agent.branch = Some(branch.clone());
+            agent.worktree_path = Some(repo.clone());
+            projection.agents.push(agent);
+            let mut start = WorkEvent::new(WorkEventKind::Start, &work_id, at);
+            start.owner = projection.owner.clone();
+            start.agent_session_id = Some("new-session".into());
+            start.agent_id = Some("codex".into());
+            start.execution_container = Some(foreign.clone());
+            Ok(((), vec![start]))
+        })
+        .unwrap();
+        let saved = load_workspace_work_items_from_path(&works_path)
+            .unwrap()
+            .unwrap();
+        let old = saved
+            .work_items
+            .iter()
+            .find(|item| item.id == old_id)
+            .unwrap();
+        assert_eq!(old.execution_containers, [own], "Issue #{issue}");
+        assert_eq!(old.owner.as_deref(), Some("Issue #2359"));
+        assert!(old.is_incomplete() && !old.discarded);
+        assert!(container_detachments_path(&works_path).exists());
+
+        let target = SessionBoundWorkspaceMutationTarget {
+            project_state_root: repo.clone(),
+            work_event_root: repo.clone(),
+            session_id: "new-session".into(),
+            branch_identity: branch,
+            worktree_identity: repo,
+            work_id,
+            owner: Some(format!("Issue #{issue}")),
+            agent_id: "codex".into(),
+        };
+        t812_apply_resolved_workspace_update(
+            &target,
+            WorkspaceProjectionUpdate {
+                title: None,
+                status_category: None,
+                status_text: None,
+                owner: None,
+                next_action: None,
+                summary: Some("first update after launch".into()),
+                progress_summary: None,
+                agent_session_id: Some("new-session".into()),
+                agent_current_focus: None,
+                agent_title_summary: None,
+            },
+        )
+        .expect("new launch updates without an ambiguous foreign container");
+    }
+}
+
+/// Issue #4739: a repair cannot steal live authority or discarded lineage.
+#[test]
+fn launch_transaction_preserves_live_work_and_discarded_container_history() {
+    assert_launch_preserves_foreign_authority(false);
+}
+
+#[test]
+fn launch_transaction_recovery_preserves_a_newer_live_assignment() {
+    assert_launch_preserves_foreign_authority(true);
+}
+
+fn assert_launch_preserves_foreign_authority(recovering: bool) {
+    let _guard = lock_test_env();
+    let temp = tempfile::tempdir().unwrap();
+    let _home = ScopedHome::set(&temp.path().join("home"));
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    let at = Utc.with_ymd_and_hms(2026, 9, 28, 0, 0, 0).unwrap();
+    let branch = "work/issue-4595";
+    let work_id = canonical_work_id(&repo, Some(branch), Some(&repo)).unwrap();
+    let container = WorkspaceExecutionContainerRef {
+        branch: Some(branch.into()),
+        worktree_path: Some(repo.clone()),
+        pr_number: None,
+        pr_url: None,
+        pr_state: None,
+    };
+    let mut items = WorkItemsProjection::empty(at);
+    for id in ["live", "discarded"] {
+        let mut event = WorkEvent::new(WorkEventKind::Update, id, at);
+        event.execution_container = Some(container.clone());
+        items.apply_event(event);
+    }
+    items
+        .work_items
+        .iter_mut()
+        .find(|item| item.id == "discarded")
+        .unwrap()
+        .discarded = true;
+    let works_path = gwt_workspace_work_items_path_for_repo_path(&repo);
+    save_workspace_work_items_projection_to_path(&works_path, &items).unwrap();
+    let current_path = gwt_workspace_projection_path_for_repo_path(&repo);
+    let (_, transaction) = build_workspace_state_transaction_locked(
+        &current_path,
+        &works_path,
+        &gwt_repo_local_work_events_dir(&repo),
+        &repo,
+        |projection, _, _| {
+            if !recovering {
+                projection
+                    .agents
+                    .push(assigned_agent("live-session", "codex", "live"));
+            }
+            let mut agent = assigned_agent("new-session", "codex", &work_id);
+            agent.branch = Some(branch.into());
+            agent.worktree_path = Some(repo.clone());
+            projection.agents.push(agent);
+            let mut start = WorkEvent::new(WorkEventKind::Start, &work_id, at);
+            start.agent_session_id = Some("new-session".into());
+            start.execution_container = Some(container.clone());
+            Ok(((), vec![start]))
+        },
+    )
+    .unwrap();
+    write_pending_transaction_markers(&transaction);
+    if recovering {
+        // Only current changed after the marker: its newly-live assignment
+        // must not be judged against the transaction's stale agent snapshot.
+        let mut current = transaction.projection.clone();
+        current
+            .agents
+            .push(assigned_agent("live-session", "codex", "live"));
+        save_workspace_projection_to_path_unlocked(&current_path, &current).unwrap();
+    }
+    apply_workspace_state_transaction_locked(&current_path, &transaction, recovering).unwrap();
+    let saved = load_workspace_work_items_from_path(&works_path)
+        .unwrap()
+        .unwrap();
+    for id in ["live", "discarded"] {
+        let item = saved.work_items.iter().find(|item| item.id == id).unwrap();
+        assert_eq!(item.execution_containers, std::slice::from_ref(&container));
+    }
+    assert!(!container_detachments_path(&works_path).exists());
+    assert!(
+        validate_session_bound_work_authority_uniqueness(
+            &saved,
+            &work_id,
+            "new-session",
+            branch,
+            &repo,
+            "launch",
+        )
+        .is_err(),
+        "a live competing owner must remain fail-closed"
+    );
+}
+
 #[test]
 fn ordinary_workspace_saves_preserve_invalid_existing_state() {
     let tmp = tempfile::tempdir().unwrap();
