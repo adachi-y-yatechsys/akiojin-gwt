@@ -163,12 +163,20 @@ def deferred_restore():
         lease.parent.mkdir(parents=True)
         with lease.open("a") as holder:
             fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            result = subprocess.run(
-                [str(GWTD)], cwd=repo, env=env, text=True, capture_output=True,
-                input=json.dumps({"schema_version": 1, "operation": "verify.run",
-                                  "params": {"commands": ["cargo test --all-features"],
-                                             "max_wait_secs": 0}}),
-            )
+            try:
+                result = subprocess.run(
+                    [str(GWTD)], cwd=repo, env=env, text=True, capture_output=True,
+                    input=json.dumps({"schema_version": 1, "operation": "verify.run",
+                                      "params": {"commands": ["cargo test --all-features"],
+                                                 "max_wait_secs": 0}}),
+                    timeout=1800,
+                )
+            except subprocess.TimeoutExpired as error:
+                output = "".join(
+                    chunk.decode(errors="replace") if isinstance(chunk, bytes) else chunk or ""
+                    for chunk in (error.stdout, error.stderr)
+                )
+                raise AssertionError(f"deferred verify.run timed out after 1800s:\n{output}") from error
         output = result.stdout + result.stderr
         assert result.returncode != 0 and "deferred" in output, output
         reached = [json.loads(line) for line in calls.read_text().splitlines()] if calls.exists() else []
