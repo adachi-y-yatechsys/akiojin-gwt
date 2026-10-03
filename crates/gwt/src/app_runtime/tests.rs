@@ -13698,7 +13698,7 @@ fn app_runtime_open_launch_wizard_uses_cached_previous_profile_without_hydrating
     assert!(view.skip_permissions);
     // Toggle visibility still follows the manual-setup launch path.
     assert!(!view.show_skip_permissions);
-    assert!(view.codex_fast_mode);
+    assert!(view.fast_mode);
 }
 
 #[test]
@@ -40459,7 +40459,7 @@ fn workspace_cleanup_failure_does_not_emit_done_work_item() {
         branch,
         false,
         false,
-        None,
+        "cleanup-op-1",
     );
 
     assert!(immediate_events.is_empty());
@@ -46089,7 +46089,7 @@ fn frontend_project_log_tab_id_routes_non_window_owners() {
                 branch: "work/example".into(),
                 delete_remote: false,
                 force_filesystem_delete: false,
-                operation_id: None,
+                operation_id: "cleanup-op-1".to_string(),
             },
             Some("tab-b"),
         ),
@@ -48435,6 +48435,7 @@ fn app_runtime_issue_monitor_queue_push_adds_only_to_the_local_terminal_queue() 
                     number: *number,
                     queued_at: "2026-09-10T00:00:00Z".to_string(),
                     queued_by: "operator".to_string(),
+                    ..Default::default()
                 },
             )
             .collect(),
@@ -48505,6 +48506,7 @@ fn app_runtime_issue_monitor_queue_remove_drops_only_the_local_terminal_entry() 
                     number: *number,
                     queued_at: "2026-09-10T00:00:00Z".to_string(),
                     queued_by: "operator".to_string(),
+                    ..Default::default()
                 },
             )
             .collect(),
@@ -48594,6 +48596,7 @@ fn app_runtime_local_driver_locked_latest_state_preserves_proposal_fence_result_
         source: gwt::IssueMonitorCandidateSource::Live,
         live_error: None,
         readiness_failures: Vec::new(),
+        urgent_assignments: Default::default(),
     };
     let now = "2026-07-28T00:00:00Z";
     let mut stale = gwt::IssueMonitorState::new(gwt::IssueMonitorConfig::default());
@@ -48745,6 +48748,7 @@ fn app_runtime_local_driver_slow_persist_does_not_silently_drop_prepared_proposa
         source: gwt::IssueMonitorCandidateSource::Live,
         live_error: None,
         readiness_failures: Vec::new(),
+        urgent_assignments: Default::default(),
     };
     let now = "2026-07-28T00:00:00Z";
     let mut stale = gwt::IssueMonitorState::new(gwt::IssueMonitorConfig::default());
