@@ -110,7 +110,9 @@ pub(crate) fn classify_command(command: &str) -> CommandWeight {
     let test_filter = args
         .iter()
         .position(|arg| arg == "--")
-        .is_some_and(|separator| has_libtest_filter(&args[separator + 1..]));
+        .map_or(Some(false), |separator| {
+            has_libtest_filter(&args[separator + 1..])
+        });
     let cargo_args: Vec<&str> = args[1..]
         .iter()
         .map(String::as_str)
@@ -148,35 +150,52 @@ pub(crate) fn classify_command(command: &str) -> CommandWeight {
     if subcommand == "nextest" && args.next() != Some("run") {
         return CommandWeight::Heavy;
     }
+    let Some(test_filter) = test_filter else {
+        return CommandWeight::Heavy;
+    };
     classify_cargo_scope(&args.collect::<Vec<_>>(), test_filter)
 }
 
-/// Do not mistake option values such as `--skip some_test` for a filter.
-fn has_libtest_filter(args: &[String]) -> bool {
+/// None means unbounded or unknown, not merely the absence of a filter.
+/// Libtest ORs filters, so an empty filter wins over every non-empty filter.
+/// Option values such as `--skip some_test` are not positive filters.
+fn has_libtest_filter(args: &[String]) -> Option<bool> {
+    let mut has_filter = false;
     let mut args = args.iter().map(String::as_str);
     while let Some(arg) = args.next() {
+        if arg.is_empty() {
+            return None;
+        }
+        if !arg.starts_with('-') {
+            has_filter = true;
+            continue;
+        }
+        let (flag, inline_value) = arg
+            .split_once('=')
+            .map_or((arg, None), |(flag, value)| (flag, Some(value)));
         if matches!(
-            arg,
+            flag,
             "--skip" | "--test-threads" | "--format" | "--logfile" | "--color"
         ) {
-            args.next();
-        } else if !arg.is_empty() && !arg.starts_with('-') {
-            return true;
-        } else if !matches!(
-            arg,
-            "--exact"
-                | "--ignored"
-                | "--include-ignored"
-                | "--nocapture"
-                | "--show-output"
-                | "--quiet"
-                | "-q"
-        ) && !arg.contains('=')
+            if inline_value.is_none() {
+                args.next()?;
+            }
+        } else if inline_value.is_some()
+            || !matches!(
+                flag,
+                "--exact"
+                    | "--ignored"
+                    | "--include-ignored"
+                    | "--nocapture"
+                    | "--show-output"
+                    | "--quiet"
+                    | "-q"
+            )
         {
-            return false;
+            return None;
         }
     }
-    false
+    Some(has_filter)
 }
 
 /// Weigh a scoped `cargo test` by the selection it builds.
@@ -1097,6 +1116,7 @@ mod tests {
             "cargo test -p gwt --all-features --test verification_lease",
             "cargo test -p gwt --all-features --lib verification_lease::tests",
             "cargo test -p gwt --all-features --lib -- verification_lease::tests --exact",
+            r#"cargo test -p gwt --lib verification_lease -- --skip """#,
             "markdownlint README.md",
             "markdownlint-cli2 README.md",
             "bunx markdownlint-cli2 README.md",
@@ -1113,6 +1133,11 @@ mod tests {
             "cargo test -p gwt --lib --features extra",
             "cargo test -p gwt --lib -- --skip ignored_case",
             "cargo test -p gwt --lib -- --test-threads 1",
+            r#"cargo test -p gwt --all-features --lib verification_lease -- """#,
+            r#"cargo test -p gwt --lib -- verification_lease """#,
+            r#"cargo test -p gwt --lib -- "" verification_lease"#,
+            r#"cargo test -p gwt --lib "" -- verification_lease"#,
+            r#"cargo test -p gwt --lib -- """#,
             "cargo test -p gwt --doc",
             "cargo doc --workspace",
             "bunx arbitrary-script README.md",
@@ -1183,11 +1208,11 @@ mod tests {
             CommandWeight::Heavy
         );
 
-        // Cargo's own arguments end at `--`; the rest is the test binary's
-        // filter and says nothing about what cargo builds.
+        // Unknown libtest options cannot establish a bounded selection,
+        // even when Cargo supplied a non-empty filter before `--`.
         assert_eq!(
             classify_command("cargo test -p gwt --lib verification_lease -- --all-features"),
-            CommandWeight::Light
+            CommandWeight::Heavy
         );
         assert_eq!(
             classify_command("cargo +nightly test -p gwt --lib verification_lease"),
