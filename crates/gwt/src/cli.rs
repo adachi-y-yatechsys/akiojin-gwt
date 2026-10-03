@@ -673,7 +673,8 @@ pub(crate) fn run_collect<E: CliEnv>(
             if let Some(bin) = expected_hook_bin {
                 input = input.with_expected_hook_bin(bin);
             }
-            let health = hook::health::read_managed_hook_health(&input);
+            let mut health = hook::health::read_managed_hook_health(&input);
+            hook::append_codex_trust_health_for_doctor(&input, &mut health);
             let payload = serde_json::json!({
                 "repair": repair,
                 "health": health,
