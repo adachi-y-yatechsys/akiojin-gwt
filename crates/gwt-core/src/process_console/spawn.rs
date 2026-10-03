@@ -2070,17 +2070,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn process_is_alive(pid: u32) -> bool {
-        crate::process::hidden_command("kill")
-            .args(["-0", &pid.to_string()])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false)
-    }
-
-    #[cfg(unix)]
     fn wait_for_process_exit(pid: u32) {
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while std::time::Instant::now() < deadline {
