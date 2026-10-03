@@ -13698,7 +13698,7 @@ fn app_runtime_open_launch_wizard_uses_cached_previous_profile_without_hydrating
     assert!(view.skip_permissions);
     // Toggle visibility still follows the manual-setup launch path.
     assert!(!view.show_skip_permissions);
-    assert!(view.codex_fast_mode);
+    assert!(view.fast_mode);
 }
 
 #[test]
@@ -40459,7 +40459,7 @@ fn workspace_cleanup_failure_does_not_emit_done_work_item() {
         branch,
         false,
         false,
-        None,
+        "cleanup-op-1",
     );
 
     assert!(immediate_events.is_empty());
@@ -46089,7 +46089,7 @@ fn frontend_project_log_tab_id_routes_non_window_owners() {
                 branch: "work/example".into(),
                 delete_remote: false,
                 force_filesystem_delete: false,
-                operation_id: None,
+                operation_id: "cleanup-op-1".to_string(),
             },
             Some("tab-b"),
         ),
