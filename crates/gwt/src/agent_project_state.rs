@@ -4292,7 +4292,7 @@ fn resolve_unique_existing_work(
             ));
         }
     }
-    if !agent.is_assigned() {
+    if !agent.is_assigned() && !expected.allow_terminal {
         return Err(workspace_ensure_error(
             session_id,
             "latest canonical Session assignment is Unassigned",
@@ -4304,17 +4304,52 @@ fn resolve_unique_existing_work(
             "canonical Session agent identity does not match the durable Session",
         ));
     }
-    let work_id = agent
-        .workspace_id
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
+    let work_items_path =
+        gwt_core::paths::gwt_workspace_work_items_path_for_repo_path(work_items_root);
+    let work_items = load_workspace_work_items_from_path(&work_items_path)
+        .map_err(|error| {
             workspace_ensure_error(
                 session_id,
-                "latest canonical Session assignment has no Work id",
+                &format!("assigned WorkItems projection cannot be read: {error}"),
             )
         })?
-        .to_string();
+        .ok_or_else(|| {
+            workspace_ensure_error(session_id, "assigned WorkItems projection is missing")
+        })?;
+    let work_id = if agent.is_assigned() {
+        agent
+            .workspace_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                workspace_ensure_error(
+                    session_id,
+                    "latest canonical Session assignment has no Work id",
+                )
+            })?
+            .to_string()
+    } else {
+        // A terminal read can use the durable Work's exact Session history.
+        // Never infer an active mutation target or hide a conflicting Work.
+        let mut candidates = work_items.work_items.iter().filter(|item| {
+            item.agents
+                .iter()
+                .any(|reference| reference.session_id == session_id)
+        });
+        let item = candidates.next().ok_or_else(|| {
+            workspace_ensure_error(
+                session_id,
+                "Unassigned Session has no canonical terminal Work",
+            )
+        })?;
+        if agent.workspace_id.is_some() || candidates.next().is_some() || !item.is_terminal() {
+            return Err(workspace_ensure_error(
+                session_id,
+                "Unassigned Session has no unique canonical terminal Work authority",
+            ));
+        }
+        item.id.clone()
+    };
 
     let assigned_branch = agent
         .branch
@@ -4331,18 +4366,6 @@ fn resolve_unique_existing_work(
         ));
     }
 
-    let work_items_path =
-        gwt_core::paths::gwt_workspace_work_items_path_for_repo_path(work_items_root);
-    let work_items = load_workspace_work_items_from_path(&work_items_path)
-        .map_err(|error| {
-            workspace_ensure_error(
-                session_id,
-                &format!("assigned WorkItems projection cannot be read: {error}"),
-            )
-        })?
-        .ok_or_else(|| {
-            workspace_ensure_error(session_id, "assigned WorkItems projection is missing")
-        })?;
     let matches = work_items
         .work_items
         .iter()
