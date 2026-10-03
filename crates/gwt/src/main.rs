@@ -336,9 +336,29 @@ fn record_update_available(
         }
         return Vec::new();
     }
+    let mut events = Vec::new();
+    if let gwt_core::update::UpdateState::Available { latest, .. } = &state {
+        match update_front_door::discard_superseded_pending_update(latest) {
+            Ok(Some(version)) => events.extend(app.release_update_auto_apply_events(
+                &version,
+                app_runtime::UpdateAutoApplyRelease::Superseded,
+            )),
+            Ok(None) => {}
+            Err(error) => {
+                return vec![update_download_failure(
+                    "Replace staged update",
+                    error,
+                    gwt_core::update::update_log_path()
+                        .to_string_lossy()
+                        .into_owned(),
+                )]
+            }
+        }
+    }
     app.pending_update = Some(state.clone());
     app.start_automatic_update_download();
-    vec![OutboundEvent::broadcast(BackendEvent::UpdateState(state))]
+    events.push(OutboundEvent::broadcast(BackendEvent::UpdateState(state)));
+    events
 }
 
 /// Every download producer enters here, including Release Notes selections.
@@ -383,13 +403,10 @@ fn finish_update_download(
     app.update_download_in_flight = None;
     let deferred = app.deferred_update_discovery.take();
     let mut events: Vec<_> = failure.into_iter().collect();
-    // On success, keep the staged selection and its drain: starting another
-    // worker could race its graceful restart. The next launch polls afresh.
-    // On failure, replay the discovery that the poller's last_seen suppresses.
-    if !events.is_empty() {
-        if let Some(state) = deferred {
-            events.extend(record_update_available(app, state));
-        }
+    // PollState already recorded this discovery, so replay it after either
+    // outcome instead of losing the newer release until the next launch.
+    if let Some(state) = deferred {
+        events.extend(record_update_available(app, state));
     }
     events
 }
@@ -721,8 +738,15 @@ fn spawn_update_apply_resolution(
             .to_string_lossy()
             .to_string();
         let resolved = match gwt_core::update::load_pending_update_manifest() {
-            Some(manifest) => Ok(manifest),
-            None => update_front_door::prepare_and_persist_pending_update(state),
+            Some(manifest)
+                if matches!(
+                    &state, gwt_core::update::UpdateState::Available { latest, .. }
+                        if latest == &manifest.version
+                ) =>
+            {
+                Ok(manifest)
+            }
+            _ => update_front_door::prepare_and_persist_pending_update(state),
         };
         match resolved {
             Ok(manifest) => {
@@ -753,6 +777,36 @@ fn spawn_update_apply_resolution(
             }
         }
     });
+}
+
+fn admit_prepared_update(
+    app: &AppRuntime,
+    manifest: &gwt_core::update::PendingUpdateManifest,
+    admission: &mut update_front_door::UpdateApplyAdmission,
+) -> (bool, Vec<OutboundEvent>) {
+    if !admission.begin_commit() {
+        return (false, Vec::new());
+    }
+    if let Some(gwt_core::update::UpdateState::Available { latest, .. }) = &app.pending_update {
+        if gwt_core::update::pending_version_is_newer(latest, &manifest.version) {
+            admission.failed();
+            let message = match update_front_door::discard_superseded_pending_update(latest) {
+                Ok(_) => format!("Update v{latest} replaced v{}; use the update button to apply the newer release.", manifest.version),
+                Err(error) => error,
+            };
+            return (
+                false,
+                vec![update_download_failure(
+                    "Replace staged update",
+                    message,
+                    gwt_core::update::update_log_path()
+                        .to_string_lossy()
+                        .into_owned(),
+                )],
+            );
+        }
+    }
+    (true, Vec::new())
 }
 
 fn spawn_gui_exit_backstop(reason: GuiShutdownReason, grace: Duration) {
@@ -4740,6 +4794,126 @@ mod tests {
                 "both the automatic request and manual clients need the shared worker's failure"
             );
         }
+    }
+
+    #[test]
+    fn update_download_success_replays_newer_discovery() {
+        let temp = tempdir().expect("tempdir");
+        let _gwt_home = ScopedGwtHome::set(temp.path());
+        let mut runtime = sample_runtime(temp.path(), Vec::new(), None);
+        let state = gwt_core::update::UpdateState::Available {
+            current: "9.106.0".into(),
+            latest: "9.108.0".into(),
+            release_url: "https://example.invalid/release".into(),
+            asset_url: Some("https://example.invalid/gwt.tar.gz".into()),
+            checked_at: Utc::now(),
+        };
+        runtime.update_download_in_flight =
+            Some(crate::app_runtime::UPDATE_AUTO_APPLY_CLIENT_ID.into());
+        runtime.deferred_update_discovery = Some(state.clone());
+        let events = super::finish_update_download(&mut runtime, None);
+        assert_eq!(runtime.pending_update.as_ref(), Some(&state));
+        assert!(events.iter().any(|event| matches!(
+            &event.event, BackendEvent::UpdateState(discovered) if discovered == &state
+        )));
+    }
+
+    #[test]
+    fn update_available_replaces_staged_payload_before_broadcast() {
+        let temp = tempdir().expect("tempdir");
+        let _gwt_home = ScopedGwtHome::set(temp.path());
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let prefs_path = gwt::issue_monitor_prefs_path_for_repo_path(&repo);
+        gwt::save_issue_monitor_prefs(
+            &prefs_path,
+            &gwt::IssueMonitorPrefs {
+                update_drain: Some(gwt::IssueMonitorUpdateDrain {
+                    version: "9.107.0".into(),
+                    since: Utc::now().to_rfc3339(),
+                    reason: gwt::IssueMonitorUpdateDrainReason::Auto,
+                    blocking: Vec::new(),
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let tab = sample_project_tab(
+            "tab-1",
+            "Repo",
+            repo,
+            ProjectKind::Git,
+            &[WindowPreset::Shell],
+        );
+        let mut runtime = sample_runtime(temp.path(), vec![tab], Some("tab-1"));
+        let old_dir = gwt_core::paths::gwt_updates_dir().join("v9.107.0");
+        fs::create_dir_all(&old_dir).unwrap();
+        let payload = old_dir.join("gwt");
+        fs::write(&payload, "old payload").unwrap();
+        let manifest = gwt_core::update::PendingUpdateManifest {
+            version: "9.107.0".into(),
+            asset_url: "https://example.invalid/gwt.tar.gz".into(),
+            payload: gwt_core::update::PreparedPayload::PortableBinary { path: payload },
+            downloaded_at: Utc::now().to_rfc3339(),
+        };
+        gwt_core::update::persist_pending_update_manifest(&manifest).unwrap();
+        let mut state = gwt_core::update::UpdateState::Available {
+            current: "9.106.0".into(),
+            latest: "9.107.0".into(),
+            release_url: "https://example.invalid/release".into(),
+            asset_url: Some(manifest.asset_url.clone()),
+            checked_at: Utc::now(),
+        };
+        super::record_update_available(&mut runtime, state.clone());
+        assert!(gwt_core::update::load_pending_update_manifest().is_some());
+        if let gwt_core::update::UpdateState::Available { latest, .. } = &mut state {
+            *latest = "9.108.0".into();
+        }
+        let events = super::record_update_available(&mut runtime, state.clone());
+        assert_eq!(runtime.pending_update.as_ref(), Some(&state));
+        assert!(events.iter().any(|event| matches!(
+            &event.event, BackendEvent::UpdateState(discovered) if discovered == &state
+        )));
+        assert!(
+            gwt_core::update::load_pending_update_manifest().is_none(),
+            "new discovery must invalidate the old restart target"
+        );
+        assert!(!old_dir.exists(), "the superseded download must be removed");
+        assert!(
+            gwt::load_issue_monitor_prefs(&prefs_path)
+                .unwrap()
+                .update_drain
+                .is_none(),
+            "old automatic drain must not republish or apply the obsolete version"
+        );
+
+        // A resolver which started before discovery may persist the old
+        // release afterwards. Recheck the authoritative target at commit.
+        fs::create_dir_all(&old_dir).unwrap();
+        fs::write(old_dir.join("gwt"), "late old payload").unwrap();
+        gwt_core::update::persist_pending_update_manifest(&manifest).unwrap();
+        let mut admission = crate::update_front_door::UpdateApplyAdmission::default();
+        assert!(admission.begin_resolution());
+        assert!(!super::admit_prepared_update(&runtime, &manifest, &mut admission).0);
+        assert!(gwt_core::update::load_pending_update_manifest().is_none());
+        assert!(!old_dir.exists());
+        assert!(
+            admission.begin_resolution(),
+            "the current release can be retried"
+        );
+        let mut current_manifest = manifest.clone();
+        current_manifest.version = "9.108.0".into();
+        assert!(super::admit_prepared_update(&runtime, &current_manifest, &mut admission).0);
+        // Duplicate results after commitment must not reopen admission or
+        // delete files which an already-started helper may still be using.
+        fs::create_dir_all(&old_dir).unwrap();
+        fs::write(old_dir.join("gwt"), "helper-owned payload").unwrap();
+        gwt_core::update::persist_pending_update_manifest(&manifest).unwrap();
+        let (admitted, events) = super::admit_prepared_update(&runtime, &manifest, &mut admission);
+        assert!(!admitted && events.is_empty());
+        assert!(gwt_core::update::load_pending_update_manifest().is_some());
+        assert!(old_dir.exists());
+        assert!(!admission.begin_resolution());
     }
 
     #[test]
@@ -11210,7 +11384,9 @@ fn main() -> std::io::Result<()> {
             }) => {
                 clients.dispatch(app.apply_launch_wizard_branch_candidates(wizard_id, candidates));
             }
-            Event::UserEvent(UserEvent::UpdateAvailable(state)) => {
+            Event::UserEvent(UserEvent::UpdateAvailable(state))
+                if update_apply_admission.accepts_discovery() =>
+            {
                 clients.dispatch(record_update_available(app, state));
             }
             Event::UserEvent(UserEvent::ApplyUpdate { state, client_id }) => {
@@ -11355,7 +11531,9 @@ fn main() -> std::io::Result<()> {
                     let _ = apply_proxy.send_event(UserEvent::UpdateDownloadFinished(None));
                 });
             }
-            Event::UserEvent(UserEvent::UpdateDownloadFinished(failure)) => {
+            Event::UserEvent(UserEvent::UpdateDownloadFinished(failure))
+                if update_apply_admission.accepts_discovery() =>
+            {
                 clients.dispatch(finish_update_download(app, failure));
             }
             Event::UserEvent(UserEvent::UpdatePrepared {
@@ -11432,7 +11610,9 @@ fn main() -> std::io::Result<()> {
                 manifest,
                 client_id,
             }) => {
-                if !update_apply_admission.begin_commit() {
+                let (admitted, events) = admit_prepared_update(app, &manifest, &mut update_apply_admission);
+                clients.dispatch(events);
+                if !admitted {
                     return;
                 }
                 app.record_update_apply_observation(

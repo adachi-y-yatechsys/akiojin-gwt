@@ -425,11 +425,19 @@ every idle row, and `dry_run: true` reports the targets without touching
 anything. `issue.monitor.profiles` reads the launch
 candidate pool and `issue.monitor.profiles.set` replaces it; with two or more
 candidates the Monitor launches each Issue with the first eligible candidate
-(rate-limit holds, the usage threshold, and `prefer_for` routing decide
-eligibility; the exact rules are specified in SPEC
+(rate-limit holds and `prefer_for` routing decide eligibility; a provider
+leaves the pool when it refuses a launch, not when a usage reading predicts it
+will; the exact rules are specified in SPEC
 [#3914](https://github.com/akiojin/gwt/issues/3914)), so one rate-limited
-provider no longer stops the queue. Saving Agent settings for a second provider
-in the GUI appends it to the same pool. All operations accept an optional
+provider no longer stops the queue. `issue.monitor.status` reports each
+provider's latest usage reading under `provider_usage`, or why there is none.
+Every rate-limit refusal immediately holds its provider. If all candidates
+are held, the queue resumes at the earliest known reset; if every reset is
+unknown, `needs_human_fleet` reports `launch_candidates_exhausted` instead
+of periodically retrying. In the GUI, the Issue Monitor settings form
+(`⚙ Settings`) lists the same pool as Agent Settings sets: `＋` adds a set, `−`
+removes one, the arrows reorder them, and the saved order is the launch order.
+All operations accept an optional
 `project_root` and otherwise target the current worktree. Priority and
 daemon-absent configuration changes become visible to running instances on the
 next scan/rebase.

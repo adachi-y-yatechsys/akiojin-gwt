@@ -63,6 +63,8 @@ pub(crate) enum UpdateAutoApplyRelease {
     Cancelled,
     /// The persisted manifest for the drained version is gone.
     PayloadMissing,
+    /// A newer release invalidated this staged version.
+    Superseded,
 }
 
 /// A notification-center record about the self-update (AC-12), broadcast to
@@ -751,6 +753,28 @@ pub struct IssueMonitorProfileSaveContext {
     /// the wizard can say which candidate the save replaces without re-reading
     /// preferences on every keystroke.
     pub(crate) pool: Vec<gwt::IssueMonitorLaunchProfile>,
+    /// Issue #4911: the Agent Settings sets the settings form is editing.
+    /// `None` for the per-Issue form, which still switches the pool head.
+    pub(crate) sets: Option<IssueMonitorAgentSettingsSets>,
+}
+
+/// Issue #4911: the ordered Agent Settings sets of one open settings form,
+/// one per launch candidate.
+///
+/// Only the open set lives in the wizard, and the wizard cannot show a saved
+/// profile as it is: it fills an unset model or reasoning with its own default
+/// and holds no runtime choice before its Runtime step. So a set is changed
+/// only where the operator changed the form, and a set nobody touched is
+/// written back unchanged.
+#[derive(Debug, Clone)]
+pub struct IssueMonitorAgentSettingsSets {
+    /// Never empty. The entry at `active` is the open set as it was saved or
+    /// last left; the wizard holds the operator's edits to it.
+    pub(crate) profiles: Vec<gwt::IssueMonitorLaunchProfile>,
+    pub(crate) active: usize,
+    /// What the form read when the open set was opened, before any edit.
+    /// `None` when the form could not launch that set's agent at all.
+    pub(crate) opened_as: Option<gwt::IssueMonitorLaunchProfile>,
 }
 
 #[derive(Debug, Clone)]
@@ -8122,13 +8146,17 @@ impl AppRuntime {
                     "Update v{version} is no longer staged on disk — the drain was released; download it again from the update button."
                 ),
             ),
+            UpdateAutoApplyRelease::Superseded => (
+                "info",
+                format!("Update v{version} was replaced by a newer release; its automatic apply was cancelled."),
+            ),
         };
         self.record_update_apply_observation(
             version,
-            if release == UpdateAutoApplyRelease::Cancelled {
-                "pending_refused"
-            } else {
-                "pending_failed"
+            match release {
+                UpdateAutoApplyRelease::Cancelled => "pending_refused",
+                UpdateAutoApplyRelease::PayloadMissing => "pending_failed",
+                UpdateAutoApplyRelease::Superseded => "pending_superseded",
             },
             &message,
         );
@@ -11293,75 +11321,8 @@ impl AppRuntime {
             }
         }
         self.provider_usage_accounts = accounts;
-        self.hasten_provider_quota_reverifications(now);
         events.extend(self.sweep_provider_quota_candidates(now));
         events
-    }
-
-    /// Issue #4366 AC-5: a poller reading newer than a held provider's last
-    /// refused launch, and reading the account as usable, contradicts the
-    /// hold. The daemon is asked to give that provider its re-verification
-    /// launch now; the launch outcome, not the reading, decides the release.
-    fn hasten_provider_quota_reverifications(&self, now: chrono::DateTime<chrono::Utc>) {
-        let at = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-        let mut project_roots: Vec<PathBuf> = Vec::new();
-        for tab in &self.tabs {
-            if tab.kind == gwt::ProjectKind::Git && !project_roots.contains(&tab.project_root) {
-                project_roots.push(tab.project_root.clone());
-            }
-        }
-        for project_root in project_roots {
-            let Ok(prefs) = gwt::load_issue_monitor_prefs(
-                &gwt::issue_monitor_prefs_path_for_repo_path(&project_root),
-            ) else {
-                continue;
-            };
-            // Only a hold whose re-verification is not yet due is hastened;
-            // every due one is left out whatever the pool offers.
-            let admission_holds = prefs.launch_admission_provider_quota_holds(&at, |_| true);
-            for (provider, evidence) in &prefs.provider_quota_hold_evidence {
-                if !admission_holds.contains_key(provider)
-                    || !gwt::issue_monitor::provider_reports_healthy_for_agent(
-                        provider,
-                        &self.provider_usage_accounts,
-                    )
-                {
-                    continue;
-                }
-                let reading_is_newer = self
-                    .provider_usage_accounts
-                    .iter()
-                    .filter(|account| {
-                        matches!(
-                            (&account.provider, provider.as_str()),
-                            (gwt_core::usage::UsageProvider::Codex, "codex")
-                                | (gwt_core::usage::UsageProvider::ClaudeCode, "claude")
-                        )
-                    })
-                    .filter_map(|account| account.fetched_at)
-                    .zip(
-                        chrono::DateTime::parse_from_rfc3339(&evidence.recorded_at)
-                            .ok()
-                            .map(|recorded| recorded.with_timezone(&chrono::Utc)),
-                    )
-                    .any(|(fetched, recorded)| fetched > recorded);
-                if !reading_is_newer {
-                    continue;
-                }
-                if let Err(error) = self.publish_issue_monitor_control(
-                    &project_root,
-                    serde_json::json!({
-                        "quota_hold_reverify": { "provider": provider, "at": at },
-                    }),
-                ) {
-                    tracing::debug!(
-                        error = %error,
-                        provider = %provider,
-                        "issue monitor quota re-verification publish failed (non-fatal)"
-                    );
-                }
-            }
-        }
     }
 
     #[cfg(test)]

@@ -520,6 +520,20 @@ fn attach_spotlight(status: &mut crate::IssueMonitorAgentStatus) {
     status.spotlight = Some(crate::spotlight::probe());
 }
 
+/// Issue #4908 AC-5 / AC-6: the usage poller's latest reading per provider,
+/// from the host-local snapshot the GUI's poller publishes. Attached at the
+/// surface because the daemon has no poller, and so the answer is the same
+/// with or without a live one: every provider gets a row, and a row with no
+/// reading says why rather than reporting nothing or zero.
+fn attach_provider_usage(status: &mut crate::IssueMonitorAgentStatus) {
+    status.provider_usage = Some(
+        gwt_core::usage::snapshot_store::read_provider_usage_readings(
+            &gwt_core::usage::snapshot_store::provider_usage_snapshot_path(),
+            chrono::Utc::now(),
+        ),
+    );
+}
+
 /// Issue #4087 AC-1: the Issue cache full-refresh cadence, read from the
 /// cache on disk at status time so a stopped refresh is visible next to
 /// `scan_stall` in the one snapshot the PM already reads.
@@ -665,6 +679,7 @@ fn run_monitor_status<E: CliEnv>(
     attach_build_artifact_gc(&project_root, &mut status);
     attach_memory_pressure(&mut status);
     attach_spotlight(&mut status);
+    attach_provider_usage(&mut status);
     attach_issue_cache_status(&project_root, &mut status);
     // Keep the existing owner slots and add physical observations without
     // changing the meaning of active_launches or feeding admission.
@@ -1915,7 +1930,12 @@ fn run_monitor_quota_hold_clear_inner<E: CliEnv>(
             "status": if release.released_reset_at.is_some() { "cleared" } else { "not_held" },
             "reason": reason,
             "released_at": released_at,
-            "released_reset_at": release.released_reset_at,
+            // Issue #4908 AC-3: a hold with no stated reset reads `unknown`
+            // here as it does in the status, never as its internal deadline.
+            "released_reset_at": release
+                .released_reset_at
+                .as_deref()
+                .map(crate::issue_monitor::provider_quota_reset_label),
             "released_issues": released_issues,
             "provider_quota_holds": remaining,
             "delivery": delivery,
@@ -7507,6 +7527,78 @@ mod tests {
         );
     }
 
+    /// Issue #4908 AC-5 / AC-6: the usage poller's reading is in the status
+    /// with when it was taken, and a host where nothing was read says so
+    /// instead of returning an empty or zero-filled account.
+    #[test]
+    fn issue_monitor_status_reports_provider_usage_readings_or_their_absence() {
+        let tmp = TempDir::new().expect("tempdir");
+        let _home = ScopedGwtHome::set(tmp.path().join("home"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        let status = |env: &mut crate::cli::TestEnv| -> serde_json::Value {
+            let mut out = String::new();
+            run(
+                env,
+                IssueCommand::MonitorStatus { project_root: None },
+                &mut out,
+            )
+            .expect("status");
+            serde_json::from_str(out.trim()).expect("status json")
+        };
+        let mut env = crate::cli::TestEnv::new(repo.clone());
+
+        let unobserved = status(&mut env);
+        let rows = unobserved["provider_usage"]
+            .as_array()
+            .unwrap_or_else(|| panic!("provider_usage must be listed: {unobserved}"));
+        assert_eq!(rows.len(), 2, "{unobserved}");
+        for row in rows {
+            assert_eq!(row["state"], "not_observed", "{unobserved}");
+            assert!(
+                row.get("windows").is_none() && row.get("limit_reached").is_none(),
+                "an unobserved provider carries no numbers: {unobserved}"
+            );
+        }
+
+        let now = chrono::Utc::now();
+        let fetched_at = now - chrono::Duration::seconds(20);
+        gwt_core::usage::snapshot_store::write_provider_usage_snapshot(
+            &gwt_core::usage::snapshot_store::provider_usage_snapshot_path(),
+            &[gwt_core::usage::ProviderUsage {
+                provider: gwt_core::usage::UsageProvider::Codex,
+                account_id: Some("acct".to_string()),
+                account_label: None,
+                plan: Some("pro".to_string()),
+                windows: vec![gwt_core::usage::UsageWindow::new(
+                    gwt_core::usage::WindowKind::Weekly,
+                    100.0,
+                    None,
+                )],
+                limit_reached: true,
+                state: gwt_core::usage::UsageState::Ok,
+                fetched_at: Some(fetched_at),
+            }],
+            now,
+        )
+        .expect("publish the poller reading");
+
+        let observed = status(&mut env);
+        let codex = observed["provider_usage"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["provider"] == "codex"))
+            .unwrap_or_else(|| panic!("codex row: {observed}"));
+        assert_eq!(codex["state"], "ok", "{observed}");
+        assert_eq!(codex["limit_reached"], true, "{observed}");
+        assert_eq!(codex["windows"][0]["kind"], "weekly", "{observed}");
+        assert_eq!(codex["windows"][0]["used_percent"], 100.0, "{observed}");
+        assert_eq!(
+            codex["fetched_at"],
+            fetched_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            "{observed}"
+        );
+    }
+
     /// Issue #4386 AC-1/AC-3: Spotlight's indexing CPU is observable from the
     /// status the PM already reads, with the threshold that raises the
     /// saturation warning, and the block is present without a warning on
@@ -7656,6 +7748,8 @@ mod tests {
             memory_pressure: None,
             spotlight: None,
             build_artifact_gc: None,
+            needs_human_fleet: None,
+            provider_usage: None,
             issue_cache: None,
             review_windows: Vec::new(),
             failure_surge: None,
@@ -7738,6 +7832,8 @@ mod tests {
             memory_pressure: None,
             spotlight: None,
             build_artifact_gc: None,
+            needs_human_fleet: None,
+            provider_usage: None,
             issue_cache: None,
             review_windows: Vec::new(),
             failure_surge: None,
@@ -7871,6 +7967,8 @@ mod tests {
                 memory_pressure: None,
                 spotlight: None,
                 build_artifact_gc: None,
+                needs_human_fleet: None,
+                provider_usage: None,
                 issue_cache: None,
                 review_windows: Vec::new(),
                 failure_surge: None,
@@ -7944,6 +8042,8 @@ mod tests {
             memory_pressure: None,
             spotlight: None,
             build_artifact_gc: None,
+            needs_human_fleet: None,
+            provider_usage: None,
             issue_cache: None,
             review_windows: Vec::new(),
             failure_surge: None,
@@ -8077,13 +8177,15 @@ mod tests {
         // cache refresh block, read from the cache on disk, and Issue #4009
         // AC-4 for the host free-space block, measured at call time, and
         // Issue #4234 AC-5 for the gwt process memory block, and Issue #4386
-        // AC-1 for the Spotlight indexing block.
+        // AC-1 for the Spotlight indexing block, and Issue #4908 AC-5 for the
+        // provider usage block, read from the poller's host-local snapshot.
         for attached in [
             "github_budget",
             "issue_cache",
             "disk_space",
             "memory_pressure",
             "spotlight",
+            "provider_usage",
         ] {
             assert!(
                 status
@@ -10329,6 +10431,8 @@ mod tests {
             memory_pressure: None,
             spotlight: None,
             build_artifact_gc: None,
+            needs_human_fleet: None,
+            provider_usage: None,
             review_windows: Vec::new(),
             failure_surge: None,
             stall_reason: None,

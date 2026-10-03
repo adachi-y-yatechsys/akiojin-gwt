@@ -4465,6 +4465,20 @@ fn with_workspace_transaction_recovery_observed_profiled<T>(
                     };
                     if let Some(external_commit) = transaction.external_commit.as_ref() {
                         if external_commit.phase == ExternalWorkspaceCommitPhase::Prepared {
+                            // Probe without waiting: the finalizer acquires these
+                            // state locks while holding its operation lock.
+                            if try_acquire_external_workspace_operation_lock(
+                                &transaction.current_path,
+                                &transaction.work_items_path,
+                                &external_commit.operation_id,
+                            )?
+                            .is_none()
+                            {
+                                return Err(GwtError::Other(format!(
+                                    "workspace operation {} is in flight; wait for its finalizer to complete and retry in 5 seconds (completion may take longer); no recovery action is needed while it is running",
+                                    external_commit.operation_id
+                                )));
+                            }
                             return Err(GwtError::Other(format!(
                             "workspace state transaction external commit is unresolved for operation {}",
                             external_commit.operation_id
@@ -6002,8 +6016,8 @@ fn bleed_identity_pair(event: &WorkEvent) -> Option<(String, String)> {
 /// Event ids are kept so the intake dedup still skips re-ingestion, and the
 /// Work items are re-folded from their events. The shared current projection
 /// is cleared when its (title, owner) pair carries the contamination (full
-/// clear) or its owner value alone does (owner-only clear). Stray agents
-/// assigned to a different work id are pruned from the current projection in
+/// clear) or its owner value alone does (owner-only clear). Agent assignments
+/// without a matching WorkItem Session reference are pruned from the projection in
 /// the same pass. Runs after every work-events ingest; converges to a no-op
 /// once the data is clean.
 pub fn repair_resume_owner_bleed_paths(
@@ -6027,6 +6041,24 @@ fn repair_resume_owner_bleed_paths_locked(
     let Some(mut works) = load_workspace_work_items_from_path(work_items_path)? else {
         return Ok(report);
     };
+
+    // current.json contains assignments for every Work in the repository.
+    // Repairing the selected Work's metadata must not revoke another Work's
+    // Session authority. Capture references before the event rebuild drains
+    // the projection; liveness cleanup belongs to the runtime's live set.
+    let assignments: HashMap<String, HashSet<String>> = works
+        .work_items
+        .iter()
+        .map(|item| {
+            (
+                item.id.clone(),
+                item.agents
+                    .iter()
+                    .map(|agent| agent.session_id.clone())
+                    .collect(),
+            )
+        })
+        .collect();
 
     let mut stamped: HashMap<(String, String, String), HashSet<String>> = HashMap::new();
     for item in &works.work_items {
@@ -6106,7 +6138,6 @@ fn repair_resume_owner_bleed_paths_locked(
         current.owner = None;
         current.summary = None;
         current.next_action = None;
-        current.agents.clear();
         current.status_category = WorkspaceStatusCategory::Idle;
         current.status_text = "No active work".to_string();
         current.updated_at = now;
@@ -6121,20 +6152,20 @@ fn repair_resume_owner_bleed_paths_locked(
             report.cleared_current = true;
             current_changed = true;
         }
-        let before = current.agents.len();
-        let current_id = current.id.clone();
-        current.agents.retain(|agent| {
-            agent
-                .workspace_id
-                .as_deref()
-                .is_none_or(|assigned| assigned == current_id)
-        });
-        let pruned = before - current.agents.len();
-        if pruned > 0 {
-            report.pruned_current_agents = pruned;
-            current.updated_at = now;
-            current_changed = true;
-        }
+    }
+    let before = current.agents.len();
+    current.agents.retain(|agent| {
+        agent.workspace_id.as_deref().is_none_or(|work_id| {
+            assignments
+                .get(work_id)
+                .is_some_and(|sessions| sessions.contains(&agent.session_id))
+        })
+    });
+    let pruned = before - current.agents.len();
+    if pruned > 0 {
+        report.pruned_current_agents = pruned;
+        current.updated_at = now;
+        current_changed = true;
     }
     if current_changed {
         save_workspace_projection_to_path_unlocked(current_projection_path, &current)?;
@@ -8060,6 +8091,23 @@ fn synthesize_workspace_work_item_from_legacy(
     journal_entries: &[WorkspaceJournalEntry],
     _project_root: &Path,
 ) -> Option<WorkItem> {
+    // The shared projection keeps other Works' Session assignments, but a
+    // legacy WorkItem must only inherit the selected Work's agents/status.
+    let scoped_projection = projection.map(|projection| {
+        let mut scoped = projection.clone();
+        scoped.agents = projection
+            .latest_agents()
+            .filter(|agent| {
+                agent
+                    .workspace_id
+                    .as_deref()
+                    .is_none_or(|id| id == scoped.id)
+            })
+            .cloned()
+            .collect();
+        scoped
+    });
+    let projection = scoped_projection.as_ref();
     if projection.is_none() && journal_entries.is_empty() {
         return None;
     }

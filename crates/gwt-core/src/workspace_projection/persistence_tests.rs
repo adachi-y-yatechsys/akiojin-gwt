@@ -2443,6 +2443,9 @@ fn workspace_state_transaction_commit_refusal_blocks_until_explicit_rejection() 
         blocked.is_err(),
         "ordinary writers must fail closed while external commit state is unresolved"
     );
+    let error = blocked.unwrap_err().to_string();
+    assert!(error.contains("unresolved"), "{error}");
+    assert!(!error.contains("in flight"), "{error}");
     assert_eq!(
         fs::read(&current).expect("read current while blocked"),
         current_before
@@ -2511,6 +2514,9 @@ fn workspace_state_transaction_reject_reports_busy_during_in_flight_external_com
         workspace_id: None,
         updated_at: now,
     });
+    let mut other_session = initial.agents[0].clone();
+    other_session.session_id = "session-waiting-writer".to_string();
+    initial.agents.push(other_session);
     save_workspace_projection_to_path(&current, &initial).expect("save initial current");
 
     let (commit_entered_tx, commit_entered_rx) = std::sync::mpsc::channel();
@@ -2556,6 +2562,19 @@ fn workspace_state_transaction_reject_reports_busy_during_in_flight_external_com
         .recv()
         .expect("external commit must start");
 
+    let retry_update = || {
+        transact_workspace_state_at(&current, &works, &events, &root, |projection, _, _| {
+            let agent = projection
+                .agents
+                .iter_mut()
+                .find(|agent| agent.session_id == "session-waiting-writer")
+                .expect("same waiting Session");
+            agent.current_focus = Some("retried update".to_string());
+            Ok(((), Vec::new()))
+        })
+    };
+    let in_flight_result = retry_update();
+
     assert_eq!(
         resolve_workspace_state_external_commit_at(
             &current,
@@ -2577,6 +2596,15 @@ fn workspace_state_transaction_reject_reports_busy_during_in_flight_external_com
         .join()
         .expect("join transaction")
         .expect("external commit and Work publication succeed");
+    let error = in_flight_result.expect_err("writer must wait").to_string();
+    assert!(error.contains("continue-operation-in-flight"), "{error}");
+    assert!(error.contains("in flight"), "{error}");
+    assert!(
+        error.contains("wait") && error.contains("retry in 5 seconds"),
+        "{error}"
+    );
+    assert!(!error.contains("unresolved"), "{error}");
+    retry_update().expect("same Session update succeeds after external commit completes");
     assert!(
         resolve_workspace_state_external_commit_at(
             &current,
@@ -2591,6 +2619,16 @@ fn workspace_state_transaction_reject_reports_busy_during_in_flight_external_com
     let saved = load_workspace_projection_from_path(&current)
         .expect("load current")
         .expect("current exists");
+    assert_eq!(
+        saved
+            .agents
+            .iter()
+            .find(|agent| agent.session_id == "session-waiting-writer")
+            .unwrap()
+            .current_focus
+            .as_deref(),
+        Some("retried update")
+    );
     assert_eq!(
         workspace_assignment_for_session(&saved, "session-in-flight-commit"),
         WorkspaceSessionAssignment::Assigned("work-in-flight-commit".to_string())
@@ -7678,6 +7716,14 @@ fn workspace_work_items_synthesize_from_legacy_current_and_journal_without_rewri
     projection.summary = Some("Legacy current state remains readable.".to_string());
     projection.owner = Some("SPEC-2359".to_string());
     projection.board_refs.push("board-legacy-1".to_string());
+    let mut foreign_agent = assigned_agent("session-foreign", "codex", "workspace-other");
+    foreign_agent.status_category = WorkspaceStatusCategory::Blocked;
+    foreign_agent.updated_at = second_at;
+    let mut stale_agent = foreign_agent.clone();
+    stale_agent.workspace_id = Some(projection.id.clone());
+    stale_agent.updated_at = first_at;
+    projection.agents.push(stale_agent);
+    projection.agents.push(foreign_agent);
     save_workspace_projection_to_path(&current_path, &projection).expect("save legacy projection");
 
     append_workspace_journal_entry_to_path(
@@ -7733,6 +7779,8 @@ fn workspace_work_items_synthesize_from_legacy_current_and_journal_without_rewri
     assert_eq!(item.title, "Work WorkItem history");
     assert_eq!(item.status_category, WorkspaceStatusCategory::Active);
     assert_eq!(item.owner.as_deref(), Some("SPEC-2359"));
+    assert_eq!(item.agents.len(), 1);
+    assert_eq!(item.agents[0].session_id, "session-legacy");
     assert_eq!(item.board_refs, vec!["board-legacy-1".to_string()]);
     assert_eq!(item.events.len(), 2);
     assert_eq!(
@@ -13560,6 +13608,9 @@ fn repair_resume_owner_bleed_sanitizes_cross_item_stamp() {
     // must still clear the identity.
     current.next_action = Some("Check Board for latest updates".to_string());
     current.status_text = "883 active agents".to_string();
+    current
+        .agents
+        .push(bleed_test_agent("sess-1", "work-work-b-00000001"));
     for seq in 0..5 {
         current.agents.push(bleed_test_agent(
             &format!("dead-{seq}"),
@@ -13609,7 +13660,8 @@ fn repair_resume_owner_bleed_sanitizes_cross_item_stamp() {
         .expect("current exists");
     assert_eq!(repaired_current.owner, None);
     assert_eq!(repaired_current.next_action, None);
-    assert!(repaired_current.agents.is_empty(), "dead agents purged");
+    assert_eq!(repaired_current.agents.len(), 1, "unbacked agents purged");
+    assert_eq!(repaired_current.agents[0].session_id, "sess-1");
 
     let second = repair_resume_owner_bleed_paths(&work_items_path, &current_path, now)
         .expect("repair rerun");
@@ -13649,6 +13701,40 @@ fn repair_resume_owner_bleed_keeps_legitimate_duplicates_below_threshold() {
             .iter()
             .all(|item| item.owner.as_deref() == Some("SPEC-2359")),
         "below-threshold duplicates keep their owner"
+    );
+}
+
+#[test]
+fn repair_resume_owner_bleed_preserves_other_work_session_assignment_after_reload() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let works_path = temp.path().join("works.json");
+    let current_path = temp.path().join("current.json");
+    let now = Utc.timestamp_opt(31_000, 0).unwrap();
+    let mut works = WorkItemsProjection::empty(now);
+    let mut current = WorkspaceProjection::default_for_project("/repo");
+    current.id = "work-a".to_string();
+    for (work_id, session_id) in [("work-a", "session-a"), ("work-b", "session-b")] {
+        let mut event = WorkEvent::new(WorkEventKind::Start, work_id, now);
+        event.agent_session_id = Some(session_id.to_string());
+        works.apply_event(event);
+        current.agents.push(bleed_test_agent(session_id, work_id));
+    }
+    save_workspace_work_items_projection_to_path(&works_path, &works).unwrap();
+    save_workspace_projection_to_path(&current_path, &current).unwrap();
+    drop(current);
+    drop(works);
+
+    repair_resume_owner_bleed_paths(&works_path, &current_path, now).unwrap();
+
+    let reloaded = load_workspace_projection_from_path(&current_path)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        reloaded
+            .latest_agent_for_session("session-b")
+            .and_then(|agent| agent.workspace_id.as_deref()),
+        Some("work-b"),
+        "restart/intake repair must preserve another Work's canonical Session assignment"
     );
 }
 
