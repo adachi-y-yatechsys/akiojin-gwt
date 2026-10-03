@@ -225,7 +225,10 @@ function issueRowSecondaryItems({ entry, work, attention, primary }) {
       key: "queue",
       label: `Queue ${entry.queue_position}${terminal ? ` · ${terminal}` : ""}${entry.queued_by ? ` · ${entry.queued_by}` : ""}`,
     });
-    items.push({ kind: "chip", key: "queue-priority", label: issueQueuePriorityLabel(entry) });
+    if (entry.priority === "urgent" || entry.priority_reason === "pm_demoted" ||
+        entry.priority_reason === "urgent_limit_reached") {
+      items.push({ kind: "chip", key: "queue-priority", label: issueQueuePriorityLabel(entry) });
+    }
   }
   if (work?.pr_number) {
     const prState = String(work.pr_state || "").trim();
