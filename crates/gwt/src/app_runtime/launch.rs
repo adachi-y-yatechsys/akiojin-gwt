@@ -1958,7 +1958,7 @@ pub(super) fn launch_config_from_persisted_session(
     if let Some(model) = session.model.clone() {
         builder = builder.model(model);
     }
-    if let Some(version) = session.tool_version.clone() {
+    if let Some(version) = session.launch_tool_version() {
         builder = builder.version(version);
     }
     if let Some(level) = session.reasoning_level.clone() {
@@ -2023,7 +2023,7 @@ pub(super) fn launch_config_from_persisted_session(
     }
 
     let mut config = builder.build();
-    if let Some(version) = session.tool_version.clone() {
+    if let Some(version) = session.launch_tool_version() {
         config.tool_version = Some(version);
     }
     if !session.display_name.is_empty() {
@@ -4769,13 +4769,11 @@ impl AppRuntime {
             );
         }
         self.window_details.remove(id);
-        // Publish the PTY handle to the WebSocket fast-path registry BEFORE
-        // inserting the runtime so that the first `terminal_input` from the
-        // frontend (which can arrive immediately after `TerminalStatus`) has a
-        // target to write to. Registry holds a cloned `Arc<PtyHandle>`; the
-        // real owner remains the `Mutex<Pane>` in `WindowRuntime`.
-        self.register_pty_writer(id, &pane);
+        // Publish the handle with its exact runtime incarnation before any
+        // status event exposes the pane. The registry owns only a cloned Arc;
+        // the process owner remains WindowRuntime.
         self.runtimes.insert(id.to_string(), runtime);
+        self.register_pty_writer(id, &pane);
         // Issue #4143 (AC-3): the PTY is live, so this restore no longer needs
         // the pre-PTY failure guard.
         self.restore_launch_windows.remove(id);
@@ -5126,6 +5124,33 @@ impl AppRuntime {
                 .project_root
                 .clone()
         });
+        let project_root = project_root_path.display().to_string();
+        let title = config.display_name.clone();
+        let resume_title = workspace_resume_context
+            .as_ref()
+            .and_then(WorkspaceResumeContext::purpose_title);
+        let purpose_title = if resume_title.is_some() {
+            resume_title
+        } else {
+            agent_launch_purpose_title(
+                &project_root_path,
+                config.linked_issue_number,
+                config.branch.as_deref(),
+                &issue_link_cache_dir,
+            )
+            .map_err(|error| {
+                let message = error.to_string();
+                if let Some(context) = self.project_context_for_root(&project_root_path) {
+                    self.proxy
+                        .for_project(context)
+                        .send(UserEvent::WorkspaceStateLoadFailed {
+                            project_root: project_root_path.clone(),
+                            error: crate::workspace_state_load_error(&project_root_path, error),
+                        });
+                }
+                message
+            })?
+        };
         let prepared_manual_launch_claim = claim_prepared_manual_successor_launch(
             &self.sessions_dir,
             &project_root_path,
@@ -5134,19 +5159,6 @@ impl AppRuntime {
         let tab = self
             .tab_mut(tab_id)
             .ok_or_else(|| "Project tab not found".to_string())?;
-        let project_root = project_root_path.display().to_string();
-        let title = config.display_name.clone();
-        let purpose_title = workspace_resume_context
-            .as_ref()
-            .and_then(WorkspaceResumeContext::purpose_title)
-            .or_else(|| {
-                agent_launch_purpose_title(
-                    &project_root_path,
-                    config.linked_issue_number,
-                    config.branch.as_deref(),
-                    &issue_link_cache_dir,
-                )
-            });
         let window = match placement {
             AgentWindowPlacement::Centered(bounds) => {
                 tab.workspace
@@ -5543,9 +5555,12 @@ impl AppRuntime {
                 gwt_agent::SessionMode::Resume | gwt_agent::SessionMode::Continue
             ) {
                 if let Some(predecessor) = config.predecessor_session_id.clone() {
+                    // Issue #4783 AC-2: an automatic restore never reactivates
+                    // a terminal predecessor generation; see the coordinator.
                     if let Some((receipt, binding)) = gwt::prepare_resume_producing_authority(
                         Path::new(&project_root),
                         &predecessor,
+                        config.automatic_restore,
                     ) {
                         match receipt.outcome {
                             gwt::AgentExecutionContinuationOutcome::SuccessorCreated
@@ -6852,7 +6867,7 @@ mod agent_endpoint_env_tests {
         .install(&mut env)
         .expect("materialize predecessor generation");
         let (receipt, binding) =
-            gwt::prepare_resume_producing_authority(&launch.project, &launch.session.id)
+            gwt::prepare_resume_producing_authority(&launch.project, &launch.session.id, false)
                 .expect("recover producing authority for the relaunch");
         assert_eq!(
             receipt.outcome,
@@ -8042,7 +8057,7 @@ mod agent_endpoint_env_tests {
         .expect("persist the finished predecessor incarnation");
 
         let (receipt, binding) =
-            gwt::prepare_resume_producing_authority(&launch.project, &holder_id)
+            gwt::prepare_resume_producing_authority(&launch.project, &holder_id, false)
                 .expect("recover producing authority for the relaunch");
         assert_eq!(
             receipt.outcome,

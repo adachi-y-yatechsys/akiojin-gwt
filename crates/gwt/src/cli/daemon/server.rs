@@ -79,6 +79,7 @@ const DAEMON_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 /// `GWT_TEST_BUDGET_ISSUE_MONITOR_PREFS_MS` under the env lock instead.
 #[cfg(test)]
 pub(super) struct ScopedIssueMonitorPrefsTimeout(
+    // Retain the guard until scope exit so Drop restores the budget; no field read is needed.
     #[allow(dead_code)] gwt_core::deadline_budget::ScopedDeadlineBudget,
 );
 
@@ -2530,14 +2531,14 @@ fn apply_routine_issue_monitor_control(
             agent_id,
         } => {
             monitor.record_autonomous_heartbeat(issue_number, &at);
-            // Issue #4366 AC-4: activity on a held provider can release it,
-            // and a released hold readmits Issues, so that case scans.
-            agent_id.is_some_and(|agent_id| {
-                monitor.record_provider_activity(issue_number, &agent_id, &at)
-            })
+            // Heartbeats are liveness evidence, not provider quota recovery.
+            let _ = agent_id;
+            false
         }
         IssueMonitorControl::QuotaHoldReverify { provider, at } => {
-            monitor.hasten_provider_quota_reverification(&provider, &at)
+            // Accept messages from older GUIs without reopening quota holds.
+            tracing::debug!(%provider, %at, "ignored retired quota re-verification request");
+            false
         }
         IssueMonitorControl::WaitDeclared {
             issue_number,
@@ -2697,8 +2698,11 @@ fn apply_routine_issue_monitor_control(
                 if let Some(issue_number) =
                     issue_number.or_else(|| monitor.launched_window_issue(&window_id))
                 {
-                    monitor.record_agent_issue_failed_classified_at(
+                    // Issue #4815: the window says whether this is the bound
+                    // implementation pane or the review pane.
+                    monitor.record_agent_window_issue_failed_classified_at(
                         issue_number,
+                        &window_id,
                         message,
                         classification,
                         now,
@@ -7698,8 +7702,78 @@ exit 0
         (should_scan, publisher.await.expect("publisher task joins"))
     }
 
+    /// Issue #4815: which ladder a failure reported during `Reviewing` lands
+    /// on. The bound implementation window's failure is the implementation's
+    /// (attempt counted, re-queued); a failure with no window, or from the
+    /// review pane, is the review's (record stays `Implementing`, slot kept,
+    /// review ladder counted).
+    #[derive(Clone, Copy)]
+    enum ReviewingFailureRouting {
+        ImplementationRetry,
+        ReviewLadder,
+    }
+
+    /// `slot_held`: the implementation launch still occupies its slot
+    /// (`active_count` on a live monitor, `launched_issues` in prefs).
+    fn assert_reviewing_failure_outcome(
+        routing: ReviewingFailureRouting,
+        record: &crate::AutonomousIssueRecord,
+        slot_held: bool,
+        context: &str,
+    ) {
+        match routing {
+            ReviewingFailureRouting::ImplementationRetry => {
+                assert_eq!(
+                    record.attempts, 1,
+                    "{context}: the failed attempt is counted"
+                );
+                assert_eq!(record.phase, crate::AutonomousPhase::Idle, "{context}");
+                assert!(record.retry_not_before.is_some(), "{context}");
+                assert!(record.review_attempts.is_none(), "{context}");
+                assert!(!slot_held, "{context}: the slot is released for the retry");
+            }
+            ReviewingFailureRouting::ReviewLadder => {
+                assert_eq!(
+                    record.attempts, 0,
+                    "{context}: no implementation attempt is spent"
+                );
+                assert_eq!(
+                    record.phase,
+                    crate::AutonomousPhase::Implementing,
+                    "{context}"
+                );
+                let attempts = record
+                    .review_attempts
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{context}: the review ladder counts the failure"));
+                assert_eq!(attempts.count, 1, "{context}: receipt applies only once");
+                assert_eq!(attempts.reviewed_sha, "abc123", "{context}");
+                assert!(attempts.not_before.is_some(), "{context}");
+                assert!(record.review_dispatch_hold.is_some(), "{context}");
+                assert!(slot_held, "{context}: the implementation keeps its slot");
+            }
+        }
+    }
+
+    fn expected_inbox_state_after_reviewing_failure(
+        routing: ReviewingFailureRouting,
+    ) -> crate::MonitorInboxState {
+        match routing {
+            ReviewingFailureRouting::ImplementationRetry => crate::MonitorInboxState::Queued,
+            ReviewingFailureRouting::ReviewLadder => crate::MonitorInboxState::Launched,
+        }
+    }
+
+    fn prefs_hold_launched_slot(prefs: &crate::IssueMonitorPrefs, issue_number: u64) -> bool {
+        prefs
+            .launched_issues
+            .iter()
+            .any(|launched| launched.issue_number == issue_number)
+    }
+
     async fn assert_ambiguous_autonomous_failure_receipt_replays_once(
         failure_payload: serde_json::Value,
+        routing: ReviewingFailureRouting,
     ) {
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
@@ -7775,9 +7849,12 @@ exit 0
             .iter()
             .find(|record| record.issue_number == 42)
             .expect("first failure outcome is visible");
-        assert_eq!(first.attempts, 1);
-        assert_eq!(first.phase, crate::AutonomousPhase::Idle);
-        assert!(first.retry_not_before.is_some());
+        assert_reviewing_failure_outcome(
+            routing,
+            first,
+            prefs_hold_launched_slot(&visible, 42),
+            "visible snapshot",
+        );
         assert!(
             visible
                 .failed_issues
@@ -7787,14 +7864,17 @@ exit 0
         );
         let live_record = monitor
             .autonomous_record(42)
+            .cloned()
             .expect("visible rename converges the live monitor before retry");
-        assert_eq!(live_record.attempts, 1);
-        assert_eq!(live_record.phase, crate::AutonomousPhase::Idle);
-        assert!(live_record.retry_not_before.is_some());
-        assert_eq!(monitor.active_count(), 0);
+        assert_reviewing_failure_outcome(
+            routing,
+            &live_record,
+            monitor.active_count() == 1,
+            "live monitor before retry",
+        );
         assert_eq!(
             monitor.inbox_item(42).map(|item| item.state),
-            Some(crate::MonitorInboxState::Queued),
+            Some(expected_inbox_state_after_reviewing_failure(routing)),
             "the same-process retry starts from the exact visible control outcome"
         );
 
@@ -7854,14 +7934,18 @@ exit 0
 
         let final_record = monitor
             .autonomous_record(42)
+            .cloned()
             .expect("retry outcome remains recorded");
-        assert_eq!(final_record.attempts, 1, "receipt applies only once");
-        assert_eq!(final_record.phase, crate::AutonomousPhase::Idle);
-        assert!(final_record.retry_not_before.is_some());
+        assert_reviewing_failure_outcome(
+            routing,
+            &final_record,
+            monitor.active_count() == 1,
+            "after replay (receipt applies only once)",
+        );
         assert_eq!(
             monitor.inbox_item(42).map(|item| item.state),
-            Some(crate::MonitorInboxState::Queued),
-            "replay preserves the autonomous retry inbox outcome"
+            Some(expected_inbox_state_after_reviewing_failure(routing)),
+            "replay preserves the inbox outcome"
         );
         let durable = crate::load_issue_monitor_prefs(&prefs_path).expect("reload final prefs");
         let durable_record = durable
@@ -7869,9 +7953,12 @@ exit 0
             .iter()
             .find(|record| record.issue_number == 42)
             .expect("durable retry outcome");
-        assert_eq!(durable_record.attempts, 1);
-        assert_eq!(durable_record.phase, crate::AutonomousPhase::Idle);
-        assert!(durable_record.retry_not_before.is_some());
+        assert_reviewing_failure_outcome(
+            routing,
+            durable_record,
+            prefs_hold_launched_slot(&durable, 42),
+            "durable prefs after replay",
+        );
         assert!(
             durable
                 .failed_issues
@@ -7888,12 +7975,17 @@ exit 0
         let _env_lock = crate::env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert_ambiguous_autonomous_failure_receipt_replays_once(serde_json::json!({
-            "launch_failed": {
-                "issue_number": 42,
-                "message": "independent review could not start",
-            }
-        }))
+        // Issue #4815: a launch failure during `Reviewing` is the review
+        // window's (the implementation is already launched).
+        assert_ambiguous_autonomous_failure_receipt_replays_once(
+            serde_json::json!({
+                "launch_failed": {
+                    "issue_number": 42,
+                    "message": "independent review could not start",
+                }
+            }),
+            ReviewingFailureRouting::ReviewLadder,
+        )
         .await;
     }
 
@@ -7904,13 +7996,18 @@ exit 0
         let _env_lock = crate::env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert_ambiguous_autonomous_failure_receipt_replays_once(serde_json::json!({
-            "agent_failed": {
-                "issue_number": 42,
-                "window_id": "tab-1::agent-42",
-                "message": "agent exited before review",
-            }
-        }))
+        // The bound implementation window failed: the implementation ladder
+        // takes it even though the record is `Reviewing` (Issue #4815).
+        assert_ambiguous_autonomous_failure_receipt_replays_once(
+            serde_json::json!({
+                "agent_failed": {
+                    "issue_number": 42,
+                    "window_id": "tab-1::agent-42",
+                    "message": "agent exited before review",
+                }
+            }),
+            ReviewingFailureRouting::ImplementationRetry,
+        )
         .await;
     }
 
@@ -7955,19 +8052,30 @@ exit 0
             .expect("first admission receipt")
             .control_id
             .clone();
+        // Issue #4815: the review launch failure lands on the review ladder;
+        // the implementation keeps its slot and its attempt budget.
         assert_eq!(
             monitor.autonomous_record(42).map(|record| record.phase),
-            Some(crate::AutonomousPhase::Idle)
+            Some(crate::AutonomousPhase::Implementing)
         );
         assert_eq!(
+            monitor.autonomous_record(42).and_then(|record| record
+                .review_attempts
+                .as_ref()
+                .map(|attempts| attempts.count)),
+            Some(1)
+        );
+        assert_eq!(monitor.attempt_count(42), 0);
+        assert_eq!(
             monitor.inbox_item(42).map(|item| item.state),
-            Some(crate::MonitorInboxState::Queued)
+            Some(crate::MonitorInboxState::Launched)
         );
 
-        // A manual Launch Now can fail before the daemon observes any
-        // materializing/launched marker. Its separate admission ID, rather than
-        // lifecycle-state heuristics, distinguishes it from the first control's
-        // durability retry.
+        // A second, distinct launch failure arrives while the record is back
+        // in `Implementing`. Its separate admission ID, rather than
+        // lifecycle-state heuristics, distinguishes it from the first
+        // control's durability retry: it is applied as a new failure (the
+        // implementation ladder this time) instead of being deduped.
         assert!(matches!(
             apply_control_for_test(
                 &prefs_path,
@@ -7987,14 +8095,28 @@ exit 0
             .expect("second admission receipt");
         assert_ne!(second_receipt.control_id, first_receipt);
         assert_eq!(
-            monitor.inbox_item(42).map(|item| item.state),
-            Some(crate::MonitorInboxState::LaunchFailed)
+            monitor.attempt_count(42),
+            1,
+            "the distinct admission was applied, not replayed"
         );
-        assert!(crate::load_issue_monitor_prefs(&prefs_path)
-            .expect("reload distinct admission")
-            .failed_issues
-            .iter()
-            .any(|failure| failure.issue_number == 42));
+        assert_eq!(
+            monitor.autonomous_record(42).map(|record| record.phase),
+            Some(crate::AutonomousPhase::Idle)
+        );
+        assert_eq!(
+            monitor.inbox_item(42).map(|item| item.state),
+            Some(crate::MonitorInboxState::Queued)
+        );
+        let durable =
+            crate::load_issue_monitor_prefs(&prefs_path).expect("reload distinct admission");
+        assert_eq!(
+            durable
+                .autonomous_records
+                .iter()
+                .find(|record| record.issue_number == 42)
+                .map(|record| record.attempts),
+            Some(1)
+        );
     }
 
     #[test]
@@ -8032,12 +8154,16 @@ exit 0
             apply_accepted_control_for_test(&prefs_path, &mut monitor, accepted.clone()),
             super::IssueMonitorControlCommit::Committed { .. }
         ));
-        assert_eq!(
+        // Issue #4815: the review ladder's backoff is anchored to the
+        // receipt's processing time, exactly as the implementation ladder was.
+        let review_attempts = |monitor: &crate::IssueMonitorState| {
             monitor
                 .autonomous_record(42)
-                .unwrap()
-                .retry_not_before
-                .as_deref(),
+                .and_then(|record| record.review_attempts.clone())
+                .expect("review attempt recorded")
+        };
+        assert_eq!(
+            review_attempts(&monitor).not_before.as_deref(),
             Some("2000-01-01T00:01:00Z")
         );
         assert!(matches!(
@@ -8045,7 +8171,8 @@ exit 0
             super::IssueMonitorControlCommit::Committed { .. }
         ));
         assert_eq!(stale.prefs(), monitor.prefs());
-        assert_eq!(stale.attempt_count(42), 1);
+        assert_eq!(review_attempts(&stale).count, 1);
+        assert_eq!(stale.attempt_count(42), 0);
     }
 
     #[test]
@@ -8122,15 +8249,23 @@ exit 0
             "retry={retry:?}, last_error={:?}",
             monitor.status_view().last_error
         );
-        assert_eq!(monitor.active_count(), 0);
+        // Issue #4815: the converged outcome is the review ladder's.
+        assert_eq!(monitor.active_count(), 1);
         assert_eq!(
             monitor.autonomous_record(42).map(|record| record.phase),
-            Some(crate::AutonomousPhase::Idle)
+            Some(crate::AutonomousPhase::Implementing)
         );
-        assert_eq!(monitor.attempt_count(42), 1);
+        assert_eq!(monitor.attempt_count(42), 0);
+        assert_eq!(
+            monitor.autonomous_record(42).and_then(|record| record
+                .review_attempts
+                .as_ref()
+                .map(|attempts| attempts.count)),
+            Some(1)
+        );
         assert_eq!(
             monitor.inbox_item(42).map(|item| item.state),
-            Some(crate::MonitorInboxState::Queued)
+            Some(crate::MonitorInboxState::Launched)
         );
         assert_eq!(
             monitor.prefs(),
@@ -8861,6 +8996,7 @@ exit 0
                 review_dispatch_hold: None,
                 last_failure_message: None,
                 delivering_since: None,
+                review_attempts: None,
             }],
             ..crate::IssueMonitorPrefs::default()
         };
@@ -8973,6 +9109,7 @@ exit 0
                 review_dispatch_hold: None,
                 last_failure_message: None,
                 delivering_since: None,
+                review_attempts: None,
             }],
             ..crate::IssueMonitorPrefs::default()
         };
@@ -9621,7 +9758,6 @@ exit 0
     /// human handoff.
     #[test]
     fn a_provider_usage_limit_control_holds_the_issue_instead_of_failing_it() {
-        let _quota_hold = crate::issue_monitor::hold_provider_quota_on_first_failure_in_this_test();
         let mut monitor = crate::IssueMonitorState::with_prefs(
             crate::IssueMonitorConfig {
                 enabled: true,
@@ -9706,7 +9842,6 @@ exit 0
     /// after reset.
     #[test]
     fn a_provider_usage_limit_control_gates_claim_planning_until_reset() {
-        let _quota_hold = crate::issue_monitor::hold_provider_quota_on_first_failure_in_this_test();
         let mut profile = sample_issue_monitor_profile();
         profile.agent_id = "codex".to_string();
         let mut monitor = crate::IssueMonitorState::with_prefs(
@@ -9826,7 +9961,6 @@ exit 0
 
     #[test]
     fn typed_provider_usage_limit_primary_path_preserves_the_reported_provider() {
-        let _quota_hold = crate::issue_monitor::hold_provider_quota_on_first_failure_in_this_test();
         let mut monitor = crate::IssueMonitorState::with_prefs(
             crate::IssueMonitorConfig {
                 enabled: true,
@@ -9894,7 +10028,6 @@ exit 0
 
     #[test]
     fn typed_provider_usage_limit_routine_defense_preserves_the_reported_provider() {
-        let _quota_hold = crate::issue_monitor::hold_provider_quota_on_first_failure_in_this_test();
         let mut monitor = crate::IssueMonitorState::with_prefs(
             crate::IssueMonitorConfig {
                 enabled: true,
@@ -10204,20 +10337,38 @@ exit 0
         let should_scan = apply_issue_monitor_control(&mut monitor, control);
 
         assert!(should_scan);
+        // Issue #4815: the review window's failure is the review ladder's.
+        // The record returns to Implementing for the backed-off re-dispatch
+        // (never stranded in Reviewing) and the implementation keeps its
+        // slot and attempt budget.
+        let record = monitor.autonomous_record(42).expect("record retained");
         assert_eq!(
-            monitor.autonomous_record(42).map(|r| r.phase),
-            Some(crate::AutonomousPhase::Idle),
-            "routed back to Idle for retry, not stranded in Reviewing"
+            record.phase,
+            crate::AutonomousPhase::Implementing,
+            "routed back to Implementing for the backed-off re-dispatch, not stranded in Reviewing"
         );
         assert_eq!(
             monitor.attempt_count(42),
-            1,
-            "the failed attempt is counted"
+            0,
+            "no implementation attempt is spent"
         );
+        let attempts = record
+            .review_attempts
+            .as_ref()
+            .expect("the review ladder counts the failure");
+        assert_eq!(
+            (attempts.reviewed_sha.as_str(), attempts.count),
+            ("abc123", 1)
+        );
+        assert!(attempts.not_before.is_some());
+        assert!(record
+            .review_dispatch_hold
+            .as_ref()
+            .is_some_and(|hold| hold.reason.contains("PR #99") && hold.reason.contains("abc123")));
         assert_eq!(
             monitor.inbox_item(42).map(|item| item.state),
-            Some(crate::MonitorInboxState::Queued),
-            "re-queued for automatic relaunch"
+            Some(crate::MonitorInboxState::Launched),
+            "the implementation stays launched"
         );
     }
 
@@ -12930,6 +13081,7 @@ exit 0
 
     #[test]
     fn scan_now_driver_persists_legacy_completion_recovery_for_launch_now() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let _env_lock = crate::env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -12985,6 +13137,7 @@ exit 0
 
     #[test]
     fn scan_now_driver_treats_closed_issue_as_terminal_negative_control() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let _env_lock = crate::env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -13260,6 +13413,7 @@ exit 0
                     review_dispatch_hold: None,
                     last_failure_message: None,
                     delivering_since: None,
+                    review_attempts: None,
                 }],
                 ..crate::IssueMonitorPrefs::default()
             },
@@ -13425,6 +13579,7 @@ exit 0
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn valid_startup_off_commits_before_any_stale_prepared_grant_starts() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let _env_lock = crate::env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -13511,6 +13666,7 @@ exit 0
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn production_server_shutdown_waits_for_authority_revocation_and_reaps_child() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let _env_lock = crate::env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -13638,6 +13794,7 @@ exit 0
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // serializes process-wide fake-gh environment
     async fn worker_off_during_blocked_arm_serializes_compensating_disarm() {
+        let _prefs_budget = pin_prefs_hang_guard();
         // SPEC #3200 Phase 7 Scenarios 30-31: OFF commits while an already
         // started arm command is blocked. The old command may still succeed,
         // but its exact result cannot enter delivery; one durable disarm must
@@ -13749,6 +13906,7 @@ exit 1
                     review_dispatch_hold: None,
                     last_failure_message: None,
                     delivering_since: None,
+                    review_attempts: None,
                 }],
                 ..crate::IssueMonitorPrefs::default()
             },
@@ -14367,69 +14525,77 @@ exit 1
         });
     }
 
-    #[tokio::test]
-    async fn worker_stays_starting_until_the_local_fallback_lease_is_released() {
-        let temp = TempDir::new().expect("tempdir");
-        let repo = temp.path().join("repo");
-        fs::create_dir_all(&repo).expect("repo");
-        init_git_repo(&repo);
-        commit_initial_branch(&repo);
-        git_remote_add_origin(&repo, "https://github.com/example/repo.git");
-        let scope = RuntimeScope::new(
-            "abcdef0123456789",
-            "feedfacecafebeef",
-            repo,
-            RuntimeTarget::Host,
-        )
-        .expect("scope");
-        let prefs_path = crate::issue_monitor_prefs_path_for_repo_path(&scope.project_root);
-        crate::save_issue_monitor_prefs(&prefs_path, &crate::IssueMonitorPrefs::default())
-            .expect("seed prefs");
-        let local_lease = crate::try_acquire_issue_monitor_local_fallback_lease(&prefs_path)
-            .expect("hold GUI fallback authority");
-        let hub = BroadcastHub::new();
-        let shutdown = Arc::new(DaemonShutdown::new());
-        let worker = super::spawn_issue_monitor_worker_with_config(
-            scope,
-            hub.clone(),
-            Arc::clone(&shutdown),
-            crate::IssueMonitorConfig::default(),
-        );
-        let publisher = tokio::spawn({
-            let hub = hub.clone();
-            async move {
-                hub.publish_issue_monitor_control(DaemonFrame::Event {
-                    channel: crate::runtime_daemon_events::ISSUE_MONITOR_CONTROL_CHANNEL
-                        .to_string(),
-                    payload: crate::runtime_daemon_events::issue_monitor_payload(
-                        "control",
-                        serde_json::json!({"config_set": {"max_active_agents": 2}}),
-                        std::process::id().wrapping_add(1),
-                    ),
-                })
-                .await
-            }
-        });
+    #[test]
+    fn worker_stays_starting_until_the_local_fallback_lease_is_released() {
+        let _prefs_budget = pin_prefs_hang_guard();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .on_thread_start(|| std::mem::forget(pin_prefs_hang_guard()))
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let temp = TempDir::new().expect("tempdir");
+            let repo = temp.path().join("repo");
+            fs::create_dir_all(&repo).expect("repo");
+            init_git_repo(&repo);
+            commit_initial_branch(&repo);
+            git_remote_add_origin(&repo, "https://github.com/example/repo.git");
+            let scope = RuntimeScope::new(
+                "abcdef0123456789",
+                "feedfacecafebeef",
+                repo,
+                RuntimeTarget::Host,
+            )
+            .expect("scope");
+            let prefs_path = crate::issue_monitor_prefs_path_for_repo_path(&scope.project_root);
+            crate::save_issue_monitor_prefs(&prefs_path, &crate::IssueMonitorPrefs::default())
+                .expect("seed prefs");
+            let local_lease = crate::try_acquire_issue_monitor_local_fallback_lease(&prefs_path)
+                .expect("hold GUI fallback authority");
+            let hub = BroadcastHub::new();
+            let shutdown = Arc::new(DaemonShutdown::new());
+            let worker = super::spawn_issue_monitor_worker_with_config(
+                scope,
+                hub.clone(),
+                Arc::clone(&shutdown),
+                crate::IssueMonitorConfig::default(),
+            );
+            let publisher = tokio::spawn({
+                let hub = hub.clone();
+                async move {
+                    hub.publish_issue_monitor_control(DaemonFrame::Event {
+                        channel: crate::runtime_daemon_events::ISSUE_MONITOR_CONTROL_CHANNEL
+                            .to_string(),
+                        payload: crate::runtime_daemon_events::issue_monitor_payload(
+                            "control",
+                            serde_json::json!({"config_set": {"max_active_agents": 2}}),
+                            std::process::id().wrapping_add(1),
+                        ),
+                    })
+                    .await
+                }
+            });
 
-        tokio::time::sleep(Duration::from_millis(75)).await;
-        assert!(
-            !publisher.is_finished(),
-            "fence-less contention keeps controls in Starting"
-        );
-        drop(local_lease);
-        let publish_result = tokio::time::timeout(HANG_GUARD, publisher)
-            .await
-            .expect("publisher reaches Ready after lease release")
-            .expect("publisher task joins");
-        assert!(
-            publish_result.is_ok(),
-            "the retried daemon owns and commits the control: {publish_result:?}"
-        );
-        shutdown.request();
-        tokio::time::timeout(HANG_GUARD, worker)
-            .await
-            .expect("worker shutdown is bounded")
-            .expect("worker exits cleanly");
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            assert!(
+                !publisher.is_finished(),
+                "fence-less contention keeps controls in Starting"
+            );
+            drop(local_lease);
+            let publish_result = tokio::time::timeout(HANG_GUARD, publisher)
+                .await
+                .expect("publisher reaches Ready after lease release")
+                .expect("publisher task joins");
+            assert!(
+                publish_result.is_ok(),
+                "the retried daemon owns and commits the control: {publish_result:?}"
+            );
+            shutdown.request();
+            tokio::time::timeout(HANG_GUARD, worker)
+                .await
+                .expect("worker shutdown is bounded")
+                .expect("worker exits cleanly");
+        });
     }
 
     /// Issue #4199: `Rejected` and `RecoveryBlocked` answer different
@@ -14839,6 +15005,7 @@ exit 1
 
     #[test]
     fn malformed_lifetime_authority_fence_blocks_ready_and_is_retained() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         crate::save_issue_monitor_prefs(
@@ -15198,6 +15365,7 @@ exit 1
 
     #[test]
     fn shutdown_fence_unlink_parent_sync_failure_keeps_drop_retry_armed() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let _env_lock = crate::env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -15668,6 +15836,7 @@ exit 1
     #[test]
     #[allow(clippy::await_holding_lock)]
     fn worker_abort_denies_detached_grant_and_durably_revokes_authority() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let _env_lock = crate::env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -15679,6 +15848,7 @@ exit 1
             // the queued-effect case is covered by the adjacent test.
             .max_blocking_threads(2)
             .enable_all()
+            .on_thread_start(|| std::mem::forget(pin_prefs_hang_guard()))
             .build()
             .expect("runtime");
         let temp = TempDir::new().expect("tempdir");
@@ -16560,6 +16730,7 @@ exit 1
                 review_dispatch_hold: None,
                 last_failure_message: None,
                 delivering_since: None,
+                review_attempts: None,
             }],
             ..crate::IssueMonitorPrefs::default()
         };
@@ -16629,6 +16800,7 @@ exit 1
                 review_dispatch_hold: None,
                 last_failure_message: None,
                 delivering_since: None,
+                review_attempts: None,
             }],
             ..crate::IssueMonitorPrefs::default()
         };
@@ -16751,6 +16923,7 @@ exit 1
                     review_dispatch_hold: None,
                     last_failure_message: None,
                     delivering_since: None,
+                    review_attempts: None,
                 },
                 crate::AutonomousIssueRecord {
                     issue_number: 8,
@@ -16772,6 +16945,7 @@ exit 1
                     review_dispatch_hold: None,
                     last_failure_message: None,
                     delivering_since: None,
+                    review_attempts: None,
                 },
             ],
             ..crate::IssueMonitorPrefs::default()
@@ -16844,6 +17018,7 @@ exit 1
                 review_dispatch_hold: None,
                 last_failure_message: None,
                 delivering_since: None,
+                review_attempts: None,
             }],
             ..crate::IssueMonitorPrefs::default()
         };
@@ -17491,6 +17666,7 @@ exit 1
     #[test]
     #[allow(clippy::await_holding_lock)]
     fn replayed_arm_with_advanced_head_compensates_before_settling() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let _env_lock = crate::env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -17571,6 +17747,7 @@ exit 1
                 review_dispatch_hold: None,
                 last_failure_message: None,
                 delivering_since: None,
+                review_attempts: None,
             }],
             ..crate::IssueMonitorPrefs::default()
         };
@@ -17680,6 +17857,7 @@ exit 1
 
     #[test]
     fn merged_before_disarm_is_needs_human_not_false_kill_switch_success() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let disarm = crate::PendingIssueMonitorEffect {
@@ -17718,6 +17896,7 @@ exit 1
                 review_dispatch_hold: None,
                 last_failure_message: None,
                 delivering_since: None,
+                review_attempts: None,
             }],
             ..crate::IssueMonitorPrefs::default()
         };
@@ -17859,6 +18038,7 @@ exit 1
                 review_dispatch_hold: None,
                 last_failure_message: None,
                 delivering_since: None,
+                review_attempts: None,
             }],
             ..crate::IssueMonitorPrefs::default()
         };
@@ -18222,6 +18402,7 @@ exit 1
             review_dispatch_hold: None,
             last_failure_message: None,
             delivering_since: None,
+            review_attempts: None,
         };
         let disk_same_key = record(42, crate::AutonomousPhase::Implementing, 1);
         let local_same_key = record(42, crate::AutonomousPhase::Reviewing, 2);
@@ -18461,6 +18642,7 @@ exit 1
                     review_dispatch_hold: None,
                     last_failure_message: None,
                     delivering_since: None,
+                    review_attempts: None,
                 }],
                 ..crate::IssueMonitorPrefs::default()
             },
@@ -18620,6 +18802,7 @@ exit 1
 
     #[test]
     fn stale_local_off_failure_denies_and_enters_retry_barrier() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         crate::save_issue_monitor_prefs(
@@ -18640,6 +18823,8 @@ exit 1
             },
         );
         let lock = issue_monitor_prefs_lock_for_test(&prefs_path);
+        let contended_budget =
+            super::ScopedIssueMonitorPrefsTimeout::set(Duration::from_millis(250));
         let mut permit = super::IssueMonitorEffectPermit::new();
         let captured_grant = permit.capture();
         let mut pending = None;
@@ -18670,6 +18855,7 @@ exit 1
         );
 
         FileExt::unlock(&lock).expect("release prefs lock");
+        drop(contended_budget);
         let _clock = ScopedOperationClock::set(Instant::now());
         let retry = super::try_apply_accepted_issue_monitor_control_with_disk_migration(
             &prefs_path,
@@ -18878,6 +19064,7 @@ exit 1
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn off_lock_timeout_retries_and_commits_revocation_after_unlock() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let _env_lock = crate::env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -18981,6 +19168,8 @@ exit 1
         );
         assert!(wait_for_path(&effect_started).await);
         let lock = issue_monitor_prefs_lock_for_test(&prefs_path);
+        let contended_budget =
+            super::ScopedIssueMonitorPrefsTimeout::set(Duration::from_millis(250));
         let source_pid = std::process::id().wrapping_add(1);
         let off_receipt = tokio::spawn({
             let hub = hub.clone();
@@ -19007,6 +19196,7 @@ exit 1
             .await;
         tokio::time::sleep(Duration::from_millis(650)).await;
         FileExt::unlock(&lock).expect("release prefs lock");
+        drop(contended_budget);
         tokio::time::timeout(HANG_GUARD, off_receipt)
             .await
             .expect("OFF receipt resolves after retry")
@@ -19080,6 +19270,7 @@ exit 1
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn pending_off_is_barrier_to_reenable_without_permit_aba() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let _env_lock = crate::env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -19137,6 +19328,8 @@ exit 1
             "the worker publishes its seeded projection before controls contend"
         );
         let lock = issue_monitor_prefs_lock_for_test(&prefs_path);
+        let contended_budget =
+            super::ScopedIssueMonitorPrefsTimeout::set(Duration::from_millis(250));
         let source_pid = std::process::id().wrapping_add(1);
         let mut publishers = Vec::new();
         for enabled in [false, true, false, true] {
@@ -19170,6 +19363,7 @@ exit 1
             "no ordered receipt resolves before the first durable commit"
         );
         FileExt::unlock(&lock).expect("release prefs lock");
+        drop(contended_budget);
         for publisher in publishers {
             tokio::time::timeout(HANG_GUARD, publisher)
                 .await
@@ -19216,6 +19410,7 @@ exit 1
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn shutdown_rejects_pending_and_queued_control_receipts_without_ack() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let _env_lock = crate::env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -19257,6 +19452,8 @@ exit 1
             Duration::from_secs(1),
         );
         let lock = issue_monitor_prefs_lock_for_test(&prefs_path);
+        let contended_budget =
+            super::ScopedIssueMonitorPrefsTimeout::set(Duration::from_millis(250));
         let source_pid = std::process::id().wrapping_add(1);
         let pending = tokio::spawn({
             let hub = hub.clone();
@@ -19310,6 +19507,7 @@ exit 1
             .expect("queued receipt resolves")
             .expect("queued publisher joins");
         FileExt::unlock(&lock).expect("release prefs lock");
+        drop(contended_budget);
         tokio::time::timeout(HANG_GUARD, worker)
             .await
             .expect("worker shutdown is bounded")
@@ -19325,6 +19523,7 @@ exit 1
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn routine_control_lock_retry_keeps_receipt_and_fifo_until_commit() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let _env_lock = crate::env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -19365,6 +19564,8 @@ exit 1
             Duration::from_secs(1),
         );
         let lock = issue_monitor_prefs_lock_for_test(&prefs_path);
+        let contended_budget =
+            super::ScopedIssueMonitorPrefsTimeout::set(Duration::from_millis(250));
         let publish = |hub: BroadcastHub, max_active_agents| {
             tokio::spawn(async move {
                 hub.publish_issue_monitor_control(DaemonFrame::Event {
@@ -19403,6 +19604,7 @@ exit 1
         );
 
         FileExt::unlock(&lock).expect("release prefs lock");
+        drop(contended_budget);
         first
             .await
             .expect("first publisher joins")
@@ -19425,6 +19627,7 @@ exit 1
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn routine_retry_fences_a_scan_captured_while_the_control_is_pending() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let _env_lock = crate::env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -19483,6 +19686,7 @@ exit 1
                     review_dispatch_hold: None,
                     last_failure_message: None,
                     delivering_since: None,
+                    review_attempts: None,
                 }],
                 ..crate::IssueMonitorPrefs::default()
             },
@@ -19502,6 +19706,8 @@ exit 1
             Duration::from_secs(2),
         );
         let lock = issue_monitor_prefs_lock_for_test(&prefs_path);
+        let contended_budget =
+            super::ScopedIssueMonitorPrefsTimeout::set(Duration::from_millis(250));
         let mut receipt = hub
             .enqueue_issue_monitor_control(DaemonFrame::Event {
                 channel: crate::runtime_daemon_events::ISSUE_MONITOR_CONTROL_CHANNEL.to_string(),
@@ -19536,6 +19742,7 @@ exit 1
         );
 
         FileExt::unlock(&lock).expect("release prefs lock");
+        drop(contended_budget);
         tokio::time::timeout(HANG_GUARD, receipt)
             .await
             .expect("heartbeat receipt resolves after retry")
@@ -19781,6 +19988,7 @@ exit 1
             review_dispatch_hold: None,
             last_failure_message: None,
             delivering_since: None,
+            review_attempts: None,
         };
         crate::save_issue_monitor_prefs(
             &prefs_path,

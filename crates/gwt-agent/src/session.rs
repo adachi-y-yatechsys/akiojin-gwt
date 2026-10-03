@@ -394,6 +394,9 @@ pub struct Session {
     pub session_history: Vec<AgentSessionHistoryEntry>,
     pub status: AgentStatus,
     pub tool_version: Option<String>,
+    /// User-selected launch route, separate from the observed runtime version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_version_selector: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_runtime_provenance: Option<ToolRuntimeProvenance>,
     pub model: Option<String>,
@@ -548,6 +551,40 @@ pub struct SessionRuntimeState {
 }
 
 impl Session {
+    /// Recover the launch selector separately from the observed runtime version.
+    /// Direct Host runs must continue using the installed executable on restore.
+    pub fn launch_tool_version(&self) -> Option<String> {
+        if self.runtime_target == LaunchRuntimeTarget::Host
+            && matches!(self.agent_id, AgentId::ClaudeCode | AgentId::Codex)
+        {
+            if let Some(selector) = &self.tool_version_selector {
+                return Some(selector.clone());
+            }
+            if let Some(provenance) = &self.tool_runtime_provenance {
+                return Some(provenance.requested_selector.clone());
+            }
+            let command = Path::new(&self.launch_command)
+                .file_stem()
+                .and_then(|name| name.to_str());
+            if command.is_some_and(|name| name.eq_ignore_ascii_case(self.agent_id.command())) {
+                return Some("installed".into());
+            }
+            if command.is_some_and(|name| {
+                name.eq_ignore_ascii_case("npx") || name.eq_ignore_ascii_case("bunx")
+            }) {
+                let prefix = format!("{}@", self.agent_id.npm_package()?);
+                if let Some(selector) = self
+                    .launch_args
+                    .iter()
+                    .find_map(|arg| arg.strip_prefix(&prefix))
+                {
+                    return Some(selector.into());
+                }
+            }
+        }
+        self.tool_version.clone()
+    }
+
     /// Current persisted session schema version. SPEC-1921 Phase 53 / FR-066.
     /// Bump when adding a new migration in `migrate_legacy_launch_args` and
     /// ensure the new migration is idempotent relative to this value.
@@ -575,6 +612,7 @@ impl Session {
             session_history: Vec::new(),
             status: AgentStatus::Unknown,
             tool_version: None,
+            tool_version_selector: None,
             tool_runtime_provenance: None,
             model: None,
             reasoning_level: None,
@@ -627,6 +665,7 @@ impl Session {
         let mut session = Self::new(worktree_path, branch, config.agent_id.clone());
         session.display_name = config.display_name.clone();
         session.tool_version = config.tool_version.clone();
+        session.tool_version_selector = config.tool_version_selector.clone();
         session.tool_runtime_provenance = config.tool_runtime_provenance.clone();
         session.model = config.model.clone();
         session.reasoning_level = config.reasoning_level.clone();
@@ -1385,6 +1424,120 @@ where
         )),
         SessionPathState::Error(error) => Err(error),
     })
+}
+
+/// Lease two distinct Sessions in lexical order under an already-held owner
+/// lease. A single thread guard covers the pair; ordinary nested Session
+/// leases remain forbidden. The callback receives Sessions in caller order.
+pub fn with_session_pair_lease<T>(
+    sessions_dir: &Path,
+    session_ids: [&str; 2],
+    operation: impl FnOnce([Session; 2]) -> io::Result<T>,
+) -> io::Result<T> {
+    let _thread_guard = SessionLeaseThreadGuard::enter()?;
+    if session_ids[0] == session_ids[1] {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Session pair must be distinct",
+        ));
+    }
+    for id in session_ids {
+        validate_session_id_path_component(id)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    }
+    fs::create_dir_all(sessions_dir)?;
+    let mut ordered = session_ids;
+    ordered.sort_unstable();
+    let deadline = Instant::now() + SESSION_LEASE_WAIT;
+    let mut locks = Vec::with_capacity(2);
+    for id in ordered {
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(session_lock_path(sessions_dir, id))?;
+        loop {
+            match file.try_lock_exclusive() {
+                Ok(()) => break,
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock
+                        || error.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
+                {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Err(io::Error::new(
+                            io::ErrorKind::WouldBlock,
+                            "Session pair lease is held; retry after it settles",
+                        ));
+                    }
+                    std::thread::sleep(
+                        SESSION_LEASE_POLL.min(deadline.saturating_duration_since(now)),
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        locks.push(file);
+    }
+    let sessions = [
+        Session::load(&session_file_path(sessions_dir, session_ids[0]))?,
+        Session::load(&session_file_path(sessions_dir, session_ids[1]))?,
+    ];
+    let result = operation(sessions);
+    // File ownership is the RAII lock guard, including every early error.
+    drop(locks);
+    result
+}
+
+/// Finalize an exact observed runtime after its child exit was proved by the
+/// caller. Supports unbound duplicate Sessions as well as bound ones. Both
+/// durable snapshots must still match under the caller's Session lease.
+pub fn persist_observed_session_runtime_stopped_under_lease(
+    sessions_dir: &Path,
+    expected: &Session,
+    host_pid: u32,
+    expected_runtime: &SessionRuntimeState,
+) -> io::Result<bool> {
+    require_current_thread_session_lease()?;
+    validate_session_id_path_component(&expected.id)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    if host_pid == 0
+        || expected_runtime
+            .runtime_incarnation
+            .is_none_or(|value| value == 0)
+        || expected_runtime
+            .host_started_at
+            .is_none_or(|value| value == 0)
+        || expected_runtime.child_pid.is_none_or(|value| value == 0)
+        || expected_runtime
+            .child_started_at
+            .is_none_or(|value| value == 0)
+    {
+        return Ok(false);
+    }
+    let path = session_file_path(sessions_dir, &expected.id);
+    let mut current = Session::load(&path)?;
+    if serialize_session_toml(&current)? != serialize_session_toml(expected)? {
+        return Ok(false);
+    }
+    let runtime_path = runtime_state_path_for_pid(sessions_dir, host_pid, &expected.id);
+    let mut runtime = SessionRuntimeState::load(&runtime_path)?;
+    if runtime.execution_identity != expected_runtime.execution_identity
+        || runtime.runtime_incarnation != expected_runtime.runtime_incarnation
+        || runtime.host_started_at != expected_runtime.host_started_at
+        || runtime.child_pid != expected_runtime.child_pid
+        || runtime.child_started_at != expected_runtime.child_started_at
+    {
+        return Ok(false);
+    }
+    current.update_status(AgentStatus::Stopped);
+    current.restore_window_on_startup = false;
+    runtime.status = AgentStatus::Stopped;
+    runtime.updated_at = Utc::now();
+    write_session_toml_atomic(&path, &serialize_session_toml(&current)?)?;
+    runtime.save(&runtime_path)?;
+    Ok(true)
 }
 
 fn write_session_toml_atomic(path: &Path, content: &str) -> io::Result<()> {
@@ -2809,6 +2962,26 @@ mod tests {
         assert!(!session.id.is_empty());
         // Verify it's a valid UUID
         assert!(Uuid::parse_str(&session.id).is_ok());
+    }
+
+    #[test]
+    fn launch_tool_version_keeps_observed_direct_versions_out_of_package_pins() {
+        let mut session = Session::new("/tmp/wt", "main", AgentId::ClaudeCode);
+        session.tool_version = Some("2.1.156".into());
+        session.launch_command = "/opt/bin/claude".into();
+        assert_eq!(session.launch_tool_version().as_deref(), Some("installed"));
+        session.launch_command = "npx".into();
+        session.launch_args = vec!["-y".into(), "@anthropic-ai/claude-code@latest".into()];
+        assert_eq!(session.launch_tool_version().as_deref(), Some("latest"));
+        session.launch_args = vec!["-y".into(), "@anthropic-ai/claude-code@2.1.156".into()];
+        assert_eq!(session.launch_tool_version().as_deref(), Some("2.1.156"));
+        session.tool_version_selector = Some("latest".into());
+        session.launch_command = "bun".into();
+        session.launch_args = vec!["/cache/claude.js".into()];
+        assert_eq!(session.launch_tool_version().as_deref(), Some("latest"));
+        session.runtime_target = LaunchRuntimeTarget::Docker;
+        session.launch_command = "claude".into();
+        assert_eq!(session.launch_tool_version().as_deref(), Some("2.1.156"));
     }
 
     #[test]

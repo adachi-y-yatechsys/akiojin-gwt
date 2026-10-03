@@ -36,6 +36,12 @@ pub(crate) struct ExecutionTerminalFacts {
     pub(crate) settlement_clear: bool,
     pub(crate) settlement_obligation_open: bool,
     pub(crate) open_obligations: usize,
+    /// Issue #4783 AC-1: the generation was Blocked by a revoked-launch
+    /// release — what `issue.monitor.stop` writes on the ledger. Durable on
+    /// the execution side, so it still says "stopped through the Monitor"
+    /// after the Monitor prefs lost the hold (a requeue, a prefs reset, a
+    /// different store) and until `execution.reopen` clears it.
+    pub(crate) launch_revoked: bool,
 }
 
 impl ExecutionTerminalFacts {
@@ -49,6 +55,10 @@ impl ExecutionTerminalFacts {
             settlement_clear: diagnosis.settlement_severity == "clear",
             settlement_obligation_open: diagnosis.settlement_obligation_open,
             open_obligations: diagnosis.open_obligations.len(),
+            launch_revoked: diagnosis.ecr_status
+                == gwt::cli::execution_state::ExecutionDiagnosisState::Blocked
+                && diagnosis.missing_verification.as_deref()
+                    == Some(gwt::cli::execution_state::REVOKED_LAUNCH_MISSING_VERIFICATION),
         }
     }
 }
@@ -377,6 +387,22 @@ pub(crate) fn restore_admission_for_facts(
                 .is_some_and(|monitor| monitor.issue_closed) =>
         {
             RestoreAdmission::RefuseRetainedTerminal
+        }
+        // Issue #4783 AC-1: a generation Blocked by `issue.monitor.stop` is
+        // not the recoverable Blocked that `execution_blocked_or_corrupt`
+        // admits below — the operator stopped this Work. The Monitor-side
+        // hold (`failure_hold` / `monitor_stopped`) refuses it while the
+        // prefs carry it; the ledger marker refuses it after they stop
+        // carrying it, which is how a stopped Issue's window came back on
+        // the next restart. Held, not terminal: the placeholder stays, and
+        // `execution.reopen` lifts the marker.
+        TerminalCloseEligibility::Ineligible(_)
+            if facts
+                .execution
+                .as_ref()
+                .is_some_and(|execution| execution.launch_revoked) =>
+        {
+            RestoreAdmission::RefuseHeld("launch_revoked")
         }
         // Issue #4802 AC-4: an execution that reached Completed is
         // finished Work even while a settlement obligation is still open.
@@ -962,6 +988,7 @@ mod tests {
             settlement_clear: true,
             settlement_obligation_open: false,
             open_obligations: 0,
+            launch_revoked: false,
         }
     }
 
@@ -973,7 +1000,59 @@ mod tests {
             settlement_clear: false,
             settlement_obligation_open: false,
             open_obligations: 1,
+            launch_revoked: false,
         }
+    }
+
+    /// What `issue.monitor.stop` leaves on the ledger: a Blocked generation
+    /// whose `missing_verification` is the revoked-launch settlement.
+    fn revoked_execution(owner: u64) -> ExecutionTerminalFacts {
+        ExecutionTerminalFacts {
+            status: ExecutionDiagnosisState::Blocked,
+            binding: ExecutionBindingState::Terminal,
+            owner_number: Some(owner),
+            settlement_clear: false,
+            settlement_obligation_open: false,
+            open_obligations: 0,
+            launch_revoked: true,
+        }
+    }
+
+    /// Issue #4783 AC-1: a generation the Monitor revoked is refused even
+    /// when the Monitor prefs carry no hold any more; an ordinary Blocked
+    /// generation keeps today's recoverable admission.
+    #[test]
+    fn restore_refuses_a_monitor_revoked_generation_without_a_prefs_hold() {
+        let placeholder = |execution: ExecutionTerminalFacts| TerminalWindowFacts {
+            window_status: WindowProcessStatus::Stopped,
+            session_status: Some(gwt_agent::AgentStatus::Stopped),
+            ..facts(Some(execution), Some(MonitorTerminalFacts::default()))
+        };
+        assert_eq!(
+            restore_admission_for_facts(&placeholder(revoked_execution(42)), true),
+            RestoreAdmission::RefuseHeld("launch_revoked")
+        );
+        assert_eq!(
+            restore_admission_for_facts(&placeholder(revoked_execution(42)), false),
+            RestoreAdmission::RefuseHeld("launch_revoked"),
+            "an orphan Session of a revoked generation does not come back either"
+        );
+        let mut recoverable = revoked_execution(42);
+        recoverable.launch_revoked = false;
+        assert_eq!(
+            restore_admission_for_facts(&placeholder(recoverable), true),
+            RestoreAdmission::Admit,
+            "a Blocked generation nobody revoked is still recovered by restore"
+        );
+        // The marker is read only off a Blocked diagnosis.
+        let mut diagnosis =
+            gwt::cli::execution_state::diagnose_for_projection(std::path::Path::new("."), None);
+        diagnosis.ecr_status = ExecutionDiagnosisState::Blocked;
+        diagnosis.missing_verification =
+            Some(gwt::cli::execution_state::REVOKED_LAUNCH_MISSING_VERIFICATION.to_string());
+        assert!(ExecutionTerminalFacts::from_diagnosis(&diagnosis).launch_revoked);
+        diagnosis.ecr_status = ExecutionDiagnosisState::Active;
+        assert!(!ExecutionTerminalFacts::from_diagnosis(&diagnosis).launch_revoked);
     }
 
     fn tracked_monitor() -> MonitorTerminalFacts {

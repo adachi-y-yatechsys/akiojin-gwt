@@ -1,7 +1,7 @@
 #![cfg_attr(all(windows, not(test)), windows_subsystem = "windows")]
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     io,
     path::{Path, PathBuf},
     sync::{mpsc as std_mpsc, Arc, Mutex, OnceLock, RwLock},
@@ -336,9 +336,29 @@ fn record_update_available(
         }
         return Vec::new();
     }
+    let mut events = Vec::new();
+    if let gwt_core::update::UpdateState::Available { latest, .. } = &state {
+        match update_front_door::discard_superseded_pending_update(latest) {
+            Ok(Some(version)) => events.extend(app.release_update_auto_apply_events(
+                &version,
+                app_runtime::UpdateAutoApplyRelease::Superseded,
+            )),
+            Ok(None) => {}
+            Err(error) => {
+                return vec![update_download_failure(
+                    "Replace staged update",
+                    error,
+                    gwt_core::update::update_log_path()
+                        .to_string_lossy()
+                        .into_owned(),
+                )]
+            }
+        }
+    }
     app.pending_update = Some(state.clone());
     app.start_automatic_update_download();
-    vec![OutboundEvent::broadcast(BackendEvent::UpdateState(state))]
+    events.push(OutboundEvent::broadcast(BackendEvent::UpdateState(state)));
+    events
 }
 
 /// Every download producer enters here, including Release Notes selections.
@@ -383,13 +403,10 @@ fn finish_update_download(
     app.update_download_in_flight = None;
     let deferred = app.deferred_update_discovery.take();
     let mut events: Vec<_> = failure.into_iter().collect();
-    // On success, keep the staged selection and its drain: starting another
-    // worker could race its graceful restart. The next launch polls afresh.
-    // On failure, replay the discovery that the poller's last_seen suppresses.
-    if !events.is_empty() {
-        if let Some(state) = deferred {
-            events.extend(record_update_available(app, state));
-        }
+    // PollState already recorded this discovery, so replay it after either
+    // outcome instead of losing the newer release until the next launch.
+    if let Some(state) = deferred {
+        events.extend(record_update_available(app, state));
     }
     events
 }
@@ -721,8 +738,15 @@ fn spawn_update_apply_resolution(
             .to_string_lossy()
             .to_string();
         let resolved = match gwt_core::update::load_pending_update_manifest() {
-            Some(manifest) => Ok(manifest),
-            None => update_front_door::prepare_and_persist_pending_update(state),
+            Some(manifest)
+                if matches!(
+                    &state, gwt_core::update::UpdateState::Available { latest, .. }
+                        if latest == &manifest.version
+                ) =>
+            {
+                Ok(manifest)
+            }
+            _ => update_front_door::prepare_and_persist_pending_update(state),
         };
         match resolved {
             Ok(manifest) => {
@@ -753,6 +777,36 @@ fn spawn_update_apply_resolution(
             }
         }
     });
+}
+
+fn admit_prepared_update(
+    app: &AppRuntime,
+    manifest: &gwt_core::update::PendingUpdateManifest,
+    admission: &mut update_front_door::UpdateApplyAdmission,
+) -> (bool, Vec<OutboundEvent>) {
+    if !admission.begin_commit() {
+        return (false, Vec::new());
+    }
+    if let Some(gwt_core::update::UpdateState::Available { latest, .. }) = &app.pending_update {
+        if gwt_core::update::pending_version_is_newer(latest, &manifest.version) {
+            admission.failed();
+            let message = match update_front_door::discard_superseded_pending_update(latest) {
+                Ok(_) => format!("Update v{latest} replaced v{}; use the update button to apply the newer release.", manifest.version),
+                Err(error) => error,
+            };
+            return (
+                false,
+                vec![update_download_failure(
+                    "Replace staged update",
+                    message,
+                    gwt_core::update::update_log_path()
+                        .to_string_lossy()
+                        .into_owned(),
+                )],
+            );
+        }
+    }
+    (true, Vec::new())
 }
 
 fn spawn_gui_exit_backstop(reason: GuiShutdownReason, grace: Duration) {
@@ -1032,23 +1086,44 @@ fn spawn_workspace_projection_reload(
     spawner: &app_runtime::BlockingTaskSpawner,
     proxy: app_runtime::AppEventProxy,
     context: app_runtime::ProjectContext,
+    imported_from: Option<PathBuf>,
 ) {
     let proxy = proxy.for_project(context.clone());
     spawner.spawn(move || {
-        if let Some(event) = load_workspace_projection_user_event(&context.project_root) {
+        if let Some(mut event) = load_workspace_projection_user_event(&context.project_root) {
+            if let UserEvent::WorkspaceProjectionLoaded {
+                imported_from: source,
+                ..
+            } = &mut event
+            {
+                if source.is_none() {
+                    *source = imported_from;
+                }
+            }
             proxy.send(event);
         }
     });
 }
 
 fn load_workspace_projection_user_event(project_root: &Path) -> Option<UserEvent> {
-    match gwt_core::workspace_projection::load_workspace_projection(project_root) {
-        Ok(Some(mut projection)) => {
+    let loaded = (|| {
+        let imported_from =
+            gwt_core::workspace_projection::pending_legacy_workspace_state_import(project_root)?;
+        // Both canonical files belong to the same writer admission boundary.
+        gwt_core::workspace_projection::load_workspace_work_items(project_root)?;
+        let projection = gwt_core::workspace_projection::load_workspace_projection(project_root)?;
+        Ok::<_, gwt_core::error::GwtError>((projection, imported_from))
+    })();
+    match loaded {
+        Ok((mut projection, imported_from)) => {
             // This helper runs on the watcher thread or a blocking runtime
             // worker. Materialize the linked-Issue fallback here so the Tao
             // handler never reopens issue-cache files while applying the
             // already-loaded Workspace snapshot.
-            if let Some(issue) = projection.linked_issues.first_mut() {
+            if let Some(issue) = projection
+                .as_mut()
+                .and_then(|value| value.linked_issues.first_mut())
+            {
                 let has_title = issue
                     .title
                     .as_deref()
@@ -1063,18 +1138,28 @@ fn load_workspace_projection_user_event(project_root: &Path) -> Option<UserEvent
             }
             Some(UserEvent::WorkspaceProjectionLoaded {
                 project_root: project_root.to_path_buf(),
-                projection: Box::new(projection),
+                projection: projection.map(Box::new),
+                imported_from,
             })
         }
-        Ok(None) => None,
-        Err(error) => {
-            tracing::warn!(
-                project_root = %project_root.display(),
-                error = %error,
-                "workspace projection snapshot load failed"
-            );
-            None
-        }
+        Err(error) => Some(UserEvent::WorkspaceStateLoadFailed {
+            project_root: project_root.to_path_buf(),
+            error: workspace_state_load_error(project_root, error),
+        }),
+    }
+}
+
+fn workspace_state_load_error(
+    project_root: &Path,
+    error: gwt_core::error::GwtError,
+) -> gwt_core::WorkspaceStateLoadError {
+    match error {
+        gwt_core::error::GwtError::WorkspaceStateLoad(error) => error,
+        error => gwt_core::WorkspaceStateLoadError {
+            path: gwt_core::paths::gwt_workspace_projection_path_for_repo_path(project_root),
+            kind: gwt_core::WorkspaceStateLoadErrorKind::Io,
+            message: error.to_string(),
+        },
     }
 }
 
@@ -1279,6 +1364,8 @@ fn spawn_active_work_projection_refresh(
             tab_id,
             view: None,
             completed: false,
+            load_error: None,
+            imported_from: None,
         });
         let _ = proxy.send_event(UserEvent::ActiveWorkProjectionRefreshed {
             project_root,
@@ -1618,6 +1705,7 @@ pub(crate) struct DockerBundleMounts {
 pub(crate) struct PtyWriterEntry {
     pub(crate) project_key: gwt_core::repo_hash::ProjectKey,
     pub(crate) handle: Arc<PtyHandle>,
+    pub(crate) monitor_runtime: Option<gwt::monitor_duplicate_runtime::MonitorRuntimeRegistration>,
 }
 
 type PtyWriterRegistry = Arc<RwLock<HashMap<String, Arc<PtyWriterEntry>>>>;
@@ -1886,7 +1974,12 @@ enum UserEvent {
     },
     WorkspaceProjectionLoaded {
         project_root: PathBuf,
-        projection: Box<gwt_core::workspace_projection::WorkspaceProjection>,
+        projection: Option<Box<gwt_core::workspace_projection::WorkspaceProjection>>,
+        imported_from: Option<PathBuf>,
+    },
+    WorkspaceStateLoadFailed {
+        project_root: PathBuf,
+        error: gwt_core::WorkspaceStateLoadError,
     },
     WindowCloseFinalized {
         window_id: String,
@@ -2617,6 +2710,68 @@ mod tests {
     }
 
     #[test]
+    fn workspace_state_load_failure_is_delivered_without_replacing_the_file() {
+        let temp = tempdir().expect("tempdir");
+        let _gwt_home = ScopedGwtHome::set(temp.path());
+        let project_root = temp.path().join("repo");
+        fs::create_dir_all(&project_root).unwrap();
+        let path = gwt_core::paths::gwt_workspace_projection_path_for_repo_path(&project_root);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let broken = b"{broken workspace";
+        fs::write(&path, broken).unwrap();
+
+        match super::load_workspace_projection_user_event(&project_root) {
+            Some(UserEvent::WorkspaceStateLoadFailed { error, .. }) => {
+                assert_eq!(error.path, path);
+                assert_eq!(error.kind, gwt_core::WorkspaceStateLoadErrorKind::Malformed);
+            }
+            other => panic!("expected a load failure notice, got {other:?}"),
+        }
+        assert_eq!(fs::read(&path).unwrap(), broken);
+    }
+
+    #[test]
+    fn workspace_state_legacy_import_is_delivered_as_information() {
+        let temp = tempdir().expect("tempdir");
+        let _gwt_home = ScopedGwtHome::set(temp.path());
+        let project_root = temp.path().join("repo");
+        fs::create_dir_all(&project_root).unwrap();
+        let legacy = gwt_core::paths::gwt_project_dir_for_repo_path(&project_root)
+            .join("workspace/current.json");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        let projection =
+            gwt_core::workspace_projection::WorkspaceProjection::default_for_project(&project_root);
+        let bytes = serde_json::to_vec(&projection).unwrap();
+        fs::write(&legacy, &bytes).unwrap();
+
+        match super::load_workspace_projection_user_event(&project_root) {
+            Some(UserEvent::WorkspaceProjectionLoaded {
+                imported_from: Some(source),
+                projection: Some(_),
+                ..
+            }) => assert_eq!(source, legacy),
+            other => panic!("expected a legacy import notice, got {other:?}"),
+        }
+        assert_eq!(fs::read(&legacy).unwrap(), bytes);
+    }
+
+    #[test]
+    fn workspace_state_healthy_empty_load_delivers_recovery() {
+        let temp = tempdir().expect("tempdir");
+        let _gwt_home = ScopedGwtHome::set(temp.path());
+        let project_root = temp.path().join("repo");
+        fs::create_dir_all(&project_root).unwrap();
+        assert!(matches!(
+            super::load_workspace_projection_user_event(&project_root),
+            Some(UserEvent::WorkspaceProjectionLoaded {
+                projection: None,
+                imported_from: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn workspace_projection_event_carries_the_snapshot_loaded_off_the_event_loop() {
         let temp = tempdir().expect("tempdir");
         let _gwt_home = ScopedGwtHome::set(temp.path());
@@ -2646,7 +2801,8 @@ mod tests {
         match super::load_workspace_projection_user_event(&project_root) {
             Some(UserEvent::WorkspaceProjectionLoaded {
                 project_root: actual_root,
-                projection: actual_projection,
+                projection: Some(actual_projection),
+                ..
             }) => {
                 assert_eq!(actual_root, project_root);
                 assert_eq!(actual_projection.title, "snapshot from watcher thread");
@@ -4655,6 +4811,126 @@ mod tests {
                 "both the automatic request and manual clients need the shared worker's failure"
             );
         }
+    }
+
+    #[test]
+    fn update_download_success_replays_newer_discovery() {
+        let temp = tempdir().expect("tempdir");
+        let _gwt_home = ScopedGwtHome::set(temp.path());
+        let mut runtime = sample_runtime(temp.path(), Vec::new(), None);
+        let state = gwt_core::update::UpdateState::Available {
+            current: "9.106.0".into(),
+            latest: "9.108.0".into(),
+            release_url: "https://example.invalid/release".into(),
+            asset_url: Some("https://example.invalid/gwt.tar.gz".into()),
+            checked_at: Utc::now(),
+        };
+        runtime.update_download_in_flight =
+            Some(crate::app_runtime::UPDATE_AUTO_APPLY_CLIENT_ID.into());
+        runtime.deferred_update_discovery = Some(state.clone());
+        let events = super::finish_update_download(&mut runtime, None);
+        assert_eq!(runtime.pending_update.as_ref(), Some(&state));
+        assert!(events.iter().any(|event| matches!(
+            &event.event, BackendEvent::UpdateState(discovered) if discovered == &state
+        )));
+    }
+
+    #[test]
+    fn update_available_replaces_staged_payload_before_broadcast() {
+        let temp = tempdir().expect("tempdir");
+        let _gwt_home = ScopedGwtHome::set(temp.path());
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let prefs_path = gwt::issue_monitor_prefs_path_for_repo_path(&repo);
+        gwt::save_issue_monitor_prefs(
+            &prefs_path,
+            &gwt::IssueMonitorPrefs {
+                update_drain: Some(gwt::IssueMonitorUpdateDrain {
+                    version: "9.107.0".into(),
+                    since: Utc::now().to_rfc3339(),
+                    reason: gwt::IssueMonitorUpdateDrainReason::Auto,
+                    blocking: Vec::new(),
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let tab = sample_project_tab(
+            "tab-1",
+            "Repo",
+            repo,
+            ProjectKind::Git,
+            &[WindowPreset::Shell],
+        );
+        let mut runtime = sample_runtime(temp.path(), vec![tab], Some("tab-1"));
+        let old_dir = gwt_core::paths::gwt_updates_dir().join("v9.107.0");
+        fs::create_dir_all(&old_dir).unwrap();
+        let payload = old_dir.join("gwt");
+        fs::write(&payload, "old payload").unwrap();
+        let manifest = gwt_core::update::PendingUpdateManifest {
+            version: "9.107.0".into(),
+            asset_url: "https://example.invalid/gwt.tar.gz".into(),
+            payload: gwt_core::update::PreparedPayload::PortableBinary { path: payload },
+            downloaded_at: Utc::now().to_rfc3339(),
+        };
+        gwt_core::update::persist_pending_update_manifest(&manifest).unwrap();
+        let mut state = gwt_core::update::UpdateState::Available {
+            current: "9.106.0".into(),
+            latest: "9.107.0".into(),
+            release_url: "https://example.invalid/release".into(),
+            asset_url: Some(manifest.asset_url.clone()),
+            checked_at: Utc::now(),
+        };
+        super::record_update_available(&mut runtime, state.clone());
+        assert!(gwt_core::update::load_pending_update_manifest().is_some());
+        if let gwt_core::update::UpdateState::Available { latest, .. } = &mut state {
+            *latest = "9.108.0".into();
+        }
+        let events = super::record_update_available(&mut runtime, state.clone());
+        assert_eq!(runtime.pending_update.as_ref(), Some(&state));
+        assert!(events.iter().any(|event| matches!(
+            &event.event, BackendEvent::UpdateState(discovered) if discovered == &state
+        )));
+        assert!(
+            gwt_core::update::load_pending_update_manifest().is_none(),
+            "new discovery must invalidate the old restart target"
+        );
+        assert!(!old_dir.exists(), "the superseded download must be removed");
+        assert!(
+            gwt::load_issue_monitor_prefs(&prefs_path)
+                .unwrap()
+                .update_drain
+                .is_none(),
+            "old automatic drain must not republish or apply the obsolete version"
+        );
+
+        // A resolver which started before discovery may persist the old
+        // release afterwards. Recheck the authoritative target at commit.
+        fs::create_dir_all(&old_dir).unwrap();
+        fs::write(old_dir.join("gwt"), "late old payload").unwrap();
+        gwt_core::update::persist_pending_update_manifest(&manifest).unwrap();
+        let mut admission = crate::update_front_door::UpdateApplyAdmission::default();
+        assert!(admission.begin_resolution());
+        assert!(!super::admit_prepared_update(&runtime, &manifest, &mut admission).0);
+        assert!(gwt_core::update::load_pending_update_manifest().is_none());
+        assert!(!old_dir.exists());
+        assert!(
+            admission.begin_resolution(),
+            "the current release can be retried"
+        );
+        let mut current_manifest = manifest.clone();
+        current_manifest.version = "9.108.0".into();
+        assert!(super::admit_prepared_update(&runtime, &current_manifest, &mut admission).0);
+        // Duplicate results after commitment must not reopen admission or
+        // delete files which an already-started helper may still be using.
+        fs::create_dir_all(&old_dir).unwrap();
+        fs::write(old_dir.join("gwt"), "helper-owned payload").unwrap();
+        gwt_core::update::persist_pending_update_manifest(&manifest).unwrap();
+        let (admitted, events) = super::admit_prepared_update(&runtime, &manifest, &mut admission);
+        assert!(!admitted && events.is_empty());
+        assert!(gwt_core::update::load_pending_update_manifest().is_some());
+        assert!(old_dir.exists());
+        assert!(!admission.begin_resolution());
     }
 
     #[test]
@@ -7712,59 +7988,6 @@ mod tests {
         );
         assert_eq!(knowledge_kind_for_preset(WindowPreset::Branches), None);
     }
-    #[test]
-    fn preferred_issue_launch_branch_prefers_develop_then_head_then_first_local() {
-        let entries = vec![
-            BranchListEntry {
-                name: "feature/demo".to_string(),
-                scope: BranchScope::Local,
-                is_head: true,
-                upstream: None,
-                ahead: 0,
-                behind: 0,
-                last_commit_date: None,
-                cleanup_ready: true,
-                cleanup: BranchCleanupInfo::default(),
-                resume: gwt::BranchResumeInfo::unavailable(),
-                start_work_eligibility: None,
-            },
-            BranchListEntry {
-                name: "develop".to_string(),
-                scope: BranchScope::Local,
-                is_head: false,
-                upstream: None,
-                ahead: 0,
-                behind: 0,
-                last_commit_date: None,
-                cleanup_ready: true,
-                cleanup: BranchCleanupInfo::default(),
-                resume: gwt::BranchResumeInfo::unavailable(),
-                start_work_eligibility: None,
-            },
-        ];
-        assert_eq!(
-            super::preferred_issue_launch_branch(&entries),
-            Some("develop".to_string())
-        );
-
-        let head_only = vec![BranchListEntry {
-            name: "feature/demo".to_string(),
-            scope: BranchScope::Local,
-            is_head: true,
-            upstream: None,
-            ahead: 0,
-            behind: 0,
-            last_commit_date: None,
-            cleanup_ready: true,
-            cleanup: BranchCleanupInfo::default(),
-            resume: gwt::BranchResumeInfo::unavailable(),
-            start_work_eligibility: None,
-        }];
-        assert_eq!(
-            super::preferred_issue_launch_branch(&head_only),
-            Some("feature/demo".to_string())
-        );
-    }
 
     #[test]
     fn normalize_active_tab_id_prefers_existing_selection_or_first_tab() {
@@ -10116,6 +10339,22 @@ fn main() -> std::io::Result<()> {
     );
     #[cfg(windows)]
     verification_cap_relief::spawn(pty_writers.clone());
+    let monitor_projects = Arc::new(RwLock::new(BTreeMap::new()));
+    let monitor_writers = pty_writers.clone();
+    gwt::monitor_duplicate_runtime::spawn(monitor_projects.clone(), move || {
+        let writers = monitor_writers.read().ok()?;
+        Some(
+            writers
+                .values()
+                .filter_map(|entry| {
+                    Some(gwt::monitor_duplicate_runtime::RegisteredMonitorRuntime {
+                        registration: entry.monitor_runtime.clone()?,
+                        handle: entry.handle.clone(),
+                    })
+                })
+                .collect(),
+        )
+    });
     runtime_health_poller::spawn_runtime_health_poller(&runtime, clients.clone(), pty_writers);
     eprintln!("gwt browser URL: {browser_url}");
     // SPEC-1939 T-IDX-109/110 / Issue #2584 — Playwright e2e seam.
@@ -10326,6 +10565,11 @@ fn main() -> std::io::Result<()> {
                     ready.set_agent_capability_issuer(server.agent_capability_issuer());
                     ready.set_server_url(browser_url.clone());
                     ready.set_usage_refresh(usage_refresh.clone());
+                    if let Ok(mut projects) = monitor_projects.write() {
+                        for context in ready.project_contexts() {
+                            projects.insert(context.project_root, ready.sessions_dir.clone());
+                        }
+                    }
                     board_projection_watchers.sync(&ready, proxy.clone());
                     workspace_projection_watchers.sync(&ready, proxy.clone());
                     board_daemon_subscribers.sync(&ready, proxy.clone());
@@ -10743,16 +10987,22 @@ fn main() -> std::io::Result<()> {
             }
             Event::UserEvent(UserEvent::WorkspaceProjectionChanged { project_root }) => {
                 if let Some(context) = app.project_context_for_root(&project_root) {
-                    spawn_workspace_projection_reload(&app.blocking_tasks, app.proxy.clone(), context);
+                    spawn_workspace_projection_reload(&app.blocking_tasks, app.proxy.clone(), context, None);
                 }
             }
             Event::UserEvent(UserEvent::WorkspaceProjectionLoaded {
                 project_root,
                 projection,
+                imported_from,
             }) => {
-                let events =
-                    app.handle_workspace_projection_changed_events(&project_root, &projection);
+                let mut events = app.handle_workspace_state_loaded(&project_root, imported_from);
+                if let Some(projection) = projection {
+                    events.extend(app.handle_workspace_projection_changed_events(&project_root, &projection));
+                }
                 clients.dispatch(events);
+            }
+            Event::UserEvent(UserEvent::WorkspaceStateLoadFailed { project_root, error }) => {
+                clients.dispatch(app.handle_workspace_state_load_failed(&project_root, error));
             }
             Event::UserEvent(UserEvent::ActiveWorkProjectionPrepared(prepared)) => {
                 let commit = app.handle_active_work_projection_prepared(*prepared);
@@ -11098,7 +11348,9 @@ fn main() -> std::io::Result<()> {
             }) => {
                 clients.dispatch(app.apply_launch_wizard_branch_candidates(wizard_id, candidates));
             }
-            Event::UserEvent(UserEvent::UpdateAvailable(state)) => {
+            Event::UserEvent(UserEvent::UpdateAvailable(state))
+                if update_apply_admission.accepts_discovery() =>
+            {
                 clients.dispatch(record_update_available(app, state));
             }
             Event::UserEvent(UserEvent::ApplyUpdate { state, client_id }) => {
@@ -11243,7 +11495,9 @@ fn main() -> std::io::Result<()> {
                     let _ = apply_proxy.send_event(UserEvent::UpdateDownloadFinished(None));
                 });
             }
-            Event::UserEvent(UserEvent::UpdateDownloadFinished(failure)) => {
+            Event::UserEvent(UserEvent::UpdateDownloadFinished(failure))
+                if update_apply_admission.accepts_discovery() =>
+            {
                 clients.dispatch(finish_update_download(app, failure));
             }
             Event::UserEvent(UserEvent::UpdatePrepared {
@@ -11320,7 +11574,9 @@ fn main() -> std::io::Result<()> {
                 manifest,
                 client_id,
             }) => {
-                if !update_apply_admission.begin_commit() {
+                let (admitted, events) = admit_prepared_update(app, &manifest, &mut update_apply_admission);
+                clients.dispatch(events);
+                if !admitted {
                     return;
                 }
                 app.record_update_apply_observation(
@@ -11490,6 +11746,13 @@ fn main() -> std::io::Result<()> {
                 }
             }
             Event::MainEventsCleared => {
+                // Publish project membership even before a Monitor PTY exists.
+                // The worker retains it and needs no GUI round trip per census.
+                if let Ok(mut projects) = monitor_projects.write() {
+                    for context in app.project_contexts() {
+                        projects.insert(context.project_root, app.sessions_dir.clone());
+                    }
+                }
                 clients.dispatch(app.refresh_project_aggregates());
                 if let Some(tray_icon) = &tray_icon_handle {
                     let snapshot = app.tray_snapshot();

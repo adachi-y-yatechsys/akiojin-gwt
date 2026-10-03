@@ -90,6 +90,32 @@ and basic `gwt.exe` launch evidence.
 curl -fsSL https://raw.githubusercontent.com/akiojin/gwt/main/installers/macos/uninstall.sh | bash
 ```
 
+### Upgrade floor
+
+The upgrade floor for retiring one-shot migrations is **v9.72.1**, the latest
+release on 2026-08-03 UTC (60 days before the 2026-10-02 change). For an older
+installation, first install [v9.106.0](https://github.com/akiojin/gwt/releases/tag/v9.106.0),
+open your projects to run their retained migrations, then install the new version.
+Back up your gwt configuration and project state before upgrading.
+
+Legacy Claude Code backend rows are an exception: no released startup path ran
+their automatic migration. **旧 backend 設定は自動移行されません。Settings で provider を再登録してください**
+(Old backend settings are not migrated automatically; re-register the provider in
+Settings → Agent Backends.) Copy the endpoint, API key and model from the old
+entry, then select the built-in Claude Code agent with the registered backend.
+The old configuration remains readable and is not rewritten or deleted on launch.
+
+Migrations introduced after this floor remain supported, including Session schema
+5, PM scratch relocation, work-item projection rebuild v2 and ProjectKey migration.
+The usage `window_minutes` contract and the Workspace projection backfill associated
+with open SPEC #2359 are also retained. Importing old HOME / Workspace state from
+`workspace/current.json` and `work_items.json` remains a data-protection exception
+until startup can safely diagnose unsupported layouts before creating new state.
+The coordination event import and discussion import also remain supported: they
+serve the current recovery and session-specific Stop contracts. The obsolete agent
+identity reset is retired; startup preserves saved purpose and focus values and
+leaves `agent_identity.migration.json` unchanged (or absent).
+
 ## Requirements
 
 - `git` available in `PATH`
@@ -403,11 +429,19 @@ every idle row, and `dry_run: true` reports the targets without touching
 anything. `issue.monitor.profiles` reads the launch
 candidate pool and `issue.monitor.profiles.set` replaces it; with two or more
 candidates the Monitor launches each Issue with the first eligible candidate
-(rate-limit holds, the usage threshold, and `prefer_for` routing decide
-eligibility; the exact rules are specified in SPEC
+(rate-limit holds and `prefer_for` routing decide eligibility; a provider
+leaves the pool when it refuses a launch, not when a usage reading predicts it
+will; the exact rules are specified in SPEC
 [#3914](https://github.com/akiojin/gwt/issues/3914)), so one rate-limited
-provider no longer stops the queue. Saving Agent settings for a second provider
-in the GUI appends it to the same pool. All operations accept an optional
+provider no longer stops the queue. `issue.monitor.status` reports each
+provider's latest usage reading under `provider_usage`, or why there is none.
+Every rate-limit refusal immediately holds its provider. If all candidates
+are held, the queue resumes at the earliest known reset; if every reset is
+unknown, `needs_human_fleet` reports `launch_candidates_exhausted` instead
+of periodically retrying. In the GUI, the Issue Monitor settings form
+(`⚙ Settings`) lists the same pool as Agent Settings sets: `＋` adds a set, `−`
+removes one, the arrows reorder them, and the saved order is the launch order.
+All operations accept an optional
 `project_root` and otherwise target the current worktree. Priority and
 daemon-absent configuration changes become visible to running instances on the
 next scan/rebase.
@@ -633,6 +667,10 @@ and coordination-event summaries.
 - Whether `.codex/hooks.json` is version-controlled is a repository decision.
   When the file already exists, gwt replaces only gwt-managed hook entries and
   keeps user hooks plus unrelated top-level settings.
+- The gwt repository itself ignores `.codex/hooks.json` and generates it locally
+  when gwt prepares an agent session. Windows uses a PowerShell EncodedCommand;
+  macOS and Linux use a POSIX shell command. Keeping this generated file untracked
+  prevents platform-specific changes from dirtying the checkout.
 - A version-controlled `.codex/hooks.json` should keep the portable `gwtd`
   fallback so a machine-local absolute path is never committed. Regenerate it
   with
@@ -1194,6 +1232,15 @@ must not be bypassed with `kill` or `pkill`.
 estimate or lease TTL, not a live progress counter. An unchanged value does not
 prove a stall. `waiter_action: wait` means waiting for canonical admission is
 expected; a pending queue position grants no permission to stop the holder.
+
+`verify.run` saves an unfinished record before starting commands. If the runner
+is terminated externally, a companion records the interruption, the last active
+command, and any completed command results. `execution.status` distinguishes
+`running` and `interrupted` from `missing_record`; interrupted evidence cannot
+authorize completion or a PR and requires a new run. The diagnostic copy at
+`.gwt/tmp/verify-run.json` is written atomically; the machine-local trusted record
+remains authoritative. The interruption reason says `signal unknown` when the
+exact signal cannot be observed.
 
 The `pre-push` hook deliberately runs only checks that do not compile the
 workspace: `cargo fmt --all -- --check`, Markdownlint, and the SKILL.md

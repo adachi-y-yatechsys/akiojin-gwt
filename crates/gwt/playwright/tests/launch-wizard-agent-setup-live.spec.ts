@@ -59,6 +59,36 @@ test.describe.serial("Launch Wizard agent setup affordance (live backend)", () =
     }
   });
 
+  for (const [agentId, displayName] of [["claude", "Claude Code"], ["codex", "Codex"]]) {
+    test(`${displayName} shows installed preference, detected version and setup action`, async ({ page }, testInfo) => {
+      const { pageErrors, consoleErrors } = collectErrors(page);
+      wizardFixture = await openLiveLaunchWizardForBranch(page);
+      await enterManualSetupSettings(page);
+      await selectWizardAgent(page, agentId);
+      const wizard = page.locator("#wizard-modal");
+      const version = wizard.getByLabel("Version", { exact: true });
+      await expect(version).toHaveValue("installed");
+      const installed = version.locator('option[value="installed"]');
+      await expect(installed).toContainText("package fallback");
+      const setup = wizard.locator(`.launch-agent-setup[data-agent-id="${agentId}"]`);
+      await expect(setup).toBeVisible();
+      const missing = (await installed.textContent())?.includes("not found");
+      await expect(setup).toHaveAttribute("data-setup-kind", missing ? "install" : "update");
+      await expect(setup.getByRole("button", { name: `${missing ? "Install" : "Update"} ${displayName}` })).toBeVisible();
+      if (!missing) {
+        await expect(installed).toContainText(/\d+\.\d+/);
+        await expect(installed).toContainText("PATH");
+      }
+      await page.evaluate(() => new Promise(requestAnimationFrame));
+      expect(pageErrors).toEqual([]);
+      expect(consoleErrors).toEqual([]);
+      await setup.scrollIntoViewIfNeeded();
+      await page.screenshot({ path: testInfo.outputPath(`${agentId}-setup.png`), fullPage: true });
+      await version.scrollIntoViewIfNeeded();
+      await page.screenshot({ path: testInfo.outputPath(`${agentId}-installed-preference.png`), fullPage: true });
+    });
+  }
+
   test("uninstalled installer-only agent shows setup affordance and no Installed entry", async ({
     page,
   }) => {
@@ -158,7 +188,7 @@ async function enterManualSetupSettings(page: Page): Promise<void> {
   }
   await sendLiveGwtEvent(page, {
     kind: "launch_wizard_action",
-    action: { kind: "set_launch_path", path: "manual_setup" },
+    action: { kind: "use_start_method", method: "configure_and_start" },
     bounds: null,
   });
   await expect(target).toBeVisible({ timeout: 10_000 });

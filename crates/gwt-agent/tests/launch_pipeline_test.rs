@@ -218,6 +218,7 @@ fn prepare_agent_launch_composes_session_env_without_spawning() {
         color: AgentColor::Green,
         model: None,
         tool_version: None,
+        tool_version_selector: None,
         tool_runtime_provenance: None,
         tool_runtime_source_session_id: None,
         reasoning_level: None,
@@ -236,6 +237,7 @@ fn prepare_agent_launch_composes_session_env_without_spawning() {
         explicit_follow_up: false,
         execution_intent: gwt_agent::ExecutionLaunchIntent::Automatic,
         launch_route: gwt_agent::LaunchRoute::Manual,
+        automatic_restore: false,
         permission_decision: gwt_agent::PermissionModeDecision::default(),
     };
 

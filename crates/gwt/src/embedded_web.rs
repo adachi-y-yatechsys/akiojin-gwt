@@ -126,6 +126,7 @@ root_js_modules! {
     // Issue #3365 — user-visible degradation notice for swallowed
     // render/receive failures.
     "render-degradation-banner.js" => "createRenderDegradationBanner",
+    "workspace-state-notice.js" => "createWorkspaceStateNotice",
     // SPEC-1939 Phase 24 — per-window terminal output batching before xterm
     // write.
     "terminal-output-buffer.js" => "createTerminalOutputBatcher",

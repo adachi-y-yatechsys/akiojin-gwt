@@ -823,48 +823,85 @@ impl AppRuntime {
         let now = chrono::Utc::now();
         let mut orphan_intake_prune_plans = Vec::new();
         for tab in &self.tabs {
-            let _ =
-                gwt_core::workspace_projection::retroactive_auto_done_scan(&tab.project_root, now);
-            // SPEC-2359 US-39 / FR-142..145: backfill Phase U-6 schema
-            // additions (`summary`, `created_at`, `creator`,
-            // `lifecycle_stage`) on legacy `workspace.json` files. Runs
-            // alongside the auto-done scan above with independent helpers
-            // and an independent `workspace.migration.json` marker, so the
-            // two migrations are exactly-once each and never duplicate work.
-            // Errors are silently dropped (`let _ = ...`) so a corrupt or
-            // unreadable Workspace cannot block daemon startup.
-            let _ = gwt_core::workspace_projection_migration::migrate_workspace_projection_for_repo(
-                &tab.project_root,
-            );
-            // SPEC-2359 Phase W-16 (FR-393): decompose legacy mega-items
-            // (pre-W-12 records keyed to one projection UUID fusing dozens of
-            // branches) into canonical branch-keyed items so each branch row
-            // shows its real title / sessions. Idempotent; must run before
-            // the intake/reconcile chain so decomposed branches are not
-            // redundantly backfilled.
-            let _ = gwt_core::workspace_projection::decompose_legacy_multi_branch_work_items(
-                &tab.project_root,
-            );
+            let Some(context) = self.project_context_for_root(&tab.project_root) else {
+                continue;
+            };
+            let proxy = self.proxy.for_project(context);
+            let inventory = startup_inventories.get(&tab.project_root).cloned();
+            // Capture legacy provenance before these retained migrations import
+            // it. A later watcher sees only the canonical files. Stop the writer
+            // chain on a load failure; malformed Works may still recover through
+            // the complete-source intake below (Issue #4925).
+            let prepared = (|| {
+                let imported_from =
+                    gwt_core::workspace_projection::pending_legacy_workspace_state_import(
+                        &tab.project_root,
+                    )?;
+                gwt_core::workspace_projection::retroactive_auto_done_scan(&tab.project_root, now)?;
+                // SPEC-2359 US-39 and W-16: schema backfill and legacy mega-item
+                // decomposition precede intake/reconcile, preserving their order.
+                gwt_core::workspace_projection_migration::migrate_workspace_projection_for_repo(
+                    &tab.project_root,
+                )?;
+                gwt_core::workspace_projection::decompose_legacy_multi_branch_work_items(
+                    &tab.project_root,
+                )?;
+                Ok::<_, gwt_core::GwtError>(imported_from)
+            })();
+            match prepared {
+                Ok(Some(imported_from)) => {
+                    if let Some(mut event) =
+                        crate::load_workspace_projection_user_event(&tab.project_root)
+                    {
+                        let ready = if let crate::UserEvent::WorkspaceProjectionLoaded {
+                            imported_from: captured,
+                            ..
+                        } = &mut event
+                        {
+                            *captured = Some(imported_from);
+                            true
+                        } else {
+                            false
+                        };
+                        proxy.send(event);
+                        if !ready {
+                            continue;
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    let error = crate::workspace_state_load_error(&tab.project_root, error);
+                    let can_rebuild = error.kind
+                        == gwt_core::WorkspaceStateLoadErrorKind::Malformed
+                        && error.path
+                            == gwt_core::paths::gwt_workspace_work_items_path_for_repo_path(
+                                &tab.project_root,
+                            );
+                    proxy.send(crate::UserEvent::WorkspaceStateLoadFailed {
+                        project_root: tab.project_root.clone(),
+                        error,
+                    });
+                    if can_rebuild {
+                        self.spawn_work_events_ingest_with_inventory(
+                            tab.project_root.clone(),
+                            true,
+                            inventory,
+                        );
+                    }
+                    continue;
+                }
+            }
             // SPEC-2359 W-16 (FR-387): cross-machine work events intake.
             // Supersedes the one-shot `rebuild_work_items_from_events_for_repo`
             // migration gate — the intake is a permanently-installed idempotent
             // consumer over the same (and more) sources. Runs on a background
             // thread; its completion event then runs the worktree reconcile
             // (intake → reconcile order) and the merge scan.
-            let inventory = startup_inventories.get(&tab.project_root).cloned();
             self.spawn_work_events_ingest_with_inventory(
                 tab.project_root.clone(),
                 true,
                 inventory.clone(),
-            );
-            // SPEC-2359 Phase W-11 (US-58 / FR-346): one-shot, version-guarded
-            // clear of legacy prompt-derived title_summary / current_focus so
-            // existing broken titles ("あなたの目的は何ですか" etc.) heal via the
-            // display fallback and agent re-authoring. Idempotent via
-            // `agent_identity.migration.json`; never re-clears agent-authored
-            // values written after the marker.
-            let _ = gwt_core::workspace_projection::reset_legacy_agent_identity_for_repo(
-                &tab.project_root,
             );
             // Snapshot candidates before the GUI becomes interactive, then
             // inspect/remove only that fixed set on a recovery worker. A new
@@ -1098,23 +1135,7 @@ impl AppRuntime {
             return Err(RestoreRefusal::DiagnosticWindow);
         }
         // Preserve terminal cleanup before applying spawn-only refusals.
-        let mut completed_work = false;
-        match self.restore_work_terminality(session, project_root, window_id) {
-            RestoreAdmission::RefuseTerminal(reason) => {
-                return Err(RestoreRefusal::TerminalWork(reason))
-            }
-            RestoreAdmission::RefuseUnprovable(cause) => {
-                return Err(RestoreRefusal::TerminalFactsUnreadable(cause))
-            }
-            RestoreAdmission::RefuseRetainedTerminal => {
-                return Err(RestoreRefusal::ClosedWorkDiagnostic)
-            }
-            RestoreAdmission::RefuseHeld(cause) => return Err(RestoreRefusal::MonitorHold(cause)),
-            // Issue #4802 (AC-4): a spawn-only refusal, reported after the
-            // more specific worktree answers below.
-            RestoreAdmission::RefuseCompletedWork => completed_work = true,
-            RestoreAdmission::Admit => {}
-        }
+        let completed_work = self.work_terminality_refusal(session, project_root, window_id)?;
         // Reopened #4143 AC-6: queued and in-flight restores reserve their
         // worktree before a PTY attaches and enters active_agent_sessions.
         let worktree = &session.worktree_path;
@@ -1173,6 +1194,62 @@ impl AppRuntime {
             return Err(RestoreRefusal::NoResumeSession);
         }
         Ok(())
+    }
+
+    /// The Work-terminality half of [`Self::restore_admission`]. `Ok(true)`
+    /// is the spawn-only `CompletedWork` refusal of Issue #4802 (AC-4), which
+    /// the caller reports after the more specific worktree answers.
+    fn work_terminality_refusal(
+        &self,
+        session: &gwt_agent::Session,
+        project_root: &Path,
+        window_id: Option<&str>,
+    ) -> Result<bool, RestoreRefusal> {
+        match self.restore_work_terminality(session, project_root, window_id) {
+            RestoreAdmission::RefuseTerminal(reason) => Err(RestoreRefusal::TerminalWork(reason)),
+            RestoreAdmission::RefuseUnprovable(cause) => {
+                Err(RestoreRefusal::TerminalFactsUnreadable(cause))
+            }
+            RestoreAdmission::RefuseRetainedTerminal => Err(RestoreRefusal::ClosedWorkDiagnostic),
+            RestoreAdmission::RefuseHeld(cause) => Err(RestoreRefusal::MonitorHold(cause)),
+            RestoreAdmission::RefuseCompletedWork => Ok(true),
+            RestoreAdmission::Admit => Ok(false),
+        }
+    }
+
+    /// Issue #4783 AC-2: the admission decision, re-read at the spawn
+    /// boundary of an automatic restore.
+    ///
+    /// Admission runs once, at the startup sweep or the Open Project sweep;
+    /// the PTY spawn that restores the window happens later, after the canvas
+    /// round trip (and, for a PM worktree, an asynchronous preparation). The
+    /// spawn used to re-check only the cwd and the PM guards, so Work that
+    /// became terminal in between — or was admitted on facts a concurrent
+    /// Monitor scan has since settled — still came back as an agent. Reading
+    /// the same facts again immediately before the spawn is what keeps the
+    /// restore honest to the decision it was granted.
+    fn late_restore_refusal(
+        &self,
+        tab_id: &str,
+        session: &gwt_agent::Session,
+    ) -> Option<RestoreRefusal> {
+        let tab = self.tab(tab_id)?;
+        let placeholder_window_id = tab
+            .workspace
+            .persisted()
+            .windows
+            .iter()
+            .find(|window| window.session_id.as_deref() == Some(session.id.as_str()))
+            .map(|window| combined_window_id(tab_id, &window.id));
+        match self.work_terminality_refusal(
+            session,
+            &tab.project_root,
+            placeholder_window_id.as_deref(),
+        ) {
+            Err(refusal) => Some(refusal),
+            Ok(true) => Some(RestoreRefusal::CompletedWork),
+            Ok(false) => None,
+        }
     }
 
     /// Only discard a provably empty placeholder. An unknown execution,
@@ -1660,10 +1737,27 @@ impl AppRuntime {
         fallback_geometry: WindowGeometry,
         origin: RestoreOrigin,
     ) -> Vec<OutboundEvent> {
+        // Issue #4783 AC-2: re-evaluate the admission immediately before the
+        // spawn. A refusal here is logged like the sweep's, and a terminal
+        // one removes its placeholder the same way; the caller then counts
+        // the missing spawn as `launch_not_started`.
+        if origin == RestoreOrigin::Automatic {
+            if let Some(refusal) = self.late_restore_refusal(tab_id, &session) {
+                RestoreAdmissionLog::default().refuse(&session.id, refusal);
+                if let Some(reason) = refusal.removal_reason() {
+                    self.remove_refused_session_restore(tab_id, &session.id, None, reason);
+                }
+                return Vec::new();
+            }
+        }
         let mut config = launch_config_from_persisted_session(&session);
         if origin == RestoreOrigin::UserRequested {
             config.launch_route = gwt_agent::LaunchRoute::Manual;
         }
+        // Issue #4783 AC-2: tell the launch worker this Resume is a restore
+        // nobody asked for, so a terminal predecessor generation is left
+        // alone instead of being continued into a new Active generation.
+        config.automatic_restore = origin == RestoreOrigin::Automatic;
         let geometry = self
             .remove_stale_paused_agent_window(tab_id, &session.id, None)
             .unwrap_or(fallback_geometry);

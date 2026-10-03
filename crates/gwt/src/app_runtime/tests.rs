@@ -1848,13 +1848,13 @@ fn pin_monitor_fixture_package_runners(
 /// health-checks whatever `npx` / `bunx` the machine happens to have, which is
 /// invisible on a developer box with the provider CLI installed (the direct
 /// probe succeeds and returns early) and fails on CI, where the fallback runs.
-fn pin_runtime_package_runners(
-    runtime: &AppRuntime,
-    _temp_root: &Path,
-    extra_env: &[(&str, &str)],
-) {
+fn pin_runtime_package_runners(runtime: &AppRuntime, temp_root: &Path, extra_env: &[(&str, &str)]) {
     let mut settings = Settings::default();
-    pin_launch_package_runners(&mut settings, shared_fixture_package_runner_bin());
+    let runner_bin = write_fixture_package_runners(temp_root);
+    // Monitor launches prefer installed providers; keep their version evidence
+    // hermetic without shadowing provider fixtures in unrelated runtime tests.
+    write_fixture_runners(temp_root, &["codex", "claude"]);
+    pin_launch_package_runners(&mut settings, &runner_bin);
     for (key, value) in extra_env {
         settings
             .profiles
@@ -8657,6 +8657,7 @@ fn issue_monitor_autonomous_record(
         review_dispatch_hold: None,
         last_failure_message: None,
         delivering_since: None,
+        review_attempts: None,
     }
 }
 
@@ -13692,7 +13693,7 @@ fn app_runtime_open_launch_wizard_uses_cached_previous_profile_without_hydrating
     assert_eq!(view.selected_agent_id, "codex");
     assert_eq!(view.selected_model, "gpt-5.5");
     assert_eq!(view.selected_reasoning, "high");
-    assert_eq!(view.selected_version, "latest");
+    assert_eq!(view.selected_version, "installed");
     assert_eq!(view.selected_execution_mode, "continue");
     // Issue #3462: Continue inherits the persisted Skip Permissions preference.
     assert!(view.skip_permissions);
@@ -18414,6 +18415,22 @@ fn continue_work_grok_preflight_uses_the_active_profile_environment() {
     );
     assert_eq!(config.session_mode, gwt_agent::SessionMode::Resume);
     assert_eq!(config.resume_session_id.as_deref(), Some(conversation_id));
+}
+
+#[test]
+fn persisted_direct_session_observed_version_does_not_pin_restore() {
+    let temp = tempdir().expect("tempdir");
+    let _gwt_home = ScopedGwtHome::set(temp.path());
+    let mut session = gwt_agent::Session::new(
+        temp.path(),
+        "work/issue-3894",
+        gwt_agent::AgentId::ClaudeCode,
+    );
+    session.tool_version = Some("2.1.156".into());
+    session.launch_command = "/opt/bin/claude".into();
+    let config = super::launch_config_from_persisted_session(&session);
+    assert_eq!(config.command, "claude");
+    assert_eq!(config.tool_version.as_deref(), Some("installed"));
 }
 
 #[test]
@@ -31036,6 +31053,62 @@ fn startup_self_heals_managed_hooks_in_every_known_worktree() {
     }
 }
 
+/// Issue #4825 / SPEC-2359 FR-346 retirement: startup keeps saved agent
+/// identity intact whether the obsolete reset marker is absent or stale.
+#[test]
+fn bootstrap_preserves_agent_identity_without_running_retired_reset() {
+    use gwt_core::workspace_projection::{
+        load_workspace_projection_from_path, save_workspace_projection_to_path, WorkspaceProjection,
+    };
+
+    let _env_lock = env_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for marker in [None, Some(br#"{"version":0}"#.as_slice())] {
+        let temp = tempdir().expect("tempdir");
+        let _home = ScopedGwtHome::set(temp.path());
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("repo dir");
+        run_git(&repo, &["init", "-q"]);
+        let current = gwt_core::paths::gwt_workspace_projection_path_for_repo_path(&repo);
+        let mut projection = WorkspaceProjection::default_for_project(&repo);
+        let mut agent = workspace_agent_summary_for_test("saved-identity", None);
+        agent.title_summary = Some("Saved purpose".to_string());
+        agent.current_focus = Some("Saved progress".to_string());
+        projection.agents.push(agent);
+        save_workspace_projection_to_path(&current, &projection).expect("save identity");
+        let marker_path = current.with_file_name("agent_identity.migration.json");
+        if let Some(bytes) = marker {
+            fs::write(&marker_path, bytes).expect("stale reset marker");
+        }
+        let tab = sample_project_tab("tab-repo", "Repo", repo, ProjectKind::Git, &[]);
+        let mut runtime = sample_runtime(temp.path(), vec![tab], Some("tab-repo"));
+        let (spawner, _tasks) = BlockingTaskSpawner::queued();
+        runtime.blocking_tasks = spawner;
+
+        runtime.bootstrap();
+
+        let loaded = load_workspace_projection_from_path(&current)
+            .expect("load identity after startup")
+            .expect("projection retained");
+        assert_eq!(
+            loaded.agents, projection.agents,
+            "startup must retain identity"
+        );
+        match marker {
+            Some(bytes) => assert_eq!(
+                fs::read(&marker_path).expect("retired marker retained"),
+                bytes,
+                "startup must not rewrite a retired marker"
+            ),
+            None => assert!(
+                !marker_path.exists(),
+                "startup must not create a reset marker"
+            ),
+        }
+    }
+}
+
 /// Issue #3808 AC-4: the worktree-wide managed hook self-heal audited 203
 /// worktrees for 191 s on the startup path, ahead of the embedded server
 /// bind. Launches refresh the managed assets of the worktree they start in,
@@ -35215,6 +35288,9 @@ fn provider_usage_limit_keeps_the_pane_out_of_the_done_state() {
         "session-1",
     ));
 
+    // Refusal evidence also wins when usage telemetry still reads healthy.
+    runtime.set_provider_usage_accounts(vec![codex_usage_account(26.0, false)]);
+
     let _ = runtime.handle_runtime_status_with_exit_confirmation(
         window_id.clone(),
         WindowProcessStatus::Stopped,
@@ -38065,6 +38141,16 @@ fn bootstrap_hands_its_worktree_inventory_to_the_startup_ingest() {
         sample_runtime_with_events(temp.path(), vec![tab], Some("tab-repo"));
     let (spawner, _tasks) = BlockingTaskSpawner::queued();
     runtime.blocking_tasks = spawner;
+    // Startup performs retained legacy import before the asynchronous watcher
+    // can see it, so startup itself must publish the informational notice.
+    let legacy_path =
+        gwt_core::paths::gwt_project_dir_for_repo_path(&repo).join("workspace/current.json");
+    let legacy = serde_json::to_vec(
+        &gwt_core::workspace_projection::WorkspaceProjection::default_for_project(&repo),
+    )
+    .unwrap();
+    fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+    fs::write(&legacy_path, &legacy).unwrap();
 
     runtime.bootstrap();
 
@@ -38095,6 +38181,11 @@ fn bootstrap_hands_its_worktree_inventory_to_the_startup_ingest() {
         !local_branches.is_empty(),
         "the reconcile ran on the worker from the bootstrap listing: {local_branches:?}"
     );
+    assert!(events.lock().unwrap().iter().any(|event| matches!(
+        recorded_project_payload(event),
+        UserEvent::WorkspaceProjectionLoaded { imported_from: Some(path), .. } if path == &legacy_path
+    )), "startup import must reach the common notice delivery path");
+    assert_eq!(fs::read(&legacy_path).unwrap(), legacy);
 }
 
 thread_local! {
@@ -43402,7 +43493,8 @@ fn board_origin_agent_resume_config_uses_exact_saved_session() {
     session.agent_session_id = Some("codex-resume-123".to_string());
     session.model = Some("gpt-5.5".to_string());
     session.reasoning_level = Some("high".to_string());
-    session.tool_version = Some("latest".to_string());
+    session.tool_version = Some("0.116.0".to_string());
+    session.tool_version_selector = Some("latest".to_string());
     session.tool_runtime_provenance = Some(gwt_agent::ToolRuntimeProvenance {
         schema_version: gwt_agent::ToolRuntimeProvenance::CURRENT_SCHEMA_VERSION,
         official_package: "@openai/codex".to_string(),
@@ -43419,6 +43511,8 @@ fn board_origin_agent_resume_config_uses_exact_saved_session() {
         .board_origin_agent_resume_config("session-origin")
         .expect("resume config");
 
+    assert_eq!(config.command, "codex");
+    assert_eq!(config.tool_version_selector.as_deref(), Some("latest"));
     assert_eq!(config.branch.as_deref(), Some("work/board-origin"));
     assert_eq!(config.working_dir.as_deref(), Some(repo.as_path()));
     assert_eq!(
@@ -45694,6 +45788,17 @@ fn app_runtime_select_and_save_profile_broadcasts_snapshot_to_profile_windows() 
             && snapshot.selected_profile == "dev"
     ));
 
+    runtime.launch_wizard_cache = LaunchWizardMemoryCache::load_with_agent_options(
+        temp.path(),
+        vec![gwt::AgentOption {
+            id: "stale-detection-sentinel".into(),
+            name: "Stale detection".into(),
+            available: false,
+            installed_version: None,
+            versions: Vec::new(),
+            custom_agent: None,
+        }],
+    );
     let events = runtime.handle_frontend_event(
         "client-1".to_string(),
         FrontendEvent::SaveProfile {
@@ -45709,6 +45814,14 @@ fn app_runtime_select_and_save_profile_broadcasts_snapshot_to_profile_windows() 
         },
     );
 
+    assert!(
+        runtime
+            .launch_wizard_cache
+            .agent_options()
+            .iter()
+            .all(|agent| { agent.id != "stale-detection-sentinel" }),
+        "saving a profile must invalidate installed CLI detection"
+    );
     assert_eq!(events.len(), 2);
     assert!(events.iter().any(|event| matches!(
         event,
@@ -47362,6 +47475,7 @@ fn agent_launch_purpose_title_reads_detached_issue_cache_for_non_repo_root() {
             Some("work/issue-3426"),
             temp.path(),
         )
+        .expect("healthy workspace state")
         .as_deref(),
         Some("fix(launch): stranded Active generation recovery"),
     );
@@ -47771,6 +47885,7 @@ fn app_runtime_agent_failed_ack_runs_ui_finalize_without_a_local_write() {
                 review_dispatch_hold: None,
                 last_failure_message: None,
                 delivering_since: None,
+                review_attempts: None,
             }],
             ..gwt::IssueMonitorPrefs::default()
         },
@@ -53463,7 +53578,11 @@ fn assert_monitor_fresh_successor(result: AgentLaunchResult, fixture: &MonitorRe
     assert_eq!(successor.model.as_deref(), Some("gpt-5.5"));
     assert_eq!(successor.reasoning_level.as_deref(), Some("high"));
     assert_eq!(successor.agent_id, gwt_agent::AgentId::Codex);
-    assert_eq!(successor.tool_version.as_deref(), Some("latest"));
+    assert_eq!(successor.tool_version.as_deref(), Some("1.2.3"));
+    assert_eq!(
+        successor.tool_version_selector.as_deref(),
+        Some("installed")
+    );
     assert!(successor.skip_permissions);
     assert!(!successor.fast_mode);
     assert!(!successor.codex_fast_mode);
@@ -54280,8 +54399,16 @@ fn app_runtime_answered_handoff_exact_resume_retains_autonomous_context() {
 /// fixture pins one. Drop the pin and the guard refuses the probe by name
 /// instead of spawning the host `npx` under a five-second budget — the failure
 /// mode that turned unrelated `app_runtime` tests red on a loaded CI runner.
+///
+/// Issue #4927: the Session asks for an exact package version. A Host Codex
+/// launch that asks for `latest` prefers the installed CLI (#4917), so whether
+/// it reaches the package runner at all would depend on what the machine
+/// running the test has installed. An exact version takes the package-runner
+/// route on every host.
 #[test]
 fn monitor_launch_without_pinned_package_runners_is_refused() {
+    // Never published, so no host package cache can answer for it.
+    const EXACT_PACKAGE_VERSION: &str = "0.0.0";
     let _env_lock = env_test_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -54306,6 +54433,18 @@ fn monitor_launch_without_pinned_package_runners_is_refused() {
             .expect("fixture profile config path"),
         &Settings::default(),
     );
+    let mut source = gwt_agent::Session::load(
+        &fixture
+            .sessions_dir
+            .join(format!("{}.toml", fixture.source_session_id)),
+    )
+    .expect("load monitored Session");
+    source.tool_version = Some(EXACT_PACKAGE_VERSION.to_string());
+    source
+        .save(&fixture.sessions_dir)
+        .expect("save exact-version Session");
+    // The resume candidate is read from the launch wizard cache, not from disk.
+    fixture.runtime.launch_wizard_cache.record_session(source);
 
     fixture.runtime.auto_launch_issue_monitor_delivery_events(
         &fixture.runtime.test_context(),
@@ -54321,6 +54460,11 @@ fn monitor_launch_without_pinned_package_runners_is_refused() {
     assert!(
         error.contains(gwt_core::process_console::REAL_RUNNER_PROBE_BLOCKED_ERROR_CODE),
         "the refusal must name the guard, not look like a runner timeout: {error}"
+    );
+    assert!(
+        error.contains(&format!("@openai/codex@{EXACT_PACKAGE_VERSION}")),
+        "the refused probe must be the exact package the Session asked for, not a fallback \
+         from an installed CLI: {error}"
     );
 }
 
@@ -54886,7 +55030,11 @@ fn app_runtime_monitor_fresh_required_switches_to_current_provider_profile() {
     assert!(successor.agent_session_id.is_none());
     assert_eq!(successor.model.as_deref(), Some("sonnet"));
     assert_eq!(successor.reasoning_level.as_deref(), Some("low"));
-    assert_eq!(successor.tool_version.as_deref(), Some("latest"));
+    assert_eq!(successor.tool_version.as_deref(), Some("1.2.3"));
+    assert_eq!(
+        successor.tool_version_selector.as_deref(),
+        Some("installed")
+    );
     assert!(successor.skip_permissions);
     assert!(!successor.fast_mode);
     assert!(!successor.codex_fast_mode);
@@ -55455,6 +55603,7 @@ fn app_runtime_issue_monitor_profile_save_switches_the_pool_head() {
             client_id: "client-1".to_string(),
             issue_number: None,
             pool: seeded.launch_profile_pool(),
+            sets: None,
         },
         request,
     );
@@ -55477,10 +55626,12 @@ fn app_runtime_issue_monitor_profile_save_switches_the_pool_head() {
 }
 
 #[test]
-fn app_runtime_issue_monitor_configure_profile_previews_the_pool_head_replacement() {
-    // Issue #4079 AC-2: with more than one provider in the pool the form must
-    // say which candidate the save writes, and its preview of the resulting
-    // pool summary must be what the Monitor reports afterwards.
+fn app_runtime_issue_monitor_configure_issue_previews_the_pool_head_replacement() {
+    // Issue #4079 AC-2: with more than one provider in the pool the per-Issue
+    // form must say which candidate the save writes, and its preview of the
+    // resulting pool summary must be what the Monitor reports afterwards.
+    // (Issue #4911: the settings form edits every set instead; this form still
+    // switches the head.)
     let _env_lock = env_test_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -55489,7 +55640,7 @@ fn app_runtime_issue_monitor_configure_profile_previews_the_pool_head_replacemen
     let _userprofile = ScopedEnvVar::set("USERPROFILE", temp.path());
     let repo = temp.path().join("repo");
     fs::create_dir_all(&repo).expect("create repo");
-    init_repo(&repo);
+    init_repo_with_initial_commit(&repo);
     let prefs_path = gwt::issue_monitor_prefs_path_for_repo_path(&repo);
     let mut seeded = gwt::IssueMonitorPrefs::default();
     seeded.set_launch_profile_pool(vec![pool_profile("claude"), pool_profile("codex")]);
@@ -55500,7 +55651,10 @@ fn app_runtime_issue_monitor_configure_profile_previews_the_pool_head_replacemen
 
     let events = runtime.handle_frontend_event(
         "client-1".to_string(),
-        FrontendEvent::IssueMonitorConfigureProfile,
+        FrontendEvent::IssueMonitorConfigureIssue {
+            issue_number: 3165,
+            linked_issue_kind: Some(LinkedIssueKind::Spec),
+        },
     );
     let view = events
         .iter()
@@ -55616,17 +55770,22 @@ fn app_runtime_issue_monitor_configure_profile_shows_the_saved_head_while_it_is_
             _ => None,
         })
         .expect("launch wizard view");
-    let impact = view
-        .issue_monitor_pool_impact
+    let pool = view
+        .issue_monitor_pool
         .as_ref()
-        .expect("Agent Settings previews its effect on the candidate pool");
+        .expect("Agent Settings lists the saved candidates as its sets");
+    assert_eq!(pool.active_index, 0);
     assert_eq!(
-        impact.agent_id, "codex",
-        "the form opens on the saved head, not on the held fallback: {impact:?}"
+        view.selected_agent_id, "codex",
+        "the form opens on the saved head, not on the held fallback: {pool:?}"
     );
     assert_eq!(
-        impact.replaced_agent_id, None,
-        "saving the form unchanged must not switch the saved head to the fallback: {impact:?}"
+        pool.sets
+            .iter()
+            .map(|set| set.agent_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["codex", "claude"],
+        "saving the form unchanged must not switch the saved head to the fallback: {pool:?}"
     );
     // The agent picker follows the installed agents in this environment, so
     // the profile the form was filled from shows in what the save would
@@ -55636,8 +55795,8 @@ fn app_runtime_issue_monitor_configure_profile_shows_the_saved_head_while_it_is_
             .status_view()
             .launch_profile_summary;
     assert_eq!(
-        impact.resulting_summary, saved_summary,
-        "the form must open on the saved head's own model and reasoning: {impact:?}"
+        pool.resulting_summary, saved_summary,
+        "the form must open on the saved head's own model and reasoning: {pool:?}"
     );
 }
 
@@ -55800,6 +55959,430 @@ fn app_runtime_issue_monitor_configure_profile_saves_global_profile_without_laun
     );
 }
 
+fn agent_settings_option(id: &str, name: &str) -> gwt::AgentOption {
+    gwt::AgentOption {
+        id: id.to_string(),
+        name: name.to_string(),
+        available: true,
+        installed_version: Some("latest".to_string()),
+        versions: vec!["latest".to_string()],
+        custom_agent: None,
+    }
+}
+
+/// Issue #4911: a runtime whose Launch Wizard offers three agents, with the
+/// Agent Settings form opened on the seeded candidate pool.
+fn open_agent_settings_sets(
+    temp: &Path,
+    repo: &Path,
+    pool: Vec<gwt::IssueMonitorLaunchProfile>,
+) -> (AppRuntime, Arc<Mutex<Vec<UserEvent>>>, Vec<OutboundEvent>) {
+    let mut seeded = gwt::IssueMonitorPrefs::default();
+    seeded.set_launch_profile_pool(pool);
+    gwt::save_issue_monitor_prefs(&gwt::issue_monitor_prefs_path_for_repo_path(repo), &seeded)
+        .expect("seed pool");
+    let tab = sample_project_tab("tab-1", "Repo", repo.to_path_buf(), ProjectKind::Git, &[]);
+    let (mut runtime, recorded_events) = sample_runtime_with_events(temp, vec![tab], Some("tab-1"));
+    runtime.launch_wizard_cache = LaunchWizardMemoryCache::load_with_agent_options(
+        &temp.join("sessions"),
+        vec![
+            agent_settings_option("codex", "Codex"),
+            agent_settings_option("claude", "Claude Code"),
+            agent_settings_option("grok", "Grok Build"),
+        ],
+    );
+    let events = runtime.handle_frontend_event(
+        "client-1".to_string(),
+        FrontendEvent::IssueMonitorConfigureProfile,
+    );
+    (runtime, recorded_events, events)
+}
+
+fn agent_settings_view(events: &[OutboundEvent]) -> &gwt::LaunchWizardView {
+    events
+        .iter()
+        .find_map(|event| match &event.event {
+            BackendEvent::LaunchWizardState {
+                wizard: Some(wizard),
+            } => Some(wizard.as_ref()),
+            _ => None,
+        })
+        .expect("launch wizard view")
+}
+
+fn agent_settings_set_agents(view: &gwt::LaunchWizardView) -> Vec<String> {
+    view.issue_monitor_pool
+        .as_ref()
+        .expect("Agent Settings must list its sets")
+        .sets
+        .iter()
+        .map(|set| set.agent_id.clone())
+        .collect()
+}
+
+/// Settings → Runtime → Confirm → Save, as the operator drives it.
+fn save_agent_settings_sets(
+    runtime: &mut AppRuntime,
+    recorded_events: &Arc<Mutex<Vec<UserEvent>>>,
+) -> Vec<OutboundEvent> {
+    save_agent_settings_sets_in(runtime, recorded_events, |_| {})
+}
+
+/// [`save_agent_settings_sets`] in a repository whose runtime context the
+/// test describes, e.g. one that has a Compose service.
+fn save_agent_settings_sets_in(
+    runtime: &mut AppRuntime,
+    recorded_events: &Arc<Mutex<Vec<UserEvent>>>,
+    describe_repository: impl FnOnce(&mut gwt::LaunchWizardHydration),
+) -> Vec<OutboundEvent> {
+    runtime.handle_launch_wizard_action(&runtime.test_context(), LaunchWizardAction::Submit, None);
+    wait_for_recorded_event(
+        "agent settings runtime resolution",
+        recorded_events,
+        |events| {
+            events.iter().any(|event| {
+                matches!(
+                    recorded_project_payload(event),
+                    UserEvent::LaunchWizardRuntimeResolved { .. }
+                )
+            })
+        },
+    );
+    let resolved_event = {
+        let mut events = recorded_events.lock().expect("event log");
+        events
+            .iter()
+            .position(|event| {
+                matches!(
+                    recorded_project_payload(event),
+                    UserEvent::LaunchWizardRuntimeResolved { .. }
+                )
+            })
+            .map(|index| events.remove(index))
+            .expect("runtime resolved event")
+    };
+    let UserEvent::LaunchWizardRuntimeResolved { wizard_id, result } = resolved_event else {
+        unreachable!("matched above")
+    };
+    let mut hydration = result.expect("runtime context resolves");
+    describe_repository(&mut hydration);
+    runtime.handle_launch_wizard_runtime_resolved(wizard_id, Ok(hydration));
+    runtime.handle_launch_wizard_action(&runtime.test_context(), LaunchWizardAction::Submit, None);
+    runtime.handle_launch_wizard_action(&runtime.test_context(), LaunchWizardAction::Submit, None)
+}
+
+#[test]
+fn app_runtime_issue_monitor_agent_settings_sets_are_added_reordered_and_saved_in_order() {
+    // Issue #4911 AC-1/AC-3/AC-5/AC-7: `＋` adds a set edited through the same
+    // form, a set can be moved to the front, an agent cannot appear twice, and
+    // the save writes the sets in the order `issue.monitor.profiles` reports.
+    let _env_lock = env_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().expect("tempdir");
+    let _home = ScopedEnvVar::set("HOME", temp.path());
+    let _userprofile = ScopedEnvVar::set("USERPROFILE", temp.path());
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    init_repo(&repo);
+    let mut codex = pool_profile("codex");
+    codex.prefer_for = vec!["type:fix".to_string()];
+    let mut claude = pool_profile("claude");
+    claude.skip_permissions = true;
+    let (mut runtime, recorded_events, events) =
+        open_agent_settings_sets(temp.path(), &repo, vec![codex, claude.clone()]);
+
+    let view = agent_settings_view(&events);
+    assert_eq!(agent_settings_set_agents(view), vec!["codex", "claude"]);
+    let pool = view.issue_monitor_pool.as_ref().expect("pool view");
+    assert_eq!(pool.active_index, 0);
+    assert!(pool.remove_disabled_reason.is_none());
+    assert!(pool.add_disabled_reason.is_none());
+
+    // An edit to the open set survives opening another one.
+    runtime.handle_launch_wizard_action(
+        &runtime.test_context(),
+        LaunchWizardAction::SetReasoning {
+            reasoning: "high".to_string(),
+        },
+        None,
+    );
+    let events = runtime.handle_launch_wizard_action(
+        &runtime.test_context(),
+        LaunchWizardAction::AddAgentSettingsSet,
+        None,
+    );
+    let view = agent_settings_view(&events);
+    assert_eq!(
+        agent_settings_set_agents(view),
+        vec!["codex", "claude", "grok"],
+        "the new set takes the first agent no other set uses"
+    );
+    let pool = view.issue_monitor_pool.as_ref().expect("pool view");
+    assert_eq!(pool.active_index, 2, "the new set opens for editing");
+    assert_eq!(view.selected_agent_id, "grok");
+    assert!(
+        pool.add_disabled_reason.is_some(),
+        "every offered agent now has a set: {pool:?}"
+    );
+
+    let events = runtime.handle_launch_wizard_action(
+        &runtime.test_context(),
+        LaunchWizardAction::SetAgent {
+            agent_id: "codex".to_string(),
+        },
+        None,
+    );
+    let view = agent_settings_view(&events);
+    assert!(
+        view.error
+            .as_deref()
+            .is_some_and(|error| error.contains("Agent Settings 1")),
+        "a second set for the same agent is refused and names the set that has it: {:?}",
+        view.error
+    );
+    assert_eq!(view.selected_agent_id, "grok");
+
+    let events = runtime.handle_launch_wizard_action(
+        &runtime.test_context(),
+        LaunchWizardAction::MoveAgentSettingsSet { index: 2, to: 0 },
+        None,
+    );
+    let view = agent_settings_view(&events);
+    assert_eq!(
+        agent_settings_set_agents(view),
+        vec!["grok", "codex", "claude"]
+    );
+    let pool = view.issue_monitor_pool.as_ref().expect("pool view");
+    assert_eq!(pool.active_index, 0, "the open set moves with its form");
+    let previewed_summary = pool.resulting_summary.clone();
+
+    let saved_events = save_agent_settings_sets(&mut runtime, &recorded_events);
+    assert!(saved_events.iter().any(|event| matches!(
+        &event.event,
+        BackendEvent::IssueMonitorToast { message, .. } if message == "Issue Monitor settings saved"
+    )));
+
+    let prefs = gwt::load_issue_monitor_prefs(&gwt::issue_monitor_prefs_path_for_repo_path(&repo))
+        .expect("load prefs");
+    let saved = prefs.launch_profile_pool();
+    assert_eq!(
+        saved
+            .iter()
+            .map(|profile| profile.agent_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["grok", "codex", "claude"],
+        "the set order is the launch candidate order"
+    );
+    assert_eq!(
+        prefs.launch_profile.as_ref().map(|p| p.agent_id.as_str()),
+        Some("grok"),
+        "the first set is what the next launch uses"
+    );
+    assert_eq!(saved[1].reasoning.as_deref(), Some("high"));
+    assert_eq!(
+        saved[1].prefer_for,
+        vec!["type:fix".to_string()],
+        "routing tags stay with the set whose agent did not change"
+    );
+    assert_eq!(saved[2], claude, "a set that was never opened is untouched");
+    let status =
+        gwt::IssueMonitorState::with_prefs(gwt::IssueMonitorConfig::default(), prefs).status_view();
+    assert_eq!(
+        status.launch_profile_summary, previewed_summary,
+        "the form previews the summary the Monitor reports after the save"
+    );
+    assert_eq!(
+        status
+            .launch_profile_candidates
+            .iter()
+            .map(|candidate| candidate.agent_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["grok", "codex", "claude"]
+    );
+}
+
+#[test]
+fn app_runtime_issue_monitor_agent_settings_keeps_a_runtime_the_form_was_not_asked_about() {
+    // Issue #4911 AC-5: the form only asks where a set runs in its Runtime
+    // step and reads Host before that, so leaving a set for another one must
+    // not turn a saved Docker candidate into a Host one.
+    let _env_lock = env_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().expect("tempdir");
+    let _home = ScopedEnvVar::set("HOME", temp.path());
+    let _userprofile = ScopedEnvVar::set("USERPROFILE", temp.path());
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    init_repo(&repo);
+    let mut codex = pool_profile("codex");
+    codex.runtime_target = gwt_agent::LaunchRuntimeTarget::Docker;
+    codex.docker_service = Some("gwt".to_string());
+    codex.docker_lifecycle_intent = gwt_agent::DockerLifecycleIntent::Restart;
+    let (mut runtime, recorded_events, _events) = open_agent_settings_sets(
+        temp.path(),
+        &repo,
+        vec![codex.clone(), pool_profile("claude")],
+    );
+
+    let events = runtime.handle_launch_wizard_action(
+        &runtime.test_context(),
+        LaunchWizardAction::SelectAgentSettingsSet { index: 1 },
+        None,
+    );
+    let view = agent_settings_view(&events);
+    assert_eq!(view.selected_agent_id, "claude");
+    let pool = view.issue_monitor_pool.as_ref().expect("pool view");
+    assert!(
+        pool.sets[0]
+            .summary
+            .iter()
+            .any(|row| row.label == "Runtime" && row.value == "docker:gwt"),
+        "the set that was left still runs where it was saved to run: {pool:?}"
+    );
+
+    save_agent_settings_sets(&mut runtime, &recorded_events);
+
+    let saved = gwt::load_issue_monitor_prefs(&gwt::issue_monitor_prefs_path_for_repo_path(&repo))
+        .expect("load prefs")
+        .launch_profile_pool();
+    assert_eq!(
+        saved[0], codex,
+        "opening a set and leaving it unedited changes nothing about it"
+    );
+}
+
+#[test]
+fn app_runtime_issue_monitor_agent_settings_runtime_step_starts_from_the_open_set() {
+    // Issue #4911 AC-5: the Runtime step proposes where the open set runs. It
+    // used to propose the repository's default — Docker wherever a Compose
+    // service exists — so saving a Host set unedited rewrote it to Docker.
+    let _env_lock = env_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().expect("tempdir");
+    let _home = ScopedEnvVar::set("HOME", temp.path());
+    let _userprofile = ScopedEnvVar::set("USERPROFILE", temp.path());
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    init_repo(&repo);
+    let (mut runtime, recorded_events, _events) =
+        open_agent_settings_sets(temp.path(), &repo, vec![pool_profile("codex")]);
+
+    save_agent_settings_sets_in(&mut runtime, &recorded_events, |hydration| {
+        hydration.docker_context = Some(gwt::DockerWizardContext {
+            services: vec!["app".to_string()],
+            suggested_service: Some("app".to_string()),
+        });
+    });
+
+    let saved = gwt::load_issue_monitor_prefs(&gwt::issue_monitor_prefs_path_for_repo_path(&repo))
+        .expect("load prefs")
+        .launch_profile_pool();
+    assert_eq!(saved[0].agent_id, "codex");
+    assert_eq!(
+        saved[0].runtime_target,
+        gwt_agent::LaunchRuntimeTarget::Host,
+        "a set saved to run on the host still does after an unedited save"
+    );
+    assert_eq!(saved[0].docker_service, None);
+}
+
+#[test]
+fn app_runtime_issue_monitor_agent_settings_keeps_at_least_one_set() {
+    // Issue #4911 AC-2/AC-6: `−` removes a set, but the last one stays and the
+    // form says why.
+    let _env_lock = env_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().expect("tempdir");
+    let _home = ScopedEnvVar::set("HOME", temp.path());
+    let _userprofile = ScopedEnvVar::set("USERPROFILE", temp.path());
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    init_repo(&repo);
+    let (mut runtime, _recorded_events, _events) = open_agent_settings_sets(
+        temp.path(),
+        &repo,
+        vec![pool_profile("codex"), pool_profile("claude")],
+    );
+
+    let events = runtime.handle_launch_wizard_action(
+        &runtime.test_context(),
+        LaunchWizardAction::RemoveAgentSettingsSet { index: 0 },
+        None,
+    );
+    let view = agent_settings_view(&events);
+    assert_eq!(agent_settings_set_agents(view), vec!["claude"]);
+    assert_eq!(
+        view.selected_agent_id, "claude",
+        "removing the open set opens the one that took its place"
+    );
+    let reason = view
+        .issue_monitor_pool
+        .as_ref()
+        .and_then(|pool| pool.remove_disabled_reason.clone())
+        .expect("the last set says why it cannot be removed");
+
+    let events = runtime.handle_launch_wizard_action(
+        &runtime.test_context(),
+        LaunchWizardAction::RemoveAgentSettingsSet { index: 0 },
+        None,
+    );
+    let view = agent_settings_view(&events);
+    assert_eq!(agent_settings_set_agents(view), vec!["claude"]);
+    assert_eq!(view.error.as_deref(), Some(reason.as_str()));
+}
+
+#[test]
+fn app_runtime_issue_monitor_agent_settings_save_refuses_a_pool_changed_elsewhere() {
+    // Issue #4911 AC-8: the form saves the whole pool, so a pool another
+    // window or `issue.monitor.profiles.set` changed meanwhile must not be
+    // overwritten silently.
+    let _env_lock = env_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().expect("tempdir");
+    let _home = ScopedEnvVar::set("HOME", temp.path());
+    let _userprofile = ScopedEnvVar::set("USERPROFILE", temp.path());
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    init_repo(&repo);
+    let (mut runtime, recorded_events, _events) =
+        open_agent_settings_sets(temp.path(), &repo, vec![pool_profile("codex")]);
+
+    let prefs_path = gwt::issue_monitor_prefs_path_for_repo_path(&repo);
+    let mut elsewhere = gwt::load_issue_monitor_prefs(&prefs_path).expect("load prefs");
+    elsewhere.set_launch_profile_pool(vec![pool_profile("claude"), pool_profile("codex")]);
+    gwt::save_issue_monitor_prefs(&prefs_path, &elsewhere).expect("concurrent profiles.set");
+
+    let events = save_agent_settings_sets(&mut runtime, &recorded_events);
+
+    assert!(!events.iter().any(|event| matches!(
+        &event.event,
+        BackendEvent::IssueMonitorToast { message, .. } if message == "Issue Monitor settings saved"
+    )));
+    let view = agent_settings_view(&events);
+    assert!(
+        view.error
+            .as_deref()
+            .is_some_and(|error| error.contains("changed") && error.contains("Nothing was saved")),
+        "the refusal says what happened: {:?}",
+        view.error
+    );
+    let prefs = gwt::load_issue_monitor_prefs(&prefs_path).expect("reload prefs");
+    assert_eq!(
+        prefs
+            .launch_profile_pool()
+            .iter()
+            .map(|profile| profile.agent_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["claude", "codex"],
+        "the concurrent write survives"
+    );
+}
+
 #[test]
 fn app_runtime_issue_monitor_profile_save_reports_authority_epoch_overflow() {
     let _env_lock = env_test_lock()
@@ -55835,6 +56418,7 @@ fn app_runtime_issue_monitor_profile_save_reports_authority_epoch_overflow() {
             client_id: "client-1".to_string(),
             issue_number: None,
             pool: Vec::new(),
+            sets: None,
         },
         request,
     );
@@ -55995,53 +56579,58 @@ fn app_runtime_issue_monitor_auto_launch_prefers_saved_profile() {
 }
 
 #[test]
-fn app_runtime_issue_monitor_auto_tiers_do_not_force_a_held_head() {
+fn app_runtime_issue_monitor_does_not_force_a_held_head() {
     let _env_lock = env_test_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let temp = tempdir().expect("tempdir");
-    let _home = ScopedEnvVar::set("HOME", temp.path());
-    let _userprofile = ScopedEnvVar::set("USERPROFILE", temp.path());
-    let repo = temp.path().join("repo");
-    fs::create_dir_all(&repo).expect("create repo");
-    init_repo_with_initial_commit(&repo);
-    let mut prefs = gwt::IssueMonitorPrefs {
-        launch_profile: Some(codex_issue_monitor_launch_profile()),
-        provider_quota_holds: std::collections::BTreeMap::from([
-            ("codex".to_string(), "2999-01-01T04:00:00Z".to_string()),
-            ("claude".to_string(), "2999-01-01T04:00:00Z".to_string()),
-        ]),
-        ..Default::default()
-    };
-    let mut value = serde_json::to_value(&prefs).expect("serialize prefs");
-    value["launch_auto"] = serde_json::json!(true);
-    prefs = serde_json::from_value(value).expect("auto prefs");
-    gwt::save_issue_monitor_prefs(&gwt::issue_monitor_prefs_path_for_repo_path(&repo), &prefs)
-        .expect("save prefs");
-    let tab = sample_project_tab("tab-1", "Repo", repo.clone(), ProjectKind::Git, &[]);
-    let (mut runtime, recorded_events) =
-        sample_runtime_with_events(temp.path(), vec![tab], Some("tab-1"));
-    let (spawner, queued) = BlockingTaskSpawner::queued();
-    runtime.blocking_tasks = spawner;
-    runtime.auto_launch_issue_monitor_delivery_events_for_project(
-        &repo,
-        4774,
-        LinkedIssueKind::Issue,
-        None,
-        gwt::IssueMonitorLaunchSessionStrategy::FreshRequired,
-    );
-    drain_queued_blocking_tasks(&queued);
-    runtime
-        .handle_issue_monitor_launch_prepared(take_issue4803_monitor_preparation(&recorded_events));
-    assert!(
-        runtime.tabs[0]
-            .workspace
-            .persisted()
-            .windows
-            .iter()
-            .all(|window| window.preset != WindowPreset::Agent),
-        "auto tiers must refuse when every provider is held"
-    );
+    for automatic in [true, false] {
+        let temp = tempdir().expect("tempdir");
+        let _home = ScopedEnvVar::set("HOME", temp.path());
+        let _userprofile = ScopedEnvVar::set("USERPROFILE", temp.path());
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("create repo");
+        init_repo_with_initial_commit(&repo);
+        let mut prefs = gwt::IssueMonitorPrefs {
+            launch_profile: Some(codex_issue_monitor_launch_profile()),
+            provider_quota_holds: std::collections::BTreeMap::from([
+                ("codex".to_string(), "2999-01-01T04:00:00Z".to_string()),
+                ("claude".to_string(), "2999-01-01T04:00:00Z".to_string()),
+            ]),
+            ..Default::default()
+        };
+        prefs.set_launch_profile_pool(vec![
+            codex_issue_monitor_launch_profile(),
+            claude_issue_monitor_launch_profile(),
+        ]);
+        prefs.launch_auto = automatic;
+        gwt::save_issue_monitor_prefs(&gwt::issue_monitor_prefs_path_for_repo_path(&repo), &prefs)
+            .expect("save prefs");
+        let tab = sample_project_tab("tab-1", "Repo", repo.clone(), ProjectKind::Git, &[]);
+        let (mut runtime, recorded_events) =
+            sample_runtime_with_events(temp.path(), vec![tab], Some("tab-1"));
+        let (spawner, queued) = BlockingTaskSpawner::queued();
+        runtime.blocking_tasks = spawner;
+        runtime.auto_launch_issue_monitor_delivery_events_for_project(
+            &repo,
+            4774,
+            LinkedIssueKind::Issue,
+            None,
+            gwt::IssueMonitorLaunchSessionStrategy::FreshRequired,
+        );
+        drain_queued_blocking_tasks(&queued);
+        runtime.handle_issue_monitor_launch_prepared(take_issue4803_monitor_preparation(
+            &recorded_events,
+        ));
+        assert!(
+            runtime.tabs[0]
+                .workspace
+                .persisted()
+                .windows
+                .iter()
+                .all(|window| window.preset != WindowPreset::Agent),
+            "automatic={automatic}: every held pool must refuse"
+        );
+    }
 }
 
 #[test]
@@ -56376,6 +56965,7 @@ fn app_runtime_issue_monitor_profile_save_switches_the_head_to_a_second_provider
             client_id: "client-1".to_string(),
             issue_number: None,
             pool: Vec::new(),
+            sets: None,
         },
         request,
     );
@@ -59122,7 +59712,6 @@ fn wait_for_active_work_prepare_completions(
     }
 }
 
-#[allow(dead_code)]
 fn active_work_refresh_requests(events: &Arc<Mutex<Vec<UserEvent>>>, project_root: &Path) -> usize {
     events
         .lock()
@@ -59230,6 +59819,84 @@ fn background_work_scan_results_refresh_active_work_off_the_gui_event_loop() {
         "the merge scan result reached the row"
     );
     assert_eq!(row.work_summary.as_deref(), Some("tip subject"));
+}
+
+#[test]
+fn workspace_state_load_failure_keeps_rail_and_replays_until_recovery() {
+    let _env_lock = env_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().unwrap();
+    let _gwt_home = gwt_core::test_support::ScopedGwtHome::set(temp.path());
+    let _home = ScopedEnvVar::set("HOME", temp.path());
+    let _userprofile = ScopedEnvVar::set("USERPROFILE", temp.path());
+    let repo = temp.path().join("repo");
+    let (mut runtime, _, _) = active_work_off_loop_setup(temp.path(), &repo);
+    gwt_core::workspace_projection::save_workspace_projection(
+        &repo,
+        &gwt_core::workspace_projection::WorkspaceProjection::default_for_project(&repo),
+    )
+    .unwrap();
+    drain_active_work_projection_refresh(&mut runtime, &repo);
+    let cached = || {
+        runtime
+            .project_state_for_tab("tab-1")
+            .unwrap()
+            .active_work_projection_cache
+            .borrow()
+            .get("tab-1")
+            .cloned()
+    };
+    let before = serde_json::to_value(cached()).unwrap();
+    let path = gwt_core::paths::gwt_workspace_projection_path_for_repo_path(&repo);
+    let original = fs::read(&path).unwrap();
+    fs::write(&path, b"{broken workspace").unwrap();
+
+    let events = drain_active_work_projection_refresh(&mut runtime, &repo);
+    assert!(events
+        .iter()
+        .any(|event| event.event.event_kind() == "workspace_state_notice"));
+    assert_eq!(
+        serde_json::to_value(
+            runtime
+                .project_state_for_tab("tab-1")
+                .unwrap()
+                .active_work_projection_cache
+                .borrow()
+                .get("tab-1")
+        )
+        .unwrap(),
+        before
+    );
+    let context = runtime.project_context_for_root(&repo).unwrap();
+    let replay = runtime.frontend_project_sync_events("reconnected", &context);
+    assert!(replay
+        .iter()
+        .any(|event| event.event.event_kind() == "workspace_state_notice"));
+    assert_eq!(fs::read(&path).unwrap(), b"{broken workspace");
+
+    fs::write(&path, original).unwrap();
+    let cached_refresh = drain_active_work_projection_refresh(&mut runtime, &repo);
+    assert!(
+        !cached_refresh.iter().any(|event| {
+            matches!(
+                &event.event,
+                BackendEvent::WorkspaceStateNotice { notice: None }
+            )
+        }),
+        "a cache hit must not clear the notice before a fresh load"
+    );
+    let Some(UserEvent::WorkspaceProjectionLoaded { imported_from, .. }) =
+        crate::load_workspace_projection_user_event(&repo)
+    else {
+        panic!("repaired canonical files must load successfully");
+    };
+    let recovered = runtime.handle_workspace_state_loaded(&repo, imported_from);
+    let notice = recovered
+        .iter()
+        .find(|event| event.event.event_kind() == "workspace_state_notice")
+        .expect("clear the pending load notice");
+    assert!(serde_json::to_value(&notice.event).unwrap()["notice"].is_null());
 }
 
 #[test]
@@ -77083,11 +77750,9 @@ fn account_switch_releases_pane_quota_without_relatching_the_old_notice() {
     assert!(!runtime.provider_quota_holds.contains_key(&window_id));
 }
 
-/// Issue #3923 AC-3: the incident was a Codex pane whose tail still showed an
-/// old limit notice while the poller read the account at 26% — the screen text
-/// alone must not hold the provider for the rest of the billing week.
+/// Issue #4908: a settled refusal forms a hold even while telemetry reads healthy.
 #[test]
-fn a_settled_screen_notice_does_not_become_a_hold_while_the_poller_reads_the_account_healthy() {
+fn a_settled_screen_refusal_holds_even_while_usage_reads_healthy() {
     let _env_lock = env_test_lock()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -77102,31 +77767,18 @@ fn a_settled_screen_notice_does_not_become_a_hold_while_the_poller_reads_the_acc
         Some(CODEX_USAGE_LIMIT_SCREEN),
         instant("2026-09-02T09:00:00Z"),
     );
+    assert!(!runtime.provider_quota_holds.contains_key(&window_id));
+    assert!(runtime.provider_quota_candidates.contains_key(&window_id));
     let _ = runtime.observe_provider_quota_notice(
         &window_id,
         Some(CODEX_USAGE_LIMIT_SCREEN),
         instant("2026-09-02T09:05:00Z"),
     );
-
-    assert!(
-        !runtime.provider_quota_holds.contains_key(&window_id),
-        "a healthy poller reading contradicts the screen, so the settle window must not promote it"
-    );
-    assert!(
-        runtime.provider_quota_candidates.contains_key(&window_id),
-        "the candidate stays pending so a later poller reading can still corroborate it"
-    );
-
-    runtime.set_provider_usage_accounts(vec![codex_usage_account(100.0, true)]);
-    let _ = runtime.observe_provider_quota_notice(
-        &window_id,
-        Some(CODEX_USAGE_LIMIT_SCREEN),
-        instant("2026-09-02T09:06:00Z"),
-    );
     assert!(
         runtime.provider_quota_holds.contains_key(&window_id),
-        "once the poller agrees the account is out, the same notice is a block"
+        "the settled refusal overrides usage telemetry on the first launch"
     );
+    assert!(!runtime.provider_quota_candidates.contains_key(&window_id));
 }
 
 /// Issue #3923 AC-2: a hold records what it was formed from — the matched
@@ -79522,6 +80174,199 @@ fn startup_restore_refuses_a_monitor_held_row_and_keeps_the_placeholder() {
                 .expect("load held session");
         assert!(session.restore_window_on_startup);
     }
+}
+
+/// Issue #4783 AC-1 / AC-3: a gwt restart over three Issue worktrees whose
+/// execution ledgers read Completed, Blocked-by-`issue.monitor.stop`, and
+/// ordinary recoverable Blocked restores only the last — with no Monitor
+/// hold left in the prefs to lean on. The admitted restore is then re-judged
+/// at the spawn boundary (AC-2): a hold that lands between the sweep and the
+/// drain stops the spawn.
+#[test]
+fn startup_restore_refuses_completed_and_monitor_revoked_generations() {
+    let _env_lock = crate::env_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().expect("tempdir");
+    let _gwt_home = ScopedGwtHome::set(temp.path());
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    let placeholders = vec![
+        (
+            "agent-completed".to_string(),
+            "session-completed".to_string(),
+        ),
+        ("agent-revoked".to_string(), "session-revoked".to_string()),
+        ("agent-blocked".to_string(), "session-blocked".to_string()),
+    ];
+    let tab = restore_fixture_tab("tab-1", &repo, &placeholders);
+    let mut runtime = sample_runtime(temp.path(), vec![tab], Some("tab-1"));
+    let owner_of = |number: u64| gwt::cli::execution_state::ExecutionOwnerKey {
+        kind: gwt::cli::execution_state::ExecutionOwnerKind::Issue,
+        number,
+    };
+    let mut worktrees = HashMap::new();
+    for (session_id, worktree, issue) in [
+        ("session-completed", "wt-completed", 4291u64),
+        ("session-revoked", "wt-revoked", 4294),
+        ("session-blocked", "wt-blocked", 4275),
+    ] {
+        let worktree = temp.path().join(worktree);
+        fs::create_dir_all(&worktree).expect("create worktree");
+        init_repo(&worktree);
+        save_restore_fixture_session(
+            &runtime.sessions_dir,
+            session_id,
+            &worktree,
+            Some(&format!("native-{session_id}")),
+            Some(issue),
+        );
+        gwt::cli::execution_state::materialize_at_launch(
+            &worktree,
+            gwt::cli::execution_state::ExecutionOwnerKind::Issue,
+            issue,
+            session_id,
+            "gwt-execute",
+            false,
+        )
+        .expect("materialize execution record");
+        worktrees.insert(session_id, (worktree, issue));
+    }
+    // #4291: the PR landed and the agent settled its generation.
+    let (completed_wt, _) = &worktrees["session-completed"];
+    assert!(matches!(
+        gwt::cli::execution_state::settle(
+            completed_wt,
+            "session-completed",
+            gwt::cli::execution_state::ExecutionSettlement::Completed,
+        )
+        .expect("settle completed generation"),
+        gwt::cli::execution_state::SettleResult::Settled(_)
+    ));
+    // #4294: the PM ran `issue.monitor.stop`, which revokes the generation
+    // on the ledger. The Monitor prefs carry no hold any more (a requeue or
+    // a prefs reset in between), so only the ledger can say it was stopped.
+    let (revoked_wt, revoked_issue) = &worktrees["session-revoked"];
+    gwt::cli::execution_state::ensure_generation_ledger(
+        revoked_wt,
+        owner_of(*revoked_issue),
+        gwt::cli::execution_state::LegacyActiveDisposition::Live,
+    )
+    .expect("materialize owner ledger");
+    assert!(matches!(
+        gwt::cli::execution_state::release_revoked_launch_generation(
+            revoked_wt,
+            owner_of(*revoked_issue),
+            "the operator revoked this launch: PR opened, holding",
+        )
+        .expect("release revoked generation"),
+        gwt::cli::execution_state::LaunchGenerationRelease::Released { .. }
+    ));
+    // #4275: an ordinary Blocked generation, recoverable by reopen.
+    let (blocked_wt, _) = &worktrees["session-blocked"];
+    assert!(matches!(
+        gwt::cli::execution_state::settle(
+            blocked_wt,
+            "session-blocked",
+            gwt::cli::execution_state::ExecutionSettlement::Blocked {
+                reason: "build failed".to_string(),
+                missing_verification: Some("full matrix".to_string()),
+            },
+        )
+        .expect("settle blocked generation"),
+        gwt::cli::execution_state::SettleResult::Settled(_)
+    ));
+
+    let logs = capture_tracing_events(|| {
+        runtime.queue_startup_auto_resume_sessions(&HashSet::new());
+    });
+    let queued = runtime
+        .pending_startup_auto_resume_sessions
+        .iter()
+        .map(|pending| pending.session.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        queued,
+        vec!["session-blocked"],
+        "only the recoverable Blocked generation restores"
+    );
+    let refusals = restore_admission_refusals(&logs);
+    let completed = refusals
+        .get("session-completed")
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        completed == "completed_work_retained" || completed == "terminal_work:settled_execution",
+        "a Completed generation is finished Work, got {completed:?}"
+    );
+    assert_eq!(
+        refusals.get("session-revoked").map(String::as_str),
+        Some("monitor_hold:launch_revoked"),
+        "{refusals:?}"
+    );
+    // The Monitor-revoked generation is a hold, not a terminal: the
+    // placeholder and the restore flag stay for `execution.reopen`.
+    assert!(runtime
+        .tab("tab-1")
+        .expect("tab")
+        .workspace
+        .persisted()
+        .windows
+        .iter()
+        .any(|window| window.session_id.as_deref() == Some("session-revoked")));
+    assert!(
+        gwt_agent::Session::load(&runtime.sessions_dir.join("session-revoked.toml"))
+            .expect("load revoked session")
+            .restore_window_on_startup
+    );
+
+    // AC-2: between the sweep and the drain the PM stops #4275 through the
+    // Monitor. The queued restore is re-judged at the spawn boundary and
+    // nothing spawns.
+    let mut monitor = gwt::IssueMonitorState::new(gwt::IssueMonitorConfig::default());
+    monitor.escalate_to_needs_human(
+        4275,
+        gwt::NeedsHumanKind::UserChoiceRequired,
+        "stopped: PM held this row after the sweep",
+    );
+    gwt::save_issue_monitor_prefs(
+        &gwt::issue_monitor_prefs_path_for_repo_path(&repo),
+        &monitor.prefs(),
+    )
+    .expect("seed monitor prefs");
+    let drain_logs = capture_tracing_events(|| {
+        runtime.startup_auto_resume_ready_events(canvas_bounds());
+    });
+    assert!(
+        runtime.restore_launch_windows.is_empty() && runtime.pending_auto_resume_sources.is_empty(),
+        "a restore refused at the spawn boundary spawns nothing"
+    );
+    // The spawn boundary logs the hold; the drain then counts the missing
+    // spawn as `launch_not_started`, so both reasons name this Session.
+    let late = drain_logs
+        .iter()
+        .filter(|event| {
+            event.fields.get("message").map(String::as_str) == Some("session restore refused")
+                && event.fields.get("session_id").map(String::as_str) == Some("session-blocked")
+        })
+        .filter_map(|event| event.fields.get("reason").cloned())
+        .collect::<Vec<_>>();
+    assert!(
+        late.iter()
+            .any(|reason| reason.starts_with("monitor_hold:")),
+        "the late refusal names the hold, got {late:?}"
+    );
+    assert!(
+        runtime
+            .tab("tab-1")
+            .expect("tab")
+            .workspace
+            .persisted()
+            .windows
+            .iter()
+            .any(|window| window.session_id.as_deref() == Some("session-blocked")),
+        "a held row keeps its placeholder"
+    );
 }
 
 /// Issue #4441 AC-1: the restore flag is honored on the placeholder path too.

@@ -2020,6 +2020,7 @@ mod tests {
         crate::cli::verification_record::save(
             repo.path(),
             &crate::cli::verification_record::VerificationRunRecord {
+                lifecycle: None,
                 record_id: "vrr-typed-build".to_string(),
                 user_verification_result: None,
                 session_id: session_id.to_string(),
@@ -2030,6 +2031,7 @@ mod tests {
                 verified_head: None,
                 commands: vec![crate::cli::verification_record::VerificationCommandResult {
                     headed_e2e: None,
+                    nextest: None,
                     terminated_by_signal: None,
                     command: command.clone(),
                     exit_code: 101,

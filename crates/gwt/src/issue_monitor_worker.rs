@@ -4,9 +4,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    IssueMonitorCandidateSource, IssueMonitorExecutionSettlement, IssueMonitorInboxItem,
-    IssueMonitorIssue, IssueMonitorIssueState, IssueMonitorReadiness, IssueMonitorScanSummary,
-    IssueMonitorState, IssueReadinessFailure, MonitorInboxState,
+    IssueMonitorCandidateSource, IssueMonitorExecutionSettlement, IssueMonitorIssue,
+    IssueMonitorIssueState, IssueMonitorReadiness, IssueMonitorScanSummary, IssueMonitorState,
+    IssueReadinessFailure, MonitorInboxState,
 };
 use gwt_github::{Cache, CacheEntry, IssueNumber, IssueState, SectionName};
 
@@ -464,17 +464,6 @@ pub fn issue_monitor_read_only_daemon_payloads(
     ]
 }
 
-pub fn load_open_issue_monitor_candidates(
-    owner: &str,
-    repo: &str,
-) -> Result<Vec<IssueMonitorIssue>, String> {
-    let issues = gwt_git::issue::fetch_issues(owner, repo).map_err(|error| error.to_string())?;
-    Ok(issues
-        .into_iter()
-        .map(|issue| issue_monitor_candidate(issue, IssueMonitorReadiness::NotApplicable))
-        .collect())
-}
-
 fn issue_monitor_candidate(
     issue: gwt_git::issue::Issue,
     readiness: IssueMonitorReadiness,
@@ -719,18 +708,8 @@ where
     (candidates, errors)
 }
 
-pub fn load_open_issue_monitor_candidates_for_repo_path(
-    repo_path: &Path,
-    owner: &str,
-    repo: &str,
-) -> Result<Vec<IssueMonitorIssue>, String> {
-    load_open_issue_monitor_candidates_for_repo_path_with_provenance(repo_path, owner, repo)
-        .map(|loaded| loaded.issues)
-}
-
 /// Load live candidates when available, retaining typed provenance for capped
-/// (therefore incomplete) live lists and cache fallbacks. The existing
-/// Vec-returning API above remains a compatibility wrapper.
+/// (therefore incomplete) live lists and cache fallbacks.
 pub fn load_open_issue_monitor_candidates_for_repo_path_with_provenance(
     repo_path: &Path,
     owner: &str,
@@ -983,25 +962,6 @@ pub fn try_refresh_issue_monitor_candidate(
         updated_at: Some(entry.snapshot.updated_at.0),
         ..issue.clone()
     })
-}
-
-/// Issue #3225 / #3832: GitHub-derived completion probe for the claim loop.
-/// Ordinary Issues are terminal only when GitHub reports `Closed`; linked PR
-/// evidence remains delivery evidence and cannot suppress an Open Issue.
-/// SPECs retain their structured-task plus merged-PR gate. Fails open (false)
-/// on remote errors so a transient gh failure never blocks real work.
-pub fn issue_completed_by_merged_pr(owner: &str, repo: &str, issue: &IssueMonitorIssue) -> bool {
-    match try_issue_completed_by_merged_pr(owner, repo, issue) {
-        Ok(completed) => completed,
-        Err(error) => {
-            tracing::debug!(
-                issue = issue.number,
-                error = %error,
-                "issue monitor completion probe failed (fail-open)"
-            );
-            false
-        }
-    }
 }
 
 /// Checked completion probe used by scan proposal transactions.
@@ -1590,7 +1550,7 @@ fn autonomous_eligibility_candidates<'a>(
                 .inbox_item(issue.number)
                 .is_some_and(|item| item.state == MonitorInboxState::Queued)
         })
-        .filter(|issue| monitor.retry_ready(issue.number, now))
+        .filter(|issue| monitor.retry_ready_for_saved_profile(issue.number, now))
         .collect()
 }
 
@@ -1802,7 +1762,20 @@ fn advance_one_autonomous_issue(
                 // whose review window is already live, or a full `max_active`,
                 // keeps the record Implementing so the next scan retries; the
                 // reason lands on the record for `issue.monitor.status`.
-                if let Some(hold) = monitor.review_dispatch_hold(issue_number, pr, now) {
+                // Issue #4815 AC-2: a review ladder is keyed by the reviewed
+                // SHA, and a new head resets it, so the head is read before
+                // the hold is asked whenever failures are recorded. Otherwise
+                // the readback stays after admission, as before.
+                let retry_head = if monitor.review_attempts_recorded(issue_number) {
+                    run_budgeted_readback_stage(IssueMonitorScanStage::HeadShaReadback, || {
+                        gwt_git::pr_status::try_fetch_pr_head_sha(repo_path, pr)
+                    })?
+                } else {
+                    None
+                };
+                if let Some(hold) =
+                    monitor.review_dispatch_hold(issue_number, pr, retry_head.as_deref(), now)
+                {
                     tracing::info!(
                         issue = issue_number,
                         pr,
@@ -1812,11 +1785,15 @@ fn advance_one_autonomous_issue(
                     monitor.hold_review_dispatch(issue_number, hold);
                     return Ok(());
                 }
-                if let Some(sha) =
-                    run_budgeted_readback_stage(IssueMonitorScanStage::HeadShaReadback, || {
-                        gwt_git::pr_status::try_fetch_pr_head_sha(repo_path, pr)
-                    })?
-                {
+                let sha = match retry_head {
+                    Some(sha) => Some(sha),
+                    None => {
+                        run_budgeted_readback_stage(IssueMonitorScanStage::HeadShaReadback, || {
+                            gwt_git::pr_status::try_fetch_pr_head_sha(repo_path, pr)
+                        })?
+                    }
+                };
+                if let Some(sha) = sha {
                     let criteria = issues
                         .iter()
                         .find(|issue| issue.number == issue_number)
@@ -2237,9 +2214,6 @@ fn has_supported_github_remote_prefix(remote_url: &str) -> bool {
     .iter()
     .any(|prefix| remote_url.starts_with(prefix))
 }
-
-#[allow(dead_code)]
-fn _assert_inbox_item_is_send_sync(_: IssueMonitorInboxItem) {}
 
 #[cfg(test)]
 mod linked_pr_batch_tests {
@@ -4870,5 +4844,133 @@ exit 0
         );
         assert_eq!(monitor.active_count(), 0);
         assert_eq!(monitor.queued_issue_numbers(), vec![42]);
+    }
+
+    /// Issue #4815 AC-1: the scan step itself honours the review ladder. A
+    /// review window that fails after the first dispatch is counted once for
+    /// its SHA; the two scans inside the backoff re-detect the open PR and
+    /// produce no dispatch; the scan after the backoff dispatches once more.
+    #[test]
+    fn issue_4815_two_scans_inside_the_review_backoff_dispatch_nothing() {
+        let _env_lock = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let container_root = tmp.path().join("workspace");
+        std::fs::create_dir_all(&container_root).expect("create container root");
+        let bare_repo = container_root.join("repo.git");
+        let init = gwt_core::process::hidden_command("git")
+            .args([
+                "init",
+                "--bare",
+                bare_repo.to_str().expect("bare repo path"),
+            ])
+            .output()
+            .expect("git init --bare");
+        assert!(init.status.success());
+        let call_log = tmp.path().join("gh-calls.log");
+        let fake_gh = write_bare_repo_bound_fake_gh(&tmp.path().join("bin"), &call_log);
+        let mut path_entries = vec![fake_gh.parent().expect("fake gh parent").to_path_buf()];
+        if let Some(existing) = std::env::var_os("PATH") {
+            path_entries.extend(std::env::split_paths(&existing));
+        }
+        let _path = gwt_core::test_support::ScopedEnvVar::set(
+            "PATH",
+            std::env::join_paths(path_entries).expect("join PATH"),
+        );
+        let _sandbox = gwt_core::test_support::ScopedEnvVar::set("GWT_TEST_GH_SANDBOX", "1");
+
+        let issues = vec![IssueMonitorIssue {
+            number: 42,
+            title: "Issue 42".to_string(),
+            labels: vec!["auto-merge".to_string()],
+            state: IssueMonitorIssueState::Open,
+            body: Some("## Acceptance Criteria\n- [ ] AC-1: returns 200\n".to_string()),
+            url: None,
+            readiness: IssueMonitorReadiness::NotApplicable,
+            updated_at: Some("2026-08-15T00:00:00Z".to_string()),
+        }];
+        let mut monitor = IssueMonitorState::with_prefs(
+            IssueMonitorConfig::default(),
+            crate::IssueMonitorPrefs {
+                enabled: true,
+                autonomous_mode: true,
+                max_active_agents: 3,
+                ..crate::IssueMonitorPrefs::default()
+            },
+        );
+        monitor.terminal_queue_push(&[42], "test", "2026-07-02T00:00:00Z");
+        crate::scan_issue_monitor_candidates(&mut monitor, &issues, "2026-07-28T00:00:00Z");
+        monitor.complete_active_launch_at(42, "tab-1::impl-42", "2026-07-28T00:00:00Z");
+        monitor.set_autonomous_phase(42, crate::AutonomousPhase::Implementing);
+        let branch = monitor
+            .inbox_item(42)
+            .and_then(|item| item.launch_plan.as_ref())
+            .map(|plan| plan.branch_name.clone())
+            .expect("launch plan branch");
+        let open_prs = std::collections::HashMap::from([(branch, 7_u64)]);
+        let scan = |monitor: &mut IssueMonitorState, now: &str| {
+            advance_one_autonomous_issue(
+                monitor,
+                &issues,
+                "owner/repo",
+                &container_root,
+                "develop",
+                Some(&open_prs),
+                b"secret",
+                42,
+                now,
+            )
+            .expect("scan step");
+            monitor.take_pending_review_dispatches().len()
+        };
+
+        assert_eq!(
+            scan(&mut monitor, "2026-07-28T00:10:00Z"),
+            1,
+            "first scan dispatches"
+        );
+        assert_eq!(
+            monitor.autonomous_record(42).map(|record| record.phase),
+            Some(crate::AutonomousPhase::Reviewing)
+        );
+        // The review window fails to start.
+        monitor.record_launch_failed_at(42, "spawn failed: os error 206", "2026-07-28T00:10:05Z");
+        let attempts = monitor
+            .autonomous_record(42)
+            .and_then(|record| record.review_attempts.clone())
+            .expect("review attempt recorded");
+        assert_eq!(
+            (attempts.reviewed_sha.as_str(), attempts.count),
+            ("abc123", 1)
+        );
+        assert_eq!(attempts.not_before.as_deref(), Some("2026-07-28T00:11:05Z"));
+
+        // Two scans inside the backoff: the PR is re-detected, nothing is
+        // dispatched, and the hold names the backoff on the record.
+        assert_eq!(scan(&mut monitor, "2026-07-28T00:10:30Z"), 0);
+        assert_eq!(scan(&mut monitor, "2026-07-28T00:10:50Z"), 0);
+        assert!(monitor
+            .autonomous_record(42)
+            .and_then(|record| record.review_dispatch_hold.clone())
+            .is_some_and(|hold| hold
+                .reason
+                .contains("backing off until 2026-07-28T00:11:05Z")));
+        assert_eq!(
+            monitor.active_issue_numbers(),
+            vec![42],
+            "the implementation keeps its slot"
+        );
+        assert_eq!(
+            monitor.inbox_item(42).map(|item| item.state),
+            Some(MonitorInboxState::Launched)
+        );
+
+        // After the backoff the same head is dispatched exactly once more.
+        assert_eq!(scan(&mut monitor, "2026-07-28T00:12:00Z"), 1);
+        assert_eq!(
+            monitor.autonomous_record(42).map(|record| record.phase),
+            Some(crate::AutonomousPhase::Reviewing)
+        );
     }
 }

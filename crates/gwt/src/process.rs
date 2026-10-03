@@ -46,6 +46,36 @@ pub fn current_hostname() -> String {
     normalize_hostname(whoami::hostname().ok().as_deref())
 }
 
+/// Issue #4852 AC-2: the `hostname:user` prefix of a claim owner minted by
+/// [`current_claim_owner`], without the pid. `None` when the owner does not
+/// carry the three-part shape (a bare hostname from `queue push`, or an
+/// opaque legacy owner), so a prefix is never invented for it.
+pub fn claim_owner_host_user(owner: &str) -> Option<&str> {
+    let (prefix, pid) = owner.trim().rsplit_once(':')?;
+    if pid.is_empty() || !pid.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    prefix.contains(':').then_some(prefix)
+}
+
+/// Issue #4852 AC-2: whether two claim owners name the same `hostname:user`,
+/// whatever pid each carries. A Monitor process that restarted keeps meeting
+/// the claim comments its predecessor pid wrote on the same host; those are
+/// its own claims, not a foreign hold, so pid is deliberately not compared.
+/// Owners without the `hostname:user:pid` shape only match exactly.
+pub fn same_host_and_user(owner_a: &str, owner_b: &str) -> bool {
+    if owner_a.trim() == owner_b.trim() {
+        return true;
+    }
+    match (
+        claim_owner_host_user(owner_a),
+        claim_owner_host_user(owner_b),
+    ) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// Return the current username, falling back to the platform environment.
 pub fn current_username() -> String {
     let whoami_value = whoami::username().ok();
@@ -245,6 +275,35 @@ mod tests {
         let owner = current_claim_owner();
         assert_eq!(owner.split(':').count(), 3);
         assert!(owner.ends_with(&format!(":{}", std::process::id())));
+    }
+
+    /// Issue #4852 AC-2: a claim written by an earlier pid of this host/user
+    /// is our own; another host or user with the same pid is not.
+    #[test]
+    fn same_host_and_user_ignores_pid_but_not_host_or_user() {
+        let mine = current_claim_owner();
+        let other_pid = format!(
+            "{}:{}:{}",
+            current_hostname(),
+            current_username(),
+            std::process::id().wrapping_add(1)
+        );
+        assert!(same_host_and_user(&mine, &mine));
+        assert!(same_host_and_user(&mine, &other_pid));
+        assert!(same_host_and_user(&other_pid, &mine));
+        assert!(same_host_and_user("host-a:alice:10", "host-a:alice:20"));
+        assert!(!same_host_and_user("host-a:alice:10", "host-b:alice:10"));
+        assert!(!same_host_and_user("host-a:alice:10", "host-a:bob:10"));
+        // Owners without the three-part shape never gain a prefix match.
+        assert!(!same_host_and_user("host-a", "host-a:alice:10"));
+        assert!(!same_host_and_user("host-a/session", "host-a/session-2"));
+        assert!(same_host_and_user("host-a/session", "host-a/session"));
+        assert_eq!(
+            claim_owner_host_user("host-a:alice:10"),
+            Some("host-a:alice")
+        );
+        assert_eq!(claim_owner_host_user("host-a:alice:x"), None);
+        assert_eq!(claim_owner_host_user("alice:10"), None);
     }
 
     #[test]

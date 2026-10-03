@@ -45,6 +45,7 @@ pub mod launch_wizard;
 pub mod managed_assets;
 pub mod memory_pressure;
 pub mod migration;
+pub mod monitor_duplicate_runtime;
 pub mod native_app;
 pub mod native_notification_permission;
 pub(crate) mod path_filter;
@@ -97,11 +98,12 @@ pub use agent_project_state::{
     continue_authenticated_execution, describe_authenticated_host_contract, observe_agent_runtime,
     prepare_resume_producing_authority, probe_authenticated_execution_binding,
     probe_authenticated_prepared_execution_binding, probe_bound_authenticated_work_materialization,
-    AgentBuildAbortTerminalizationRequest, AgentExecutionAdoptionReceipt,
-    AgentExecutionAdoptionRequest, AgentExecutionBindingProbeReceipt,
-    AgentExecutionBindingProbeRequest, AgentExecutionContinuationOutcome,
-    AgentExecutionContinuationReceipt, AgentExecutionContinuationRequest, AgentHostContractReceipt,
-    AgentHostContractRequest, AgentRuntimeObservation, AgentWorkMaterializationProbeReceipt,
+    try_prepare_resume_producing_authority, AgentBuildAbortTerminalizationRequest,
+    AgentExecutionAdoptionReceipt, AgentExecutionAdoptionRequest,
+    AgentExecutionBindingProbeReceipt, AgentExecutionBindingProbeRequest,
+    AgentExecutionContinuationOutcome, AgentExecutionContinuationReceipt,
+    AgentExecutionContinuationRequest, AgentHostContractReceipt, AgentHostContractRequest,
+    AgentRuntimeObservation, AgentWorkMaterializationProbeReceipt,
     AgentWorkMaterializationProbeRequest, AgentWorkTerminalKind, AgentWorkTerminalizationOutcome,
     AgentWorkTerminalizationReceipt, AgentWorkTerminalizationRequest, AgentWorkspaceUpdateError,
     AgentWorkspaceUpdateErrorCode, AgentWorkspaceUpdateIntent, AgentWorkspaceUpdateReceipt,
@@ -219,7 +221,8 @@ pub use launch_wizard::{
     load_agent_options, AgentOption, AgentSetupAffordance, AgentSetupKind, DockerWizardContext,
     LaunchTargetKind, LaunchWizardAction, LaunchWizardAgentSetupView, LaunchWizardCompletion,
     LaunchWizardContext, LaunchWizardHolderDecisionView, LaunchWizardHydration,
-    LaunchWizardIssueMonitorPoolImpactView, LaunchWizardLaunchPath, LaunchWizardLaunchRequest,
+    LaunchWizardIssueMonitorPoolImpactView, LaunchWizardIssueMonitorPoolSetView,
+    LaunchWizardIssueMonitorPoolView, LaunchWizardLaunchPath, LaunchWizardLaunchRequest,
     LaunchWizardLiveSessionView, LaunchWizardMode, LaunchWizardOptionView,
     LaunchWizardPreviousProfile, LaunchWizardPreviousProfiles, LaunchWizardProgressStepView,
     LaunchWizardQuickStartView, LaunchWizardStartMethodKind, LaunchWizardStartMethodView,
@@ -265,6 +268,7 @@ pub use protocol::{
     UiTraceEntry, UiTracePayload, WorkAgentView, WorkEventView, WorkItemView,
     WorkspaceExecutionContainerView, WorkspaceExecutionDiagnosisView, WorkspaceHistoryAgentView,
     WorkspaceHistoryEventView, WorkspaceHistorySessionView, WorkspaceHistoryView,
-    WorkspaceJournalEntryView, WorkspaceResumeSource, WorkspaceView,
+    WorkspaceJournalEntryView, WorkspaceResumeSource, WorkspaceStateNoticeKind,
+    WorkspaceStateNoticeView, WorkspaceView,
 };
 pub use window_canvas::WindowCanvasState;
