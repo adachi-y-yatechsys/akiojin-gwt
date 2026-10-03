@@ -107,6 +107,10 @@ usage の `window_minutes` 契約と、未完了の SPEC #2359 に属する Work
 backfill も維持します。旧 HOME / Workspace の `workspace/current.json` と
 `work_items.json` からの取り込みはデータ保護の例外として保持し、起動時に新しい状態を
 作る前に未対応の配置を安全に案内できるようになるまで削除しません。
+coordination のイベント取り込みと discussion の取り込みも、現用の回復処理と session 別
+Stop 契約が利用するため保持します。旧 agent identity reset は廃止し、起動時には保存済みの
+目的・進捗を保持します。`agent_identity.migration.json` は既存の内容を変更せず、
+未作成なら新たに作成しません。
 
 ## 前提
 

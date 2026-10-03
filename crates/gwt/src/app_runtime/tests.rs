@@ -31052,6 +31052,62 @@ fn startup_self_heals_managed_hooks_in_every_known_worktree() {
     }
 }
 
+/// Issue #4825 / SPEC-2359 FR-346 retirement: startup keeps saved agent
+/// identity intact whether the obsolete reset marker is absent or stale.
+#[test]
+fn bootstrap_preserves_agent_identity_without_running_retired_reset() {
+    use gwt_core::workspace_projection::{
+        load_workspace_projection_from_path, save_workspace_projection_to_path, WorkspaceProjection,
+    };
+
+    let _env_lock = env_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for marker in [None, Some(br#"{"version":0}"#.as_slice())] {
+        let temp = tempdir().expect("tempdir");
+        let _home = ScopedGwtHome::set(temp.path());
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("repo dir");
+        run_git(&repo, &["init", "-q"]);
+        let current = gwt_core::paths::gwt_workspace_projection_path_for_repo_path(&repo);
+        let mut projection = WorkspaceProjection::default_for_project(&repo);
+        let mut agent = workspace_agent_summary_for_test("saved-identity", None);
+        agent.title_summary = Some("Saved purpose".to_string());
+        agent.current_focus = Some("Saved progress".to_string());
+        projection.agents.push(agent);
+        save_workspace_projection_to_path(&current, &projection).expect("save identity");
+        let marker_path = current.with_file_name("agent_identity.migration.json");
+        if let Some(bytes) = marker {
+            fs::write(&marker_path, bytes).expect("stale reset marker");
+        }
+        let tab = sample_project_tab("tab-repo", "Repo", repo, ProjectKind::Git, &[]);
+        let mut runtime = sample_runtime(temp.path(), vec![tab], Some("tab-repo"));
+        let (spawner, _tasks) = BlockingTaskSpawner::queued();
+        runtime.blocking_tasks = spawner;
+
+        runtime.bootstrap();
+
+        let loaded = load_workspace_projection_from_path(&current)
+            .expect("load identity after startup")
+            .expect("projection retained");
+        assert_eq!(
+            loaded.agents, projection.agents,
+            "startup must retain identity"
+        );
+        match marker {
+            Some(bytes) => assert_eq!(
+                fs::read(&marker_path).expect("retired marker retained"),
+                bytes,
+                "startup must not rewrite a retired marker"
+            ),
+            None => assert!(
+                !marker_path.exists(),
+                "startup must not create a reset marker"
+            ),
+        }
+    }
+}
+
 /// Issue #3808 AC-4: the worktree-wide managed hook self-heal audited 203
 /// worktrees for 191 s on the startup path, ahead of the embedded server
 /// bind. Launches refresh the managed assets of the worktree they start in,
