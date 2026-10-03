@@ -1874,7 +1874,6 @@ pub struct ProjectAgentAggregate {
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceStateNoticeKind {
     LoadError,
-    LegacyImported,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

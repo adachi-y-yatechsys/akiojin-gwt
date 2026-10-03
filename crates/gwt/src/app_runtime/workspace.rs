@@ -782,11 +782,7 @@ fn spawn_branch_cleanup_async(proxy: AppEventProxy, task: BranchCleanupAsyncTask
 impl AppRuntime {
     /// A cached rail refresh cannot prove that an unreadable works.json has
     /// recovered: file permissions are not part of its cache signature.
-    pub(crate) fn recheck_workspace_state_after_projection(
-        &self,
-        project_root: &Path,
-        imported_from: Option<PathBuf>,
-    ) {
+    pub(crate) fn recheck_workspace_state_after_projection(&self, project_root: &Path) {
         let Some(context) = self.project_context_for_root(project_root) else {
             return;
         };
@@ -796,12 +792,11 @@ impl AppRuntime {
                 .as_ref()
                 .is_some_and(|notice| notice.kind == gwt::WorkspaceStateNoticeKind::LoadError)
         });
-        if pending || imported_from.is_some() {
+        if pending {
             crate::spawn_workspace_projection_reload(
                 &self.blocking_tasks,
                 self.proxy.clone(),
                 context,
-                imported_from,
             );
         }
     }
@@ -834,7 +829,6 @@ impl AppRuntime {
     pub(crate) fn handle_workspace_state_loaded(
         &mut self,
         project_root: &Path,
-        imported_from: Option<PathBuf>,
     ) -> Vec<OutboundEvent> {
         let Some(context) = self.project_context_for_root(project_root) else {
             return Vec::new();
@@ -844,22 +838,15 @@ impl AppRuntime {
             .workspace_state_notice
             .as_ref()
             .is_some_and(|notice| notice.kind == gwt::WorkspaceStateNoticeKind::LoadError);
-        if imported_from.is_none() && !recovered {
+        if !recovered {
             return Vec::new();
         }
-        let notice = imported_from.map(|path| gwt::WorkspaceStateNoticeView {
-            path: path.display().to_string(),
-            message: "旧配置から取り込みました。元のファイルは保持されています。".to_string(),
-            kind: gwt::WorkspaceStateNoticeKind::LegacyImported,
-        });
-        state.workspace_state_notice = notice.clone();
-        if recovered {
-            self.spawn_work_events_ingest(project_root.to_path_buf(), true);
-            let _ = self.active_work_projection_broadcast_for_tab(&context.tab_id);
-        }
+        state.workspace_state_notice = None;
+        self.spawn_work_events_ingest(project_root.to_path_buf(), true);
+        let _ = self.active_work_projection_broadcast_for_tab(&context.tab_id);
         vec![OutboundEvent::project(
             context.project_key,
-            BackendEvent::WorkspaceStateNotice { notice },
+            BackendEvent::WorkspaceStateNotice { notice: None },
         )]
     }
 
