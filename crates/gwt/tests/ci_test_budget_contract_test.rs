@@ -20,6 +20,25 @@ use std::fs;
 use std::path::PathBuf;
 
 const TEST_WORKFLOW: &str = ".github/workflows/test.yml";
+
+#[test]
+fn real_model_step_only_runs_index_runner_ignored_tests() {
+    let workflow = read(TEST_WORKFLOW);
+    let steps = named_steps(&workflow);
+    let (_, body) = steps
+        .iter()
+        .find(|(name, _)| name == "Run ignored e2e tests with real e5 model")
+        .expect("real model step must exist");
+    let command = body
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("run: "))
+        .expect("real model command must exist");
+    assert_eq!(
+        command, "cargo test -p gwt-core --test index_runner_spawn -- --ignored",
+        "Do not run watcher_native or baseline regeneration in the model job"
+    );
+}
+
 const NIGHTLY_WORKFLOW: &str = ".github/workflows/nightly.yml";
 const RUST_JOB: &str = "  test:\n";
 const RUN_TESTS_STEP: &str = "Run tests";
