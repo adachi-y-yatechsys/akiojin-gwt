@@ -223,8 +223,9 @@ function issueRowSecondaryItems({ entry, work, attention, primary }) {
     items.push({
       kind: "chip",
       key: "queue",
-      label: `Queue ${entry.queue_position} · ${issueQueuePriorityLabel(entry)}${terminal ? ` · ${terminal}` : ""}${entry.queued_by ? ` · ${entry.queued_by}` : ""}`,
+      label: `Queue ${entry.queue_position}${terminal ? ` · ${terminal}` : ""}${entry.queued_by ? ` · ${entry.queued_by}` : ""}`,
     });
+    items.push({ kind: "chip", key: "queue-priority", label: issueQueuePriorityLabel(entry) });
   }
   if (work?.pr_number) {
     const prState = String(work.pr_state || "").trim();

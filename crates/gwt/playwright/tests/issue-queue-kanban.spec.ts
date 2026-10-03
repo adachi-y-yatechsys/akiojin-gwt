@@ -113,7 +113,13 @@ test("urgent priority, cap fallback and PM demotion preserve assignment provenan
     [4, "Normal · Urgent limit reached", "Unknown", "Not observed"],
     [1, "Normal · PM demoted", "pm-session", "2026-10-03T02:00:00Z"],
   ] as const) {
-    await expect(row(page, number)).toContainText(label);
+    const card = row(page, number);
+    const priority = card.locator('[data-key="queue-priority"]');
+    await expect(priority).toHaveText(label);
+    const cardBounds = (await card.boundingBox())!;
+    const priorityBounds = (await priority.boundingBox())!;
+    expect(priorityBounds.x + priorityBounds.width, "priority chip fits within queued card").toBeLessThanOrEqual(cardBounds.x + cardBounds.width);
+    expect(await priority.evaluate(element => element.scrollWidth <= element.clientWidth), "priority text fits without overflowing").toBe(true);
     await row(page, number).locator(".knowledge-row-select").click();
     await expect(page.locator(".issue-detail-priority")).toHaveText(`Priority: ${label}`);
     await expect(page.locator(".issue-detail-priority-assignment")).toHaveText(`Priority assigned by: ${actor} · Assigned at: ${time}`);
