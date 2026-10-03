@@ -277,6 +277,8 @@ test("Codex Fast mode uses current fields after an older View tab reloads", asyn
     await page.locator(`#op-theme-toggle [data-theme-value="${theme}"]`).click();
     await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
     cleanup = (await openLiveLaunchWizardForBranch(page)).cleanup;
+    // Opening is asynchronous; do not send a setup action before the wizard exists.
+    await expect(page.locator("#wizard-modal")).toBeVisible({ timeout: 30_000 });
     await chooseConfigureAndStart(page);
     await selectWizardAgent(page, "codex");
     const latestView = () => page.evaluate(() => {
