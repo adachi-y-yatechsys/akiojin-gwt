@@ -13579,6 +13579,7 @@ exit 0
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn valid_startup_off_commits_before_any_stale_prepared_grant_starts() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let _env_lock = crate::env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -13665,6 +13666,7 @@ exit 0
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn production_server_shutdown_waits_for_authority_revocation_and_reaps_child() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let _env_lock = crate::env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -13792,6 +13794,7 @@ exit 0
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // serializes process-wide fake-gh environment
     async fn worker_off_during_blocked_arm_serializes_compensating_disarm() {
+        let _prefs_budget = pin_prefs_hang_guard();
         // SPEC #3200 Phase 7 Scenarios 30-31: OFF commits while an already
         // started arm command is blocked. The old command may still succeed,
         // but its exact result cannot enter delivery; one durable disarm must
@@ -14522,69 +14525,77 @@ exit 1
         });
     }
 
-    #[tokio::test]
-    async fn worker_stays_starting_until_the_local_fallback_lease_is_released() {
-        let temp = TempDir::new().expect("tempdir");
-        let repo = temp.path().join("repo");
-        fs::create_dir_all(&repo).expect("repo");
-        init_git_repo(&repo);
-        commit_initial_branch(&repo);
-        git_remote_add_origin(&repo, "https://github.com/example/repo.git");
-        let scope = RuntimeScope::new(
-            "abcdef0123456789",
-            "feedfacecafebeef",
-            repo,
-            RuntimeTarget::Host,
-        )
-        .expect("scope");
-        let prefs_path = crate::issue_monitor_prefs_path_for_repo_path(&scope.project_root);
-        crate::save_issue_monitor_prefs(&prefs_path, &crate::IssueMonitorPrefs::default())
-            .expect("seed prefs");
-        let local_lease = crate::try_acquire_issue_monitor_local_fallback_lease(&prefs_path)
-            .expect("hold GUI fallback authority");
-        let hub = BroadcastHub::new();
-        let shutdown = Arc::new(DaemonShutdown::new());
-        let worker = super::spawn_issue_monitor_worker_with_config(
-            scope,
-            hub.clone(),
-            Arc::clone(&shutdown),
-            crate::IssueMonitorConfig::default(),
-        );
-        let publisher = tokio::spawn({
-            let hub = hub.clone();
-            async move {
-                hub.publish_issue_monitor_control(DaemonFrame::Event {
-                    channel: crate::runtime_daemon_events::ISSUE_MONITOR_CONTROL_CHANNEL
-                        .to_string(),
-                    payload: crate::runtime_daemon_events::issue_monitor_payload(
-                        "control",
-                        serde_json::json!({"config_set": {"max_active_agents": 2}}),
-                        std::process::id().wrapping_add(1),
-                    ),
-                })
-                .await
-            }
-        });
+    #[test]
+    fn worker_stays_starting_until_the_local_fallback_lease_is_released() {
+        let _prefs_budget = pin_prefs_hang_guard();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .on_thread_start(|| std::mem::forget(pin_prefs_hang_guard()))
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let temp = TempDir::new().expect("tempdir");
+            let repo = temp.path().join("repo");
+            fs::create_dir_all(&repo).expect("repo");
+            init_git_repo(&repo);
+            commit_initial_branch(&repo);
+            git_remote_add_origin(&repo, "https://github.com/example/repo.git");
+            let scope = RuntimeScope::new(
+                "abcdef0123456789",
+                "feedfacecafebeef",
+                repo,
+                RuntimeTarget::Host,
+            )
+            .expect("scope");
+            let prefs_path = crate::issue_monitor_prefs_path_for_repo_path(&scope.project_root);
+            crate::save_issue_monitor_prefs(&prefs_path, &crate::IssueMonitorPrefs::default())
+                .expect("seed prefs");
+            let local_lease = crate::try_acquire_issue_monitor_local_fallback_lease(&prefs_path)
+                .expect("hold GUI fallback authority");
+            let hub = BroadcastHub::new();
+            let shutdown = Arc::new(DaemonShutdown::new());
+            let worker = super::spawn_issue_monitor_worker_with_config(
+                scope,
+                hub.clone(),
+                Arc::clone(&shutdown),
+                crate::IssueMonitorConfig::default(),
+            );
+            let publisher = tokio::spawn({
+                let hub = hub.clone();
+                async move {
+                    hub.publish_issue_monitor_control(DaemonFrame::Event {
+                        channel: crate::runtime_daemon_events::ISSUE_MONITOR_CONTROL_CHANNEL
+                            .to_string(),
+                        payload: crate::runtime_daemon_events::issue_monitor_payload(
+                            "control",
+                            serde_json::json!({"config_set": {"max_active_agents": 2}}),
+                            std::process::id().wrapping_add(1),
+                        ),
+                    })
+                    .await
+                }
+            });
 
-        tokio::time::sleep(Duration::from_millis(75)).await;
-        assert!(
-            !publisher.is_finished(),
-            "fence-less contention keeps controls in Starting"
-        );
-        drop(local_lease);
-        let publish_result = tokio::time::timeout(HANG_GUARD, publisher)
-            .await
-            .expect("publisher reaches Ready after lease release")
-            .expect("publisher task joins");
-        assert!(
-            publish_result.is_ok(),
-            "the retried daemon owns and commits the control: {publish_result:?}"
-        );
-        shutdown.request();
-        tokio::time::timeout(HANG_GUARD, worker)
-            .await
-            .expect("worker shutdown is bounded")
-            .expect("worker exits cleanly");
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            assert!(
+                !publisher.is_finished(),
+                "fence-less contention keeps controls in Starting"
+            );
+            drop(local_lease);
+            let publish_result = tokio::time::timeout(HANG_GUARD, publisher)
+                .await
+                .expect("publisher reaches Ready after lease release")
+                .expect("publisher task joins");
+            assert!(
+                publish_result.is_ok(),
+                "the retried daemon owns and commits the control: {publish_result:?}"
+            );
+            shutdown.request();
+            tokio::time::timeout(HANG_GUARD, worker)
+                .await
+                .expect("worker shutdown is bounded")
+                .expect("worker exits cleanly");
+        });
     }
 
     /// Issue #4199: `Rejected` and `RecoveryBlocked` answer different
@@ -15825,6 +15836,7 @@ exit 1
     #[test]
     #[allow(clippy::await_holding_lock)]
     fn worker_abort_denies_detached_grant_and_durably_revokes_authority() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let _env_lock = crate::env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -15836,6 +15848,7 @@ exit 1
             // the queued-effect case is covered by the adjacent test.
             .max_blocking_threads(2)
             .enable_all()
+            .on_thread_start(|| std::mem::forget(pin_prefs_hang_guard()))
             .build()
             .expect("runtime");
         let temp = TempDir::new().expect("tempdir");
@@ -18789,6 +18802,7 @@ exit 1
 
     #[test]
     fn stale_local_off_failure_denies_and_enters_retry_barrier() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         crate::save_issue_monitor_prefs(
@@ -18809,6 +18823,8 @@ exit 1
             },
         );
         let lock = issue_monitor_prefs_lock_for_test(&prefs_path);
+        let contended_budget =
+            super::ScopedIssueMonitorPrefsTimeout::set(Duration::from_millis(250));
         let mut permit = super::IssueMonitorEffectPermit::new();
         let captured_grant = permit.capture();
         let mut pending = None;
@@ -18839,6 +18855,7 @@ exit 1
         );
 
         FileExt::unlock(&lock).expect("release prefs lock");
+        drop(contended_budget);
         let _clock = ScopedOperationClock::set(Instant::now());
         let retry = super::try_apply_accepted_issue_monitor_control_with_disk_migration(
             &prefs_path,
@@ -19047,6 +19064,7 @@ exit 1
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn off_lock_timeout_retries_and_commits_revocation_after_unlock() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let _env_lock = crate::env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -19150,6 +19168,8 @@ exit 1
         );
         assert!(wait_for_path(&effect_started).await);
         let lock = issue_monitor_prefs_lock_for_test(&prefs_path);
+        let contended_budget =
+            super::ScopedIssueMonitorPrefsTimeout::set(Duration::from_millis(250));
         let source_pid = std::process::id().wrapping_add(1);
         let off_receipt = tokio::spawn({
             let hub = hub.clone();
@@ -19176,6 +19196,7 @@ exit 1
             .await;
         tokio::time::sleep(Duration::from_millis(650)).await;
         FileExt::unlock(&lock).expect("release prefs lock");
+        drop(contended_budget);
         tokio::time::timeout(HANG_GUARD, off_receipt)
             .await
             .expect("OFF receipt resolves after retry")
@@ -19249,6 +19270,7 @@ exit 1
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn pending_off_is_barrier_to_reenable_without_permit_aba() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let _env_lock = crate::env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -19306,6 +19328,8 @@ exit 1
             "the worker publishes its seeded projection before controls contend"
         );
         let lock = issue_monitor_prefs_lock_for_test(&prefs_path);
+        let contended_budget =
+            super::ScopedIssueMonitorPrefsTimeout::set(Duration::from_millis(250));
         let source_pid = std::process::id().wrapping_add(1);
         let mut publishers = Vec::new();
         for enabled in [false, true, false, true] {
@@ -19339,6 +19363,7 @@ exit 1
             "no ordered receipt resolves before the first durable commit"
         );
         FileExt::unlock(&lock).expect("release prefs lock");
+        drop(contended_budget);
         for publisher in publishers {
             tokio::time::timeout(HANG_GUARD, publisher)
                 .await
@@ -19385,6 +19410,7 @@ exit 1
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn shutdown_rejects_pending_and_queued_control_receipts_without_ack() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let _env_lock = crate::env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -19426,6 +19452,8 @@ exit 1
             Duration::from_secs(1),
         );
         let lock = issue_monitor_prefs_lock_for_test(&prefs_path);
+        let contended_budget =
+            super::ScopedIssueMonitorPrefsTimeout::set(Duration::from_millis(250));
         let source_pid = std::process::id().wrapping_add(1);
         let pending = tokio::spawn({
             let hub = hub.clone();
@@ -19479,6 +19507,7 @@ exit 1
             .expect("queued receipt resolves")
             .expect("queued publisher joins");
         FileExt::unlock(&lock).expect("release prefs lock");
+        drop(contended_budget);
         tokio::time::timeout(HANG_GUARD, worker)
             .await
             .expect("worker shutdown is bounded")
@@ -19494,6 +19523,7 @@ exit 1
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn routine_control_lock_retry_keeps_receipt_and_fifo_until_commit() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let _env_lock = crate::env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -19534,6 +19564,8 @@ exit 1
             Duration::from_secs(1),
         );
         let lock = issue_monitor_prefs_lock_for_test(&prefs_path);
+        let contended_budget =
+            super::ScopedIssueMonitorPrefsTimeout::set(Duration::from_millis(250));
         let publish = |hub: BroadcastHub, max_active_agents| {
             tokio::spawn(async move {
                 hub.publish_issue_monitor_control(DaemonFrame::Event {
@@ -19572,6 +19604,7 @@ exit 1
         );
 
         FileExt::unlock(&lock).expect("release prefs lock");
+        drop(contended_budget);
         first
             .await
             .expect("first publisher joins")
@@ -19594,6 +19627,7 @@ exit 1
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn routine_retry_fences_a_scan_captured_while_the_control_is_pending() {
+        let _prefs_budget = pin_prefs_hang_guard();
         let _env_lock = crate::env_test_lock()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -19672,6 +19706,8 @@ exit 1
             Duration::from_secs(2),
         );
         let lock = issue_monitor_prefs_lock_for_test(&prefs_path);
+        let contended_budget =
+            super::ScopedIssueMonitorPrefsTimeout::set(Duration::from_millis(250));
         let mut receipt = hub
             .enqueue_issue_monitor_control(DaemonFrame::Event {
                 channel: crate::runtime_daemon_events::ISSUE_MONITOR_CONTROL_CHANNEL.to_string(),
@@ -19706,6 +19742,7 @@ exit 1
         );
 
         FileExt::unlock(&lock).expect("release prefs lock");
+        drop(contended_budget);
         tokio::time::timeout(HANG_GUARD, receipt)
             .await
             .expect("heartbeat receipt resolves after retry")
