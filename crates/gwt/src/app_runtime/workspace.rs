@@ -1049,11 +1049,10 @@ mod tests {
             .expect("save current projection");
         let legacy_path = gwt_core::paths::gwt_project_dir_for_repo_path(&project_root)
             .join("workspace/current.json");
-        gwt_core::workspace_projection::save_workspace_projection_to_path(
-            &legacy_path,
-            &projection,
-        )
-        .expect("save remaining legacy projection");
+        // Retired HOME residue predates the current writer, which rejects it.
+        let legacy_bytes = serde_json::to_vec(&projection).expect("serialize legacy fixture");
+        std::fs::create_dir_all(legacy_path.parent().unwrap()).expect("create legacy directory");
+        std::fs::write(&legacy_path, &legacy_bytes).expect("seed remaining legacy projection");
         let current_path =
             gwt_core::paths::gwt_workspace_projection_path_for_repo_path(&project_root);
         let lock = std::fs::OpenOptions::new()
@@ -1084,15 +1083,21 @@ mod tests {
             (true, false),
             "a deleted current projection must not be broadcast or recreated by cleanup completion"
         );
-        assert!(
-            !legacy_path.exists(),
-            "cleanup must invalidate the legacy source that could recreate canonical state"
+        assert_eq!(
+            std::fs::read(&legacy_path).expect("read preserved legacy projection"),
+            legacy_bytes,
+            "cleanup must preserve retired HOME bytes when canonical state disappears"
         );
+        let error = gwt_core::workspace_projection::load_workspace_projection(&project_root)
+            .expect_err("remaining retired HOME state must be refused");
         assert!(
-            gwt_core::workspace_projection::load_workspace_projection(&project_root)
-                .expect("load projection after cleanup")
-                .is_none(),
-            "a normal load after cleanup must not remigrate deleted canonical state"
+            matches!(
+                error,
+                gwt_core::error::GwtError::WorkspaceStateLoad(ref detail)
+                    if detail.kind == gwt_core::error::WorkspaceStateLoadErrorKind::LegacyLayout
+                        && detail.path == legacy_path
+            ),
+            "a normal load must refuse retired state without recreating canonical state: {error}"
         );
     }
 }
