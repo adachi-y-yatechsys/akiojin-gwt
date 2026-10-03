@@ -7621,6 +7621,7 @@ exit 0
                         number: *number,
                         queued_at: "2026-07-27T00:00:00Z".to_string(),
                         queued_by: "test".to_string(),
+                        ..Default::default()
                     });
             }
         }

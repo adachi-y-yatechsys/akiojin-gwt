@@ -372,11 +372,21 @@ Auto-refill は**既定で OFF**です。有効にすると、条件を満たす
 **Hide preview / Show preview** でボードを全幅に広げたり、詳細ペインを再表示したりできます。
 列は縮めず横スクロールします。従来の `issue_monitor` preset も同じ Issue サーフェスを開きます。
 
-open な GitHub Issue は、明示的にキューへ追加するか、有効にした Auto-refill が追加する
+open な GitHub Issue は、明示的な追加、有効な Auto-refill、または `urgent` ラベルによる投入
 まで Backlog に留まります。キューへの所属は Monitor の実行候補になる条件であり、
 準備状態・claim・同時実行数のチェックは引き続き適用されます。行の `Launch now` は
 起動フローを開き、起動時に `work/issue-N` のブランチ/worktree を作成して
 `gwt-execute #N` でエージェントを開始します。起動失敗は Issue 行に残ります。
+
+`urgent` は誰でも付与できます。実行候補の urgent Issue は Auto-refill が無効でも
+自動投入されますが、明示的なキュー削除は優先されます。既定では付与順に最大2件が
+先頭群へ入り、保存済みの通常順序と `max_active` は変わりません。
+`issue.monitor.queue.urgent_limit` の `limit` で上限を変更できます（`0` は先頭群への昇格だけを無効化）。
+超過分は通常順序に従います。`issue.monitor.queue.demote` の `number` で指定した Issue は
+永続的に通常優先度へ戻り、scan・再起動後も urgent ラベルより降格が優先されます。
+カードと詳細では urgent・上限超過・降格を区別し、`issue.monitor.queue.list` と
+`issue.monitor.status` からも理由と観測済みの GitHub ラベル付与者・時刻を確認できます。
+未取得の履歴は不明として表示します。
 
 Agent や自動化からは `issue.monitor.status` で確認し、`issue.monitor.queue.push`、
 `issue.monitor.queue.remove`、`issue.monitor.queue.move` で所属と順序を変更できます。
