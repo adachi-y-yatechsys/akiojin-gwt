@@ -1746,7 +1746,7 @@ mod tests {
         let agents = gwt_agent::load_custom_agents_from_path(&path).expect("read legacy data");
         let mut state = LaunchWizardState::open_with(
             context(branch("feature/gui"), "feature/gui"),
-            build_agent_options(Vec::new(), &gwt_agent::VersionCache::new(), agents),
+            build_agent_options(Vec::new(), agents),
             Vec::new(),
         );
         state.set_agent_id("legacy-cc");

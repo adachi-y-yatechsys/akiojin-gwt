@@ -14814,7 +14814,7 @@ fn app_runtime_launch_wizard_submit_failure_emits_structured_error_log() {
     let rows = gwt_core::error_ledger::list_since(None).unwrap();
     let row = rows
         .iter()
-        .find(|row| row.message == "Agent option is unavailable")
+        .find(|row| row.message == "No supported agent CLI was detected")
         .unwrap();
     assert_eq!(
         row.target.project_root.as_deref(),
@@ -14854,7 +14854,7 @@ fn app_runtime_launch_wizard_submit_failure_emits_structured_error_log() {
     );
     assert_eq!(
         event.fields.get("error").map(String::as_str),
-        Some("Agent option is unavailable")
+        Some("No supported agent CLI was detected")
     );
 }
 
@@ -14986,13 +14986,7 @@ fn app_runtime_launch_wizard_set_agent_failure_logs_requested_agent() {
             .map(String::as_str),
         Some("host")
     );
-    assert_eq!(
-        event
-            .fields
-            .get("selected_tool_version")
-            .map(String::as_str),
-        Some("")
-    );
+    assert!(!event.fields.contains_key("selected_tool_version"));
 }
 
 #[test]
@@ -18427,7 +18421,7 @@ fn persisted_direct_session_observed_version_does_not_pin_restore() {
     session.launch_command = "/opt/bin/claude".into();
     let config = super::launch_config_from_persisted_session(&session);
     assert_eq!(config.command, "claude");
-    assert_eq!(config.tool_version.as_deref(), Some("installed"));
+    assert_eq!(config.tool_version, None);
 }
 
 /// SPEC-1921 AS-1921-D (AC-1921-L6): a Session saved while a version could
@@ -56020,8 +56014,7 @@ fn agent_settings_option(id: &str, name: &str) -> gwt::AgentOption {
         id: id.to_string(),
         name: name.to_string(),
         available: true,
-        installed_version: Some("latest".to_string()),
-        versions: vec!["latest".to_string()],
+        installed_version: Some("0.159.2".to_string()),
         custom_agent: None,
     }
 }
@@ -56064,6 +56057,52 @@ fn agent_settings_view(events: &[OutboundEvent]) -> &gwt::LaunchWizardView {
             _ => None,
         })
         .expect("launch wizard view")
+}
+
+#[test]
+fn app_runtime_issue_monitor_agent_settings_preserves_an_undetected_saved_agent() {
+    let _env_lock = env_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().expect("tempdir");
+    let _home = ScopedEnvVar::set("HOME", temp.path());
+    let _userprofile = ScopedEnvVar::set("USERPROFILE", temp.path());
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    init_repo(&repo);
+    let mut codex = pool_profile("codex");
+    codex.version = Some("0.121.0".to_string());
+    codex.prefer_for = vec!["type:fix".to_string()];
+    let (mut runtime, _, _) = open_agent_settings_sets(temp.path(), &repo, vec![codex.clone()]);
+    runtime.launch_wizard_cache = LaunchWizardMemoryCache::load_with_agent_options(
+        &temp.path().join("sessions"),
+        vec![agent_settings_option("claude", "Claude Code")],
+    );
+    let events = runtime.handle_frontend_event(
+        "client-1".to_string(),
+        FrontendEvent::IssueMonitorConfigureProfile,
+    );
+    assert_eq!(
+        agent_settings_set_agents(agent_settings_view(&events)),
+        ["codex"]
+    );
+    assert_eq!(
+        runtime
+            .launch_wizard_for(&runtime.test_context())
+            .unwrap()
+            .wizard
+            .agent_id,
+        "codex"
+    );
+    let events = runtime.handle_launch_wizard_action(
+        &runtime.test_context(),
+        LaunchWizardAction::Submit,
+        None,
+    );
+    assert!(agent_settings_view(&events).error.is_some());
+    let prefs = gwt::load_issue_monitor_prefs(&gwt::issue_monitor_prefs_path_for_repo_path(&repo))
+        .expect("read unchanged pool");
+    assert_eq!(prefs.launch_profile_pool(), [codex]);
 }
 
 fn agent_settings_set_agents(view: &gwt::LaunchWizardView) -> Vec<String> {
@@ -56273,6 +56312,7 @@ fn app_runtime_issue_monitor_agent_settings_keeps_a_runtime_the_form_was_not_ask
     fs::create_dir_all(&repo).expect("create repo");
     init_repo(&repo);
     let mut codex = pool_profile("codex");
+    codex.version = Some("0.121.0".to_string());
     codex.runtime_target = gwt_agent::LaunchRuntimeTarget::Docker;
     codex.docker_service = Some("gwt".to_string());
     codex.docker_lifecycle_intent = gwt_agent::DockerLifecycleIntent::Restart;
@@ -56296,6 +56336,13 @@ fn app_runtime_issue_monitor_agent_settings_keeps_a_runtime_the_form_was_not_ask
             .iter()
             .any(|row| row.label == "Runtime" && row.value == "docker:gwt"),
         "the set that was left still runs where it was saved to run: {pool:?}"
+    );
+    assert!(
+        pool.sets[0]
+            .summary
+            .iter()
+            .any(|row| row.label == "Version" && row.value == "0.159.2"),
+        "closed sets must show the detected version, not the ignored saved pin: {pool:?}"
     );
 
     save_agent_settings_sets(&mut runtime, &recorded_events);
@@ -71199,9 +71246,49 @@ fn pm_process_launch_isolates_discovery_and_keeps_project_data_readable() {
     }
 }
 
-/// SPEC-1921 AS-1921-D (AC-1921-L6): a PM profile saved with a version
-/// selector still starts the PM, on the resolved executable. The stored value
-/// is left in the profile and is not read at launch.
+/// SPEC-1921 AS-1921-D: legacy Monitor selectors do not reach the launch;
+/// reading them does not rewrite the saved candidate pool.
+#[test]
+fn monitor_stored_version_selector_is_ignored_without_rewriting_the_profile() {
+    let temp = tempdir().expect("tempdir");
+    let _gwt_home = ScopedGwtHome::set(temp.path());
+    let path = temp.path().join("issue-monitor.json");
+    for version in ["latest", "0.121.0"] {
+        let mut profile = codex_issue_monitor_launch_profile();
+        profile.version = Some(version.into());
+        let prefs = gwt::IssueMonitorPrefs {
+            launch_profile: Some(profile),
+            ..Default::default()
+        };
+        gwt::save_issue_monitor_prefs(&path, &prefs).expect("save profile");
+        let before = fs::read(&path).expect("profile bytes");
+        let loaded = gwt::load_issue_monitor_prefs(&path).expect("load profile");
+        let previous =
+            gwt::LaunchWizardPreviousProfiles::from_profile(loaded.launch_profile.map(Into::into));
+        let mut wizard = sample_ready_agent_launch_wizard_session("tab-1", temp.path()).wizard;
+        wizard.apply_hydration(gwt::LaunchWizardHydration {
+            selected_branch: None,
+            normalized_branch_name: "feature/demo".into(),
+            worktree_path: Some(temp.path().to_path_buf()),
+            quick_start_root: temp.path().to_path_buf(),
+            docker_context: None,
+            docker_service_status: gwt_docker::ComposeServiceStatus::NotFound,
+            agent_options: sample_agent_options(),
+            quick_start_entries: Vec::new(),
+            previous_profiles: Some(previous),
+            open_branch_candidates: Vec::new(),
+        });
+        wizard.apply(LaunchWizardAction::SetAgent {
+            agent_id: "codex".into(),
+        });
+        let config = wizard.build_launch_config().expect("launch config");
+        assert_eq!(config.command, "codex");
+        assert_eq!(config.tool_version, None);
+        assert!(!config.args.iter().any(|arg| arg.contains("@openai/codex@")));
+        assert_eq!(fs::read(&path).expect("unchanged profile"), before);
+    }
+}
+
 #[test]
 fn pm_launch_config_reads_a_stored_version_selector_as_installed() {
     let worktree = std::path::Path::new("/tmp/pm-worktree");

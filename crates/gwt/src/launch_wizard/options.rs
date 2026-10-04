@@ -1417,7 +1417,7 @@ mod tests {
     /// point must run real install detection and derive `available` from it.
     /// A fake `agy` on PATH is the only detectable built-in, so Antigravity
     /// must come back available with its probed version while every other
-    /// built-in is reported as not installed instead of hardcoded `true`.
+    /// built-in is excluded from the launch choices.
     #[cfg(unix)]
     #[test]
     fn load_agent_options_runs_detection_and_derives_availability() {
@@ -1471,14 +1471,14 @@ mod tests {
             .expect("Antigravity option");
         assert!(agy.available, "detected agent must be available");
         assert_eq!(agy.installed_version.as_deref(), Some("1.2.3"));
-        for option in options.iter().filter(|option| option.id != "agy") {
-            assert!(
-                !option.available,
-                "{} is not on PATH and must not be reported available",
-                option.id
-            );
-            assert_eq!(option.installed_version, None, "{}", option.id);
-        }
+        assert_eq!(
+            options
+                .iter()
+                .map(|option| option.id.as_str())
+                .collect::<Vec<_>>(),
+            ["agy"],
+            "undetected built-ins must be absent from launch choices"
+        );
     }
 
     #[test]

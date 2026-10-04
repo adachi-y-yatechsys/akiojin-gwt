@@ -518,10 +518,10 @@ fn agent_settings_set_summary(
         value,
     };
     let key = agent_settings_provider_key(&profile.agent_id);
-    let agent = agents
+    let detected_agent = agents
         .iter()
-        .find(|agent| agent_settings_provider_key(&agent.id) == key)
-        .map_or_else(|| profile.agent_id.clone(), |agent| agent.name.clone());
+        .find(|agent| agent_settings_provider_key(&agent.id) == key);
+    let agent = detected_agent.map_or_else(|| profile.agent_id.clone(), |agent| agent.name.clone());
     let mut rows = vec![
         row("Agent", agent),
         row(
@@ -539,8 +539,8 @@ fn agent_settings_set_summary(
                 .unwrap_or_else(|| "auto".to_string()),
         ),
     ];
-    if let Some(version) = profile.version.clone() {
-        rows.push(row("Version", version));
+    if let Some(version) = detected_agent.and_then(|agent| agent.installed_version.as_ref()) {
+        rows.push(row("Version", version.clone()));
     }
     rows.push(row(
         "Runtime",
@@ -2651,6 +2651,7 @@ impl AppRuntime {
         project_root: PathBuf,
         previous_profiles: gwt::LaunchWizardPreviousProfiles,
     ) -> LaunchWizardState {
+        let saved_agent_id = previous_profiles.preferred_agent_id().map(str::to_string);
         let base_branch_name = gwt::start_work::START_WORK_BASE_BRANCH_CANDIDATES[0].to_string();
         let mut wizard = LaunchWizardState::open_start_work_with_previous_profiles(
             LaunchWizardContext {
@@ -2676,6 +2677,11 @@ impl AppRuntime {
         wizard.apply(gwt::LaunchWizardAction::UseStartMethod {
             method: gwt::LaunchWizardStartMethodKind::ConfigureAndStart,
         });
+        // D4: an undetected saved agent must not become an implicit pool edit.
+        // Keep its identity so validation requires an explicit replacement.
+        if let Some(saved_agent_id) = saved_agent_id {
+            wizard.agent_id = saved_agent_id;
+        }
         wizard
     }
 
