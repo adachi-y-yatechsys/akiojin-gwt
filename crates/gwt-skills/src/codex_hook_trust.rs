@@ -485,6 +485,7 @@ fn register_codex_managed_hook_trust_with_writer(
                 "Codex config root must be a TOML table",
             )
         })?;
+        collect_missing_codex_managed_hook_state(root_table, expected_gwt_bin)?;
         let hooks_table = ensure_child_table(root_table, "hooks")?;
         let state_table = ensure_child_table(hooks_table, "state")?;
 
@@ -535,6 +536,114 @@ fn register_codex_managed_hook_trust_with_writer(
             true,
         ))
     })
+}
+
+/// Reclaim trust for missing generated hooks without registering any new trust.
+/// Unknown fingerprints and existing files are retained. The missing-file check
+/// and publication share the same config lock as concurrent launch registration.
+pub fn garbage_collect_codex_managed_hook_trust(
+    config_path: &Path,
+    expected_gwt_bin: Option<&str>,
+) -> io::Result<usize> {
+    garbage_collect_codex_managed_hook_trust_with_writer(
+        config_path,
+        expected_gwt_bin,
+        write_text_atomically,
+    )
+}
+
+fn garbage_collect_codex_managed_hook_trust_with_writer(
+    config_path: &Path,
+    expected_gwt_bin: Option<&str>,
+    write_config: impl FnOnce(&Path, &str) -> io::Result<()>,
+) -> io::Result<usize> {
+    match fs::metadata(config_path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+        Ok(_) => {}
+    }
+    with_codex_config_lock(config_path, || {
+        let mut root = read_codex_config(config_path)?;
+        let removed = collect_missing_codex_managed_hook_state(
+            root.as_table_mut().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Codex config root must be a TOML table",
+                )
+            })?,
+            expected_gwt_bin,
+        )?;
+        if removed > 0 {
+            let rendered = toml::to_string_pretty(&root).map_err(io::Error::other)?;
+            write_config(config_path, &rendered)?;
+        }
+        Ok(removed)
+    })
+}
+
+fn collect_missing_codex_managed_hook_state(
+    root: &mut toml::Table,
+    expected_gwt_bin: Option<&str>,
+) -> io::Result<usize> {
+    let Some(hooks) = root.get_mut("hooks") else {
+        return Ok(0);
+    };
+    let hooks = hooks.as_table_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Codex config key `hooks` must be a TOML table",
+        )
+    })?;
+    let Some(state) = hooks.get_mut("state") else {
+        return Ok(0);
+    };
+    let state = state.as_table_mut().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Codex config key `hooks.state` must be a TOML table",
+        )
+    })?;
+    let mut known = std::collections::BTreeSet::new();
+    for (event, name) in MANAGED_EVENTS {
+        let mut commands = expected_generated_gwt_event_commands(event, expected_gwt_bin);
+        commands.extend(codex_event_hook_commands_with_bin(
+            crate::CANONICAL_HOOK_BIN,
+            event,
+        ));
+        if *name == "stop" {
+            commands.extend(codex_self_improvement_stop_hook_commands());
+        }
+        for command in commands {
+            let hook = json!({"command": command});
+            known.insert((
+                *name,
+                command_hook_identity_hash(name, "*", hook.as_object().unwrap())?,
+            ));
+        }
+    }
+    let before = state.len();
+    state.retain(|key, value| {
+        let mut parts = key.rsplitn(4, ':');
+        let (Some(handler), Some(group), Some(event), Some(path)) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return true;
+        };
+        let path = Path::new(path);
+        let Some(hash) = value.get("trusted_hash").and_then(toml::Value::as_str) else {
+            return true;
+        };
+        if handler.parse::<usize>().is_err()
+            || group.parse::<usize>().is_err()
+            || !path.is_absolute()
+            || !path.ends_with(".codex/hooks.json")
+            || !known.contains(&(event, hash.to_string()))
+        {
+            return true;
+        }
+        !matches!(fs::metadata(path), Err(error) if error.kind() == io::ErrorKind::NotFound)
+    });
+    Ok(before - state.len())
 }
 
 fn hook_trust_report(
@@ -1603,6 +1712,142 @@ mod tests {
         fs::remove_dir_all(parent.join("worktree")).unwrap();
         revoke_codex_managed_project_trust(&worktree, &config).unwrap();
         assert!(trust_state(&config).is_empty());
+    }
+
+    #[test]
+    fn garbage_collection_keeps_live_state_and_does_not_rewrite_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = worktree_with_generated_hooks();
+        let config = dir.path().join("config.toml");
+        register_codex_managed_hook_trust(live.path(), &config).unwrap();
+        let contents = format!("# user comment\n{}", fs::read_to_string(&config).unwrap());
+        fs::write(&config, &contents).unwrap();
+
+        assert_eq!(
+            garbage_collect_codex_managed_hook_trust(&config, None).unwrap(),
+            0
+        );
+        assert_eq!(fs::read_to_string(&config).unwrap(), contents);
+        let absent = dir.path().join("absent/config.toml");
+        assert_eq!(
+            garbage_collect_codex_managed_hook_trust(&absent, None).unwrap(),
+            0
+        );
+        assert!(!absent.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn garbage_collection_and_registration_share_the_config_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = worktree_with_generated_hooks();
+        let live = worktree_with_generated_hooks();
+        let launch = worktree_with_generated_hooks();
+        let config = dir.path().join("config.toml");
+        let gone_entries = register_codex_managed_hook_trust(gone.path(), &config)
+            .unwrap()
+            .trusted_entries;
+        let live_entries = register_codex_managed_hook_trust(live.path(), &config)
+            .unwrap()
+            .trusted_entries;
+        gone.close().unwrap();
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let gc_config = config.clone();
+        let gc = thread::spawn(move || {
+            garbage_collect_codex_managed_hook_trust_with_writer(&gc_config, None, |path, text| {
+                locked_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                write_text_atomically(path, text)
+            })
+            .unwrap()
+        });
+        locked_rx.recv().unwrap();
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(codex_config_lock_path(&config))
+            .unwrap();
+        let lock_result = lock.try_lock_exclusive();
+        if lock_result.is_ok() {
+            FileExt::unlock(&lock).unwrap();
+        }
+        let (started_tx, started_rx) = mpsc::channel();
+        let launch_config = config.clone();
+        let registrar = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            register_codex_managed_hook_trust(launch.path(), &launch_config).unwrap()
+        });
+        started_rx.recv().unwrap();
+        release_tx.send(()).unwrap();
+        assert_eq!(gc.join().unwrap(), gone_entries.len());
+        let launched = registrar.join().unwrap();
+        assert!(
+            lock_result.is_err(),
+            "GC must hold config.toml.gwt-lock through publication"
+        );
+        let state = trust_state(&config);
+        assert_eq!(
+            state.len(),
+            live_entries.len() + launched.trusted_entries.len()
+        );
+        for entry in live_entries.into_iter().chain(launched.trusted_entries) {
+            assert_eq!(
+                state[&entry.key]["trusted_hash"].as_str(),
+                Some(entry.trusted_hash.as_str())
+            );
+        }
+        for entry in gone_entries {
+            assert!(!state.contains_key(&entry.key));
+        }
+    }
+
+    #[test]
+    fn registration_reclaims_missing_managed_hooks_and_preserves_live_and_unknown_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = worktree_with_generated_hooks();
+        let live = worktree_with_generated_hooks();
+        let config = dir.path().join("config.toml");
+        let removed = register_codex_managed_hook_trust(gone.path(), &config).unwrap();
+        let unknown_key = format!(
+            "{}:stop:0:0",
+            dir.path().join("unmanaged/.codex/hooks.json").display()
+        );
+        let mut root = read_codex_config(&config).unwrap();
+        root["hooks"]["state"].as_table_mut().unwrap().insert(
+            unknown_key.clone(),
+            toml::Value::Table(toml::Table::from_iter([
+                ("enabled".into(), toml::Value::Boolean(false)),
+                (
+                    "trusted_hash".into(),
+                    toml::Value::String("sha256:user-owned".into()),
+                ),
+            ])),
+        );
+        fs::write(&config, toml::to_string(&root).unwrap()).unwrap();
+        gone.close().unwrap();
+
+        let retained = register_codex_managed_hook_trust(live.path(), &config).unwrap();
+
+        let state = trust_state(&config);
+        assert_eq!(state.len(), retained.trusted_entries.len() + 1);
+        for entry in removed.trusted_entries {
+            assert!(
+                !state.contains_key(&entry.key),
+                "stale entry: {}",
+                entry.key
+            );
+        }
+        for entry in retained.trusted_entries {
+            assert_eq!(
+                state[&entry.key]["trusted_hash"].as_str(),
+                Some(entry.trusted_hash.as_str())
+            );
+        }
+        assert_eq!(
+            state[&unknown_key]["trusted_hash"].as_str(),
+            Some("sha256:user-owned")
+        );
+        assert_eq!(state[&unknown_key]["enabled"].as_bool(), Some(false));
     }
 
     #[test]
