@@ -13,19 +13,20 @@
 //! `super::pr::name` / `crate::cli::pr::name` exactly as before.
 
 mod gh;
+pub(crate) mod head_check;
 pub(crate) mod types;
 
 #[allow(unused_imports)]
 pub(super) use gh::{
     comment_on_pr_via_gh, convert_pr_to_draft_via_gh, create_pr_via_gh, edit_or_create_repo_guard,
     edit_pr_via_gh, extract_pr_url, fetch_current_pr_via_gh, fetch_pr_checks_via_gh,
-    fetch_pr_quarantine_context_via_gh, fetch_pr_review_thread_state_via_gh,
-    fetch_pr_review_threads_via_gh, fetch_pr_reviews_via_gh, mark_pr_ready_via_gh,
-    parse_available_fields, parse_pr_checks_items_json, parse_pr_checks_items_response,
-    parse_pr_number_from_url, probe_github_rate_limit_via_gh,
-    reply_and_resolve_pr_review_threads_via_gh, review_thread_has_comment_body,
-    should_reply_to_review_thread, should_resolve_review_thread, update_branch_failure_is_conflict,
-    update_pr_branch_via_gh,
+    fetch_pr_head_sha_via_gh, fetch_pr_quarantine_context_via_gh,
+    fetch_pr_review_thread_state_via_gh, fetch_pr_review_threads_via_gh, fetch_pr_reviews_via_gh,
+    mark_pr_ready_via_gh, parse_available_fields, parse_github_remote_url as parse_pr_remote_url,
+    parse_pr_checks_items_json, parse_pr_checks_items_response, parse_pr_number_from_url,
+    probe_github_rate_limit_via_gh, reply_and_resolve_pr_review_threads_via_gh,
+    resolve_pr_fork_url_via_gh, review_thread_has_comment_body, should_reply_to_review_thread,
+    should_resolve_review_thread, update_branch_failure_is_conflict, update_pr_branch_via_gh,
 };
 
 use gwt_git::PrStatus;
@@ -569,6 +570,19 @@ pub(super) fn run<E: CliEnv>(
                             completion: None,
                         });
                     }
+                    Ok(Some(verification)) if verification_guard.is_none() => {
+                        // Manual and unmanaged Ready handoffs must bind the
+                        // compared SHA to the same fresh record at dispatch.
+                        verification_guard = Some(VerificationMutationGuard {
+                            session_id: session_id.unwrap_or_default().to_string(),
+                            owner_number: verification.owner_number,
+                            record_id: verification.record_id.clone(),
+                            run_hash: verification.content_hash.clone(),
+                            plan_hash: verification.verification_plan_hash.clone(),
+                            allow_ready_adjudication: target_pr.is_some(),
+                            completion: None,
+                        });
+                    }
                     Ok(_) => {}
                     Err(error) => {
                         out.push_str(&format!(
@@ -678,7 +692,45 @@ pub(super) fn run<E: CliEnv>(
                     )
                 }),
                 || {
-                    let pr = env.create_pr(&base, head.as_deref(), &title, body, &labels, draft)?;
+                    let mut checked_body = body.to_string();
+                    let mut checked_head = head.clone();
+                    if !draft {
+                        let worktree = mutation_worktree.as_deref().expect("mutation worktree");
+                        let record = crate::cli::verification_record::load(worktree)?;
+                        if let Some(mut check) = env.compare_pr_head(
+                            &base,
+                            head.as_deref(),
+                            record
+                                .as_ref()
+                                .and_then(|record| record.verified_head.as_deref()),
+                        )? {
+                            check.record_id = record.map(|record| record.record_id);
+                            let report = check.report()?;
+                            crate::cli::trusted_store::write(
+                                worktree,
+                                &format!("pr-head-check-{}.json", uuid::Uuid::new_v4()),
+                                report.as_bytes(),
+                            )?;
+                            out.push_str(&format!("PR head comparison: {report}\n"));
+                            if !check.allowed() {
+                                out.push_str(&check.refusal());
+                                out.push('\n');
+                                return Ok(None);
+                            }
+                            if checked_head.is_none() {
+                                checked_head = Some(check.head_branch.clone());
+                            }
+                            checked_body.push_str(&check.body_note()?);
+                        }
+                    }
+                    let pr = env.create_pr(
+                        &base,
+                        checked_head.as_deref(),
+                        &title,
+                        &checked_body,
+                        &labels,
+                        draft,
+                    )?;
                     record_mutated_workspace_pr_metadata(
                         env,
                         &pr,
@@ -686,10 +738,13 @@ pub(super) fn run<E: CliEnv>(
                         head.as_deref(),
                         false,
                     )?;
-                    Ok(pr)
+                    Ok(Some(pr))
                 },
             )
             .map_err(super::io_as_api_error)?;
+            let Some(pr) = pr else {
+                return Ok(2);
+            };
             out.push_str("created pull request\n");
             render_pr(out, &pr);
             0
@@ -737,6 +792,48 @@ pub(super) fn run<E: CliEnv>(
         PrCommand::View { number } => {
             let pr = env.fetch_pr(number).map_err(super::io_as_api_error)?;
             render_pr(out, &pr);
+            let retained = env
+                .fetch_pr_quarantine_context(number)
+                .ok()
+                .and_then(|context| head_check::from_body(&context.body));
+            let verified = retained
+                .as_ref()
+                .map(|check| check.verified_head.clone())
+                .or_else(|| {
+                    if current_branch_name(env.repo_path()).as_deref()
+                        != Some(pr.head_ref_name.as_str())
+                    {
+                        return None;
+                    }
+                    crate::cli::verification_record::load(env.repo_path())
+                        .ok()
+                        .flatten()
+                        .filter(|record| {
+                            record.all_passed
+                                && crate::cli::verification_record::integrity_ok(record)
+                        })
+                        .filter(|_| {
+                            env.fetch_current_pr()
+                                .ok()
+                                .flatten()
+                                .is_some_and(|current| current.number == number)
+                        })
+                        .and_then(|record| record.verified_head)
+                });
+            if let Some(verified) = verified {
+                match env.fetch_pr_head_sha(number) {
+                    Ok(Some(remote)) => {
+                        let state = if remote == verified { "matched" } else { "drift" };
+                        out.push_str(&format!("PR head comparison: verified_head={verified} remote_head={remote} classification={state}\n"));
+                        if state == "drift" {
+                            out.push_str("PR head drift detected. Record this comparison with pr.comment or issue.comment; fast-forward locally and rerun verify.plan / verify.run before claiming the current PR snapshot is verified.\n");
+                        }
+                    }
+                    result => out.push_str(&format!("PR head comparison: verified_head={verified} remote_head=unknown ({result:?})\n")),
+                }
+            } else {
+                out.push_str("PR head comparison: unknown (no retained verified HEAD or local verification record).\n");
+            }
             0
         }
         PrCommand::Ready { number } => {
@@ -854,6 +951,12 @@ pub(super) fn run<E: CliEnv>(
             0
         }
     };
+    // Issue #4850: a skipped best-effort step is said on the text surface too,
+    // so the argv path and the daemon log read the same warning the JSON
+    // envelope carries in `warnings[]`.
+    for warning in crate::cli::operation_warnings::snapshot() {
+        out.push_str(&format!("warning: {}\n", warning.message));
+    }
     if cmd_settles_pr_obligation && code == 0 {
         // P11: successful PR mutations settle open PR obligations.
         if let Some(session_id) = std::env::var(gwt_agent::GWT_SESSION_ID_ENV)
@@ -900,6 +1003,31 @@ fn record_explicit_pr_metadata<E: CliEnv>(
 // Called inside dispatch_pr_mutation's existing owner/Session lease. A valid
 // execution binding remains authoritative when the shared current projection
 // no longer carries the Session, including delivery after Work finalization.
+/// Issue #4850 AC-1: how long the post-mutation Work metadata recording may
+/// wait for the workspace Work items / verification locks. The GitHub
+/// mutation is already committed when this runs, so an unbounded wait hangs
+/// `pr.edit` with the PR updated remotely and nothing to show for it locally
+/// (five-minute stalls on a contended host). Past the bound the recording is
+/// skipped with a warning that names the observed holder, never a hang.
+const PR_METADATA_RECORD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The warning code the envelope carries when the recording was skipped.
+pub(crate) const WORK_PR_METADATA_RECORDING_SKIPPED: &str = "work_pr_metadata_recording_skipped";
+
+#[cfg(test)]
+thread_local! {
+    static PR_METADATA_RECORD_DEADLINE_OVERRIDE: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn pr_metadata_record_deadline() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(override_) = PR_METADATA_RECORD_DEADLINE_OVERRIDE.with(std::cell::Cell::get) {
+        return override_;
+    }
+    PR_METADATA_RECORD_DEADLINE
+}
+
 fn record_mutated_workspace_pr_metadata<E: CliEnv>(
     env: &E,
     pr: &PrStatus,
@@ -907,6 +1035,12 @@ fn record_mutated_workspace_pr_metadata<E: CliEnv>(
     requested_head: Option<&str>,
     require_existing_pr: bool,
 ) -> std::io::Result<()> {
+    // Issue #4850 AC-1: bound every local lock this step takes. Nested
+    // deadlines keep the earliest, so an ambient (shorter) deadline still
+    // wins; without one this used to wait forever on `works.lock`.
+    let _deadline = gwt_core::operation_deadline::ScopedOperationDeadline::enter(
+        gwt_core::operation_deadline::now() + pr_metadata_record_deadline(),
+    );
     let result = (|| {
         let worktree = gwt_core::paths::resolve_current_worktree_root(env.repo_path());
         // Every successful mutation certifies the exact event returned by its
@@ -947,12 +1081,28 @@ fn record_mutated_workspace_pr_metadata<E: CliEnv>(
         }
         Ok(())
     })();
-    result.map_err(|error| {
-        std::io::Error::other(format!(
+    match result {
+        Ok(()) => Ok(()),
+        // Issue #4850 AC-1/AC-2: out of budget is not a broken binding. The
+        // remote mutation stands; say what was skipped, and who held the
+        // lock (the named lock's observed holder rides in `error`).
+        Err(error) if gwt_core::operation_deadline::is_deadline_expired(&error) => {
+            crate::cli::operation_warnings::push(
+                WORK_PR_METADATA_RECORDING_SKIPPED,
+                format!(
+                    "PR #{} ({}) was updated on GitHub, but local Work PR metadata recording was skipped: it did not obtain the workspace lock within {}s ({error}). Retry pr.ready for this existing PR once the lock holder finishes; do not create another PR.",
+                    pr.number,
+                    pr.url,
+                    pr_metadata_record_deadline().as_secs(),
+                ),
+            );
+            Ok(())
+        }
+        Err(error) => Err(std::io::Error::other(format!(
             "PR #{} ({}) was updated on GitHub, but Work PR metadata was not recorded: {error}. Repair the Work binding and retry pr.ready for this existing PR; do not create another PR.",
             pr.number, pr.url
-        ))
-    })
+        ))),
+    }
 }
 
 fn sync_workspace_pr_metadata<E: CliEnv>(
@@ -1407,6 +1557,12 @@ pub(super) fn render_pr_inventory(out: &mut String, read: &gwt_git::PrInventoryR
             if let Some(blocker) = &item.ready_to_promote_blocker {
                 row["ready_to_promote_blocker"] = serde_json::json!(blocker);
             }
+            // Issue #4872 AC-4: what the merge queue is doing with a row that
+            // is, or may be held as, `BEHIND`. Probed for those rows only, so
+            // the key is absent — unknown, not "no queue" — everywhere else.
+            if let Some(queue) = &item.merge_queue {
+                row["merge_queue"] = serde_json::json!(queue);
+            }
             row
         })
         .collect();
@@ -1564,12 +1720,22 @@ mod tests {
         );
     }
 
+    fn seed_remote_pr_base(repo: &std::path::Path) {
+        assert!(gwt_core::process::hidden_command("git")
+            .args(["push", "origin", "HEAD:refs/heads/develop"])
+            .current_dir(repo)
+            .status()
+            .unwrap()
+            .success());
+    }
+
     fn seeded_inventory_item() -> gwt_git::PrInventoryItem {
         gwt_git::PrInventoryItem {
             base_ref_name: "develop".to_string(),
             created_at: None,
             age_hours: None,
             auto_merge_enabled: false,
+            merge_queue: None,
             check_counts: None,
             conflict: None,
             unresolved_review_threads: None,
@@ -1621,6 +1787,169 @@ mod tests {
             merge_state_status: "CLEAN".to_string(),
             review_status: "APPROVED".to_string(),
         }
+    }
+
+    #[test]
+    fn issue_4979_create_checks_remote_only_commits_before_dispatch() {
+        let _env_lock = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = tempfile::tempdir().unwrap();
+        let _home = ScopedEnvVar::set("HOME", temp.path());
+        let _profile = ScopedEnvVar::set("USERPROFILE", temp.path());
+        let repo = temp.path().join("repo");
+        let remote = temp.path().join("remote.git");
+        let other = temp.path().join("other");
+        std::fs::create_dir(&repo).unwrap();
+        crate::cli::trusted_store::init_git_repo_with_origin(&repo);
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let output = gwt_core::process::hidden_command("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(temp.path(), &["init", "--bare", remote.to_str().unwrap()]);
+        git(
+            &repo,
+            &["remote", "set-url", "origin", remote.to_str().unwrap()],
+        );
+        let branch = git(&repo, &["branch", "--show-current"]);
+        git(
+            &repo,
+            &["push", "-u", "origin", &branch, "HEAD:refs/heads/develop"],
+        );
+        let identity = initialize_pr_generation_authority(&repo, "remote-head-session");
+        persist_pr_generation_session(&repo, "remote-head-session", identity.clone());
+        seed_pr_generation_work(&repo, "remote-head-session");
+        let _session = ScopedEnvVar::set(gwt_agent::GWT_SESSION_ID_ENV, "remote-head-session");
+        crate::cli::verification_record::save_plan(
+            &repo,
+            &crate::cli::verification_record::VerificationPlanRecord {
+                session_id: "remote-head-session".to_string(),
+                owner_number: Some(42),
+                execution_binding: Some(identity),
+                commands: vec!["git --version".to_string()],
+                derived: false,
+                surfaces: Vec::new(),
+                generated_outputs: Vec::new(),
+                quarantines: Vec::new(),
+                worktree_fingerprint: String::new(),
+                created_at: chrono::Utc::now(),
+                content_hash: String::new(),
+            },
+        )
+        .unwrap();
+        let (record, _) = crate::cli::verification_record::run_verification(
+            &repo,
+            "remote-head-session",
+            &["git --version".to_string()],
+        )
+        .unwrap();
+        git(
+            temp.path(),
+            &[
+                "clone",
+                "--branch",
+                &branch,
+                remote.to_str().unwrap(),
+                other.to_str().unwrap(),
+            ],
+        );
+        git(&other, &["config", "user.email", "other@example.com"]);
+        git(&other, &["config", "user.name", "other"]);
+        std::fs::create_dir(other.join(".gwt")).unwrap();
+        std::fs::write(other.join(".gwt/note"), "bookkeeping").unwrap();
+        git(&other, &["add", ".gwt/note"]);
+        git(&other, &["commit", "-m", "chore(work): add bookkeeping"]);
+        git(&other, &["push", "origin", &branch]);
+        let mut env = crate::cli::TestEnv::new(repo.clone());
+        env.seed_created_pr(seeded_pr());
+        let command = PrCommand::CreateBody {
+            base: s("develop"),
+            head: None,
+            title: s("fix: remote head"),
+            body: s("User Verification Result: confirmed\n"),
+            labels: vec![],
+            draft: false,
+        };
+        let mut out = String::new();
+        assert_eq!(
+            run(&mut env, command.clone(), &mut out).unwrap(),
+            0,
+            "bookkeeping must pass: {out}"
+        );
+        assert_eq!(env.pr_create_call_log.len(), 1);
+        std::fs::write(other.join("product.rs"), "pub fn changed() {}\n").unwrap();
+        git(&other, &["add", "product.rs"]);
+        git(&other, &["commit", "-m", "fix: unverified product"]);
+        git(&other, &["push", "origin", &branch]);
+        let product = git(&other, &["rev-parse", "HEAD"]);
+        let retained_body = env.pr_create_call_log[0].body.clone();
+        let retained = head_check::from_body(&retained_body).expect("creation retains comparison");
+        assert_eq!(
+            retained.verified_head,
+            record.verified_head.clone().unwrap()
+        );
+        assert_eq!(retained.classification, "bookkeeping_or_base_sync");
+        let audit_dir = crate::cli::trusted_store::trusted_dir_for_worktree(&repo).unwrap();
+        assert!(std::fs::read_dir(audit_dir).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("pr-head-check-")));
+        let mut pr = seeded_pr();
+        pr.head_ref_name = branch.clone();
+        env.seed_pr(7, pr);
+        env.pr_quarantine_contexts.insert(
+            7,
+            PrQuarantineContext {
+                number: 7,
+                body: retained_body,
+                comments: Vec::new(),
+            },
+        );
+        out.clear();
+        assert_eq!(
+            run(&mut env, PrCommand::View { number: 7 }, &mut out).unwrap(),
+            0
+        );
+        assert!(
+            out.contains("classification=drift")
+                && out.contains(&product)
+                && out.contains(&retained.verified_head)
+                && out.contains("issue.comment"),
+            "{out}"
+        );
+        out.clear();
+        assert_eq!(
+            run(&mut env, command, &mut out).unwrap(),
+            2,
+            "unverified remote product must refuse: {out}"
+        );
+        assert_eq!(
+            env.pr_create_call_log.len(),
+            1,
+            "refusal must precede GitHub mutation"
+        );
+        assert!(
+            out.contains(&product) && out.contains("product.rs"),
+            "{out}"
+        );
+        assert!(
+            out.contains(record.verified_head.as_deref().unwrap()),
+            "{out}"
+        );
+        assert!(
+            out.contains("--ff-only") && out.contains("verify.run"),
+            "{out}"
+        );
     }
 
     fn persist_pr_generation_session(
@@ -1854,6 +2183,130 @@ mod tests {
             worktree.path(),
             Some("session-current"),
         );
+    }
+
+    /// Issue #4850 AC-1/AC-2/AC-3: with `works.lock` held by someone else,
+    /// `pr.edit` still returns `ok` for the committed GitHub update within the
+    /// bound, carries a warning that names the holder and the skipped
+    /// recording, and records nothing; with the lock free it records the PR
+    /// metadata exactly as before.
+    #[test]
+    fn issue_4850_pr_edit_returns_with_a_warning_when_the_work_items_lock_is_held() {
+        let _env_lock = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = tempfile::tempdir().expect("isolated gwt home");
+        let _home = gwt_core::test_support::ScopedEnvVar::set("HOME", home.path());
+        let _userprofile = gwt_core::test_support::ScopedEnvVar::set("USERPROFILE", home.path());
+        let worktree = tempfile::tempdir().expect("PR authority repository");
+        crate::cli::trusted_store::init_git_repo_with_origin(worktree.path());
+        let identity = initialize_pr_generation_authority(worktree.path(), "session-current");
+        persist_pr_generation_session(worktree.path(), "session-current", identity);
+        seed_pr_generation_work(worktree.path(), "session-current");
+        let _session = gwt_core::test_support::ScopedEnvVar::set(
+            gwt_agent::GWT_SESSION_ID_ENV,
+            "session-current",
+        );
+        let mut env = crate::cli::TestEnv::new(worktree.path().to_path_buf());
+        env.seed_pr(7, seeded_pr());
+        seed_readable_pr_body(&mut env);
+        env.seed_created_pr(seeded_pr());
+        // The edited PR is the current branch's PR, so the Work link holds.
+        env.seed_current_pr(Some(seeded_pr()));
+        crate::cli::operation_warnings::take();
+        let works_path =
+            gwt_core::paths::gwt_workspace_work_items_path_for_repo_path(worktree.path());
+        let recorded_pr_number = |works_path: &std::path::Path| {
+            gwt_core::workspace_projection::load_workspace_work_items_from_path(works_path)
+                .expect("read works")
+                .expect("works seeded")
+                .work_items
+                .iter()
+                .flat_map(|item| item.execution_containers.iter())
+                .find_map(|container| container.pr_number)
+        };
+        assert_eq!(recorded_pr_number(&works_path), None);
+
+        // Another process is holding the Work items lock (a Monitor scan, a
+        // PM refresh). The deadline is shortened so the test does not wait
+        // the production ten seconds.
+        PR_METADATA_RECORD_DEADLINE_OVERRIDE
+            .with(|cell| cell.set(Some(std::time::Duration::from_millis(300))));
+        let holder = gwt_core::operation_deadline::NamedFileLock::acquire(
+            &works_path.with_extension("lock"),
+            "pm.refresh",
+        )
+        .expect("hold the Work items lock");
+        let started = std::time::Instant::now();
+        let mut out = String::new();
+        let code = run(
+            &mut env,
+            PrCommand::EditBody {
+                number: 7,
+                title: Some(s("updated")),
+                body: None,
+                add_labels: vec![s("auto-merge")],
+            },
+            &mut out,
+        )
+        .expect("edit returns instead of hanging");
+        let elapsed = started.elapsed();
+        PR_METADATA_RECORD_DEADLINE_OVERRIDE.with(|cell| cell.set(None));
+        assert_eq!(code, 0, "the remote mutation succeeded: {out}");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "returned within the bound, took {elapsed:?}"
+        );
+        assert_eq!(env.pr_edit_call_log.len(), 1, "GitHub was updated first");
+        let warnings = crate::cli::operation_warnings::take();
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert_eq!(warnings[0].code, WORK_PR_METADATA_RECORDING_SKIPPED);
+        let message = &warnings[0].message;
+        assert!(message.contains("PR #7"), "{message}");
+        assert!(message.contains("recording was skipped"), "{message}");
+        assert!(
+            message.contains(&format!("pid={}", std::process::id())),
+            "AC-2: the holder pid is named: {message}"
+        );
+        assert!(
+            message.contains("operation=pm.refresh"),
+            "AC-2: the holder operation: {message}"
+        );
+        assert!(
+            message.contains("acquired_at="),
+            "AC-2: since when: {message}"
+        );
+        assert!(message.contains("deadline expired"), "{message}");
+        assert!(out.contains("updated pull request"), "{out}");
+        assert!(
+            out.contains("warning:") && out.contains("recording was skipped"),
+            "the text surface says it too: {out}"
+        );
+        assert_eq!(
+            recorded_pr_number(&works_path),
+            None,
+            "nothing was recorded while the lock was held"
+        );
+        holder.unlock().expect("release the Work items lock");
+
+        // Lock free: the same edit records the PR on the Work as today.
+        env.pr_edit_call_log.clear();
+        let mut out = String::new();
+        let code = run(
+            &mut env,
+            PrCommand::EditBody {
+                number: 7,
+                title: Some(s("updated again")),
+                body: None,
+                add_labels: vec![],
+            },
+            &mut out,
+        )
+        .expect("edit with the lock free");
+        assert_eq!(code, 0, "{out}");
+        assert!(crate::cli::operation_warnings::take().is_empty());
+        assert!(!out.contains("warning:"), "{out}");
+        assert_eq!(recorded_pr_number(&works_path), Some(7));
     }
 
     #[test]
@@ -2192,6 +2645,78 @@ mod tests {
     }
 
     #[test]
+    fn manual_active_create_rejects_verification_replacement_before_dispatch() {
+        let _lock = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = tempfile::tempdir().unwrap();
+        let _home = ScopedEnvVar::set("HOME", home.path());
+        let _profile = ScopedEnvVar::set("USERPROFILE", home.path());
+        let worktree = tempfile::tempdir().unwrap();
+        crate::cli::trusted_store::init_git_repo_with_origin(worktree.path());
+        let session_id = "manual-active-head-4979";
+        let identity = initialize_pr_generation_authority(worktree.path(), session_id);
+        persist_pr_generation_session(worktree.path(), session_id, identity.clone());
+        seed_pr_generation_work(worktree.path(), session_id);
+        let _session = ScopedEnvVar::set(gwt_agent::GWT_SESSION_ID_ENV, session_id);
+        crate::cli::verification_record::save_plan(
+            worktree.path(),
+            &crate::cli::verification_record::VerificationPlanRecord {
+                session_id: session_id.to_string(),
+                owner_number: Some(42),
+                execution_binding: Some(identity),
+                commands: vec!["git --version".to_string()],
+                derived: false,
+                worktree_fingerprint: String::new(),
+                surfaces: Vec::new(),
+                generated_outputs: Vec::new(),
+                quarantines: Vec::new(),
+                created_at: chrono::Utc::now(),
+                content_hash: String::new(),
+            },
+        )
+        .unwrap();
+        let (original, _) = crate::cli::verification_record::run_verification(
+            worktree.path(),
+            session_id,
+            &["git --version".to_string()],
+        )
+        .unwrap();
+        let repo = worktree.path().to_path_buf();
+        let mut replacement = original;
+        replacement.record_id = "manual-active-replacement".to_string();
+        replacement.all_passed = false;
+        crate::cli::trusted_store::set_write_lease_acquired_hook(move || {
+            crate::cli::verification_record::save(&repo, &replacement).unwrap();
+        });
+        let mut env = crate::cli::TestEnv::new(worktree.path().to_path_buf());
+        env.seed_created_pr(seeded_pr());
+        let error = run(
+            &mut env,
+            PrCommand::CreateBody {
+                base: s("develop"),
+                head: None,
+                title: s("fix: manual active head"),
+                body: s("User Verification Result: confirmed\n"),
+                labels: Vec::new(),
+                draft: false,
+            },
+            &mut String::new(),
+        )
+        .expect_err("manual Ready create must reject a replaced verification snapshot");
+        assert!(
+            error
+                .to_string()
+                .contains("changed before external dispatch"),
+            "{error}"
+        );
+        assert!(
+            env.pr_create_call_log.is_empty(),
+            "replacement must not reach GitHub"
+        );
+    }
+
+    #[test]
     fn ready_dispatch_rejects_verification_record_substitution() {
         let _env_lock = crate::env_test_lock()
             .lock()
@@ -2294,6 +2819,7 @@ mod tests {
         let _home = ScopedEnvVar::set("HOME", home.path());
         let _userprofile = ScopedEnvVar::set("USERPROFILE", home.path());
         let fixture = crate::cli::verification_record::tests::WorkEventGitFixture::tracked();
+        seed_remote_pr_base(&fixture.repo);
         let session_id = "session-pr-shard-delivery";
         let identity = initialize_pr_generation_authority(&fixture.repo, session_id);
         persist_pr_generation_session(&fixture.repo, session_id, identity);
@@ -2575,6 +3101,7 @@ mod tests {
         let _home = gwt_core::test_support::ScopedEnvVar::set("HOME", home.path());
         let _userprofile = gwt_core::test_support::ScopedEnvVar::set("USERPROFILE", home.path());
         let fixture = crate::cli::verification_record::tests::WorkEventGitFixture::tracked();
+        seed_remote_pr_base(&fixture.repo);
         let session_id = "session-completed-settled-handoff";
         let active_identity = initialize_pr_generation_authority(&fixture.repo, session_id);
         persist_pr_generation_session(&fixture.repo, session_id, active_identity.clone());
@@ -2731,6 +3258,7 @@ mod tests {
         let _home = gwt_core::test_support::ScopedEnvVar::set("HOME", home.path());
         let _userprofile = gwt_core::test_support::ScopedEnvVar::set("USERPROFILE", home.path());
         let fixture = crate::cli::verification_record::tests::WorkEventGitFixture::tracked();
+        seed_remote_pr_base(&fixture.repo);
         let session_id = "session-receipt-independent-pr";
         let identity = initialize_pr_generation_authority(&fixture.repo, session_id);
         persist_pr_generation_session(&fixture.repo, session_id, identity);
@@ -3493,6 +4021,7 @@ mod tests {
         assert!(out.contains("\"count\": 1"), "{out}");
         assert!(!out.contains("CLI family split body"), "{out}");
         assert!(!out.contains("deferred_user_verification"), "{out}");
+        assert!(!out.contains("merge_queue"), "{out}");
         // Issue #3891 AC-1 / AC-4: where the rows came from and what the read
         // cost are part of every answer, so a throttled or cached read is
         // observable by the PM.
@@ -3526,6 +4055,36 @@ mod tests {
         assert_eq!(
             env.pr_list_options,
             Some(gwt_git::PrInventoryOptions::default())
+        );
+    }
+
+    /// Issue #4872 AC-4: a probed row carries the merge queue's view, so the
+    /// PM can tell a `BEHIND` the queue resolves from one that needs a redo.
+    #[test]
+    fn pr_list_renders_the_merge_queue_state_of_a_probed_row() {
+        let mut item = seeded_inventory_item();
+        item.merge_queue = Some(gwt_git::PrMergeQueueState {
+            enabled: true,
+            position: Some(2),
+            state: Some("AWAITING_CHECKS".to_string()),
+        });
+        let read = gwt_git::PrInventoryRead {
+            items: vec![item],
+            source: "github",
+            fetched_at: None,
+            cache_age_secs: Some(0),
+            throttled: None,
+            github_calls: 2,
+            hydrated: 0,
+            skipped_unchanged: 0,
+            unlanded_branches: Vec::new(),
+        };
+        let mut out = String::new();
+        render_pr_inventory(&mut out, &read);
+        let payload: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            payload["pull_requests"][0]["merge_queue"],
+            serde_json::json!({"enabled": true, "position": 2, "state": "AWAITING_CHECKS"})
         );
     }
 

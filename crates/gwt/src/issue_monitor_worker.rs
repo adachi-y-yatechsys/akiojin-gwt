@@ -8,6 +8,7 @@ use crate::{
     IssueMonitorIssueState, IssueMonitorReadiness, IssueMonitorScanSummary, IssueMonitorState,
     IssueReadinessFailure, MonitorInboxState,
 };
+use gwt_github::client::{IssueClient, LabelAssignment};
 use gwt_github::{Cache, CacheEntry, IssueNumber, IssueState, SectionName};
 
 pub(crate) const ISSUE_MONITOR_TARGETED_REFRESH_LIMIT: usize = 20;
@@ -21,6 +22,7 @@ pub struct IssueMonitorDaemonPayload {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoadedIssueMonitorCandidates {
     pub issues: Vec<IssueMonitorIssue>,
+    pub urgent_assignments: BTreeMap<u64, LabelAssignment>,
     pub source: IssueMonitorCandidateSource,
     /// The live-list failure that forced a cache fallback. Kept alongside the
     /// read model so failures never render as healthy.
@@ -313,13 +315,19 @@ where
 /// Issue #4131: `Blocked` is reported as `Interrupted` when the Host's Active
 /// reaper wrote it, because that status means the holder died rather than
 /// decided.
-pub fn read_execution_settlements(
+pub fn read_execution_observations(
     project_root: &Path,
     issue_numbers: &[u64],
-) -> BTreeMap<u64, IssueMonitorExecutionSettlement> {
+) -> BTreeMap<u64, crate::issue_monitor::IssueMonitorExecutionObservation> {
     use crate::cli::execution_state::{
         diagnose_owner, ExecutionControlStatus, ExecutionOwnerKey, ExecutionOwnerKind,
     };
+    let sessions_dir = gwt_core::paths::gwt_sessions_dir();
+    let inventory = crate::session_inventory::observe_sessions(project_root, &sessions_dir);
+    let worktrees = gwt_git::worktree::WorktreeManager::new(project_root)
+        .list()
+        .unwrap_or_default();
+    let normalized = |path: &Path| dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     issue_numbers
         .iter()
         .map(|issue_number| {
@@ -330,28 +338,66 @@ pub fn read_execution_settlements(
                     number: *issue_number,
                 },
             );
+            // The holder is not necessarily the only agent in this worktree:
+            // an unbound/manual Session can already have a live exact PTY.
+            let worktree = diagnosis
+                .holder_worktree
+                .as_deref()
+                .map(Path::new)
+                .or_else(|| {
+                    worktrees
+                        .iter()
+                        .find(|worktree| {
+                            worktree.branch.as_deref()
+                                == Some(&format!("work/issue-{issue_number}"))
+                        })
+                        .map(|worktree| worktree.path.as_path())
+                });
+            let belongs_here = |path: &Path, owner: Option<u64>| {
+                worktree.map_or(owner == Some(*issue_number), |target| {
+                    normalized(target) == normalized(path)
+                })
+            };
+            let process_held = inventory
+                .sessions
+                .iter()
+                .any(|session| belongs_here(&session.worktree_path, session.issue_number))
+                || inventory.uncertainties.iter().any(|uncertainty| {
+                    uncertainty
+                        .session_id
+                        .as_deref()
+                        .and_then(|id| {
+                            gwt_agent::Session::load(&sessions_dir.join(format!("{id}.toml"))).ok()
+                        })
+                        .is_none_or(|session| {
+                            belongs_here(&session.worktree_path, session.linked_issue_number)
+                        })
+                });
+            let process_held = process_held
+                || diagnosis.holder_runtime.as_deref() == Some("live")
+                || (diagnosis.ecr_status == Some(ExecutionControlStatus::Active)
+                    && !diagnosis.reclaimable);
             let settlement = match diagnosis.ecr_status {
                 Some(ExecutionControlStatus::Active) if diagnosis.reclaimable => {
                     IssueMonitorExecutionSettlement::Active
                 }
-                // A missing pane is not exit proof: a headless or detached
-                // exact process can still own this generation.
                 Some(ExecutionControlStatus::Active) => IssueMonitorExecutionSettlement::Unknown,
                 Some(ExecutionControlStatus::Completed) => {
                     IssueMonitorExecutionSettlement::Completed
                 }
-                // Issue #4131: the generation reaper runs earlier in this same
-                // scan, so a holder that an auto-update restart killed reaches
-                // this read already `Blocked` — written for it, not by it.
-                // Reporting that as a settlement made the idle release treat
-                // interrupted work as finished and park the Issue.
                 Some(ExecutionControlStatus::Blocked) if diagnosis.ecr_settled_by_host_reaper => {
                     IssueMonitorExecutionSettlement::Interrupted
                 }
                 Some(ExecutionControlStatus::Blocked) => IssueMonitorExecutionSettlement::Blocked,
                 None => IssueMonitorExecutionSettlement::Unknown,
             };
-            (*issue_number, settlement)
+            (
+                *issue_number,
+                crate::issue_monitor::IssueMonitorExecutionObservation {
+                    settlement,
+                    process_held,
+                },
+            )
         })
         .collect()
 }
@@ -364,7 +410,7 @@ pub fn reconcile_issue_monitor_idle_windows(
     now: &str,
 ) -> crate::IssueMonitorIdleReconciliation {
     let settlements =
-        read_execution_settlements(project_root, &monitor.execution_settlement_issue_numbers());
+        read_execution_observations(project_root, &monitor.execution_settlement_issue_numbers());
     let outcome = monitor.reconcile_idle_windows(&settlements, now);
     if !outcome.released.is_empty() || !outcome.rebound.is_empty() {
         tracing::info!(
@@ -708,6 +754,53 @@ where
     (candidates, errors)
 }
 
+/// Reuse revision-bound provenance and enrich newly observed urgent labels.
+fn load_urgent_assignments_with<E: fmt::Display>(
+    issues: &[IssueMonitorIssue],
+    prefs: &crate::IssueMonitorPrefs,
+    mut fetch: impl FnMut(u64) -> Result<Option<LabelAssignment>, E>,
+) -> BTreeMap<u64, LabelAssignment> {
+    let mut assignments = BTreeMap::new();
+    for issue in issues.iter().filter(|issue| {
+        issue.state == IssueMonitorIssueState::Open
+            && issue
+                .labels
+                .iter()
+                .any(|label| label.eq_ignore_ascii_case("urgent"))
+    }) {
+        if let Some(grant) = prefs
+            .urgent_queue
+            .grants
+            .get(&issue.number)
+            .filter(|grant| {
+                grant.label_present
+                    && issue.updated_at.is_some()
+                    && grant.issue_updated_at == issue.updated_at
+                    && grant.assignment_revision == issue.updated_at
+                    && grant.assigned_at.is_some()
+            })
+        {
+            assignments.insert(
+                issue.number,
+                LabelAssignment {
+                    actor: grant.assigned_by.clone(),
+                    created_at: grant.assigned_at.clone().expect("known assignment time"),
+                },
+            );
+            continue;
+        }
+        match fetch(issue.number) {
+            Ok(Some(assignment)) => {
+                assignments.insert(issue.number, assignment);
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(issue = issue.number, %error,
+                "urgent label assignment unavailable; continuing candidate scan"),
+        }
+    }
+    assignments
+}
+
 /// Load live candidates when available, retaining typed provenance for capped
 /// (therefore incomplete) live lists and cache fallbacks.
 pub fn load_open_issue_monitor_candidates_for_repo_path_with_provenance(
@@ -740,6 +833,36 @@ pub fn load_open_issue_monitor_candidates_for_repo_path_with_provenance(
                         number,
                     )
                 });
+            let prefs = crate::load_issue_monitor_prefs(
+                &crate::issue_monitor_prefs_path_for_repo_path(repo_path),
+            )
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "urgent assignment cache unavailable");
+                crate::IssueMonitorPrefs::default()
+            });
+            // Construct/authenticate only when a live urgent revision actually
+            // needs enrichment. Retain a construction error for this scan so a
+            // broken credential probe is not repeated for every urgent row.
+            let mut client = None;
+            let urgent_assignments = load_urgent_assignments_with(&issues, &prefs, |number| {
+                if !readback_fan_out_has_budget() {
+                    return Err("urgent assignment deferred to preserve launch budget".to_string());
+                }
+                run_budgeted_readback_stage(IssueMonitorScanStage::CandidateLoad, || {
+                    let client = client
+                        .get_or_insert_with(|| {
+                            gwt_github::client::http::HttpIssueClient::from_runtime_environment(
+                                owner, repo,
+                            )
+                        })
+                        .as_ref()
+                        .map_err(ToString::to_string)?;
+                    client
+                        .fetch_label_assignment(IssueNumber(number), "urgent")
+                        .map_err(|error| error.to_string())
+                })
+                .map_err(|error| error.to_string())
+            });
             return Ok(LoadedIssueMonitorCandidates {
                 issues,
                 source,
@@ -748,6 +871,7 @@ pub fn load_open_issue_monitor_candidates_for_repo_path_with_provenance(
                 // refresh. The per-Issue reasons ride their own rows instead.
                 live_error: None,
                 readiness_failures,
+                urgent_assignments,
             });
         }
         Err(error) => error.to_string(),
@@ -808,6 +932,7 @@ where
                 source,
                 live_error: None,
                 readiness_failures: Vec::new(),
+                urgent_assignments: BTreeMap::new(),
             })
         }
         Err(live_error) => {
@@ -818,6 +943,7 @@ where
                         source: IssueMonitorCandidateSource::Cache,
                         live_error: Some(live_error),
                         readiness_failures: Vec::new(),
+                        urgent_assignments: BTreeMap::new(),
                     });
                 }
             }
@@ -891,6 +1017,14 @@ pub fn scan_loaded_issue_monitor_candidates_for_project_tab(
             expected_project_tab_id,
             now,
         );
+    for (number, assignment) in &loaded.urgent_assignments {
+        let revision = loaded
+            .issues
+            .iter()
+            .find(|issue| issue.number == *number)
+            .and_then(|issue| issue.updated_at.as_deref());
+        monitor.record_urgent_assignment(*number, revision, assignment);
+    }
     // Issue #3964 AC-1: every scan — daemon or GUI fallback — asks the owner
     // ledger whether a generation-conflict hold still protects anything. The
     // reaper released 29 of the 45 stranded production generations and their
@@ -1550,7 +1684,7 @@ fn autonomous_eligibility_candidates<'a>(
                 .inbox_item(issue.number)
                 .is_some_and(|item| item.state == MonitorInboxState::Queued)
         })
-        .filter(|issue| monitor.retry_ready(issue.number, now))
+        .filter(|issue| monitor.retry_ready_for_saved_profile(issue.number, now))
         .collect()
 }
 
@@ -1762,7 +1896,20 @@ fn advance_one_autonomous_issue(
                 // whose review window is already live, or a full `max_active`,
                 // keeps the record Implementing so the next scan retries; the
                 // reason lands on the record for `issue.monitor.status`.
-                if let Some(hold) = monitor.review_dispatch_hold(issue_number, pr, now) {
+                // Issue #4815 AC-2: a review ladder is keyed by the reviewed
+                // SHA, and a new head resets it, so the head is read before
+                // the hold is asked whenever failures are recorded. Otherwise
+                // the readback stays after admission, as before.
+                let retry_head = if monitor.review_attempts_recorded(issue_number) {
+                    run_budgeted_readback_stage(IssueMonitorScanStage::HeadShaReadback, || {
+                        gwt_git::pr_status::try_fetch_pr_head_sha(repo_path, pr)
+                    })?
+                } else {
+                    None
+                };
+                if let Some(hold) =
+                    monitor.review_dispatch_hold(issue_number, pr, retry_head.as_deref(), now)
+                {
                     tracing::info!(
                         issue = issue_number,
                         pr,
@@ -1772,11 +1919,15 @@ fn advance_one_autonomous_issue(
                     monitor.hold_review_dispatch(issue_number, hold);
                     return Ok(());
                 }
-                if let Some(sha) =
-                    run_budgeted_readback_stage(IssueMonitorScanStage::HeadShaReadback, || {
-                        gwt_git::pr_status::try_fetch_pr_head_sha(repo_path, pr)
-                    })?
-                {
+                let sha = match retry_head {
+                    Some(sha) => Some(sha),
+                    None => {
+                        run_budgeted_readback_stage(IssueMonitorScanStage::HeadShaReadback, || {
+                            gwt_git::pr_status::try_fetch_pr_head_sha(repo_path, pr)
+                        })?
+                    }
+                };
+                if let Some(sha) = sha {
                     let criteria = issues
                         .iter()
                         .find(|issue| issue.number == issue_number)
@@ -2288,6 +2439,147 @@ mod tests {
             readiness: IssueMonitorReadiness::NotApplicable,
             updated_at: Some("2026-08-15T00:00:00Z".to_string()),
         }
+    }
+
+    #[test]
+    fn urgent_assignment_loader_reuses_revision_and_fetches_changed_urgent_only() {
+        let mut cached = issue(1);
+        cached.labels.push("urgent".into());
+        cached.updated_at = Some("2026-10-03T00:00:00Z".into());
+        let mut changed = cached.clone();
+        changed.number = 2;
+        changed.updated_at = Some("2026-10-03T01:00:00Z".into());
+        let mut monitor = IssueMonitorState::new(Default::default());
+        let prior = LabelAssignment {
+            actor: Some("first".into()),
+            created_at: "2026-10-02T00:00:00Z".into(),
+        };
+        for number in [1, 2] {
+            let mut old = cached.clone();
+            old.number = number;
+            monitor.observe_urgent_issue(&old, "2026-10-03T00:00:00Z");
+            monitor.record_urgent_assignment(number, old.updated_at.as_deref(), &prior);
+        }
+        let fresh = LabelAssignment {
+            actor: Some("second".into()),
+            created_at: "2026-10-03T01:00:00Z".into(),
+        };
+        let mut calls = Vec::new();
+        let assignments = load_urgent_assignments_with(
+            &[cached, changed, issue(3)],
+            &monitor.prefs(),
+            |number| {
+                calls.push(number);
+                Ok::<_, String>(Some(fresh.clone()))
+            },
+        );
+        assert_eq!(calls, vec![2]);
+        assert_eq!(assignments.get(&1), Some(&prior));
+        assert_eq!(assignments.get(&2), Some(&fresh));
+    }
+
+    #[test]
+    fn urgent_assignment_failed_refresh_preserves_fifo_and_retries() {
+        let mut first = issue(1);
+        first.labels.push("urgent".into());
+        first.updated_at = Some("2026-10-03T03:00:00Z".into());
+        let mut second = first.clone();
+        second.number = 2;
+        let mut monitor = IssueMonitorState::new(Default::default());
+        monitor.terminal_queue_push(&[1, 2], "test", "2026-10-03T03:00:00Z");
+        for (issue, assigned_at) in [
+            (&first, "2026-10-03T01:00:00Z"),
+            (&second, "2026-10-03T02:00:00Z"),
+        ] {
+            monitor.observe_urgent_issue(issue, "2026-10-03T03:00:00Z");
+            monitor.record_urgent_assignment(
+                issue.number,
+                issue.updated_at.as_deref(),
+                &LabelAssignment {
+                    actor: Some("actor".into()),
+                    created_at: assigned_at.into(),
+                },
+            );
+        }
+        first.updated_at = Some("2026-10-03T04:00:00Z".into());
+        monitor.observe_urgent_issue(&first, "2026-10-03T04:00:00Z");
+        let failed =
+            load_urgent_assignments_with(std::slice::from_ref(&first), &monitor.prefs(), |_| {
+                Err::<Option<LabelAssignment>, _>("events unavailable")
+            });
+        assert!(failed.is_empty());
+        let projection = monitor.urgent_queue_projection(&crate::process::current_hostname());
+        assert_eq!(
+            projection
+                .entries
+                .iter()
+                .map(|entry| entry.number)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(
+            projection.entries[0].assigned_at.as_deref(),
+            Some("2026-10-03T01:00:00Z")
+        );
+
+        // A failed refresh preserves ordering, but must not mark the new
+        // revision's event history as successfully fetched.
+        let mut retried = false;
+        let refreshed =
+            load_urgent_assignments_with(std::slice::from_ref(&first), &monitor.prefs(), |_| {
+                retried = true;
+                Ok::<_, String>(Some(LabelAssignment {
+                    actor: Some("other".into()),
+                    created_at: "2026-10-03T04:00:00Z".into(),
+                }))
+            });
+        assert!(retried);
+        monitor.record_urgent_assignment(1, first.updated_at.as_deref(), &refreshed[&1]);
+        let projection = monitor.urgent_queue_projection(&crate::process::current_hostname());
+        assert_eq!(
+            projection
+                .entries
+                .iter()
+                .map(|entry| entry.number)
+                .collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+    }
+
+    #[test]
+    fn urgent_assignment_loaded_metadata_reaches_status_projection() {
+        let _lock = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let home = tempfile::tempdir().unwrap();
+        let _home = gwt_core::test_support::ScopedGwtHome::set(home.path().join("home"));
+        let repo = home.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let mut urgent = issue(7);
+        urgent.labels.push("urgent".into());
+        let loaded = LoadedIssueMonitorCandidates {
+            issues: vec![urgent],
+            source: IssueMonitorCandidateSource::Live,
+            live_error: None,
+            readiness_failures: Vec::new(),
+            urgent_assignments: BTreeMap::from([(
+                7,
+                LabelAssignment {
+                    actor: Some("octocat".into()),
+                    created_at: "2026-10-02T00:00:00Z".into(),
+                },
+            )]),
+        };
+        let mut monitor = IssueMonitorState::new(Default::default());
+        scan_loaded_issue_monitor_candidates(&mut monitor, &loaded, &repo, "2026-10-03T00:00:00Z");
+        let status = monitor.status_view();
+        let entry = status
+            .terminal_queue
+            .iter()
+            .find(|entry| entry.number == 7)
+            .unwrap();
+        assert_eq!(entry.assigned_by.as_deref(), Some("octocat"));
+        assert_eq!(entry.assigned_at.as_deref(), Some("2026-10-02T00:00:00Z"));
     }
 
     fn github_issue(number: u64) -> IssueSnapshot {
@@ -3315,6 +3607,7 @@ mod tests {
             source: IssueMonitorCandidateSource::Live,
             live_error: None,
             readiness_failures: Vec::new(),
+            urgent_assignments: BTreeMap::new(),
         };
         let mut monitor = IssueMonitorState::new(IssueMonitorConfig {
             enabled: true,
@@ -3478,12 +3771,43 @@ mod tests {
         .save(&runtime_path)
         .unwrap();
         assert_eq!(
-            read_execution_settlements(worktree.path(), &[owner.number])
+            read_execution_observations(worktree.path(), &[owner.number])
                 .get(&owner.number)
-                .copied(),
+                .map(|observation| observation.settlement),
             Some(IssueMonitorExecutionSettlement::Unknown),
             "an exact live process must not permit recovery even without a pane"
         );
+        let mut monitor = IssueMonitorState::new(crate::IssueMonitorConfig::default());
+        monitor.record_candidate(issue(42));
+        monitor.complete_active_launch_at(42, "tab-1::live", "2026-09-07T04:00:00Z");
+        monitor.record_window_snapshot(crate::IssueMonitorWindowSnapshot {
+            project_tab_id: "tab-1".to_string(),
+            observed_at: "2026-09-07T04:10:00Z".to_string(),
+            windows: Vec::new(),
+        });
+        let outcome = reconcile_issue_monitor_idle_windows(
+            &mut monitor,
+            worktree.path(),
+            "2026-09-07T04:10:00Z",
+        );
+        assert!(
+            outcome.released.is_empty(),
+            "the exact agent process is alive"
+        );
+        assert!(outcome.requeued.is_empty());
+        assert_eq!(monitor.active_issue_numbers(), vec![42]);
+        assert_eq!(
+            outcome.idle_windows[0].idle_kind.as_str(),
+            "binding_pending"
+        );
+        assert!(monitor
+            .vanished_launched_windows(
+                "tab-1",
+                &Default::default(),
+                "2026-09-07T04:10:00Z",
+                &read_execution_observations(worktree.path(), &[42]),
+            )
+            .is_empty());
         std::fs::remove_file(runtime_path).unwrap();
 
         // What an auto-update restart leaves behind: the holder is gone and
@@ -3491,10 +3815,39 @@ mod tests {
         session.update_status(gwt_agent::AgentStatus::Interrupted);
         session.save(&sessions_dir).unwrap();
 
+        // A different, unbound agent in the same worktree also vetoes recovery.
+        let mut unbound = session.clone();
+        unbound.id = "unbound-live-agent".to_string();
+        unbound.execution_binding = None;
+        unbound.linked_issue_number = None;
+        unbound.update_status(gwt_agent::AgentStatus::Running);
+        unbound.save(&sessions_dir).unwrap();
+        let unbound_path = gwt_agent::runtime_state_path(&sessions_dir, &unbound.id);
+        let mut unbound_runtime =
+            gwt_agent::SessionRuntimeState::new(gwt_agent::AgentStatus::Running);
+        unbound_runtime.host_started_at = Some(started_at);
+        unbound_runtime.child_pid = Some(std::process::id());
+        unbound_runtime.child_started_at = Some(started_at);
+        unbound_runtime.save(&unbound_path).unwrap();
+        let observations = read_execution_observations(worktree.path(), &[42]);
         assert_eq!(
-            read_execution_settlements(worktree.path(), &[owner.number])
+            observations[&42].settlement,
+            IssueMonitorExecutionSettlement::Active
+        );
+        assert!(
+            observations[&42].process_held,
+            "inventory retains an unrelated live agent in the target worktree"
+        );
+        assert!(monitor
+            .reconcile_idle_windows(&observations, "2026-09-07T04:10:00Z")
+            .released
+            .is_empty());
+        std::fs::remove_file(unbound_path).unwrap();
+
+        assert_eq!(
+            read_execution_observations(worktree.path(), &[owner.number])
                 .get(&owner.number)
-                .copied(),
+                .map(|observation| observation.settlement),
             Some(IssueMonitorExecutionSettlement::Active),
             "the record is still Active before the reaper runs"
         );
@@ -3522,12 +3875,25 @@ mod tests {
         );
 
         assert_eq!(
-            read_execution_settlements(worktree.path(), &[owner.number])
+            read_execution_observations(worktree.path(), &[owner.number])
                 .get(&owner.number)
-                .copied(),
+                .map(|observation| observation.settlement),
             Some(IssueMonitorExecutionSettlement::Interrupted),
             "the reaper blocked it on the holder's behalf; the work is unfinished"
         );
+        let outcome = reconcile_issue_monitor_idle_windows(
+            &mut monitor,
+            worktree.path(),
+            "2026-09-07T04:10:00Z",
+        );
+        assert_eq!(outcome.requeued, vec![42]);
+        assert!(monitor
+            .autonomous_record(42)
+            .unwrap()
+            .last_failure_message
+            .as_deref()
+            .unwrap()
+            .contains("agent process absent"));
     }
 
     #[test]
@@ -4121,6 +4487,7 @@ mod tests {
             source: IssueMonitorCandidateSource::Live,
             live_error: Some("issue #43 targeted refresh failed".to_string()),
             readiness_failures: Vec::new(),
+            urgent_assignments: BTreeMap::new(),
         };
         assert!(
             live_with_failed_spec_enrichment.authorizes_remote_effects(),
@@ -4174,6 +4541,7 @@ mod tests {
             source: IssueMonitorCandidateSource::Cache,
             live_error: Some("operation deadline exceeded at issue-list stage".to_string()),
             readiness_failures: Vec::new(),
+            urgent_assignments: BTreeMap::new(),
         };
 
         let summary = scan_loaded_issue_monitor_candidates(
@@ -4827,5 +5195,133 @@ exit 0
         );
         assert_eq!(monitor.active_count(), 0);
         assert_eq!(monitor.queued_issue_numbers(), vec![42]);
+    }
+
+    /// Issue #4815 AC-1: the scan step itself honours the review ladder. A
+    /// review window that fails after the first dispatch is counted once for
+    /// its SHA; the two scans inside the backoff re-detect the open PR and
+    /// produce no dispatch; the scan after the backoff dispatches once more.
+    #[test]
+    fn issue_4815_two_scans_inside_the_review_backoff_dispatch_nothing() {
+        let _env_lock = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let container_root = tmp.path().join("workspace");
+        std::fs::create_dir_all(&container_root).expect("create container root");
+        let bare_repo = container_root.join("repo.git");
+        let init = gwt_core::process::hidden_command("git")
+            .args([
+                "init",
+                "--bare",
+                bare_repo.to_str().expect("bare repo path"),
+            ])
+            .output()
+            .expect("git init --bare");
+        assert!(init.status.success());
+        let call_log = tmp.path().join("gh-calls.log");
+        let fake_gh = write_bare_repo_bound_fake_gh(&tmp.path().join("bin"), &call_log);
+        let mut path_entries = vec![fake_gh.parent().expect("fake gh parent").to_path_buf()];
+        if let Some(existing) = std::env::var_os("PATH") {
+            path_entries.extend(std::env::split_paths(&existing));
+        }
+        let _path = gwt_core::test_support::ScopedEnvVar::set(
+            "PATH",
+            std::env::join_paths(path_entries).expect("join PATH"),
+        );
+        let _sandbox = gwt_core::test_support::ScopedEnvVar::set("GWT_TEST_GH_SANDBOX", "1");
+
+        let issues = vec![IssueMonitorIssue {
+            number: 42,
+            title: "Issue 42".to_string(),
+            labels: vec!["auto-merge".to_string()],
+            state: IssueMonitorIssueState::Open,
+            body: Some("## Acceptance Criteria\n- [ ] AC-1: returns 200\n".to_string()),
+            url: None,
+            readiness: IssueMonitorReadiness::NotApplicable,
+            updated_at: Some("2026-08-15T00:00:00Z".to_string()),
+        }];
+        let mut monitor = IssueMonitorState::with_prefs(
+            IssueMonitorConfig::default(),
+            crate::IssueMonitorPrefs {
+                enabled: true,
+                autonomous_mode: true,
+                max_active_agents: 3,
+                ..crate::IssueMonitorPrefs::default()
+            },
+        );
+        monitor.terminal_queue_push(&[42], "test", "2026-07-02T00:00:00Z");
+        crate::scan_issue_monitor_candidates(&mut monitor, &issues, "2026-07-28T00:00:00Z");
+        monitor.complete_active_launch_at(42, "tab-1::impl-42", "2026-07-28T00:00:00Z");
+        monitor.set_autonomous_phase(42, crate::AutonomousPhase::Implementing);
+        let branch = monitor
+            .inbox_item(42)
+            .and_then(|item| item.launch_plan.as_ref())
+            .map(|plan| plan.branch_name.clone())
+            .expect("launch plan branch");
+        let open_prs = std::collections::HashMap::from([(branch, 7_u64)]);
+        let scan = |monitor: &mut IssueMonitorState, now: &str| {
+            advance_one_autonomous_issue(
+                monitor,
+                &issues,
+                "owner/repo",
+                &container_root,
+                "develop",
+                Some(&open_prs),
+                b"secret",
+                42,
+                now,
+            )
+            .expect("scan step");
+            monitor.take_pending_review_dispatches().len()
+        };
+
+        assert_eq!(
+            scan(&mut monitor, "2026-07-28T00:10:00Z"),
+            1,
+            "first scan dispatches"
+        );
+        assert_eq!(
+            monitor.autonomous_record(42).map(|record| record.phase),
+            Some(crate::AutonomousPhase::Reviewing)
+        );
+        // The review window fails to start.
+        monitor.record_launch_failed_at(42, "spawn failed: os error 206", "2026-07-28T00:10:05Z");
+        let attempts = monitor
+            .autonomous_record(42)
+            .and_then(|record| record.review_attempts.clone())
+            .expect("review attempt recorded");
+        assert_eq!(
+            (attempts.reviewed_sha.as_str(), attempts.count),
+            ("abc123", 1)
+        );
+        assert_eq!(attempts.not_before.as_deref(), Some("2026-07-28T00:11:05Z"));
+
+        // Two scans inside the backoff: the PR is re-detected, nothing is
+        // dispatched, and the hold names the backoff on the record.
+        assert_eq!(scan(&mut monitor, "2026-07-28T00:10:30Z"), 0);
+        assert_eq!(scan(&mut monitor, "2026-07-28T00:10:50Z"), 0);
+        assert!(monitor
+            .autonomous_record(42)
+            .and_then(|record| record.review_dispatch_hold.clone())
+            .is_some_and(|hold| hold
+                .reason
+                .contains("backing off until 2026-07-28T00:11:05Z")));
+        assert_eq!(
+            monitor.active_issue_numbers(),
+            vec![42],
+            "the implementation keeps its slot"
+        );
+        assert_eq!(
+            monitor.inbox_item(42).map(|item| item.state),
+            Some(MonitorInboxState::Launched)
+        );
+
+        // After the backoff the same head is dispatched exactly once more.
+        assert_eq!(scan(&mut monitor, "2026-07-28T00:12:00Z"), 1);
+        assert_eq!(
+            monitor.autonomous_record(42).map(|record| record.phase),
+            Some(crate::AutonomousPhase::Reviewing)
+        );
     }
 }
