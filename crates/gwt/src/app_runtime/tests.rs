@@ -43562,7 +43562,7 @@ fn board_origin_agent_resume_config_uses_exact_saved_session() {
         .expect("resume config");
 
     assert_eq!(config.command, "codex");
-    assert_eq!(config.tool_version_selector.as_deref(), Some("latest"));
+    assert_eq!(config.tool_version_selector.as_deref(), Some("installed"));
     assert_eq!(config.branch.as_deref(), Some("work/board-origin"));
     assert_eq!(config.working_dir.as_deref(), Some(repo.as_path()));
     assert_eq!(
@@ -54444,19 +54444,10 @@ fn app_runtime_answered_handoff_exact_resume_retains_autonomous_context() {
     ));
 }
 
-/// Issue #3972 AC-1/AC-4: this launch path really does health-check the host
-/// package runner before spawning a provider, which is why every monitor
-/// fixture pins one. Drop the pin and the guard refuses the probe by name
-/// instead of spawning the host `npx` under a five-second budget — the failure
-/// mode that turned unrelated `app_runtime` tests red on a loaded CI runner.
-///
-/// Issue #4927: the Session asks for an exact package version. A Host Codex
-/// launch that asks for `latest` prefers the installed CLI (#4917), so whether
-/// it reaches the package runner at all would depend on what the machine
-/// running the test has installed. An exact version takes the package-runner
-/// route on every host.
+/// SPEC-1921 L1a: a saved version cannot select a package runner on exact Resume.
+/// An installed fixture CLI succeeds without a package-runner sandbox pin.
 #[test]
-fn monitor_launch_without_pinned_package_runners_is_refused() {
+fn monitor_legacy_version_resumes_installed_without_pinned_package_runners() {
     // Never published, so no host package cache can answer for it.
     const EXACT_PACKAGE_VERSION: &str = "0.0.0";
     let _env_lock = env_test_lock()
@@ -54468,6 +54459,9 @@ fn monitor_launch_without_pinned_package_runners_is_refused() {
     let _codex_home = ScopedEnvVar::set("CODEX_HOME", temp.path().join(".codex"));
     let _sandbox = ScopedEnvVar::unset(gwt_core::process_console::RUNNER_PROBE_SANDBOX_MARKER);
     let _live = ScopedEnvVar::unset(gwt_core::process_console::ALLOW_REAL_RUNNER_PROBE_MARKER);
+    let installed_bin = write_fixture_runners(temp.path(), &["codex"]);
+    let installed_cli = installed_bin.join(if cfg!(windows) { "codex.cmd" } else { "codex" });
+    let _path = prepend_tool_parent_to_path(&installed_cli);
     let mut fixture = monitor_relaunch_fixture(
         temp.path(),
         "unpinned-package-runner",
@@ -54506,16 +54500,26 @@ fn monitor_launch_without_pinned_package_runners_is_refused() {
     let (_window_id, result) =
         take_monitor_launch_complete_event("unpinned-package-runner", &fixture.recorded_events);
 
-    let error = result.expect_err("an unpinned package runner must not launch");
+    let prepared = result.expect("the saved version must not select a package runner");
+    let installed_cli = installed_cli.to_string_lossy();
     assert!(
-        error.contains(gwt_core::process_console::REAL_RUNNER_PROBE_BLOCKED_ERROR_CODE),
-        "the refusal must name the guard, not look like a runner timeout: {error}"
+        prepared.0.command == installed_cli
+            || prepared
+                .0
+                .args
+                .iter()
+                .any(|arg| arg.contains(installed_cli.as_ref())),
+        "exact Resume must use the installed fixture CLI"
     );
     assert!(
-        error.contains(&format!("@openai/codex@{EXACT_PACKAGE_VERSION}")),
-        "the refused probe must be the exact package the Session asked for, not a fallback \
-         from an installed CLI: {error}"
+        !prepared
+            .0
+            .args
+            .iter()
+            .any(|arg| arg.contains("@openai/codex@")),
+        "the ignored saved version must not reach the package runner"
     );
+    assert_monitor_exact_resume(Ok(prepared), &fixture);
 }
 
 /// Issue #3716 AC-2: an exact Resume preparation failure occurs before the
