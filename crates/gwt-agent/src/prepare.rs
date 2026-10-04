@@ -2614,7 +2614,10 @@ fn runner_probe_environment(
     });
     // Match launch selection and PTY spawn: explicit values override removals.
     for key in ALLOWLIST {
-        if let Some(value) = env_vars.get(*key) {
+        if let Some((_, value)) = env_vars
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(key))
+        {
             environment.insert((*key).to_string(), value.clone());
         }
     }
@@ -7484,6 +7487,20 @@ mod tests {
             ),
             "an explicit PATH override is applied after remove_env"
         );
+    }
+
+    #[test]
+    fn runner_probe_environment_keeps_mixed_case_explicit_path_after_removal() {
+        for key in ["Path", "path"] {
+            let env_vars = HashMap::from([(key.to_string(), "explicit-path".to_string())]);
+            let environment = runner_probe_environment(&env_vars, &["PATH".to_string()]);
+
+            assert_eq!(
+                environment.get("PATH").map(String::as_str),
+                Some("explicit-path"),
+                "explicit {key} must override inherited PATH removal"
+            );
+        }
     }
 
     #[cfg(unix)]
