@@ -2612,12 +2612,15 @@ fn runner_probe_environment(
             .iter()
             .any(|removed| removed.eq_ignore_ascii_case(key))
     });
-    // Match launch selection and PTY spawn: explicit values override removals.
+    // Match PTY spawn: explicit values override removals with native key semantics.
     for key in ALLOWLIST {
-        if let Some((_, value)) = env_vars
-            .iter()
-            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(key))
-        {
+        if let Some((_, value)) = env_vars.iter().find(|(candidate, _)| {
+            if cfg!(windows) {
+                candidate.eq_ignore_ascii_case(key)
+            } else {
+                candidate.as_str() == *key
+            }
+        }) {
             environment.insert((*key).to_string(), value.clone());
         }
     }
@@ -7490,15 +7493,15 @@ mod tests {
     }
 
     #[test]
-    fn runner_probe_environment_keeps_mixed_case_explicit_path_after_removal() {
+    fn runner_probe_environment_respects_platform_key_semantics_after_removal() {
         for key in ["Path", "path"] {
             let env_vars = HashMap::from([(key.to_string(), "explicit-path".to_string())]);
             let environment = runner_probe_environment(&env_vars, &["PATH".to_string()]);
 
             assert_eq!(
                 environment.get("PATH").map(String::as_str),
-                Some("explicit-path"),
-                "explicit {key} must override inherited PATH removal"
+                cfg!(windows).then_some("explicit-path"),
+                "explicit {key} must follow native environment key semantics"
             );
         }
     }
