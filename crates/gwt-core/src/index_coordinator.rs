@@ -2114,6 +2114,7 @@ fn read_registration(path: &Path) -> Option<Registration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::deadline_budget::HANG_GUARD;
 
     fn open(root: &Path) -> IndexCoordinator {
         IndexCoordinator::open(root).expect("open coordinator")
@@ -2124,29 +2125,20 @@ mod tests {
         key: &TargetKey,
         priority: JobPriority,
     ) -> TargetJobGuard {
-        // A target lock released by a just-finished owner can still read as
-        // contended for a scheduler tick under load, so `request_job` joins as
-        // a waiter instead of taking ownership. Production self-heals (the
-        // waiter's probe resolves it), but this helper asserts "I can own now,"
-        // so it polls until the lock is genuinely free rather than failing on a
-        // single spurious join (issue #3339). A stray join is dropped so its
-        // waiter registration is removed before the next attempt.
-        let deadline = Instant::now() + Duration::from_secs(30);
+        // Completion can be published before the owner's kernel lock is released.
+        // Reuse the waiter's outcome/lock probe, then retry actual admission:
+        // observing completion alone does not establish ownership (issue #3339).
         loop {
             match coordinator
-                .request_job(key, priority, Duration::from_secs(5))
+                .request_job(key, priority, HANG_GUARD)
                 .expect("request job")
             {
                 JobAdmission::Owner(guard) => return guard,
                 JobAdmission::Joined(waiter) => {
-                    drop(waiter);
-                    assert!(
-                        Instant::now() < deadline,
-                        "expected ownership of {} (state: {:?})",
-                        key.file_stem(),
-                        std::fs::read_to_string(coordinator.target_state_path(key)).ok(),
-                    );
-                    std::thread::sleep(Duration::from_millis(10));
+                    // test-hygiene: allow-wall-clock-deadline Kernel locks have no release notification; published outcomes may precede unlock.
+                    waiter
+                        .wait(HANG_GUARD)
+                        .unwrap_or_else(|err| panic!("waiting to own {}: {err}", key.file_stem()));
                 }
             }
         }
@@ -2458,7 +2450,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            waiter.wait(Duration::from_secs(5)).unwrap(),
+            waiter.wait(Duration::ZERO).unwrap(),
             JobOutcome::Failed {
                 message: "disk full".to_string()
             }
@@ -2474,10 +2466,7 @@ mod tests {
             JobAdmission::Owner(_) => panic!("expected join"),
         };
         drop(owner);
-        assert_eq!(
-            waiter.wait(Duration::from_secs(5)).unwrap(),
-            JobOutcome::OwnerGone
-        );
+        assert_eq!(waiter.wait(Duration::ZERO).unwrap(), JobOutcome::OwnerGone);
     }
 
     // ------------------------------------------------------------------
