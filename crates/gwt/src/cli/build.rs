@@ -2031,6 +2031,7 @@ mod tests {
                 verified_head: None,
                 driver: None,
                 commands: vec![crate::cli::verification_record::VerificationCommandResult {
+                    admission: None,
                     headed_e2e: None,
                     nextest: None,
                     terminated_by_signal: None,
