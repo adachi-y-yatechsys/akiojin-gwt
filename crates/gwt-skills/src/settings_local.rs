@@ -1093,17 +1093,33 @@ mod tests {
             let all_done = children
                 .iter_mut()
                 .all(|child| child.try_wait().expect("poll child").is_some());
-            match fs::read_to_string(&hooks_path) {
-                Ok(rendered) => {
-                    serde_json::from_str::<Value>(&rendered)
-                        .expect("destination must always hold a complete hooks.json");
-                    observations += 1;
+            // Windows can transiently deny a read during concurrent replacement.
+            // Retry only the observed OS error, for at most five 100ms waits;
+            // missing files and invalid JSON remain immediate failures.
+            let mut denied_read_retries = 0usize;
+            let rendered = loop {
+                match fs::read_to_string(&hooks_path) {
+                    Ok(rendered) => break rendered,
+                    Err(err)
+                        if cfg!(windows)
+                            && err.kind() == io::ErrorKind::PermissionDenied
+                            && err.raw_os_error() == Some(5)
+                            && denied_read_retries < 5 =>
+                    {
+                        denied_read_retries += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    Err(err) => panic!(
+                        "destination unreadable while independent processes regenerated it \
+                         (after {observations} good reads, kind {:?}, OS code {:?}): {err}",
+                        err.kind(),
+                        err.raw_os_error(),
+                    ),
                 }
-                Err(err) => panic!(
-                    "destination vanished while independent processes regenerated it \
-                     (after {observations} good reads): {err}"
-                ),
-            }
+            };
+            serde_json::from_str::<Value>(&rendered)
+                .expect("destination must always hold a complete hooks.json");
+            observations += 1;
             if all_done {
                 break;
             }
