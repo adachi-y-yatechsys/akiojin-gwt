@@ -2879,7 +2879,11 @@ fn try_apply_accepted_issue_monitor_control_with_disk_migration_observed(
     );
     let mut applied = None;
     let mut authority_changed = false;
-    let typed_failure = issue_monitor_control_has_typed_failure(&accepted.control);
+    let reject_on_false = issue_monitor_control_has_typed_failure(&accepted.control)
+        || matches!(
+            accepted.control,
+            IssueMonitorControl::TerminalDelivered { .. }
+        );
     let failure_control = matches!(
         accepted.control,
         IssueMonitorControl::LaunchFailed { .. } | IssueMonitorControl::AgentFailed { .. }
@@ -2954,7 +2958,7 @@ fn try_apply_accepted_issue_monitor_control_with_disk_migration_observed(
                 &accepted.processed_at,
             ));
             authority_changed = candidate.effect_authority_epoch() != authority_epoch_before;
-            if typed_failure && applied == Some(Some(false)) {
+            if reject_on_false && applied == Some(Some(false)) {
                 rejected = true;
                 return;
             }
@@ -5657,6 +5661,355 @@ async fn heal_endpoint_descriptor_loop(
 
 fn config_error(message: impl Into<String>) -> SpecOpsError {
     SpecOpsError::from(ApiError::Unexpected(message.into()))
+}
+
+// Terminal-delivery ACKs authorize automatic pane closure, so exercise their
+// durable acceptance contract on Windows as well as Unix.
+#[cfg(test)]
+mod terminal_delivery_control_tests {
+    use std::{collections::BTreeMap, fs, path::Path, sync::Arc};
+
+    use gwt_core::{
+        daemon::{ClientFrame, DaemonEndpoint, DaemonFrame, RuntimeScope, RuntimeTarget},
+        deadline_budget::HANG_GUARD,
+        test_support::ScopedGwtHome,
+    };
+    use tempfile::TempDir;
+
+    use super::{
+        AcceptedIssueMonitorControl, BroadcastHub, DaemonShutdown, IssueMonitorControl,
+        IssueMonitorControlCommit, IssueMonitorControlQueueError,
+    };
+
+    const WINDOW: &str = "tab-1::agent-42";
+
+    fn launched_monitor() -> crate::IssueMonitorState {
+        let mut monitor = crate::IssueMonitorState::with_prefs(
+            crate::IssueMonitorConfig::default(),
+            crate::IssueMonitorPrefs {
+                enabled: false,
+                launched_issues: vec![crate::IssueMonitorLaunchedIssue {
+                    issue_number: 42,
+                    window_id: WINDOW.to_string(),
+                }],
+                launched_claims: BTreeMap::from([(42, "claim-live".to_string())]),
+                ..crate::IssueMonitorPrefs::default()
+            },
+        );
+        monitor.record_attempt(42);
+        monitor
+    }
+
+    fn target(claim: &str, window: &str) -> crate::IssueMonitorStopTarget {
+        crate::IssueMonitorStopTarget {
+            issue_number: 42,
+            claim_id: Some(claim.to_string()),
+            delivery_id: None,
+            window_id: Some(window.to_string()),
+        }
+    }
+
+    fn payload(target: &crate::IssueMonitorStopTarget) -> serde_json::Value {
+        crate::runtime_daemon_events::issue_monitor_payload(
+            "control",
+            serde_json::json!({
+                "terminal_delivered": {
+                    "issue_number": target.issue_number,
+                    "claim_id": target.claim_id,
+                    "delivery_id": target.delivery_id,
+                    "window_id": target.window_id,
+                }
+            }),
+            std::process::id().wrapping_add(1),
+        )
+    }
+
+    async fn apply_and_complete(
+        prefs_path: &Path,
+        monitor: &mut crate::IssueMonitorState,
+        target: crate::IssueMonitorStopTarget,
+    ) -> (bool, Result<(), IssueMonitorControlQueueError>) {
+        let hub = BroadcastHub::new();
+        let mut receiver = hub
+            .take_issue_monitor_control_receiver()
+            .expect("control receiver");
+        let publisher = tokio::spawn({
+            let hub = hub.clone();
+            let payload = payload(&target);
+            async move {
+                hub.publish_issue_monitor_control(DaemonFrame::Event {
+                    channel: crate::runtime_daemon_events::ISSUE_MONITOR_CONTROL_CHANNEL
+                        .to_string(),
+                    payload,
+                })
+                .await
+            }
+        });
+        let (frame, completion) = receiver
+            .recv()
+            .await
+            .expect("admitted control")
+            .into_parts();
+        let DaemonFrame::Event { payload, .. } = frame else {
+            panic!("control queue must retain the event");
+        };
+        let control = super::decode_issue_monitor_control(payload).expect("decode control");
+        let mut permit = super::IssueMonitorEffectPermit::new();
+        let mut pending = None;
+        let should_scan = super::apply_or_queue_issue_monitor_control(
+            &hub,
+            prefs_path,
+            monitor,
+            control,
+            &mut permit,
+            &mut pending,
+            Some(completion),
+        );
+        assert!(pending.is_none(), "exact CAS has a definitive outcome");
+        let completion = tokio::time::timeout(HANG_GUARD, publisher)
+            .await
+            .expect("control completion is bounded")
+            .expect("publisher joins");
+        (should_scan, completion)
+    }
+
+    #[tokio::test]
+    async fn terminal_delivery_completion_rejects_mismatch_and_acks_committed_success() {
+        let _prefs_budget = super::pin_prefs_hang_guard();
+        let temp = TempDir::new().expect("tempdir");
+        let prefs_path = temp.path().join("issue-monitor.json");
+        let mut monitor = launched_monitor();
+        crate::save_issue_monitor_prefs(&prefs_path, &monitor.prefs()).expect("seed prefs");
+        let before = fs::read(&prefs_path).expect("read seeded bytes");
+
+        for stale in [
+            target("claim-stale", WINDOW),
+            target("claim-live", "tab-1::agent-stale"),
+        ] {
+            let (should_scan, completion) =
+                apply_and_complete(&prefs_path, &mut monitor, stale).await;
+            assert!(!should_scan);
+            assert_eq!(completion, Err(IssueMonitorControlQueueError::Rejected));
+            assert_eq!(monitor.active_count(), 1, "the live launch remains bound");
+            assert_eq!(
+                fs::read(&prefs_path).expect("reload rejected bytes"),
+                before,
+                "a mismatch cannot persist an ACK receipt"
+            );
+        }
+
+        let (should_scan, completion) =
+            apply_and_complete(&prefs_path, &mut monitor, target("claim-live", WINDOW)).await;
+        assert!(should_scan);
+        assert_eq!(completion, Ok(()));
+        assert_eq!(monitor.active_count(), 0);
+        assert_eq!(monitor.launched_window_issue(WINDOW), None);
+        assert_eq!(
+            monitor
+                .autonomous_record(42)
+                .expect("attempt record")
+                .attempts,
+            1
+        );
+        assert_eq!(
+            monitor.queue_len(),
+            0,
+            "successful delivery is not requeued"
+        );
+        assert_eq!(
+            crate::load_issue_monitor_prefs(&prefs_path).expect("reload committed prefs"),
+            monitor.prefs(),
+            "ACK follows the durable slot release"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_delivery_same_admission_receipt_replay_acks_without_settling_twice() {
+        let _prefs_budget = super::pin_prefs_hang_guard();
+        let temp = TempDir::new().expect("tempdir");
+        let prefs_path = temp.path().join("issue-monitor.json");
+        let mut monitor = launched_monitor();
+        let mut stale_volatile = monitor.clone();
+        crate::save_issue_monitor_prefs(&prefs_path, &monitor.prefs()).expect("seed prefs");
+        let accepted = AcceptedIssueMonitorControl::new(IssueMonitorControl::TerminalDelivered {
+            target: target("claim-live", WINDOW),
+        });
+        assert!(matches!(
+            super::try_apply_accepted_issue_monitor_control_with_disk_migration(
+                &prefs_path,
+                &mut monitor,
+                accepted.clone()
+            ),
+            IssueMonitorControlCommit::Committed {
+                should_scan: true,
+                ..
+            }
+        ));
+        let committed = monitor.prefs();
+        let hub = BroadcastHub::new();
+        let mut receiver = hub
+            .take_issue_monitor_control_receiver()
+            .expect("replay receiver");
+        let publisher = tokio::spawn({
+            let hub = hub.clone();
+            async move { hub.publish_issue_monitor_control(DaemonFrame::Ack).await }
+        });
+        let (_, completion) = receiver
+            .recv()
+            .await
+            .expect("replay completion")
+            .into_parts();
+        assert!(matches!(
+            super::try_apply_accepted_issue_monitor_control_with_disk_migration(
+                &prefs_path,
+                &mut stale_volatile,
+                accepted
+            ),
+            IssueMonitorControlCommit::Committed {
+                should_scan: true,
+                ..
+            }
+        ));
+        super::commit_issue_monitor_control_completion(&hub, &stale_volatile, completion);
+        assert_eq!(
+            tokio::time::timeout(HANG_GUARD, publisher)
+                .await
+                .expect("replay completion is bounded")
+                .expect("publisher joins"),
+            Ok(())
+        );
+        assert_eq!(
+            stale_volatile.prefs(),
+            committed,
+            "receipt recovery converges the pre-commit projection exactly"
+        );
+        assert_eq!(
+            crate::load_issue_monitor_prefs(&prefs_path).expect("reload replay prefs"),
+            committed
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // isolate home for the full native server lifetime
+    async fn terminal_delivery_native_ipc_rejects_mismatch_before_acknowledging_release() {
+        let _env_lock = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _prefs_budget = super::pin_prefs_hang_guard();
+        let temp = TempDir::new().expect("tempdir");
+        let _home = ScopedGwtHome::set(temp.path().join("home"));
+        let project = temp.path().join("project");
+        fs::create_dir_all(&project).expect("project");
+        let scope = RuntimeScope::from_project_root(&project, RuntimeTarget::Host).expect("scope");
+        let prefs_path = crate::issue_monitor_prefs_path_for_repo_path(&project);
+        crate::save_issue_monitor_prefs(&prefs_path, &launched_monitor().prefs())
+            .expect("seed prefs");
+        let socket_path = temp.path().join("daemon.sock");
+        let endpoint_path = temp.path().join("endpoint.json");
+        let endpoint = DaemonEndpoint::new(
+            scope,
+            std::process::id(),
+            socket_path.to_string_lossy().to_string(),
+            "terminal-delivery-test".to_string(),
+            env!("CARGO_PKG_VERSION").to_string(),
+        );
+        let lease =
+            super::acquire_daemon_startup_lease(&endpoint.scope).expect("isolated authority lease");
+        let bound = super::bind_daemon(&endpoint, &socket_path, &endpoint_path, lease)
+            .expect("native bind");
+        let shutdown = Arc::new(DaemonShutdown::new());
+        let server = tokio::spawn(super::run_bound_server(
+            endpoint.clone(),
+            endpoint_path,
+            BroadcastHub::new(),
+            Arc::clone(&shutdown),
+            crate::IssueMonitorConfig::default(),
+            super::ISSUE_MONITOR_SCAN_TIMEOUT,
+            bound,
+        ));
+
+        // Collect observations before asserting, so an unexpected ACK in RED
+        // still follows the production daemon shutdown path.
+        let exchange = tokio::time::timeout(HANG_GUARD, async {
+            let mut client = crate::cli::daemon::client::DaemonClient::connect(&endpoint).await?;
+            client.send_frame(&ClientFrame::Status).await?;
+            if !matches!(client.read_frame::<DaemonFrame>().await?,
+                DaemonFrame::Status(status) if status.issue_monitor.is_some())
+            {
+                return Err("ready status must include the Monitor projection".to_string());
+            }
+            let before = fs::read(&prefs_path).map_err(|error| error.to_string())?;
+            let mut observations = Vec::new();
+            for target in [
+                target("claim-stale", WINDOW),
+                target("claim-live", "tab-1::agent-stale"),
+                target("claim-live", WINDOW),
+            ] {
+                client
+                    .send_frame(&ClientFrame::Publish {
+                        channel: crate::runtime_daemon_events::ISSUE_MONITOR_CONTROL_CHANNEL
+                            .to_string(),
+                        payload: payload(&target),
+                    })
+                    .await?;
+                let response = client.read_frame::<DaemonFrame>().await?;
+                let bytes = fs::read(&prefs_path).map_err(|error| error.to_string())?;
+                observations.push((response, bytes));
+            }
+            Ok((before, observations))
+        })
+        .await;
+        shutdown.request();
+        assert_eq!(
+            tokio::time::timeout(HANG_GUARD, server)
+                .await
+                .expect("daemon shutdown is bounded")
+                .expect("server joins")
+                .expect("server exits"),
+            0
+        );
+        let (before, observations) = exchange
+            .expect("native IPC exchange is bounded")
+            .expect("native IPC exchange succeeds");
+        for (response, bytes) in &observations[..2] {
+            assert_eq!(
+                *response,
+                DaemonFrame::Error {
+                    message: crate::runtime_daemon_events::ISSUE_MONITOR_CONTROL_REJECTED_ERROR
+                        .to_string(),
+                }
+            );
+            assert_eq!(
+                *bytes, before,
+                "rejected IPC leaves the durable launch and receipt intact"
+            );
+        }
+        assert_eq!(observations[2].0, DaemonFrame::Ack);
+        let released: crate::IssueMonitorPrefs =
+            serde_json::from_slice(&observations[2].1).expect("ACK prefs");
+        assert!(
+            !released.enabled,
+            "fixture never enables scanning or launches"
+        );
+        assert!(released.launched_issues.is_empty());
+        assert!(released.last_control_receipt.is_some());
+        assert_eq!(
+            released
+                .autonomous_records
+                .iter()
+                .find(|record| record.issue_number == 42)
+                .expect("attempt record")
+                .attempts,
+            1
+        );
+        let settled =
+            crate::IssueMonitorState::with_prefs(crate::IssueMonitorConfig::default(), released);
+        assert_eq!(
+            settled.queue_len(),
+            0,
+            "successful delivery does not requeue work"
+        );
+    }
 }
 
 // The server fixtures below run fake `gh` shell scripts and raw Unix

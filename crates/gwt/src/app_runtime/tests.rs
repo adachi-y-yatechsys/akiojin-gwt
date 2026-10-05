@@ -78149,6 +78149,55 @@ fn terminal_convergence_grace_candidate_resets_and_closes_the_exact_window() {
     );
 }
 
+// Windows must use the shared publisher's daemon-authority diagnosis rather
+// than bypassing IPC and attempting a local write behind an active fence.
+#[test]
+fn terminal_delivery_uses_daemon_authority_diagnosis_on_every_platform() {
+    use crate::app_runtime::terminal_convergence::settle_issue_monitor_terminal_delivery_in_background;
+
+    let _env_lock = env_test_lock()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let temp = tempdir().expect("tempdir");
+    let _home = ScopedEnvVar::set("HOME", temp.path());
+    let _userprofile = ScopedEnvVar::set("USERPROFILE", temp.path());
+    let repo = temp.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("create repo");
+    init_repo(&repo);
+    let prefs_path = gwt::issue_monitor_prefs_path_for_repo_path(&repo);
+    let prefs = gwt::IssueMonitorPrefs {
+        launched_issues: vec![gwt::IssueMonitorLaunchedIssue {
+            issue_number: 42,
+            window_id: "tab-1::agent-42".to_string(),
+        }],
+        launched_claims: std::collections::BTreeMap::from([(42, "claim-live".to_string())]),
+        ..gwt::IssueMonitorPrefs::default()
+    };
+    gwt::save_issue_monitor_prefs(&prefs_path, &prefs).expect("seed prefs");
+    gwt::persist_issue_monitor_authority_fence(
+        &prefs_path,
+        &gwt::IssueMonitorAuthorityFence::current_process(),
+    )
+    .expect("seed daemon authority without its endpoint");
+
+    let error = settle_issue_monitor_terminal_delivery_in_background(
+        &repo,
+        "tab-1::agent-42",
+        42,
+        Duration::from_secs(5),
+    )
+    .expect_err("missing authority-owned endpoint retains the pane");
+    assert!(
+        error.starts_with("Issue Monitor authority fence pid "),
+        "every platform must use the shared publisher's authority diagnosis: {error}"
+    );
+    assert_eq!(
+        gwt::load_issue_monitor_prefs(&prefs_path).expect("reload prefs"),
+        prefs,
+        "uncertain daemon delivery must not fall back to local settlement"
+    );
+}
+
 // Issue #3927 (SPEC #3340 T-627 / PM ruling): the settlement bridge releases
 // the Monitor slot through the exact terminal-delivery transition (daemon
 // control, local exact-CAS fallback here) and refuses a stale identity; the
