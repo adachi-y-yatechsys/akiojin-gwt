@@ -94,6 +94,10 @@ pub const OPERATIONS: &[Operation] = &[
         aliases: &[],
     },
     Operation {
+        name: "daemon.recover",
+        aliases: &[],
+    },
+    Operation {
         name: "daemon.start",
         aliases: &[],
     },

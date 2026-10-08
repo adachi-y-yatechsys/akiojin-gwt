@@ -138,6 +138,13 @@ pub enum CliCommand {
 pub enum DaemonCommand {
     /// `daemon.start` — bootstrap and serve the runtime daemon.
     Start,
+    /// `daemon.recover` — revoke a stale v2 authority without starting work.
+    Recover {
+        project_root: PathBuf,
+        project_store_hash: String,
+        expected_fence: crate::IssueMonitorAuthorityFence,
+        expected_epoch: u64,
+    },
     /// `daemon.status` — print whether a daemon is registered for cwd scope.
     Status,
     /// `daemon.subscribe` — connect to the running daemon,

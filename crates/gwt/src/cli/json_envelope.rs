@@ -1,4 +1,73 @@
 use gwt_agent::session::GWT_SESSION_ID_ENV;
+use std::path::PathBuf;
+
+#[cfg(test)]
+mod recovery_operation_tests {
+    use super::*;
+
+    fn params() -> Value {
+        serde_json::json!({"project_root": std::env::temp_dir(),
+            "project_store_hash": "0123456789abcdef", "expected_epoch": 17,
+            "expected_fence": {"version": 2, "pid": 77, "instance_id": "old-owner"}})
+    }
+
+    #[test]
+    fn daemon_recover_decodes_an_explicit_one_shot_request() {
+        let input =
+            serde_json::json!({"operation":"daemon.recover", "params":params()}).to_string();
+        assert!(
+            parse(&input).is_ok(),
+            "the approved recovery operation is missing"
+        );
+    }
+
+    #[test]
+    fn daemon_recover_requires_all_guards_and_rejects_unknown_fields() {
+        for key in [
+            "project_root",
+            "project_store_hash",
+            "expected_epoch",
+            "expected_fence",
+        ] {
+            let mut value = params();
+            value.as_object_mut().unwrap().remove(key);
+            assert!(parse(
+                &serde_json::json!({"operation":"daemon.recover","params":value}).to_string()
+            )
+            .is_err());
+        }
+        for (key, value) in [
+            ("project_root", serde_json::json!("relative")),
+            ("expected_epoch", serde_json::json!("17")),
+            ("expected_epoch", serde_json::json!(-1)),
+            ("unexpected", serde_json::json!(true)),
+        ] {
+            let mut p = params();
+            p[key] = value;
+            assert!(parse(
+                &serde_json::json!({"operation":"daemon.recover","params":p}).to_string()
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn daemon_recover_rejects_invalid_or_extended_fence_identities() {
+        for (key, value) in [
+            ("version", serde_json::json!(1)),
+            ("pid", serde_json::json!(0)),
+            ("instance_id", serde_json::json!(" ")),
+            ("extra", serde_json::json!(1)),
+        ] {
+            let mut p = params();
+            p["expected_fence"][key] = value;
+            assert!(parse(
+                &serde_json::json!({"operation":"daemon.recover","params":p}).to_string()
+            )
+            .is_err());
+        }
+    }
+}
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
@@ -967,6 +1036,7 @@ fn parse(input: &str) -> Result<ParsedEnvelope, CliParseError> {
                 .unwrap_or(IndexScope::All),
         }),
         "diagnostics.cpu" => CliCommand::Diagnostics(DiagnosticsCommand::Cpu { json: true }),
+        "daemon.recover" => daemon_recover(params)?,
         "daemon.start" => CliCommand::Daemon(DaemonCommand::Start),
         "daemon.status" => CliCommand::Daemon(DaemonCommand::Status),
         "daemon.subscribe" => daemon_subscribe(params)?,
@@ -1581,6 +1651,61 @@ fn memory_add(params: &Map<String, Value>) -> Result<CliCommand, CliParseError> 
         learning: required_string(params, "learning")?,
         future_action: required_string(params, "future_action")?,
     })))
+}
+
+fn daemon_recover(params: &Map<String, Value>) -> Result<CliCommand, CliParseError> {
+    reject_unknown_params(
+        params,
+        &[
+            "project_root",
+            "project_store_hash",
+            "expected_epoch",
+            "expected_fence",
+        ],
+        "daemon.recover",
+    )?;
+    let project_root = PathBuf::from(required_string(params, "project_root")?);
+    if !project_root.is_absolute() {
+        return Err(CliParseError::InvalidJson(
+            "daemon.recover requires an absolute project_root".into(),
+        ));
+    }
+    let project_store_hash = required_string(params, "project_store_hash")?;
+    let epoch =
+        lookup(params, "expected_epoch").ok_or(CliParseError::MissingFlag("expected_epoch"))?;
+    let expected_epoch = epoch.as_u64().ok_or_else(|| {
+        CliParseError::InvalidJson("expected_epoch must be an unsigned integer".into())
+    })?;
+    let value =
+        lookup(params, "expected_fence").ok_or(CliParseError::MissingFlag("expected_fence"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| CliParseError::InvalidJson("expected_fence must be an object".into()))?;
+    if object
+        .keys()
+        .any(|key| !["version", "pid", "instance_id"].contains(&key.as_str()))
+    {
+        return Err(CliParseError::InvalidJson(
+            "unknown expected_fence field".into(),
+        ));
+    }
+    let expected_fence: crate::IssueMonitorAuthorityFence =
+        serde_json::from_value(value.clone())
+            .map_err(|error| CliParseError::InvalidJson(error.to_string()))?;
+    if expected_fence.version != 2
+        || expected_fence.pid == 0
+        || expected_fence.instance_id.trim().is_empty()
+    {
+        return Err(CliParseError::InvalidJson(
+            "expected_fence requires a valid version-2 identity".into(),
+        ));
+    }
+    Ok(CliCommand::Daemon(DaemonCommand::Recover {
+        project_root,
+        project_store_hash,
+        expected_fence,
+        expected_epoch,
+    }))
 }
 
 fn daemon_subscribe(params: &Map<String, Value>) -> Result<CliCommand, CliParseError> {

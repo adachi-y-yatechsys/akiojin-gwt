@@ -1430,3 +1430,45 @@ JSON operation `issue.spec.read` to inspect them locally through the cache-backe
 ## License
 
 MIT
+
+## Fork: one-shot authority recovery
+
+This fork adds the JSON-only `daemon.recover` operation. It changes a stale
+Issue Monitor authority record without starting a daemon, scan, GUI, agent,
+queue action, remote claim action, or branch pruning. Installation and a real
+recovery trial require a separate operator decision.
+
+```json
+{"operation":"daemon.recover","params":{"project_root":"/absolute/project/root","project_store_hash":"expected-store-hash","expected_epoch":17,"expected_fence":{"version":2,"pid":77,"instance_id":"exact-saved-instance"}}}
+```
+
+Pass the envelope on standard input to `gwtd`, with no command-line arguments. `project_root`
+must be an existing absolute directory whose repository identity resolves
+to the expected store; the current working directory is never a fallback.
+All four parameters are required. Unknown parameters and unknown fence
+fields are rejected. Use the exact observed epoch and version-2 fence
+identity; PID absence alone does not authorize recovery.
+
+Under the stable preferences lock, recovery obtains the matching nonblocking
+kernel authority lease and reads the current files. It refuses missing or
+invalid preferences, active authority, legacy or changed fences, enabled
+monitor/autonomy, pending effects, changed epoch, and overflow. It preserves
+all other preference fields, including launch/claim records and unknown
+fields, advances only the authority epoch, then removes the matching fence.
+The committed-generation sidecar is written best effort, following existing
+preferences persistence. Directory sync remains a compatibility no-op on
+Windows, as in the existing writer; power-loss durability is not established
+by the artificial tests.
+
+Success reports `status=authority_recovered`, `previous_epoch`, `new_epoch`,
+`runtime_clear_verified=false`, and `work_resumed=false`. It does not prove
+that agents have exited, slots are free, or remote claims are released.
+Persistence/removal errors after a write begins report `recovery outcome
+unknown`; inspect both files before deciding what to do. There is no automatic
+retry. Replaying the same guards after recovery is refused without another
+epoch advance. Never restore an old authority epoch from a backup.
+
+The command sets a cooperative five-second deadline for scope/lock/write
+checks; this is not a hard process termination guarantee. The scoped tests
+use temporary repositories and files and do not run a real `gwtd` process.
+Full canonical CI, global coverage, and operational recovery remain unverified.
