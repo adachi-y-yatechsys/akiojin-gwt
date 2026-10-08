@@ -226,7 +226,12 @@ fn within_cooldown(last_finished_at: Option<DateTime<Utc>>, now: DateTime<Utc>) 
 /// run: one free-space query per volume and one small file read. The sweep
 /// itself — which walks every worktree and may delete hundreds of gigabytes —
 /// runs on its own thread so it never holds the scan.
-pub fn maybe_spawn(project_root: &Path) -> AutoGcDecision {
+pub fn maybe_spawn(project_root: &Path, background_cleanup_allowed: bool) -> AutoGcDecision {
+    if !background_cleanup_allowed {
+        return AutoGcDecision::Skip {
+            reason: "automatic cleanup disabled for this daemon".to_string(),
+        };
+    }
     let config = current_config();
     let disk = probe_disk(project_root, &config);
     let record_path = record_path(project_root);

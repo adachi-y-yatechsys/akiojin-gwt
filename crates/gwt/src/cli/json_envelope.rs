@@ -1,9 +1,35 @@
 use gwt_agent::session::GWT_SESSION_ID_ENV;
 use std::path::PathBuf;
 
+fn minimal_daemon_operation(operation: &str) -> bool {
+    matches!(operation, "daemon.stop" | "daemon.start_without_cleanup")
+        || operation.starts_with("daemon.probe.")
+}
+
 #[cfg(test)]
 mod daemon_probe_operation_tests {
     use super::*;
+    #[test]
+    fn worker_without_cleanup_requires_explicit_project_and_refuses_extra_scope() {
+        let input = |p: Value| {
+            serde_json::json!({"operation":"daemon.start_without_cleanup","params":p}).to_string()
+        };
+        assert!(matches!(
+            parse(&input(
+                serde_json::json!({"project_root":std::env::temp_dir()})
+            ))
+            .unwrap()
+            .command,
+            CliCommand::Daemon(DaemonCommand::StartWithoutCleanup { .. })
+        ));
+        for params in [
+            serde_json::json!({}),
+            serde_json::json!({"project_root":"relative"}),
+            serde_json::json!({"project_root":std::env::temp_dir(),"allow_background_cleanup":true}),
+        ] {
+            assert!(parse(&input(params)).is_err());
+        }
+    }
     #[test]
     fn diagnostic_start_and_status_require_explicit_exact_scope() {
         for operation in ["daemon.probe.start", "daemon.probe.status"] {
@@ -289,7 +315,7 @@ pub(crate) fn dispatch<E: CliEnv>(env: &mut E, prog: &str) -> i32 {
         }
     };
     #[cfg(not(test))]
-    if parsed.operation != "daemon.stop" && !parsed.operation.starts_with("daemon.probe.") {
+    if !minimal_daemon_operation(&parsed.operation) {
         crate::perf::install_appending_to_established_log_from_settings();
     }
     let operation = parsed.operation.clone();
@@ -337,7 +363,7 @@ pub(crate) fn dispatch<E: CliEnv>(env: &mut E, prog: &str) -> i32 {
             match (code, declared_block) {
                 (0, Some(block)) => super::board::auto_file_declared_block(env, &block),
                 (0, None) => {}
-                _ if operation == "daemon.stop" || operation.starts_with("daemon.probe.") => {}
+                _ if minimal_daemon_operation(&operation) => {}
                 _ => {
                     report_operation_refusal(
                         &operation,
@@ -382,10 +408,10 @@ pub(crate) fn dispatch<E: CliEnv>(env: &mut E, prog: &str) -> i32 {
             // operation's own reply.
             // Exact stop is a cleanup boundary. A lost receipt or identity
             // refusal must not create Board work or write an error ledger.
-            if operation != "daemon.stop" && !operation.starts_with("daemon.probe.") {
+            if !minimal_daemon_operation(&operation) {
                 report_operation_refusal(&operation, &message, requested_project_root.as_deref());
             }
-            if operation == "daemon.stop" || operation.starts_with("daemon.probe.") {
+            if minimal_daemon_operation(&operation) {
             } else if let Some(refusal) = failure.refusal.as_ref() {
                 super::board::auto_file_structured_operation_refusal(
                     env, &operation, &message, refusal,
@@ -1224,6 +1250,16 @@ fn parse(input: &str) -> Result<ParsedEnvelope, CliParseError> {
         "diagnostics.cpu" => CliCommand::Diagnostics(DiagnosticsCommand::Cpu { json: true }),
         "daemon.recover" => daemon_recover(params)?,
         "daemon.start" => CliCommand::Daemon(DaemonCommand::Start),
+        "daemon.start_without_cleanup" => {
+            reject_unknown_params(params, &["project_root"], "daemon.start_without_cleanup")?;
+            let project_root = PathBuf::from(required_string(params, "project_root")?);
+            if !project_root.is_absolute() {
+                return Err(CliParseError::InvalidJson(
+                    "daemon start requires an absolute project_root".into(),
+                ));
+            }
+            CliCommand::Daemon(DaemonCommand::StartWithoutCleanup { project_root })
+        }
         "daemon.probe.start" => daemon_probe(params, false)?,
         "daemon.probe.status" => daemon_probe(params, true)?,
         "daemon.stop" => daemon_stop(params)?,

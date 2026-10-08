@@ -162,6 +162,22 @@ pub(super) fn serve_blocking_with_mode<W: std::io::Write + ?Sized>(
     writer: &mut W,
     diagnostic_only: bool,
 ) -> Result<i32, SpecOpsError> {
+    serve_blocking_with_options(
+        scope,
+        endpoint_path,
+        writer,
+        diagnostic_only,
+        !diagnostic_only,
+    )
+}
+
+pub(super) fn serve_blocking_with_options<W: std::io::Write + ?Sized>(
+    scope: RuntimeScope,
+    endpoint_path: PathBuf,
+    writer: &mut W,
+    diagnostic_only: bool,
+    background_cleanup_allowed: bool,
+) -> Result<i32, SpecOpsError> {
     // Resolve before anything is persisted or announced: a runtime root
     // longer than `sun_path` must surface as a diagnosis here rather than
     // as a bare bind failure after the endpoint file already advertised an
@@ -170,7 +186,7 @@ pub(super) fn serve_blocking_with_mode<W: std::io::Write + ?Sized>(
         resolve_daemon_socket_path(&endpoint_path).map_err(|err| config_error(err.to_string()))?;
     let socket_path = socket.path;
     let authority_lease = acquire_daemon_startup_lease(&scope)?;
-    if diagnostic_only {
+    if diagnostic_only || !background_cleanup_allowed {
         let prefs = crate::issue_monitor_prefs_path_for_repo_path(&scope.project_root);
         if !matches!(
             crate::load_issue_monitor_authority_fence(&prefs),
@@ -194,7 +210,7 @@ pub(super) fn serve_blocking_with_mode<W: std::io::Write + ?Sized>(
     // stranded the live daemon on an unlinked inode, and the loser's exit
     // cleanup then deleted the live daemon's endpoint descriptor, leaving
     // every CLI caller on "authority fence ... has no usable endpoint".
-    if diagnostic_only {
+    if diagnostic_only || !background_cleanup_allowed {
         if bind_is_present(&socket_path) || bind_is_served(&socket_path.to_string_lossy()) {
             return Err(config_error(
                 "daemon probe bind already exists; no cleanup or adoption",
@@ -213,6 +229,7 @@ pub(super) fn serve_blocking_with_mode<W: std::io::Write + ?Sized>(
         env!("CARGO_PKG_VERSION").to_string(),
     );
     endpoint.diagnostic_only = diagnostic_only;
+    endpoint.background_cleanup_allowed = background_cleanup_allowed;
 
     let runtime = Builder::new_multi_thread()
         .enable_all()
@@ -384,7 +401,7 @@ fn bind_daemon(
     endpoint_path: &Path,
     authority_lease: crate::IssueMonitorAuthorityLease,
 ) -> Result<BoundDaemon, SpecOpsError> {
-    if endpoint.diagnostic_only {
+    if endpoint.diagnostic_only || !endpoint.background_cleanup_allowed {
         // Recheck under the project lifetime lease. No stale-file sweep,
         // replacement, or adoption belongs to this diagnostic operation.
         super::probe::require_empty_endpoint_directory(
@@ -443,6 +460,7 @@ async fn run_bound_server(
             operation_timeout,
             IssueMonitorWorkerTestHooks::default(),
             Some(Arc::clone(&authority_lease)),
+            endpoint.background_cleanup_allowed,
         ))
     };
 
@@ -740,9 +758,11 @@ fn spawn_issue_monitor_worker_with_config_timeout_and_hooks(
         operation_timeout,
         test_hooks,
         None,
+        true,
     )
 }
 
+#[allow(clippy::too_many_arguments)] // Immutable per-instance cleanup policy travels with the lifetime lease.
 fn spawn_issue_monitor_worker_with_lease(
     scope: RuntimeScope,
     hub: BroadcastHub,
@@ -751,6 +771,7 @@ fn spawn_issue_monitor_worker_with_lease(
     operation_timeout: Duration,
     test_hooks: IssueMonitorWorkerTestHooks,
     authority_lease: Option<Arc<crate::IssueMonitorAuthorityLease>>,
+    background_cleanup_allowed: bool,
 ) -> tokio::task::JoinHandle<()> {
     // Establish the control-lane state from the durable snapshot before the
     // server can accept a publisher connection. Starting publishers wait on
@@ -1393,6 +1414,7 @@ fn spawn_issue_monitor_worker_with_lease(
                         issue_monitor_gui_connected(&hub),
                         deadline,
                         test_hooks.clone(),
+                        background_cleanup_allowed,
                     ),
                     deadline,
                     watchdog_fired: false,
@@ -3705,6 +3727,7 @@ fn spawn_issue_monitor_scan(
         gui_connected,
         deadline,
         IssueMonitorWorkerTestHooks::default(),
+        true,
     )
 }
 
@@ -3728,6 +3751,7 @@ fn spawn_issue_monitor_scan_with_deadline(
     gui_connected: bool,
     deadline: Instant,
     test_hooks: IssueMonitorWorkerTestHooks,
+    background_cleanup_allowed: bool,
 ) -> tokio::task::JoinHandle<
     Result<crate::IssueMonitorState, crate::issue_monitor_worker::IssueMonitorScanFailure>,
 > {
@@ -3746,8 +3770,13 @@ fn spawn_issue_monitor_scan_with_deadline(
         // scan. Unit tests drive this worker against scratch repositories and
         // must not start a host-wide sweep on a CI runner that is low on disk.
         #[cfg(not(test))]
-        crate::worktree::gc::maybe_spawn(&scope.project_root);
-        scan_issue_monitor_once_blocking(scope, monitor, gui_connected)
+        crate::worktree::gc::maybe_spawn(&scope.project_root, background_cleanup_allowed);
+        scan_issue_monitor_once_blocking_with_cleanup_policy(
+            scope,
+            monitor,
+            gui_connected,
+            background_cleanup_allowed,
+        )
     })
 }
 
@@ -4779,10 +4808,20 @@ fn daemon_run_secret() -> &'static [u8] {
         .as_slice()
 }
 
+#[cfg(all(test, unix))]
 fn scan_issue_monitor_once_blocking(
+    scope: RuntimeScope,
+    monitor: crate::IssueMonitorState,
+    gui_connected: bool,
+) -> Result<crate::IssueMonitorState, crate::issue_monitor_worker::IssueMonitorScanFailure> {
+    scan_issue_monitor_once_blocking_with_cleanup_policy(scope, monitor, gui_connected, true)
+}
+
+fn scan_issue_monitor_once_blocking_with_cleanup_policy(
     scope: RuntimeScope,
     mut monitor: crate::IssueMonitorState,
     gui_connected: bool,
+    background_cleanup_allowed: bool,
 ) -> Result<crate::IssueMonitorState, crate::issue_monitor_worker::IssueMonitorScanFailure> {
     use crate::issue_monitor_worker::IssueMonitorScanStage;
 
@@ -5037,6 +5076,7 @@ fn scan_issue_monitor_once_blocking(
             &scope.project_root,
             gwt_git::pr_status::SETTLEMENT_BASE_BRANCH,
             &merge_reconciliation,
+            background_cleanup_allowed,
         );
         for line in prune.log_lines() {
             tracing::info!("{line}");
@@ -5523,6 +5563,7 @@ async fn handle_connection(
                     protocol_version: endpoint.protocol_version,
                     daemon_version: endpoint.daemon_version.clone(),
                     diagnostic_only: endpoint.diagnostic_only,
+                    background_cleanup_allowed: endpoint.background_cleanup_allowed,
                     uptime_seconds: started_at.elapsed().as_secs(),
                     broadcast_channels: hub.channel_count(),
                     connections: connection_guard.snapshot(),
@@ -5772,7 +5813,9 @@ fn heal_endpoint_descriptor(
                 if existing.pid == endpoint.pid
                     && existing.auth_token == endpoint.auth_token
                     && existing.bind == endpoint.bind
-                    && existing.diagnostic_only == endpoint.diagnostic_only =>
+                    && existing.diagnostic_only == endpoint.diagnostic_only
+                    && existing.background_cleanup_allowed
+                        == endpoint.background_cleanup_allowed =>
             {
                 return EndpointDescriptorHeal::Intact;
             }
@@ -5807,6 +5850,7 @@ fn heal_endpoint_descriptor(
         endpoint.daemon_version.clone(),
     );
     refreshed.diagnostic_only = endpoint.diagnostic_only;
+    refreshed.background_cleanup_allowed = endpoint.background_cleanup_allowed;
     match persist_endpoint(endpoint_path, &refreshed) {
         Ok(()) => {
             tracing::warn!(

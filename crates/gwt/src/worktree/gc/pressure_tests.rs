@@ -111,6 +111,22 @@ fn disk_pressure_reclaims_idle_merged_and_unmerged_caches_from_project_container
     };
     let history = record_path(&project_root);
     assert!(last_record(&history).is_none());
+    assert_eq!(
+        maybe_spawn(&project_root, false),
+        AutoGcDecision::Skip {
+            reason: "automatic cleanup disabled for this daemon".to_string(),
+        }
+    );
+    assert!(
+        !history.exists(),
+        "disabled cleanup must not record a sweep"
+    );
+    for target in &targets {
+        assert!(
+            target.join("cache.bin").exists(),
+            "disabled cleanup must preserve caches"
+        );
+    }
     run_exclusive(&project_root, &history, &trigger);
 
     let record = last_record(&history).expect("automatic GC record");

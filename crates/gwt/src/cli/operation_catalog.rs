@@ -102,6 +102,10 @@ pub const OPERATIONS: &[Operation] = &[
         aliases: &[],
     },
     Operation {
+        name: "daemon.start_without_cleanup",
+        aliases: &[],
+    },
+    Operation {
         name: "daemon.probe.start",
         aliases: &[],
     },

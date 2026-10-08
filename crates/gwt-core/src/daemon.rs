@@ -403,6 +403,13 @@ pub struct DaemonEndpoint {
     /// Transport diagnostics only; never adopt as a work runtime.
     #[serde(default)]
     pub diagnostic_only: bool,
+    /// Per-instance permission for automatic branch and build-cache cleanup.
+    #[serde(default = "default_background_cleanup_allowed")]
+    pub background_cleanup_allowed: bool,
+}
+
+fn default_background_cleanup_allowed() -> bool {
+    true
 }
 
 impl DaemonEndpoint {
@@ -429,6 +436,7 @@ impl DaemonEndpoint {
             auth_token,
             updated_at_unix_ms: chrono::Utc::now().timestamp_millis(),
             diagnostic_only: false,
+            background_cleanup_allowed: true,
         }
     }
 
@@ -635,6 +643,8 @@ pub struct DaemonStatus {
     pub daemon_version: String,
     #[serde(default)]
     pub diagnostic_only: bool,
+    #[serde(default = "default_background_cleanup_allowed")]
+    pub background_cleanup_allowed: bool,
     pub uptime_seconds: u64,
     pub broadcast_channels: usize,
     /// Number of currently-connected IPC clients, including the one

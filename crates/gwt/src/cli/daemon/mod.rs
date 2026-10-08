@@ -104,6 +104,9 @@ pub(super) fn run<E: CliEnv>(
 ) -> Result<i32, SpecOpsError> {
     match cmd {
         DaemonCommand::Start => start_daemon(env, out),
+        DaemonCommand::StartWithoutCleanup { project_root } => {
+            probe::start_without_cleanup(&project_root, env.stdout())
+        }
         DaemonCommand::ProbeStart { project_root } => probe::start(&project_root, env.stdout()),
         DaemonCommand::ProbeStatus {
             project_root,
@@ -886,6 +889,7 @@ mod tests {
     #[test]
     fn format_probe_result_ok_includes_uptime_and_channels() {
         let status = DaemonStatus {
+            background_cleanup_allowed: true,
             diagnostic_only: false,
             protocol_version: DAEMON_PROTOCOL_VERSION,
             daemon_version: "9.14.0".to_string(),

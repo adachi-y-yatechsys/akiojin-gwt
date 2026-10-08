@@ -1,11 +1,12 @@
-//! A real transport lifecycle probe without background work. No scans,
-//! GitHub calls, artifact GC, verification children or materializers.
+//! Explicit-start entry points. The diagnostic entry creates transport only:
+//! no scans, GitHub calls, artifact GC, verification children or materializers.
+//! The normal worker entry disables automatic branch/cache cleanup only.
 use super::{client::DaemonClient, config_error};
 use gwt_core::daemon::{ClientFrame, DaemonFrame, RuntimeScope, RuntimeTarget};
 use gwt_github::SpecOpsError;
 use std::{path::Path, time::Duration};
 
-fn scope(project_root: &Path) -> Result<RuntimeScope, SpecOpsError> {
+pub(super) fn scope(project_root: &Path) -> Result<RuntimeScope, SpecOpsError> {
     if !project_root.is_absolute() {
         return Err(config_error(
             "daemon probe requires an absolute project_root",
@@ -67,6 +68,17 @@ pub(super) fn start<W: std::io::Write + ?Sized>(
     require_empty_endpoint_directory(&scope.daemon_dir(&home))?;
     let endpoint_path = scope.endpoint_path(&home);
     super::server::serve_blocking_with_mode(scope, endpoint_path, writer, true)
+}
+
+pub(super) fn start_without_cleanup<W: std::io::Write + ?Sized>(
+    project_root: &Path,
+    writer: &mut W,
+) -> Result<i32, SpecOpsError> {
+    let scope = scope(project_root)?;
+    let home = gwt_core::paths::gwt_home();
+    require_empty_endpoint_directory(&scope.daemon_dir(&home))?;
+    let endpoint_path = scope.endpoint_path(&home);
+    super::server::serve_blocking_with_options(scope, endpoint_path, writer, false, false)
 }
 
 pub(super) fn status(

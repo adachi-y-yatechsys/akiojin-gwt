@@ -38,6 +38,7 @@ async fn fixture_with_mode(
         "test".into(),
     );
     endpoint.diagnostic_only = diagnostic_only;
+    endpoint.background_cleanup_allowed = !diagnostic_only;
     let mut listener = IpcListener::bind(std::path::Path::new(&endpoint.bind)).unwrap();
     let shutdown = Arc::new(DaemonShutdown::new());
     let server_shutdown = shutdown.clone();
@@ -146,6 +147,7 @@ async fn diagnostic_server_status_and_stop_never_load_monitor_or_create_its_fenc
         "test".into(),
     );
     endpoint.diagnostic_only = true;
+    endpoint.background_cleanup_allowed = false;
     let bound = super::bind_daemon(&endpoint, &socket, &path, lease).unwrap();
     let shutdown = Arc::new(DaemonShutdown::new());
     let server = tokio::spawn(super::run_bound_server(
@@ -160,7 +162,7 @@ async fn diagnostic_server_status_and_stop_never_load_monitor_or_create_its_fenc
     let mut client = DaemonClient::connect(&endpoint).await.unwrap();
     client.send_frame(&ClientFrame::Status).await.unwrap();
     assert!(matches!(client.read_frame::<DaemonFrame>().await.unwrap(),
-        DaemonFrame::Status(s) if s.diagnostic_only && s.issue_monitor.is_none()));
+        DaemonFrame::Status(s) if s.diagnostic_only && !s.background_cleanup_allowed && s.issue_monitor.is_none()));
     drop(client);
     crate::cli::daemon::stop::request_stop(&endpoint, "probe-stop-test")
         .await
@@ -200,6 +202,7 @@ fn diagnostic_mode_survives_descriptor_repair_and_corrects_a_lost_mode_flag() {
         "test".into(),
     );
     endpoint.diagnostic_only = true;
+    endpoint.background_cleanup_allowed = false;
     let path = temp.path().join("endpoint.json");
     assert_eq!(
         super::heal_endpoint_descriptor(&endpoint, &path, &|_| false),
@@ -211,7 +214,13 @@ fn diagnostic_mode_survives_descriptor_repair_and_corrects_a_lost_mode_flag() {
             .diagnostic_only
     );
     let mut lost = endpoint.clone();
+    assert!(
+        !gwt_core::daemon::load_endpoint(&path)
+            .unwrap()
+            .background_cleanup_allowed
+    );
     lost.diagnostic_only = false;
+    lost.background_cleanup_allowed = true;
     gwt_core::daemon::persist_endpoint(&path, &lost).unwrap();
     assert_eq!(
         super::heal_endpoint_descriptor(&endpoint, &path, &|_| true),
@@ -221,6 +230,11 @@ fn diagnostic_mode_survives_descriptor_repair_and_corrects_a_lost_mode_flag() {
         gwt_core::daemon::load_endpoint(&path)
             .unwrap()
             .diagnostic_only
+    );
+    assert!(
+        !gwt_core::daemon::load_endpoint(&path)
+            .unwrap()
+            .background_cleanup_allowed
     );
 }
 

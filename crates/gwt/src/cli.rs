@@ -138,6 +138,8 @@ pub enum CliCommand {
 pub enum DaemonCommand {
     /// `daemon.start` — bootstrap and serve the runtime daemon.
     Start,
+    /// JSON-only normal worker startup without automatic destructive cleanup.
+    StartWithoutCleanup { project_root: PathBuf },
     /// JSON-only transport probe, without the Issue Monitor worker.
     ProbeStart { project_root: PathBuf },
     /// Read the exact diagnostic-only instance; never discover or bootstrap.

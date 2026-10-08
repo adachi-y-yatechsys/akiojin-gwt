@@ -1432,8 +1432,13 @@ pub fn prune_delivered_work_branches(
     repo_path: &Path,
     base_branch: &str,
     reconciliation: &IssueMonitorMergeReconciliation,
+    background_cleanup_allowed: bool,
 ) -> gwt_git::merged_branch_prune::PruneReport {
     let mut report = gwt_git::merged_branch_prune::PruneReport::default();
+    if !background_cleanup_allowed {
+        report.skipped_reason = Some("automatic cleanup disabled for this daemon".to_string());
+        return report;
+    }
     if reconciliation.merged.is_empty() {
         return report;
     }
@@ -2436,6 +2441,23 @@ mod tests {
         UpdatedAt,
     };
     use std::path::PathBuf;
+
+    #[test]
+    fn disabled_cleanup_refuses_pruning_before_git_even_after_delivery() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let missing_repo = tmp.path().join("missing-repository");
+        let reconciliation = IssueMonitorMergeReconciliation {
+            merged: vec![1],
+            ..Default::default()
+        };
+        let report =
+            prune_delivered_work_branches(&missing_repo, "develop", &reconciliation, false);
+        assert_eq!(
+            report.skipped_reason.as_deref(),
+            Some("automatic cleanup disabled for this daemon")
+        );
+        assert!(!missing_repo.exists());
+    }
 
     fn issue(number: u64) -> IssueMonitorIssue {
         IssueMonitorIssue {

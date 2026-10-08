@@ -30,6 +30,15 @@ fn diagnostic_descriptor_is_preserved_and_never_adopted_or_retired() {
     let path = scope.endpoint_path(home.path());
     let mut legacy = serde_json::to_value(&endpoint).unwrap();
     legacy.as_object_mut().unwrap().remove("diagnostic_only");
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("background_cleanup_allowed");
+    assert!(
+        serde_json::from_value::<DaemonEndpoint>(legacy.clone())
+            .unwrap()
+            .background_cleanup_allowed
+    );
     assert!(
         !serde_json::from_value::<DaemonEndpoint>(legacy)
             .unwrap()
@@ -864,6 +873,7 @@ fn client_frame_status_serializes_to_canonical_shape() {
 #[test]
 fn daemon_frame_status_carries_uptime_and_channel_count() {
     let frame = DaemonFrame::Status(DaemonStatus {
+        background_cleanup_allowed: true,
         diagnostic_only: false,
         protocol_version: DAEMON_PROTOCOL_VERSION,
         daemon_version: "9.14.0".to_string(),

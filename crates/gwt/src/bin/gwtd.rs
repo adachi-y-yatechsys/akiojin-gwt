@@ -275,6 +275,7 @@ fn format_daemon_help() -> String {
         "  daemon.start                            Bootstrap and serve the runtime daemon",
         "  daemon.recover                          Recover a stale v2 authority without starting work",
         "  daemon.stop                             Request cooperative stop of one exact instance",
+        "  daemon.start_without_cleanup            Start worker without automatic branch/cache cleanup",
         "  daemon.probe.start                      Start transport only; no worker or background work",
         "  daemon.probe.status                     Read one exact diagnostic-only instance",
         "  daemon.status                           Probe the daemon endpoint",

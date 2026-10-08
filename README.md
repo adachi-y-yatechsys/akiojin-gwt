@@ -1509,6 +1509,14 @@ actual daemon/GUI/PTY operation, power-loss durability, full CI, or acceptance.
 
 ### Exact-instance cooperative daemon stop (fork preparation)
 
+`daemon.start_without_cleanup` starts the normal Issue Monitor worker with
+automatic remote branch pruning and build-cache GC disabled for this instance.
+Pass an absolute `project_root`; existing endpoints or authority fences are
+refused. The descriptor and status report `background_cleanup_allowed: false`.
+GitHub reads, local monitor/fence updates and claim/auto-merge release
+compensations remain enabled. This is not a read-only worker or an AI launch.
+Ordinary startup retains its existing cleanup behavior.
+
 `daemon.probe.start` provides a separate transport diagnostic. Pass an absolute
 `project_root`. It creates no Issue Monitor worker, scan, GitHub mutation,
 artifact cleanup, GUI materializer or verification child. Existing descriptors,
