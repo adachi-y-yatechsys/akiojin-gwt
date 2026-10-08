@@ -422,6 +422,14 @@ Agents and automation can inspect the queue with `issue.monitor.status` and
 change membership/order with `issue.monitor.queue.push`,
 `issue.monitor.queue.remove`, and `issue.monitor.queue.move`. The
 `issue.monitor.queue.auto_refill` operation sets opt-in refill and its limit.
+Successful `issue.monitor.queue.push` confirms durable request storage, not a
+remote claim or launch. The CLI creates no remote reservation comment and uses
+the existing Monitor control lane. Failed claim reads, rejection, busy and unknown
+outcomes are not reported as full success. Only an unavailable transport permits
+local storage, guarded by the absence of Monitor authority. Existing confirmed
+claims match the issue number, claim ID and owner exactly. `force` bypasses the
+queue preflight only; it does not transfer claim authority. Positioned pushes use
+an atomic insertion/order control that older daemons reject.
 `issue.monitor.launch_now` explicitly adds the Issue at the front of the terminal
 queue and requests a scan. Existing `issue.monitor.priority.move` and
 `issue.monitor.priority.set` operations remain available. The

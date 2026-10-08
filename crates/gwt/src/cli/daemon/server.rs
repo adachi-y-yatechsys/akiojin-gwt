@@ -1838,6 +1838,15 @@ enum IssueMonitorControl {
     /// SPEC #3165 TQ-9: put Issues into this terminal's explicit queue. This is
     /// the user's own act, so the entries are attributed to the operator.
     TerminalQueuePush(Vec<u64>),
+    TerminalQueuePushAtPosition {
+        issue_numbers: Vec<u64>,
+        position: usize,
+    },
+    TerminalQueuePushObserved {
+        issue_numbers: Vec<u64>,
+        position: Option<usize>,
+        urgent_observations: Vec<crate::issue_monitor::IssueMonitorUrgentQueueObservation>,
+    },
     /// SPEC #3165 TQ-9: remove Issues from this terminal's explicit queue.
     TerminalQueueRemove(Vec<u64>),
     TerminalQueueMove {
@@ -2575,11 +2584,31 @@ fn apply_routine_issue_monitor_control(
             true
         }
         IssueMonitorControl::TerminalQueuePush(issue_numbers) => {
-            monitor.terminal_queue_push(
-                &issue_numbers,
-                "operator",
-                &chrono::Utc::now().to_rfc3339(),
-            );
+            monitor.terminal_queue_push(&issue_numbers, "operator", now);
+            true
+        }
+        IssueMonitorControl::TerminalQueuePushAtPosition {
+            issue_numbers,
+            position,
+        } => {
+            monitor.terminal_queue_push_at_position(&issue_numbers, position, "operator", now);
+            true
+        }
+        IssueMonitorControl::TerminalQueuePushObserved {
+            issue_numbers,
+            position,
+            urgent_observations,
+        } => {
+            match position {
+                Some(position) => monitor.terminal_queue_push_at_position(
+                    &issue_numbers,
+                    position,
+                    "operator",
+                    now,
+                ),
+                None => monitor.terminal_queue_push(&issue_numbers, "operator", now),
+            }
+            monitor.apply_urgent_queue_observations(&urgent_observations);
             true
         }
         IssueMonitorControl::TerminalQueueMove {
@@ -3501,6 +3530,47 @@ fn decode_issue_monitor_control_in_repo(
                     .map(serde_json::Value::as_u64)
                     .collect::<Option<Vec<_>>>()?;
                 return Some(IssueMonitorControl::TerminalQueuePush(issue_numbers));
+            }
+            // A separate control name makes old daemons reject positioned pushes
+            // instead of accepting the issues while silently ignoring their order.
+            if let Some(push) = payload.get("terminal_queue_push_at_position") {
+                let issue_numbers = push
+                    .get("issue_numbers")?
+                    .as_array()?
+                    .iter()
+                    .map(serde_json::Value::as_u64)
+                    .collect::<Option<Vec<_>>>()?;
+                let position = usize::try_from(push.get("position")?.as_u64()?).ok()?;
+                return Some(IssueMonitorControl::TerminalQueuePushAtPosition {
+                    issue_numbers,
+                    position,
+                });
+            }
+            if let Some(push) = payload.get("terminal_queue_push_observed") {
+                let issue_numbers = push
+                    .get("issue_numbers")?
+                    .as_array()?
+                    .iter()
+                    .map(serde_json::Value::as_u64)
+                    .collect::<Option<Vec<_>>>()?;
+                let position = match push.get("position").filter(|value| !value.is_null()) {
+                    Some(value) => Some(usize::try_from(value.as_u64()?).ok()?),
+                    None => None,
+                };
+                let urgent_observations: Vec<
+                    crate::issue_monitor::IssueMonitorUrgentQueueObservation,
+                > = serde_json::from_value(push.get("urgent_observations")?.clone()).ok()?;
+                if urgent_observations
+                    .iter()
+                    .any(|observation| !issue_numbers.contains(&observation.issue.number))
+                {
+                    return None;
+                }
+                return Some(IssueMonitorControl::TerminalQueuePushObserved {
+                    issue_numbers,
+                    position,
+                    urgent_observations,
+                });
             }
             if let Some(move_entry) = payload.get("terminal_queue_move") {
                 return Some(IssueMonitorControl::TerminalQueueMove {
@@ -6009,6 +6079,157 @@ mod terminal_delivery_control_tests {
             0,
             "successful delivery does not requeue work"
         );
+    }
+}
+
+#[cfg(test)]
+mod queue_push_control_tests {
+    #[test]
+    fn issue_monitor_queue_push_position_control_decodes_and_applies_atomically() {
+        let control = super::decode_issue_monitor_control(
+            crate::runtime_daemon_events::issue_monitor_payload(
+                "control",
+                serde_json::json!({"terminal_queue_push_at_position": {
+                    "issue_numbers": [43, 44, 43], "position": 0
+                }}),
+                std::process::id() + 1,
+            ),
+        )
+        .expect("positioned queue push decodes");
+        let mut monitor = crate::IssueMonitorState::new(Default::default());
+        monitor.terminal_queue_push(&[42, 43], "operator", "2026-10-08T00:00:00Z");
+        assert!(super::try_apply_issue_monitor_control(
+            &mut monitor,
+            control,
+            "2026-10-08T00:00:00Z"
+        )
+        .unwrap());
+        let prefs = monitor.prefs();
+        assert_eq!(
+            prefs.terminal_queues[&crate::process::current_hostname()]
+                .last_seen_at
+                .as_deref(),
+            Some("2026-10-08T00:00:00Z")
+        );
+        assert_eq!(
+            prefs.terminal_queues[&crate::process::current_hostname()]
+                .entries
+                .iter()
+                .map(|entry| entry.number)
+                .collect::<Vec<_>>(),
+            vec![43, 44, 42]
+        );
+        assert!(prefs.claim_identities.is_empty());
+        assert!(prefs.launching_issues.is_empty());
+    }
+
+    #[test]
+    fn issue_monitor_queue_push_position_control_rejects_invalid_positions() {
+        for push in [
+            serde_json::json!({"issue_numbers": [42]}),
+            serde_json::json!({"issue_numbers": [42], "position": -1}),
+            serde_json::json!({"issue_numbers": ["42"], "position": 0}),
+        ] {
+            assert!(super::decode_issue_monitor_control(
+                crate::runtime_daemon_events::issue_monitor_payload(
+                    "control",
+                    serde_json::json!({"terminal_queue_push_at_position": push}),
+                    std::process::id() + 1,
+                ),
+            )
+            .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_monitor_queue_push_ack_follows_durable_commit_without_launch() {
+        let _budget = super::pin_prefs_hang_guard();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("issue-monitor.json");
+        let mut monitor = crate::IssueMonitorState::new(Default::default());
+        crate::save_issue_monitor_prefs(&path, &monitor.prefs()).unwrap();
+        let hub = super::BroadcastHub::new();
+        let mut receiver = hub.take_issue_monitor_control_receiver().unwrap();
+        let publisher = tokio::spawn({
+            let hub = hub.clone();
+            async move {
+                hub.publish_issue_monitor_control(gwt_core::daemon::DaemonFrame::Event {
+                    channel: crate::runtime_daemon_events::ISSUE_MONITOR_CONTROL_CHANNEL
+                        .to_string(),
+                    payload: crate::runtime_daemon_events::issue_monitor_payload(
+                        "control",
+                        serde_json::json!({"terminal_queue_push_observed": {
+                            "issue_numbers": [42], "position": 0,
+                            "urgent_observations": [{
+                                "issue": {"number":42, "title":"Issue 42", "labels":["urgent"], "state":"open", "updated_at":"2026-10-08T00:00:00Z"},
+                                "assignment": {"actor":"alice", "created_at":"2026-10-08T00:00:00Z"},
+                                "observed_at":"2026-10-08T00:00:00Z"
+                            }]
+                        }}),
+                        std::process::id().wrapping_add(1),
+                    ),
+                })
+                .await
+            }
+        });
+        let (frame, completion) = receiver.recv().await.unwrap().into_parts();
+        assert!(
+            !publisher.is_finished(),
+            "acceptance alone is not a committed receipt"
+        );
+        let gwt_core::daemon::DaemonFrame::Event { payload, .. } = frame else {
+            panic!("event")
+        };
+        let control = super::decode_issue_monitor_control(payload).unwrap();
+        let mut permit = super::IssueMonitorEffectPermit::new();
+        let mut pending = None;
+        assert!(super::apply_or_queue_issue_monitor_control(
+            &hub,
+            &path,
+            &mut monitor,
+            control,
+            &mut permit,
+            &mut pending,
+            Some(completion),
+        ));
+        assert!(pending.is_none());
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), publisher)
+                .await
+                .unwrap()
+                .unwrap(),
+            Ok(())
+        );
+        let saved = crate::load_issue_monitor_prefs(&path).unwrap();
+        assert_eq!(
+            saved.terminal_queues[&crate::process::current_hostname()].entries[0].number,
+            42
+        );
+        assert!(saved.last_control_receipt.is_some());
+        assert_eq!(
+            saved
+                .urgent_queue
+                .projection(&saved.terminal_queues[&crate::process::current_hostname()])
+                .entries[0]
+                .assigned_by
+                .as_deref(),
+            Some("alice")
+        );
+        assert!(saved.claim_identities.is_empty());
+        assert!(saved.launching_issues.is_empty());
+        assert!(!saved.autonomous_mode);
+    }
+
+    #[test]
+    fn issue_monitor_queue_push_observation_cannot_mutate_an_unrequested_issue() {
+        assert!(super::decode_issue_monitor_control(crate::runtime_daemon_events::issue_monitor_payload(
+            "control", serde_json::json!({"terminal_queue_push_observed": {
+                "issue_numbers":[42], "urgent_observations":[{
+                    "issue":{"number":43,"title":"Other Issue","labels":["urgent"],"state":"open"},
+                    "assignment":null, "observed_at":"2026-10-08T00:00:00Z"
+                }]
+            }}), std::process::id().wrapping_add(1),
+        )).is_none());
     }
 }
 

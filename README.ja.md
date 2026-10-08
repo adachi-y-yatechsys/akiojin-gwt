@@ -395,6 +395,12 @@ open な GitHub Issue は、明示的な追加、有効な Auto-refill、また�
 Agent や自動化からは `issue.monitor.status` で確認し、`issue.monitor.queue.push`、
 `issue.monitor.queue.remove`、`issue.monitor.queue.move` で所属と順序を変更できます。
 `issue.monitor.queue.auto_refill` は自動補充の有効化と上限を設定します。
+`issue.monitor.queue.push` の成功は依頼の保存を示し、遠隔担当の取得や起動は示しません。
+CLIは遠隔の予約コメントを作らず、既存Monitorの受付を使います。担当の読取り失敗、
+受付の拒否・混雑・結果不明は全件成功にしません。通信先が存在しない場合に限り、
+Monitorの管理記録が無いことを確認してローカル保存します。保存済み担当はIssue番号・
+予約ID・担当IDの完全一致で照合します。`force`は事前の受付拒否を外すだけで、担当を奪いません。
+位置指定には追加と順序を一緒に保存する受付が必要で、対応しない旧daemonは拒否します。
 `issue.monitor.launch_now` は対象を端末キューの先頭へ明示的に追加し、scan を要求します。
 既存の `issue.monitor.priority.move` と `issue.monitor.priority.set` も利用できます。
 `issue.monitor.config.set` は処理停止、Autonomous

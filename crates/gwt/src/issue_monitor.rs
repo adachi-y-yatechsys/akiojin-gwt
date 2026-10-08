@@ -2319,6 +2319,14 @@ pub struct IssueMonitorIssue {
     pub updated_at: Option<String>,
 }
 
+/// An urgent label observation carried with an accepted queue request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueMonitorUrgentQueueObservation {
+    pub issue: IssueMonitorIssue,
+    pub assignment: Option<gwt_github::client::LabelAssignment>,
+    pub observed_at: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MonitorInboxState {
@@ -13432,6 +13440,58 @@ impl IssueMonitorState {
         }
         queue.last_seen_at = Some(now.to_string());
         self.apply_priority_order_to_queue();
+    }
+
+    /// Push and move the selected issues in stored order in one control transaction.
+    pub fn terminal_queue_push_at_position(
+        &mut self,
+        issue_numbers: &[u64],
+        position: usize,
+        queued_by: &str,
+        now: &str,
+    ) {
+        self.terminal_queue_push(issue_numbers, queued_by, now);
+        let current = self.prefs();
+        let queue = &current.terminal_queues[&crate::process::current_hostname()];
+        let mut order: Vec<_> = queue
+            .entries
+            .iter()
+            .map(|entry| entry.number)
+            .filter(|number| !issue_numbers.contains(number))
+            .collect();
+        let mut selected = Vec::new();
+        for number in issue_numbers {
+            if !selected.contains(number) {
+                selected.push(*number);
+            }
+        }
+        let at = position.min(order.len());
+        order.splice(at..at, selected);
+        // These are stored positions; urgent projection must not be subtracted twice.
+        let mut priority = order.clone();
+        priority.extend(
+            current
+                .priority_order
+                .into_iter()
+                .filter(|number| !order.contains(number)),
+        );
+        self.set_priority_order(priority);
+    }
+
+    pub fn apply_urgent_queue_observations(
+        &mut self,
+        observations: &[IssueMonitorUrgentQueueObservation],
+    ) {
+        for observation in observations {
+            self.observe_urgent_issue(&observation.issue, &observation.observed_at);
+            if let Some(assignment) = &observation.assignment {
+                self.record_urgent_assignment(
+                    observation.issue.number,
+                    observation.issue.updated_at.as_deref(),
+                    assignment,
+                );
+            }
+        }
     }
 
     pub fn terminal_queue_remove(&mut self, issue_numbers: &[u64], now: &str) {
