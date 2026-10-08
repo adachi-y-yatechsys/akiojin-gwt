@@ -426,10 +426,11 @@ async fn run_bound_server(
                         let endpoint = Arc::clone(&endpoint);
                         let hub = hub.clone();
                         let connections = Arc::clone(&connections);
+                        let shutdown = Arc::clone(&shutdown);
                         tokio::spawn(async move {
                             let guard = ConnectionGuard::new(connections);
                             if let Err(err) =
-                                handle_connection(stream, endpoint, hub, started_at, &guard).await
+                                handle_connection(stream, endpoint, hub, started_at, &guard, shutdown).await
                             {
                                 tracing::warn!("gwtd daemon: connection error: {err}");
                             }
@@ -5189,6 +5190,7 @@ async fn handle_connection(
     hub: BroadcastHub,
     started_at: Instant,
     connection_guard: &ConnectionGuard,
+    shutdown: Arc<DaemonShutdown>,
 ) -> Result<(), String> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
@@ -5222,8 +5224,13 @@ async fn handle_connection(
     // is checked at the top of each iteration to close that race.
     let forwarder_cancel = Arc::new(AtomicBool::new(false));
     let forwarder_notify = Arc::new(Notify::new());
+    let writer_shutdown = Arc::clone(&shutdown);
     let writer = tokio::spawn(async move {
         while let Some(frame) = out_rx.recv().await {
+            if matches!(frame, DaemonFrame::StopAccepted { .. }) {
+                write_stop_receipt(&mut write_half, &frame, &writer_shutdown).await;
+                break;
+            }
             if let Err(err) = write_json_line(&mut write_half, &frame).await {
                 tracing::warn!(target: "gwtd::daemon", error = %err, "writer task failed");
                 break;
@@ -5238,6 +5245,7 @@ async fn handle_connection(
     // reclaim its workload instead of orphaning it (Issue #4409 AC-2).
     let mut verification_reclaim: Option<super::verification_spawn::VerificationReclaim> = None;
     let mut subscribed_channels = HashSet::new();
+    let mut first_frame = true;
     loop {
         line.clear();
         let n = match reader.read_line(&mut line).await {
@@ -5254,7 +5262,44 @@ async fn handle_connection(
         if trimmed.is_empty() {
             continue;
         }
+        let is_first_frame = std::mem::replace(&mut first_frame, false);
         match serde_json::from_str::<ClientFrame>(trimmed) {
+            Ok(ClientFrame::Stop {
+                expected_scope,
+                expected_pid,
+                expected_instance_id,
+                request_id,
+            }) => {
+                // A dedicated connection keeps the receipt behind no other work
+                // or event writes. The handshake has already authenticated it.
+                if !is_first_frame
+                    || expected_scope != endpoint.scope
+                    || expected_pid != endpoint.pid
+                    || expected_instance_id != endpoint.instance_id()
+                    || !gwt_core::daemon::is_valid_daemon_stop_identity(
+                        expected_pid,
+                        &expected_instance_id,
+                        &request_id,
+                    )
+                {
+                    let _ = out_tx.send(DaemonFrame::Error {
+                        message:
+                            "daemon.stop requires a fresh connection and exact instance identity"
+                                .into(),
+                    });
+                } else if out_tx
+                    .send(DaemonFrame::StopAccepted {
+                        pid: endpoint.pid,
+                        instance_id: endpoint.instance_id(),
+                        request_id,
+                    })
+                    .is_err()
+                {
+                    // The accepted intent still stands when the receipt is lost.
+                    shutdown.request();
+                }
+                break;
+            }
             Ok(ClientFrame::Hook(envelope)) => {
                 // Hook envelope routing into real GUI-side handlers is
                 // gated on Phase H3 (handle_runtime_hook_event daemon
@@ -5509,6 +5554,29 @@ async fn handle_connection(
     Ok(())
 }
 
+/// Write and flush the accepted receipt before cooperative shutdown. A failed
+/// or blocked writer cannot keep an accepted stop running indefinitely; the
+/// caller then has an unknown outcome and must independently inspect exit.
+async fn write_stop_receipt<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    receipt: &DaemonFrame,
+    shutdown: &DaemonShutdown,
+) {
+    let result = tokio::time::timeout(super::stop::STOP_CONTACT_TIMEOUT, async {
+        write_json_line(writer, receipt).await?;
+        writer.flush().await.map_err(|error| error.to_string())
+    })
+    .await;
+    if !matches!(result, Ok(Ok(()))) {
+        tracing::warn!(target: "gwtd::daemon", "stop receipt undelivered; accepted shutdown proceeds");
+    }
+    shutdown.request();
+}
+
+#[cfg(test)]
+#[path = "server_stop_tests.rs"]
+mod stop_tests;
+
 async fn enqueue_issue_monitor_control(
     hub: &BroadcastHub,
     channel: &str,
@@ -5546,7 +5614,7 @@ async fn read_handshake(
     serde_json::from_str(line.trim_end()).map_err(|err| format!("handshake parse failed: {err}"))
 }
 
-fn build_handshake_response(
+pub(super) fn build_handshake_response(
     endpoint: &DaemonEndpoint,
     request: &IpcHandshakeRequest,
 ) -> IpcHandshakeResponse {
@@ -7793,6 +7861,7 @@ exit 0
                 server_hub,
                 Instant::now(),
                 &guard,
+                Arc::new(DaemonShutdown::new()),
             )
             .await
         });
@@ -7863,6 +7932,7 @@ exit 0
                         hub,
                         Instant::now(),
                         &guard,
+                        Arc::new(DaemonShutdown::new()),
                     )
                     .await
                 });

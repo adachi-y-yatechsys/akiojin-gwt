@@ -147,6 +147,13 @@ pub enum DaemonCommand {
     },
     /// `daemon.status` — print whether a daemon is registered for cwd scope.
     Status,
+    /// JSON-only exact-instance cooperative stop; no discovery or retry.
+    Stop {
+        project_root: PathBuf,
+        expected_pid: u32,
+        expected_instance_id: String,
+        request_id: String,
+    },
     /// `daemon.subscribe` — connect to the running daemon,
     /// subscribe to one or more broadcast channels, and print received events
     /// to stdout one JSON line at a time. Useful for debugging the Phase H1+

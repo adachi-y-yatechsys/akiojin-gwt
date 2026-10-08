@@ -18,6 +18,7 @@
 pub(crate) mod broadcast;
 pub mod client;
 pub(crate) mod server;
+mod stop;
 mod subscribe_resolver;
 pub(crate) mod transport;
 pub(crate) mod verification_host;
@@ -103,6 +104,18 @@ pub(super) fn run<E: CliEnv>(
     match cmd {
         DaemonCommand::Start => start_daemon(env, out),
         DaemonCommand::Status => report_status(env, out),
+        DaemonCommand::Stop {
+            project_root,
+            expected_pid,
+            expected_instance_id,
+            request_id,
+        } => stop::run(
+            &project_root,
+            expected_pid,
+            &expected_instance_id,
+            &request_id,
+            out,
+        ),
         DaemonCommand::Recover {
             project_root,
             project_store_hash,

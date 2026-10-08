@@ -2,6 +2,47 @@ use gwt_agent::session::GWT_SESSION_ID_ENV;
 use std::path::PathBuf;
 
 #[cfg(test)]
+mod daemon_stop_operation_tests {
+    use super::*;
+    fn params() -> Value {
+        serde_json::json!({"project_root":std::env::temp_dir(), "expected_pid":77,
+            "expected_instance_id":"a".repeat(64), "request_id":"stop-1"})
+    }
+    fn input(p: Value) -> String {
+        serde_json::json!({"operation":"daemon.stop", "params":p}).to_string()
+    }
+    #[test]
+    fn daemon_stop_requires_all_guards_and_refuses_mutation_fields() {
+        assert!(parse(&input(params())).is_ok());
+        for key in [
+            "project_root",
+            "expected_pid",
+            "expected_instance_id",
+            "request_id",
+        ] {
+            let mut p = params();
+            p.as_object_mut().unwrap().remove(key);
+            assert!(parse(&input(p)).is_err(), "missing {key}");
+        }
+        for (key, value) in [
+            ("project_root", serde_json::json!("relative")),
+            ("expected_pid", serde_json::json!(0)),
+            ("expected_pid", serde_json::json!(true)),
+            ("expected_pid", serde_json::json!(4294967296_u64)),
+            ("expected_instance_id", serde_json::json!("A".repeat(64))),
+            ("expected_instance_id", serde_json::json!("a".repeat(63))),
+            ("request_id", serde_json::json!(" ")),
+            ("request_id", serde_json::json!("x".repeat(129))),
+            ("force", serde_json::json!(true)),
+        ] {
+            let mut p = params();
+            p[key] = value;
+            assert!(parse(&input(p)).is_err(), "invalid {key}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod launch_budget_operation_tests {
     use super::*;
     fn params() -> Value {
@@ -250,6 +291,7 @@ pub(crate) fn dispatch<E: CliEnv>(env: &mut E, prog: &str) -> i32 {
             match (code, declared_block) {
                 (0, Some(block)) => super::board::auto_file_declared_block(env, &block),
                 (0, None) => {}
+                _ if operation == "daemon.stop" => {}
                 _ => {
                     report_operation_refusal(
                         &operation,
@@ -292,8 +334,13 @@ pub(crate) fn dispatch<E: CliEnv>(env: &mut E, prog: &str) -> i32 {
             // depending on the agent noticing it is stuck. Answering the caller
             // comes first — the escalation must never delay or replace the
             // operation's own reply.
-            report_operation_refusal(&operation, &message, requested_project_root.as_deref());
-            if let Some(refusal) = failure.refusal.as_ref() {
+            // Exact stop is a cleanup boundary. A lost receipt or identity
+            // refusal must not create Board work or write an error ledger.
+            if operation != "daemon.stop" {
+                report_operation_refusal(&operation, &message, requested_project_root.as_deref());
+            }
+            if operation == "daemon.stop" {
+            } else if let Some(refusal) = failure.refusal.as_ref() {
                 super::board::auto_file_structured_operation_refusal(
                     env, &operation, &message, refusal,
                 );
@@ -1131,6 +1178,7 @@ fn parse(input: &str) -> Result<ParsedEnvelope, CliParseError> {
         "diagnostics.cpu" => CliCommand::Diagnostics(DiagnosticsCommand::Cpu { json: true }),
         "daemon.recover" => daemon_recover(params)?,
         "daemon.start" => CliCommand::Daemon(DaemonCommand::Start),
+        "daemon.stop" => daemon_stop(params)?,
         "daemon.status" => CliCommand::Daemon(DaemonCommand::Status),
         "daemon.subscribe" => daemon_subscribe(params)?,
         "hook.register_codex_managed_hook_trust" | "hook.register-codex-managed-hook-trust" => {
@@ -1744,6 +1792,43 @@ fn memory_add(params: &Map<String, Value>) -> Result<CliCommand, CliParseError> 
         learning: required_string(params, "learning")?,
         future_action: required_string(params, "future_action")?,
     })))
+}
+
+fn daemon_stop(params: &Map<String, Value>) -> Result<CliCommand, CliParseError> {
+    reject_unknown_params(
+        params,
+        &[
+            "project_root",
+            "expected_pid",
+            "expected_instance_id",
+            "request_id",
+        ],
+        "daemon.stop",
+    )?;
+    let project_root = PathBuf::from(required_string(params, "project_root")?);
+    let expected_pid = lookup(params, "expected_pid")
+        .and_then(Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+        .ok_or_else(|| {
+            CliParseError::InvalidJson("daemon.stop requires a positive u32 expected_pid".into())
+        })?;
+    let expected_instance_id = required_string(params, "expected_instance_id")?;
+    let request_id = required_string(params, "request_id")?;
+    if !project_root.is_absolute()
+        || !gwt_core::daemon::is_valid_daemon_stop_identity(
+            expected_pid,
+            &expected_instance_id,
+            &request_id,
+        )
+    {
+        return Err(CliParseError::InvalidJson("daemon.stop requires an absolute project, exact instance identity and bounded request_id".into()));
+    }
+    Ok(CliCommand::Daemon(DaemonCommand::Stop {
+        project_root,
+        expected_pid,
+        expected_instance_id,
+        request_id,
+    }))
 }
 
 fn daemon_recover(params: &Map<String, Value>) -> Result<CliCommand, CliParseError> {

@@ -1505,3 +1505,26 @@ children, probes, external programs, another gwt home, or another project
 location. It is an operational limit, not a security boundary against an actor
 who can rewrite these files. Temporary-file/callback tests do not establish
 actual daemon/GUI/PTY operation, power-loss durability, full CI, or acceptance.
+
+
+### Exact-instance cooperative daemon stop (fork preparation)
+
+The JSON-only `daemon.stop` operation requires an absolute `project_root`,
+a positive u32 `expected_pid`, a lowercase 64-character `expected_instance_id`,
+and an ASCII alphanumeric/hyphen/underscore `request_id` of 1–128 characters.
+The instance identity is the SHA-256 digest of the exact endpoint authentication
+token; it is evidence, not a credential. Keep the token private.
+
+The operation reads only the exact endpoint, authenticates the existing scope
+handshake, and sends one stop frame on a fresh connection. It never bootstraps,
+deletes a refused endpoint, discovers another instance, retries, or files Board
+work on refusal. The server writes and flushes `stop_accepted` before requesting
+existing cooperative shutdown. If the receipt cannot be delivered within five
+seconds, accepted shutdown still proceeds and the caller has an unknown outcome.
+
+A successful receipt always has `process_exit_verified: false`. The operator
+must separately wait for its own child to exit and verify descriptor and authority
+cleanup. Existing protocol-v4 daemons do not implement stop and may refuse it;
+a new trial must first prove no daemon is running and start the reviewed fork.
+This source addition does not prove actual lifecycle cleanup, enable AI work,
+or change installed binaries.

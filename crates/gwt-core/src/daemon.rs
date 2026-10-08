@@ -403,6 +403,13 @@ pub struct DaemonEndpoint {
 }
 
 impl DaemonEndpoint {
+    /// Opaque identity for this exact daemon instance. The authentication token
+    /// stays private; this digest is evidence, never an authentication credential.
+    pub fn instance_id(&self) -> String {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(self.auth_token.as_bytes()))
+    }
+
     pub fn new(
         scope: RuntimeScope,
         pid: u32,
@@ -506,6 +513,13 @@ pub enum ClientFrame {
     Publish { channel: String, payload: Value },
     /// Request a snapshot of the daemon's current runtime stats.
     Status,
+    /// Cooperatively stop this exact instance on a fresh authenticated connection.
+    Stop {
+        expected_scope: RuntimeScope,
+        expected_pid: u32,
+        expected_instance_id: String,
+        request_id: String,
+    },
     /// Launch one verification command from the daemon instead of from the
     /// caller's process tree (Issue #4409).
     ///
@@ -597,6 +611,12 @@ pub enum DaemonFrame {
     /// Snapshot of daemon runtime stats, returned in response to a
     /// [`ClientFrame::Status`] request.
     Status(DaemonStatus),
+    /// The stop was accepted. This receipt does not prove that the process exited.
+    StopAccepted {
+        pid: u32,
+        instance_id: String,
+        request_id: String,
+    },
     /// A [`ClientFrame::SpawnVerification`] child is running.
     VerificationAccepted(VerificationSpawnAccepted),
     /// That child exited.
@@ -832,7 +852,23 @@ where
     Ok(removed)
 }
 
-fn load_endpoint(path: &Path) -> Result<DaemonEndpoint> {
+/// Shape guard shared by the JSON caller and the authenticated server.
+pub fn is_valid_daemon_stop_identity(pid: u32, instance_id: &str, request_id: &str) -> bool {
+    pid > 0
+        && instance_id.len() == 64
+        && instance_id
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        && !request_id.is_empty()
+        && request_id.len() <= 128
+        && request_id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+}
+
+/// Read only this descriptor. Unlike bootstrap resolution, never clean it up,
+/// choose another instance, or spawn a daemon when it is absent or malformed.
+pub fn load_endpoint(path: &Path) -> Result<DaemonEndpoint> {
     let payload = fs::read(path)?;
     serde_json::from_slice(&payload)
         .map_err(|e| GwtError::Other(format!("parse daemon endpoint failed: {e}")))
