@@ -436,6 +436,8 @@ pub struct IssueMonitorEffectAttemptKey {
 /// One durable side-effect proposal or in-flight delivery.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingIssueMonitorEffect {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_budget_trial_id: Option<String>,
     pub effect_id: String,
     pub authority_epoch: u64,
     pub attempt: u32,
@@ -451,6 +453,7 @@ impl PendingIssueMonitorEffect {
     ) -> Self {
         Self {
             effect_id: effect_id.into(),
+            launch_budget_trial_id: None,
             authority_epoch,
             attempt: 0,
             state: IssueMonitorEffectState::Prepared,
@@ -1614,6 +1617,8 @@ pub enum IssueMonitorProviderUsageLimitOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingIssueMonitorLaunchDelivery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_budget_trial_id: Option<String>,
     pub delivery_id: String,
     pub issue_number: u64,
     pub branch_name: String,
@@ -4212,6 +4217,8 @@ pub struct AutonomousIssueSummary {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssueMonitorState {
+    #[serde(skip)]
+    launch_budget_scope: Option<crate::launch_budget::BudgetScope>,
     pub config: IssueMonitorConfig,
     pub gui_connected: bool,
     pub inbox: Vec<IssueMonitorInboxItem>,
@@ -5392,6 +5399,24 @@ pub fn issue_monitor_launch_delivery_requeue_reason(
             delivery.issue_number == issue_number && delivery.delivery_id == delivery_id
         })?
         .requeue_reason
+}
+
+/// Only the exact saved delivery may identify a bounded trial. Legacy records
+/// and non-durable/review requests stay absent rather than using today's scope.
+pub fn issue_monitor_launch_delivery_budget_trial(
+    prefs_path: &Path,
+    issue_number: u64,
+    delivery_id: Option<&str>,
+) -> Option<String> {
+    let delivery_id = delivery_id?;
+    load_issue_monitor_prefs(prefs_path)
+        .ok()?
+        .pending_launch_deliveries
+        .into_iter()
+        .find(|delivery| {
+            delivery.issue_number == issue_number && delivery.delivery_id == delivery_id
+        })?
+        .launch_budget_trial_id
 }
 
 pub fn issue_monitor_launch_plan(issue: &IssueMonitorIssue) -> IssueMonitorLaunchPlan {
@@ -6660,6 +6685,7 @@ impl IssueMonitorState {
             requeue_audit: Vec::new(),
             failure_release_version: 0,
             queue: VecDeque::new(),
+            launch_budget_scope: None,
             pending_launches: VecDeque::new(),
             pending_launch_deliveries: VecDeque::new(),
             queued_launch_session_strategies: BTreeMap::new(),
@@ -12167,6 +12193,17 @@ impl IssueMonitorState {
 
     /// Add one Prepared effect under the current authority. An empty or reused
     /// stable id is rejected without changing the journal.
+    pub fn set_launch_budget_scope(&mut self, scope: Option<crate::launch_budget::BudgetScope>) {
+        self.launch_budget_scope = scope;
+    }
+
+    fn launch_budget_trial_for_issue(&self, issue_number: u64) -> Option<String> {
+        self.launch_budget_scope
+            .as_ref()
+            .filter(|scope| scope.issue_number == issue_number)
+            .map(|scope| scope.trial_id.clone())
+    }
+
     pub fn prepare_pending_effect(
         &mut self,
         effect_id: impl Into<String>,
@@ -12183,8 +12220,15 @@ impl IssueMonitorState {
         {
             return None;
         }
-        let effect =
+        let launch_budget_trial_id = match &payload {
+            IssueMonitorEffectPayload::AcquireClaim { issue_number, .. } => {
+                self.launch_budget_trial_for_issue(*issue_number)
+            }
+            _ => None,
+        };
+        let mut effect =
             PendingIssueMonitorEffect::prepared(effect_id, self.effect_authority_epoch, payload);
+        effect.launch_budget_trial_id = launch_budget_trial_id;
         let key = effect.attempt_key();
         self.pending_effects.push(effect);
         Some(key)
@@ -14401,6 +14445,26 @@ impl IssueMonitorState {
         claim_effect_id: &str,
         now: &str,
     ) -> bool {
+        let trial_id = self.launch_budget_trial_for_issue(issue_number);
+        self.apply_confirmed_claim_for_trial(
+            issue_number,
+            claim_id,
+            claim_owner,
+            claim_effect_id,
+            now,
+            trial_id,
+        )
+    }
+
+    pub fn apply_confirmed_claim_for_trial(
+        &mut self,
+        issue_number: u64,
+        claim_id: impl Into<String>,
+        claim_owner: impl Into<String>,
+        claim_effect_id: &str,
+        now: &str,
+        launch_budget_trial_id: Option<String>,
+    ) -> bool {
         let claim_id = claim_id.into();
         let claim_owner = claim_owner.into();
         // An exact ReleaseClaim is the durable compensation written when this
@@ -14480,6 +14544,7 @@ impl IssueMonitorState {
         {
             self.pending_launch_deliveries
                 .push_back(PendingIssueMonitorLaunchDelivery {
+                    launch_budget_trial_id,
                     delivery_id,
                     issue_number,
                     branch_name,
@@ -19342,6 +19407,7 @@ mod tests {
         state: IssueMonitorEffectState,
     ) -> PendingIssueMonitorEffect {
         PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: effect_id.to_string(),
             authority_epoch,
             attempt,
@@ -27695,6 +27761,7 @@ mod tests {
             IssueMonitorEffectState::Attempting,
         );
         let attempting_claim = PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "claim:7:attempting".to_string(),
             authority_epoch: 4,
             attempt: 1,
@@ -27709,6 +27776,7 @@ mod tests {
             },
         };
         let unrelated = PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "arm:8:100:prepared".to_string(),
             authority_epoch: 4,
             attempt: 0,
@@ -28631,6 +28699,7 @@ mod tests {
         let prepared =
             pending_arm_effect("arm:7:99:abc123:4", 4, 0, IssueMonitorEffectState::Prepared);
         let attempting = PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "disarm:arm:7:99:abc123:4".to_string(),
             authority_epoch: 5,
             attempt: 3,
@@ -28748,6 +28817,7 @@ mod tests {
         assert_eq!(autonomous, autonomous_before);
 
         let claim = PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "claim-max".to_string(),
             authority_epoch: u64::MAX,
             attempt: 2,
@@ -29878,6 +29948,132 @@ mod tests {
         assert_eq!(
             identity(&restored.pending_effects()[0]),
             (first_effect_id, first_claim_id)
+        );
+    }
+
+    #[test]
+    fn launch_budget_claim_snapshot_survives_retry_restart_and_scope_change() {
+        let mut monitor = IssueMonitorState::new(IssueMonitorConfig {
+            enabled: true,
+            max_active: 1,
+            ..IssueMonitorConfig::default()
+        });
+        monitor.set_gui_connected(true);
+        scan_queued_candidates(&mut monitor, &[issue(42)], "2026-10-08T00:00:00Z");
+        let scope = crate::launch_budget::BudgetScope {
+            trial_id: "original-trial".to_string(),
+            project_root: std::path::PathBuf::from("/artificial-project"),
+            issue_number: 42,
+            max_starts: 1,
+        };
+        monitor.set_launch_budget_scope(Some(scope.clone()));
+        assert_eq!(
+            monitor.prepare_claim_effects_with_probe(
+                "host/session",
+                "2026-10-08T00:00:01Z",
+                1,
+                |_| false
+            ),
+            1
+        );
+        let effect = monitor.pending_effects()[0].clone();
+        assert_eq!(
+            effect.launch_budget_trial_id.as_deref(),
+            Some("original-trial")
+        );
+        let key = effect.attempt_key();
+        assert!(monitor.mark_pending_effect_attempting(&key));
+        assert!(monitor.retry_pending_effect(&key));
+        let encoded = serde_json::to_string(&monitor.prefs()).unwrap();
+        let prefs: IssueMonitorPrefs = serde_json::from_str(&encoded).unwrap();
+        let mut restored = IssueMonitorState::with_prefs(IssueMonitorConfig::default(), prefs);
+        restored.set_gui_connected(true);
+        scan_queued_candidates(&mut restored, &[issue(42)], "2026-10-08T00:00:02Z");
+        restored.set_launch_budget_scope(Some(crate::launch_budget::BudgetScope {
+            trial_id: "new-trial".to_string(),
+            ..scope
+        }));
+        let saved = restored.pending_effects()[0].clone();
+        assert_eq!(
+            saved.launch_budget_trial_id.as_deref(),
+            Some("original-trial")
+        );
+        assert!(restored.apply_confirmed_claim_for_trial(
+            42,
+            "claim-42",
+            "host/session",
+            &saved.effect_id,
+            "2026-10-08T00:00:02Z",
+            saved.launch_budget_trial_id
+        ));
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("prefs.json");
+        save_issue_monitor_prefs(&path, &restored.prefs()).unwrap();
+        let delivery = restored.pending_launch_deliveries.front().unwrap();
+        assert_eq!(
+            issue_monitor_launch_delivery_budget_trial(&path, 42, Some(&delivery.delivery_id))
+                .as_deref(),
+            Some("original-trial")
+        );
+        assert_eq!(
+            issue_monitor_launch_delivery_budget_trial(&path, 43, Some(&delivery.delivery_id)),
+            None
+        );
+        assert_eq!(
+            issue_monitor_launch_delivery_budget_trial(&path, 42, Some("different-delivery")),
+            None
+        );
+        assert_eq!(
+            issue_monitor_launch_delivery_budget_trial(&path, 42, None),
+            None
+        );
+    }
+
+    #[test]
+    fn launch_budget_legacy_claim_does_not_receive_current_trial_at_completion() {
+        let mut monitor = IssueMonitorState::new(IssueMonitorConfig {
+            enabled: true,
+            max_active: 1,
+            ..IssueMonitorConfig::default()
+        });
+        monitor.set_gui_connected(true);
+        scan_queued_candidates(&mut monitor, &[issue(42)], "2026-10-08T00:00:00Z");
+        assert_eq!(
+            monitor.prepare_claim_effects_with_probe(
+                "host/session",
+                "2026-10-08T00:00:01Z",
+                1,
+                |_| false
+            ),
+            1
+        );
+        let mut serialized = serde_json::to_value(&monitor.pending_effects()[0]).unwrap();
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("launch_budget_trial_id");
+        let old: PendingIssueMonitorEffect = serde_json::from_value(serialized).unwrap();
+        monitor.set_launch_budget_scope(Some(crate::launch_budget::BudgetScope {
+            trial_id: "new-trial".to_string(),
+            project_root: std::path::PathBuf::from("/artificial-project"),
+            issue_number: 42,
+            max_starts: 1,
+        }));
+        assert!(monitor.apply_confirmed_claim_for_trial(
+            42,
+            "claim-42",
+            "host/session",
+            &old.effect_id,
+            "2026-10-08T00:00:02Z",
+            old.launch_budget_trial_id
+        ));
+        assert_eq!(
+            monitor
+                .pending_launch_deliveries
+                .front()
+                .unwrap()
+                .launch_budget_trial_id,
+            None
         );
     }
 

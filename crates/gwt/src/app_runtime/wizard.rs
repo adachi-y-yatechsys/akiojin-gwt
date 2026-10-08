@@ -3753,6 +3753,12 @@ impl AppRuntime {
         if let LaunchWizardLaunchRequest::Agent(config) = &mut launch_request {
             config.session_mode = gwt_agent::SessionMode::Normal;
             config.resume_session_id = None;
+            config.launch_budget_trial_id =
+                gwt::issue_monitor::issue_monitor_launch_delivery_budget_trial(
+                    &gwt::issue_monitor_prefs_path_for_repo_path(&project_root),
+                    issue_number,
+                    delivery_id.as_deref(),
+                );
         }
         // Issue #4217 (AC-2): every launch that reaches this path was started
         // by the Issue Monitor, so the route is recorded before — and

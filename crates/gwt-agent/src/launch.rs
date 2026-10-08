@@ -1142,6 +1142,8 @@ pub struct LaunchConfig {
     pub docker_service: Option<String>,
     pub docker_lifecycle_intent: DockerLifecycleIntent,
     pub linked_issue_number: Option<u64>,
+    /// Explicit durable bounded-trial identity; never inferred from the environment.
+    pub launch_budget_trial_id: Option<String>,
     pub windows_shell: Option<crate::WindowsShellKind>,
     /// SPEC-3214: this launch runs in an ephemeral, detached intake worktree
     /// that is removed when the session ends. `true` routes worktree
@@ -1797,6 +1799,7 @@ impl AgentLaunchBuilder {
             docker_service: self.docker_service,
             docker_lifecycle_intent: self.docker_lifecycle_intent,
             linked_issue_number: self.linked_issue_number,
+            launch_budget_trial_id: None,
             windows_shell: self.windows_shell,
             is_ephemeral: self.is_ephemeral,
             ephemeral_base_ref: self.ephemeral_base_ref,

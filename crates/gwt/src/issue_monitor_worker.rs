@@ -982,6 +982,14 @@ pub fn scan_loaded_issue_monitor_candidates_for_project_tab(
     expected_project_tab_id: Option<&str>,
     now: &str,
 ) -> IssueMonitorScanSummary {
+    let budget_scope = crate::launch_budget::BudgetStore::for_project(repo_path)
+        .status()
+        .ok()
+        .flatten()
+        .map(|status| status.scope);
+    monitor.set_launch_budget_scope(budget_scope);
+    // Unknown budgets cannot acquire an identity here; the physical start gate
+    // independently refuses unreadable records.
     // Reconcile local credentials before this scan plans claims. No network
     // request is made here; Claude credential access remains opt-in.
     let usage_config = gwt_config::Settings::load().unwrap_or_default().usage;
@@ -2061,6 +2069,7 @@ fn advance_one_autonomous_issue(
                     // the remote mutation and result reconciliation.
                     let epoch = monitor.effect_authority_epoch();
                     monitor.prepare_effect(crate::PendingIssueMonitorEffect {
+                        launch_budget_trial_id: None,
                         effect_id: format!(
                             "arm:{issue_number}:{pr}:{}:{epoch}",
                             inputs.reviewed_sha

@@ -2,6 +2,54 @@ use gwt_agent::session::GWT_SESSION_ID_ENV;
 use std::path::PathBuf;
 
 #[cfg(test)]
+mod launch_budget_operation_tests {
+    use super::*;
+    fn params() -> Value {
+        serde_json::json!({"project_root":std::env::temp_dir(),"trial_id":"trial-1","issue_number":6,"max_starts":1})
+    }
+    #[test]
+    fn launch_budget_arm_requires_exact_bounded_fields() {
+        let input = |p| {
+            serde_json::json!({"operation":"issue.monitor.launch_budget.arm","params":p})
+                .to_string()
+        };
+        assert!(parse(&input(params())).is_ok());
+        for key in ["project_root", "trial_id", "issue_number", "max_starts"] {
+            let mut p = params();
+            p.as_object_mut().unwrap().remove(key);
+            assert!(parse(&input(p)).is_err());
+        }
+        for (key, value) in [
+            ("project_root", serde_json::json!("relative")),
+            ("trial_id", serde_json::json!(" ")),
+            ("issue_number", serde_json::json!(0)),
+            ("max_starts", serde_json::json!(2)),
+            ("force", serde_json::json!(true)),
+        ] {
+            let mut p = params();
+            p[key] = value;
+            assert!(parse(&input(p)).is_err());
+        }
+    }
+    #[test]
+    fn launch_budget_status_requires_explicit_project_and_refuses_mutation_fields() {
+        let input = |p| {
+            serde_json::json!({"operation":"issue.monitor.launch_budget.status","params":p})
+                .to_string()
+        };
+        assert!(parse(&input(
+            serde_json::json!({"project_root":std::env::temp_dir()})
+        ))
+        .is_ok());
+        assert!(parse(&input(serde_json::json!({}))).is_err());
+        assert!(parse(&input(
+            serde_json::json!({"project_root":std::env::temp_dir(),"reset":true})
+        ))
+        .is_err());
+    }
+}
+
+#[cfg(test)]
 mod recovery_operation_tests {
     use super::*;
 
@@ -643,6 +691,51 @@ fn parse(input: &str) -> Result<ParsedEnvelope, CliParseError> {
         "issue.monitor.status" => CliCommand::Issue(IssueCommand::MonitorStatus {
             project_root: optional_path(params, "project_root")?,
         }),
+        "issue.monitor.launch_budget.arm" => {
+            reject_unknown_params(
+                params,
+                &["project_root", "trial_id", "issue_number", "max_starts"],
+                "issue.monitor.launch_budget.arm",
+            )?;
+            let project_root = PathBuf::from(required_string(params, "project_root")?);
+            let trial_id = required_string(params, "trial_id")?;
+            let issue_number = required_u64(params, "issue_number")?;
+            let max_starts = required_u64(params, "max_starts")?;
+            if !project_root.is_absolute()
+                || issue_number == 0
+                || max_starts != 1
+                || trial_id.is_empty()
+                || trial_id.len() > 128
+                || !trial_id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+            {
+                return Err(CliParseError::InvalidJson(
+                    "launch budget requires an absolute project, Issue, trial ID and max_starts=1"
+                        .to_string(),
+                ));
+            }
+            CliCommand::Issue(IssueCommand::MonitorLaunchBudgetArm {
+                project_root,
+                trial_id,
+                issue_number,
+                max_starts: 1,
+            })
+        }
+        "issue.monitor.launch_budget.status" => {
+            reject_unknown_params(
+                params,
+                &["project_root"],
+                "issue.monitor.launch_budget.status",
+            )?;
+            let project_root = PathBuf::from(required_string(params, "project_root")?);
+            if !project_root.is_absolute() {
+                return Err(CliParseError::InvalidJson(
+                    "launch budget status requires an absolute project".to_string(),
+                ));
+            }
+            CliCommand::Issue(IssueCommand::MonitorLaunchBudgetStatus { project_root })
+        }
         "issue.monitor.questions" => CliCommand::Issue(IssueCommand::MonitorQuestions {
             project_root: optional_path(params, "project_root")?,
         }),

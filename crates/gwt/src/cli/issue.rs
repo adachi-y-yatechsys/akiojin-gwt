@@ -218,6 +218,41 @@ pub(super) fn run<E: CliEnv>(
         IssueCommand::MonitorStatus { project_root } => {
             run_monitor_status(env, project_root.as_deref(), out)?
         }
+        IssueCommand::MonitorLaunchBudgetArm {
+            project_root,
+            trial_id,
+            issue_number,
+            max_starts,
+        } => {
+            let root = issue_monitor_project_root(env, Some(&project_root))?;
+            let scope = crate::launch_budget::BudgetScope {
+                project_root: dunce::canonicalize(&root).map_err(io_as_api_error)?,
+                trial_id,
+                issue_number,
+                max_starts,
+            };
+            let status = crate::launch_budget::BudgetStore::for_project(&root)
+                .arm(&scope)
+                .map_err(io_as_api_error)?;
+            out.push_str(
+                &serde_json::to_string(&serde_json::json!({"launch_budget":status}))
+                    .map_err(|e| io_as_api_error(io::Error::other(e)))?,
+            );
+            out.push('\n');
+            0
+        }
+        IssueCommand::MonitorLaunchBudgetStatus { project_root } => {
+            let root = issue_monitor_project_root(env, Some(&project_root))?;
+            let status = crate::launch_budget::BudgetStore::for_project(&root)
+                .status()
+                .map_err(io_as_api_error)?;
+            out.push_str(
+                &serde_json::to_string(&serde_json::json!({"launch_budget":status}))
+                    .map_err(|e| io_as_api_error(io::Error::other(e)))?,
+            );
+            out.push('\n');
+            0
+        }
         IssueCommand::MonitorPriorityMove {
             project_root,
             number,

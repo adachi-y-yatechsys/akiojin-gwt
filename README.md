@@ -1472,3 +1472,36 @@ The command sets a cooperative five-second deadline for scope/lock/write
 checks; this is not a hard process termination guarantee. The scoped tests
 use temporary repositories and files and do not run a real `gwtd` process.
 Full canonical CI, global coverage, and operational recovery remain unverified.
+
+## Fork addition: one managed-agent start per bounded trial
+
+The opt-in JSON operations `issue.monitor.launch_budget.arm` and
+`issue.monitor.launch_budget.status` take an explicit absolute `project_root`.
+Arming additionally requires an ASCII `trial_id`, a positive `issue_number`,
+and `max_starts: 1`. It writes an immutable scope and uses a shared physical
+start gate for bound and unbound managed agents. Status only reads records;
+neither operation starts the daemon, GUI, or an agent.
+
+The gate saves and flushes a spent marker **before** process creation. Failure,
+unknown outcome, panic, retry, review, and restore never replenish that start.
+Arming the same scope returns its saved status; changing scope is refused.
+There is no reset, refund, or remove operation. An unreadable or partial record
+refuses starts. The stable location-derived store is
+`~/.gwt/launch-budgets/<canonical-path-hash>/launch-budget.json`; Git origin
+changes do not select another allowance. A common lock orders arming against
+physical creation, including creation while unarmed.
+
+New durable Monitor claim proposals capture the trial ID before dispatch.
+Saved effects, deliveries, and Sessions retain it across retries and restart.
+An armed gate refuses missing/old IDs, a different Issue/project, direct Agent
+presets, and non-durable or review requests lacking an exact saved delivery.
+Shell panes remain available. With no scope configured, existing launches
+continue, while taking the same ordering lock.
+
+Activate only after confirming there are no running agents or outstanding
+old launch requests and reviewing the exact runtime, target, and budget.
+The cap covers gwt-managed task starts, not provider API calls or agent-created
+children, probes, external programs, another gwt home, or another project
+location. It is an operational limit, not a security boundary against an actor
+who can rewrite these files. Temporary-file/callback tests do not establish
+actual daemon/GUI/PTY operation, power-loss durability, full CI, or acceptance.

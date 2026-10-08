@@ -368,6 +368,14 @@ pub const OPERATIONS: &[Operation] = &[
         aliases: &[],
     },
     Operation {
+        name: "issue.monitor.launch_budget.arm",
+        aliases: &[],
+    },
+    Operation {
+        name: "issue.monitor.launch_budget.status",
+        aliases: &[],
+    },
+    Operation {
         name: "issue.monitor.stop",
         aliases: &[],
     },

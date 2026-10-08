@@ -4415,12 +4415,13 @@ fn try_commit_issue_monitor_effect_result(
                 ) => {
                     let _ = candidate.complete_pending_effect(&key);
                     if current_authority && candidate.config.enabled {
-                        let _ = candidate.apply_confirmed_claim(
+                        let _ = candidate.apply_confirmed_claim_for_trial(
                             *issue_number,
                             claim.claim_id,
                             owner,
                             &completed.effect.effect_id,
                             &completed.completed_at,
+                            completed.effect.launch_budget_trial_id.clone(),
                         );
                     }
                     settled = true;
@@ -4953,6 +4954,7 @@ fn scan_issue_monitor_once_blocking(
     for (issue_number, pr_number) in monitor.kill_switch_disarm_targets() {
         let epoch = monitor.effect_authority_epoch();
         monitor.prepare_effect(crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: format!("disarm:kill-switch:{issue_number}:{pr_number}:{epoch}"),
             authority_epoch: epoch,
             attempt: 0,
@@ -9533,6 +9535,7 @@ exit 0
     #[test]
     fn routine_controls_invalidate_scan_without_revoking_effects() {
         let attempting = crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "claim:42:stable".to_string(),
             authority_epoch: 7,
             attempt: 2,
@@ -9646,6 +9649,7 @@ exit 0
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let attempting = crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "claim:77:sc34-review".to_string(),
             authority_epoch: 7,
             attempt: 3,
@@ -9731,6 +9735,7 @@ exit 0
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let attempting = crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "claim:77:sc34-launched".to_string(),
             authority_epoch: 11,
             attempt: 4,
@@ -14282,6 +14287,7 @@ exit 0
                 autonomous_mode: true,
                 effect_authority_epoch: 7,
                 pending_effects: vec![crate::PendingIssueMonitorEffect {
+                    launch_budget_trial_id: None,
                     effect_id: "arm:42:99:abc:7".to_string(),
                     authority_epoch: 7,
                     attempt: 1,
@@ -14444,6 +14450,7 @@ exit 1
         .expect("scope");
         let prefs_path = crate::issue_monitor_prefs_path_for_repo_path(&scope.project_root);
         let arm = crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "arm:42:99:abc:7".to_string(),
             authority_epoch: 7,
             attempt: 1,
@@ -15762,6 +15769,7 @@ exit 1
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let arm = crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "arm:42:99:abc:7".to_string(),
             authority_epoch: 7,
             attempt: 1,
@@ -16279,6 +16287,7 @@ exit 1
     #[tokio::test]
     async fn outer_effect_watchdog_retains_exact_attempt_until_started_executor_joins() {
         let effect = crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "arm:42:99:abc:7".to_string(),
             authority_epoch: 7,
             attempt: 1,
@@ -16572,6 +16581,7 @@ exit 1
 
             let permit = super::IssueMonitorEffectPermit::new();
             let effect = crate::PendingIssueMonitorEffect {
+                launch_budget_trial_id: None,
                 effect_id: "claim:42:queued".to_string(),
                 authority_epoch: 7,
                 attempt: 1,
@@ -16688,6 +16698,7 @@ exit 1
             crate::IssueMonitorState::with_prefs(crate::IssueMonitorConfig::default(), initial);
         let mut stale_scan = canonical.clone();
         stale_scan.prepare_effect(crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "arm:42:99:abc123:7".to_string(),
             authority_epoch: 7,
             attempt: 0,
@@ -17223,6 +17234,7 @@ exit 1
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let effect = crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "arm:42:99:abc123:4".to_string(),
             authority_epoch: 4,
             attempt: 0,
@@ -17261,6 +17273,7 @@ exit 1
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let arm = crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "arm:42:99:abc:7".to_string(),
             authority_epoch: 7,
             attempt: 0,
@@ -17340,6 +17353,7 @@ exit 1
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let release = crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "release:77:claim-77:7".to_string(),
             authority_epoch: 7,
             attempt: 1,
@@ -17414,6 +17428,7 @@ exit 1
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let release = crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "release:77:claim-77:7".to_string(),
             authority_epoch: 7,
             attempt: 1,
@@ -17652,6 +17667,7 @@ exit 1
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let effect = crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "claim:42:mismatch:7".to_string(),
             authority_epoch: 7,
             attempt: 1,
@@ -18287,6 +18303,7 @@ exit 1
         .expect("scope");
         let prefs_path = crate::issue_monitor_prefs_path_for_repo_path(&scope.project_root);
         let arm = crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "arm:42:99:sha-a:7".to_string(),
             authority_epoch: 7,
             attempt: 1,
@@ -18390,6 +18407,7 @@ exit 1
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let disarm = crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "disarm:arm:42:99:abc:7:8".to_string(),
             authority_epoch: 8,
             attempt: 0,
@@ -18436,6 +18454,7 @@ exit 1
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let disarm = crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "disarm:arm:42:99:abc:7:8".to_string(),
             authority_epoch: 8,
             attempt: 0,
@@ -18519,6 +18538,7 @@ exit 1
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let claim = crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "claim:42:7".to_string(),
             authority_epoch: 7,
             attempt: 0,
@@ -18578,6 +18598,7 @@ exit 1
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let arm = crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "arm:42:99:abc:7".to_string(),
             authority_epoch: 7,
             attempt: 2,
@@ -19493,6 +19514,7 @@ exit 1
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let old_grant = crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "claim:42:before-overflow".to_string(),
             authority_epoch: u64::MAX - 1,
             attempt: 1,
@@ -19573,6 +19595,7 @@ exit 1
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let arm = crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "arm:42:99:no-op-drain".to_string(),
             authority_epoch: 7,
             attempt: 1,
@@ -19706,6 +19729,7 @@ exit 1
         .expect("scope");
         let prefs_path = crate::issue_monitor_prefs_path_for_repo_path(&scope.project_root);
         let arm = crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "arm:42:99:abc:7".to_string(),
             authority_epoch: 7,
             attempt: 1,
