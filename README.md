@@ -1509,6 +1509,20 @@ actual daemon/GUI/PTY operation, power-loss durability, full CI, or acceptance.
 
 ### Exact-instance cooperative daemon stop (fork preparation)
 
+`daemon.probe.start` provides a separate transport diagnostic. Pass an absolute
+`project_root`. It creates no Issue Monitor worker, scan, GitHub mutation,
+artifact cleanup, GUI materializer or verification child. Existing descriptors,
+authority fences and unknown runtime entries are refused without cleanup;
+existing regular supervisor stderr logs are preserved. The descriptor and
+status identify `diagnostic_only`, and normal bootstrap refuses this endpoint.
+
+Read this exact diagnostic instance with `daemon.probe.status`, using
+`project_root`, `expected_pid` and `expected_instance_id`. Stop it with the
+existing exact-instance `daemon.stop`. A successful probe confirms transport
+only; it does not verify normal background work, PM proposals or human acceptance.
+Probe and stop operations skip performance-log collection and automatic error
+or Board recording. The ordinary startup and work runtime remain separate.
+
 The JSON-only `daemon.stop` operation requires an absolute `project_root`,
 a positive u32 `expected_pid`, a lowercase 64-character `expected_instance_id`,
 and an ASCII alphanumeric/hyphen/underscore `request_id` of 1–128 characters.

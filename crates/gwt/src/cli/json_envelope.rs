@@ -2,6 +2,48 @@ use gwt_agent::session::GWT_SESSION_ID_ENV;
 use std::path::PathBuf;
 
 #[cfg(test)]
+mod daemon_probe_operation_tests {
+    use super::*;
+    #[test]
+    fn diagnostic_start_and_status_require_explicit_exact_scope() {
+        for operation in ["daemon.probe.start", "daemon.probe.status"] {
+            let mut params = serde_json::json!({"project_root":std::env::temp_dir()});
+            if operation.ends_with("status") {
+                params["expected_pid"] = serde_json::json!(77);
+                params["expected_instance_id"] = serde_json::json!("a".repeat(64));
+            }
+            let input =
+                |p: Value| serde_json::json!({"operation":operation,"params":p}).to_string();
+            assert!(parse(&input(params.clone())).is_ok());
+            for key in params.as_object().unwrap().keys() {
+                let mut missing = params.clone();
+                missing.as_object_mut().unwrap().remove(key);
+                assert!(parse(&input(missing)).is_err());
+            }
+            for (key, value) in [
+                ("project_root", serde_json::json!("relative")),
+                ("force", serde_json::json!(true)),
+            ] {
+                let mut bad = params.clone();
+                bad[key] = value;
+                assert!(parse(&input(bad)).is_err());
+            }
+            if operation.ends_with("status") {
+                for (key, value) in [
+                    ("expected_pid", serde_json::json!(true)),
+                    ("expected_pid", serde_json::json!(0)),
+                    ("expected_instance_id", serde_json::json!("A".repeat(64))),
+                ] {
+                    let mut bad = params.clone();
+                    bad[key] = value;
+                    assert!(parse(&input(bad)).is_err());
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod daemon_stop_operation_tests {
     use super::*;
     fn params() -> Value {
@@ -246,6 +288,10 @@ pub(crate) fn dispatch<E: CliEnv>(env: &mut E, prog: &str) -> i32 {
             return 2;
         }
     };
+    #[cfg(not(test))]
+    if parsed.operation != "daemon.stop" && !parsed.operation.starts_with("daemon.probe.") {
+        crate::perf::install_appending_to_established_log_from_settings();
+    }
     let operation = parsed.operation.clone();
     let declared_block = parsed.declared_block;
     let requested_project_root = parsed.requested_project_root;
@@ -291,7 +337,7 @@ pub(crate) fn dispatch<E: CliEnv>(env: &mut E, prog: &str) -> i32 {
             match (code, declared_block) {
                 (0, Some(block)) => super::board::auto_file_declared_block(env, &block),
                 (0, None) => {}
-                _ if operation == "daemon.stop" => {}
+                _ if operation == "daemon.stop" || operation.starts_with("daemon.probe.") => {}
                 _ => {
                     report_operation_refusal(
                         &operation,
@@ -336,10 +382,10 @@ pub(crate) fn dispatch<E: CliEnv>(env: &mut E, prog: &str) -> i32 {
             // operation's own reply.
             // Exact stop is a cleanup boundary. A lost receipt or identity
             // refusal must not create Board work or write an error ledger.
-            if operation != "daemon.stop" {
+            if operation != "daemon.stop" && !operation.starts_with("daemon.probe.") {
                 report_operation_refusal(&operation, &message, requested_project_root.as_deref());
             }
-            if operation == "daemon.stop" {
+            if operation == "daemon.stop" || operation.starts_with("daemon.probe.") {
             } else if let Some(refusal) = failure.refusal.as_ref() {
                 super::board::auto_file_structured_operation_refusal(
                     env, &operation, &message, refusal,
@@ -1178,6 +1224,8 @@ fn parse(input: &str) -> Result<ParsedEnvelope, CliParseError> {
         "diagnostics.cpu" => CliCommand::Diagnostics(DiagnosticsCommand::Cpu { json: true }),
         "daemon.recover" => daemon_recover(params)?,
         "daemon.start" => CliCommand::Daemon(DaemonCommand::Start),
+        "daemon.probe.start" => daemon_probe(params, false)?,
+        "daemon.probe.status" => daemon_probe(params, true)?,
         "daemon.stop" => daemon_stop(params)?,
         "daemon.status" => CliCommand::Daemon(DaemonCommand::Status),
         "daemon.subscribe" => daemon_subscribe(params)?,
@@ -1792,6 +1840,52 @@ fn memory_add(params: &Map<String, Value>) -> Result<CliCommand, CliParseError> 
         learning: required_string(params, "learning")?,
         future_action: required_string(params, "future_action")?,
     })))
+}
+
+fn daemon_probe(params: &Map<String, Value>, status: bool) -> Result<CliCommand, CliParseError> {
+    let operation = if status {
+        "daemon.probe.status"
+    } else {
+        "daemon.probe.start"
+    };
+    let keys: &[&str] = if status {
+        &["project_root", "expected_pid", "expected_instance_id"]
+    } else {
+        &["project_root"]
+    };
+    reject_unknown_params(params, keys, operation)?;
+    let project_root = PathBuf::from(required_string(params, "project_root")?);
+    if !project_root.is_absolute() {
+        return Err(CliParseError::InvalidJson(
+            "daemon probe requires an absolute project_root".into(),
+        ));
+    }
+    if !status {
+        return Ok(CliCommand::Daemon(DaemonCommand::ProbeStart {
+            project_root,
+        }));
+    }
+    let expected_pid = lookup(params, "expected_pid")
+        .and_then(Value::as_u64)
+        .and_then(|v| u32::try_from(v).ok())
+        .ok_or_else(|| {
+            CliParseError::InvalidJson("daemon probe requires a positive u32 expected_pid".into())
+        })?;
+    let expected_instance_id = required_string(params, "expected_instance_id")?;
+    if !gwt_core::daemon::is_valid_daemon_stop_identity(
+        expected_pid,
+        &expected_instance_id,
+        "probe-status",
+    ) {
+        return Err(CliParseError::InvalidJson(
+            "daemon probe requires exact instance identity".into(),
+        ));
+    }
+    Ok(CliCommand::Daemon(DaemonCommand::ProbeStatus {
+        project_root,
+        expected_pid,
+        expected_instance_id,
+    }))
 }
 
 fn daemon_stop(params: &Map<String, Value>) -> Result<CliCommand, CliParseError> {

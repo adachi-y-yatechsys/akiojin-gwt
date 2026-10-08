@@ -74,7 +74,11 @@ fn main() -> ExitCode {
     // daily log there would be exactly the read-repair that contract forbids.
     // Fail-open besides: a disabled kill switch or an unwritable log leaves
     // every later `record_*` call a no-op.
-    gwt::perf::install_appending_to_established_log_from_settings();
+    // Stdin operations install collection after parsing, so transport-only
+    // probes and exact cleanup never housekeep or append performance logs.
+    if argv.get(1).is_some() {
+        gwt::perf::install_appending_to_established_log_from_settings();
+    }
 
     // PM agent instruction discovery remains in runtime; this short-lived
     // gateway resolves all operations and legacy cwd-based hooks in its
@@ -271,6 +275,8 @@ fn format_daemon_help() -> String {
         "  daemon.start                            Bootstrap and serve the runtime daemon",
         "  daemon.recover                          Recover a stale v2 authority without starting work",
         "  daemon.stop                             Request cooperative stop of one exact instance",
+        "  daemon.probe.start                      Start transport only; no worker or background work",
+        "  daemon.probe.status                     Read one exact diagnostic-only instance",
         "  daemon.status                           Probe the daemon endpoint",
         "  daemon.subscribe                         Subscribe to daemon broadcast channels",
         "",

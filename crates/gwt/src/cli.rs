@@ -138,6 +138,14 @@ pub enum CliCommand {
 pub enum DaemonCommand {
     /// `daemon.start` — bootstrap and serve the runtime daemon.
     Start,
+    /// JSON-only transport probe, without the Issue Monitor worker.
+    ProbeStart { project_root: PathBuf },
+    /// Read the exact diagnostic-only instance; never discover or bootstrap.
+    ProbeStatus {
+        project_root: PathBuf,
+        expected_pid: u32,
+        expected_instance_id: String,
+    },
     /// `daemon.recover` — revoke a stale v2 authority without starting work.
     Recover {
         project_root: PathBuf,

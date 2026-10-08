@@ -191,7 +191,8 @@ pub(crate) fn locate(worktree: &Path) -> (DaemonAvailability, Option<DaemonEndpo
         // Liveness is checked apart from the protocol version on purpose: a
         // live daemon of the wrong version is a different answer from no
         // daemon at all, and `is_usable` collapses the two.
-        if endpoint.scope.repo_hash != scope.repo_hash
+        if endpoint.diagnostic_only
+            || endpoint.scope.repo_hash != scope.repo_hash
             || endpoint.scope.target != scope.target
             || endpoint.bind.trim().is_empty()
             || endpoint.auth_token.trim().is_empty()
@@ -431,7 +432,7 @@ mod tests {
             .expect("project scope");
         let mut sibling = scope.clone();
         sibling.worktree_hash = "a-different-checkout".to_string();
-        let endpoint = DaemonEndpoint::new(
+        let mut endpoint = DaemonEndpoint::new(
             sibling.clone(),
             std::process::id(),
             "/tmp/sibling.sock".to_string(),
@@ -453,5 +454,14 @@ mod tests {
             found.expect("sibling endpoint").scope.worktree_hash,
             "a-different-checkout"
         );
+        endpoint.diagnostic_only = true;
+        std::fs::write(
+            sibling.endpoint_path(&gwt_home),
+            serde_json::to_vec(&endpoint).expect("serialize diagnostic endpoint"),
+        )
+        .expect("write diagnostic endpoint");
+        let (availability, found) = locate(project.path());
+        assert_eq!(availability, DaemonAvailability::Absent);
+        assert!(found.is_none());
     }
 }

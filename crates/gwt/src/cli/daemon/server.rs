@@ -53,7 +53,8 @@ use super::broadcast::{
     IssueMonitorControlRequest,
 };
 use super::transport::{
-    bind_is_served, cleanup_stale_bind, prepare_bind_parent, IpcListener, IpcReadHalf, IpcStream,
+    bind_is_present, bind_is_served, cleanup_stale_bind, prepare_bind_parent, IpcListener,
+    IpcReadHalf, IpcStream,
 };
 
 const ACCEPT_BACKOFF_MS: u64 = 50;
@@ -152,6 +153,15 @@ pub(super) fn serve_blocking<W: std::io::Write + ?Sized>(
     endpoint_path: PathBuf,
     writer: &mut W,
 ) -> Result<i32, SpecOpsError> {
+    serve_blocking_with_mode(scope, endpoint_path, writer, false)
+}
+
+pub(super) fn serve_blocking_with_mode<W: std::io::Write + ?Sized>(
+    scope: RuntimeScope,
+    endpoint_path: PathBuf,
+    writer: &mut W,
+    diagnostic_only: bool,
+) -> Result<i32, SpecOpsError> {
     // Resolve before anything is persisted or announced: a runtime root
     // longer than `sun_path` must surface as a diagnosis here rather than
     // as a bare bind failure after the endpoint file already advertised an
@@ -160,6 +170,20 @@ pub(super) fn serve_blocking<W: std::io::Write + ?Sized>(
         resolve_daemon_socket_path(&endpoint_path).map_err(|err| config_error(err.to_string()))?;
     let socket_path = socket.path;
     let authority_lease = acquire_daemon_startup_lease(&scope)?;
+    if diagnostic_only {
+        let prefs = crate::issue_monitor_prefs_path_for_repo_path(&scope.project_root);
+        if !matches!(
+            crate::load_issue_monitor_authority_fence(&prefs),
+            Ok(crate::IssueMonitorAuthorityFenceState::Missing)
+        ) {
+            return Err(config_error(
+                "daemon probe requires missing authority fence; existing state preserved",
+            ));
+        }
+        super::probe::require_empty_endpoint_directory(
+            &scope.daemon_dir(&gwt_core::paths::gwt_home()),
+        )?;
+    }
     if let Err(err) = ensure_socket_parent(&socket_path) {
         return Err(config_error(format!(
             "failed to prepare daemon socket directory: {err}"
@@ -170,16 +194,25 @@ pub(super) fn serve_blocking<W: std::io::Write + ?Sized>(
     // stranded the live daemon on an unlinked inode, and the loser's exit
     // cleanup then deleted the live daemon's endpoint descriptor, leaving
     // every CLI caller on "authority fence ... has no usable endpoint".
-    ensure_socket_not_served(&socket_path)?;
+    if diagnostic_only {
+        if bind_is_present(&socket_path) || bind_is_served(&socket_path.to_string_lossy()) {
+            return Err(config_error(
+                "daemon probe bind already exists; no cleanup or adoption",
+            ));
+        }
+    } else {
+        ensure_socket_not_served(&socket_path)?;
+    }
 
     let auth_token = uuid::Uuid::new_v4().to_string();
-    let endpoint = DaemonEndpoint::new(
+    let mut endpoint = DaemonEndpoint::new(
         scope,
         std::process::id(),
         socket_path.to_string_lossy().to_string(),
         auth_token,
         env!("CARGO_PKG_VERSION").to_string(),
     );
+    endpoint.diagnostic_only = diagnostic_only;
 
     let runtime = Builder::new_multi_thread()
         .enable_all()
@@ -351,6 +384,15 @@ fn bind_daemon(
     endpoint_path: &Path,
     authority_lease: crate::IssueMonitorAuthorityLease,
 ) -> Result<BoundDaemon, SpecOpsError> {
+    if endpoint.diagnostic_only {
+        // Recheck under the project lifetime lease. No stale-file sweep,
+        // replacement, or adoption belongs to this diagnostic operation.
+        super::probe::require_empty_endpoint_directory(
+            endpoint_path
+                .parent()
+                .ok_or_else(|| config_error("diagnostic endpoint directory unavailable"))?,
+        )?;
+    }
     let listener = IpcListener::bind(socket_path).map_err(|err| {
         config_error(format!(
             "failed to bind daemon socket {}: {err}",
@@ -389,15 +431,20 @@ async fn run_bound_server(
     // Keep one handle through listener and worker shutdown: a failed worker
     // must not admit a second daemon while this server still answers IPC.
     let authority_lease = Arc::new(authority_lease);
-    let mut issue_monitor_worker = spawn_issue_monitor_worker_with_lease(
-        endpoint.scope.clone(),
-        hub.clone(),
-        Arc::clone(&shutdown),
-        monitor_config,
-        operation_timeout,
-        IssueMonitorWorkerTestHooks::default(),
-        Some(Arc::clone(&authority_lease)),
-    );
+    let mut issue_monitor_worker = if endpoint.diagnostic_only {
+        hub.close_issue_monitor_controls();
+        None
+    } else {
+        Some(spawn_issue_monitor_worker_with_lease(
+            endpoint.scope.clone(),
+            hub.clone(),
+            Arc::clone(&shutdown),
+            monitor_config,
+            operation_timeout,
+            IssueMonitorWorkerTestHooks::default(),
+            Some(Arc::clone(&authority_lease)),
+        ))
+    };
 
     let endpoint = Arc::new(endpoint);
     let started_at = Instant::now();
@@ -465,14 +512,16 @@ async fn run_bound_server(
         .max(ISSUE_MONITOR_SCAN_BUDGET_CEILING)
         .saturating_add(issue_monitor_prefs_timeout())
         .saturating_add(issue_monitor_prefs_timeout());
-    match tokio::time::timeout(worker_grace, &mut issue_monitor_worker).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            tracing::warn!(error = %error, "issue monitor worker failed during daemon shutdown");
-        }
-        Err(_) => {
-            tracing::error!("issue monitor worker exceeded daemon shutdown grace");
-            issue_monitor_worker.abort();
+    if let Some(worker) = issue_monitor_worker.as_mut() {
+        match tokio::time::timeout(worker_grace, &mut *worker).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(error = %error, "issue monitor worker failed during daemon shutdown");
+            }
+            Err(_) => {
+                tracing::error!("issue monitor worker exceeded daemon shutdown grace");
+                worker.abort();
+            }
         }
     }
 
@@ -5263,7 +5312,16 @@ async fn handle_connection(
             continue;
         }
         let is_first_frame = std::mem::replace(&mut first_frame, false);
-        match serde_json::from_str::<ClientFrame>(trimmed) {
+        let frame = serde_json::from_str::<ClientFrame>(trimmed);
+        if endpoint.diagnostic_only
+            && !matches!(&frame, Ok(ClientFrame::Status | ClientFrame::Stop { .. }))
+        {
+            let _ = out_tx.send(DaemonFrame::Error {
+                message: "diagnostic-only daemon admits Status and exact Stop only".into(),
+            });
+            break;
+        }
+        match frame {
             Ok(ClientFrame::Stop {
                 expected_scope,
                 expected_pid,
@@ -5464,6 +5522,7 @@ async fn handle_connection(
                 let snapshot = DaemonStatus {
                     protocol_version: endpoint.protocol_version,
                     daemon_version: endpoint.daemon_version.clone(),
+                    diagnostic_only: endpoint.diagnostic_only,
                     uptime_seconds: started_at.elapsed().as_secs(),
                     broadcast_channels: hub.channel_count(),
                     connections: connection_guard.snapshot(),
@@ -5712,7 +5771,8 @@ fn heal_endpoint_descriptor(
             Ok(existing)
                 if existing.pid == endpoint.pid
                     && existing.auth_token == endpoint.auth_token
-                    && existing.bind == endpoint.bind =>
+                    && existing.bind == endpoint.bind
+                    && existing.diagnostic_only == endpoint.diagnostic_only =>
             {
                 return EndpointDescriptorHeal::Intact;
             }
@@ -5739,13 +5799,14 @@ fn heal_endpoint_descriptor(
             );
         }
     }
-    let refreshed = DaemonEndpoint::new(
+    let mut refreshed = DaemonEndpoint::new(
         endpoint.scope.clone(),
         endpoint.pid,
         endpoint.bind.clone(),
         endpoint.auth_token.clone(),
         endpoint.daemon_version.clone(),
     );
+    refreshed.diagnostic_only = endpoint.diagnostic_only;
     match persist_endpoint(endpoint_path, &refreshed) {
         Ok(()) => {
             tracing::warn!(

@@ -102,6 +102,14 @@ pub const OPERATIONS: &[Operation] = &[
         aliases: &[],
     },
     Operation {
+        name: "daemon.probe.start",
+        aliases: &[],
+    },
+    Operation {
+        name: "daemon.probe.status",
+        aliases: &[],
+    },
+    Operation {
         name: "daemon.status",
         aliases: &[],
     },

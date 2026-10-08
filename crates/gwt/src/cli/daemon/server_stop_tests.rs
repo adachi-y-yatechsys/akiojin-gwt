@@ -16,6 +16,12 @@ use tempfile::TempDir;
 use tokio::{io::AsyncWrite, task::JoinHandle};
 
 async fn fixture() -> (TempDir, DaemonEndpoint, Arc<DaemonShutdown>, JoinHandle<()>) {
+    fixture_with_mode(false).await
+}
+
+async fn fixture_with_mode(
+    diagnostic_only: bool,
+) -> (TempDir, DaemonEndpoint, Arc<DaemonShutdown>, JoinHandle<()>) {
     let temp = TempDir::new().unwrap();
     let scope = RuntimeScope::new(
         "abcdef0123456789",
@@ -24,13 +30,14 @@ async fn fixture() -> (TempDir, DaemonEndpoint, Arc<DaemonShutdown>, JoinHandle<
         RuntimeTarget::Host,
     )
     .unwrap();
-    let endpoint = DaemonEndpoint::new(
+    let mut endpoint = DaemonEndpoint::new(
         scope,
         std::process::id(),
         temp.path().join("stop.sock").to_string_lossy().into_owned(),
         "temporary-test-token".into(),
         "test".into(),
     );
+    endpoint.diagnostic_only = diagnostic_only;
     let mut listener = IpcListener::bind(std::path::Path::new(&endpoint.bind)).unwrap();
     let shutdown = Arc::new(DaemonShutdown::new());
     let server_shutdown = shutdown.clone();
@@ -39,10 +46,14 @@ async fn fixture() -> (TempDir, DaemonEndpoint, Arc<DaemonShutdown>, JoinHandle<
         tokio::time::timeout(Duration::from_secs(10), async {
             let stream = listener.accept().await.unwrap();
             let guard = ConnectionGuard::new(Arc::new(AtomicUsize::new(0)));
+            let hub = BroadcastHub::new();
+            if diagnostic_only {
+                hub.close_issue_monitor_controls();
+            }
             super::handle_connection(
                 stream,
                 server_endpoint,
-                BroadcastHub::new(),
+                hub,
                 Instant::now(),
                 &guard,
                 server_shutdown,
@@ -54,6 +65,163 @@ async fn fixture() -> (TempDir, DaemonEndpoint, Arc<DaemonShutdown>, JoinHandle<
         .expect("temporary connection finishes");
     });
     (temp, endpoint, shutdown, server)
+}
+
+#[tokio::test]
+async fn diagnostic_transport_refuses_every_effectful_frame_before_dispatch() {
+    use gwt_core::daemon::{HookEnvelope, VerificationSpawnRequest, DAEMON_PROTOCOL_VERSION};
+    for case in 0..5 {
+        let (_temp, endpoint, shutdown, server) = fixture_with_mode(true).await;
+        let frame = match case {
+            0 => ClientFrame::Subscribe {
+                channels: vec!["board".into()],
+            },
+            1 => ClientFrame::SubscribeMaterializer {
+                channels: vec!["issue-monitor".into()],
+            },
+            2 => ClientFrame::Publish {
+                channel: "issue-monitor-control".into(),
+                payload: serde_json::json!({"operation":"launch"}),
+            },
+            3 => ClientFrame::Hook(HookEnvelope {
+                protocol_version: DAEMON_PROTOCOL_VERSION,
+                scope: endpoint.scope.clone(),
+                hook_name: "SessionStart".into(),
+                session_id: None,
+                cwd: endpoint.scope.project_root.clone(),
+                payload: serde_json::json!({}),
+            }),
+            _ => ClientFrame::SpawnVerification(VerificationSpawnRequest {
+                program: "must-not-run".into(),
+                args: vec![],
+                cwd: endpoint.scope.project_root.clone(),
+                env: vec![],
+                stdout_path: endpoint.scope.project_root.join("must-not-create.out"),
+                stderr_path: endpoint.scope.project_root.join("must-not-create.err"),
+            }),
+        };
+        let mut client = DaemonClient::connect(&endpoint).await.unwrap();
+        client.send_frame(&frame).await.unwrap();
+        assert!(matches!(client.read_frame::<DaemonFrame>().await.unwrap(),
+            DaemonFrame::Error{message} if message=="diagnostic-only daemon admits Status and exact Stop only"));
+        server.await.unwrap();
+        assert!(!shutdown.requested.load(Ordering::Acquire));
+        assert!(!endpoint
+            .scope
+            .project_root
+            .join("must-not-create.out")
+            .exists());
+        assert!(!endpoint
+            .scope
+            .project_root
+            .join("must-not-create.err")
+            .exists());
+    }
+}
+
+#[tokio::test]
+async fn diagnostic_server_status_and_stop_never_load_monitor_or_create_its_fence() {
+    use gwt_core::test_support::ScopedGwtHome;
+    let temp = TempDir::new().unwrap();
+    let _home = ScopedGwtHome::set(temp.path());
+    let scope = RuntimeScope::new(
+        "probe-repo",
+        "probe-worktree",
+        temp.path().to_owned(),
+        RuntimeTarget::Host,
+    )
+    .unwrap();
+    let prefs = crate::issue_monitor_prefs_path_for_repo_path(&scope.project_root);
+    std::fs::create_dir_all(prefs.parent().unwrap()).unwrap();
+    std::fs::write(&prefs, b"unreadable monitor bytes: must remain untouched").unwrap();
+    let lease = crate::issue_monitor::acquire_issue_monitor_daemon_lease(&prefs).unwrap();
+    let path = scope.endpoint_path(temp.path());
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let socket = path.with_extension("sock");
+    let mut endpoint = DaemonEndpoint::new(
+        scope,
+        std::process::id(),
+        socket.to_string_lossy().into_owned(),
+        "probe-test-token".into(),
+        "test".into(),
+    );
+    endpoint.diagnostic_only = true;
+    let bound = super::bind_daemon(&endpoint, &socket, &path, lease).unwrap();
+    let shutdown = Arc::new(DaemonShutdown::new());
+    let server = tokio::spawn(super::run_bound_server(
+        endpoint.clone(),
+        path,
+        BroadcastHub::new(),
+        shutdown,
+        crate::IssueMonitorConfig::default(),
+        Duration::from_secs(1),
+        bound,
+    ));
+    let mut client = DaemonClient::connect(&endpoint).await.unwrap();
+    client.send_frame(&ClientFrame::Status).await.unwrap();
+    assert!(matches!(client.read_frame::<DaemonFrame>().await.unwrap(),
+        DaemonFrame::Status(s) if s.diagnostic_only && s.issue_monitor.is_none()));
+    drop(client);
+    crate::cli::daemon::stop::request_stop(&endpoint, "probe-stop-test")
+        .await
+        .unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        std::fs::read(&prefs).unwrap(),
+        b"unreadable monitor bytes: must remain untouched"
+    );
+    assert!(!crate::issue_monitor::issue_monitor_authority_fence_path(&prefs).exists());
+    // A new lock holder proves the original project lifetime lease was released.
+    drop(crate::issue_monitor::acquire_issue_monitor_daemon_lease(&prefs).unwrap());
+}
+
+#[test]
+fn diagnostic_mode_survives_descriptor_repair_and_corrects_a_lost_mode_flag() {
+    let temp = TempDir::new().unwrap();
+    let scope = RuntimeScope::new(
+        "probe-repo",
+        "probe-worktree",
+        temp.path().to_owned(),
+        RuntimeTarget::Host,
+    )
+    .unwrap();
+    let mut endpoint = DaemonEndpoint::new(
+        scope,
+        std::process::id(),
+        "test-bind".into(),
+        "probe-test-token".into(),
+        "test".into(),
+    );
+    endpoint.diagnostic_only = true;
+    let path = temp.path().join("endpoint.json");
+    assert_eq!(
+        super::heal_endpoint_descriptor(&endpoint, &path, &|_| false),
+        super::EndpointDescriptorHeal::Rewritten
+    );
+    assert!(
+        gwt_core::daemon::load_endpoint(&path)
+            .unwrap()
+            .diagnostic_only
+    );
+    let mut lost = endpoint.clone();
+    lost.diagnostic_only = false;
+    gwt_core::daemon::persist_endpoint(&path, &lost).unwrap();
+    assert_eq!(
+        super::heal_endpoint_descriptor(&endpoint, &path, &|_| true),
+        super::EndpointDescriptorHeal::Rewritten
+    );
+    assert!(
+        gwt_core::daemon::load_endpoint(&path)
+            .unwrap()
+            .diagnostic_only
+    );
 }
 
 fn frame(endpoint: &DaemonEndpoint) -> ClientFrame {

@@ -17,6 +17,7 @@
 
 pub(crate) mod broadcast;
 pub mod client;
+mod probe;
 pub(crate) mod server;
 mod stop;
 mod subscribe_resolver;
@@ -103,6 +104,12 @@ pub(super) fn run<E: CliEnv>(
 ) -> Result<i32, SpecOpsError> {
     match cmd {
         DaemonCommand::Start => start_daemon(env, out),
+        DaemonCommand::ProbeStart { project_root } => probe::start(&project_root, env.stdout()),
+        DaemonCommand::ProbeStatus {
+            project_root,
+            expected_pid,
+            expected_instance_id,
+        } => probe::status(&project_root, expected_pid, &expected_instance_id, out),
         DaemonCommand::Status => report_status(env, out),
         DaemonCommand::Stop {
             project_root,
@@ -879,6 +886,7 @@ mod tests {
     #[test]
     fn format_probe_result_ok_includes_uptime_and_channels() {
         let status = DaemonStatus {
+            diagnostic_only: false,
             protocol_version: DAEMON_PROTOCOL_VERSION,
             daemon_version: "9.14.0".to_string(),
             uptime_seconds: 12,

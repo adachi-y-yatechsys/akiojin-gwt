@@ -400,6 +400,9 @@ pub struct DaemonEndpoint {
     pub bind: String,
     pub auth_token: String,
     pub updated_at_unix_ms: i64,
+    /// Transport diagnostics only; never adopt as a work runtime.
+    #[serde(default)]
+    pub diagnostic_only: bool,
 }
 
 impl DaemonEndpoint {
@@ -425,6 +428,7 @@ impl DaemonEndpoint {
             bind,
             auth_token,
             updated_at_unix_ms: chrono::Utc::now().timestamp_millis(),
+            diagnostic_only: false,
         }
     }
 
@@ -438,6 +442,7 @@ impl DaemonEndpoint {
         F: Fn(u32) -> bool,
     {
         self.protocol_version == expected_protocol_version
+            && !self.diagnostic_only
             && self.scope == *expected_scope
             && self.pid > 0
             && !self.bind.trim().is_empty()
@@ -628,6 +633,8 @@ pub enum DaemonFrame {
 pub struct DaemonStatus {
     pub protocol_version: u32,
     pub daemon_version: String,
+    #[serde(default)]
+    pub diagnostic_only: bool,
     pub uptime_seconds: u64,
     pub broadcast_channels: usize,
     /// Number of currently-connected IPC clients, including the one
@@ -771,6 +778,9 @@ where
 {
     let endpoint_path = scope.endpoint_path(gwt_home);
     match load_endpoint(&endpoint_path) {
+        Ok(endpoint) if endpoint.diagnostic_only => Err(GwtError::Config(
+            "diagnostic-only daemon cannot be adopted as a work runtime; stop its exact instance first".into(),
+        )),
         Ok(endpoint) if endpoint.is_usable(scope, expected_protocol_version, &is_process_alive) => {
             match expected_daemon_version {
                 Some(expected) if !daemon_versions_match(&endpoint.daemon_version, expected) => {
@@ -816,7 +826,9 @@ where
 /// zero) *and* nothing answers on its bind address (`is_bind_serving`). A
 /// descriptor whose pid died but whose socket still serves belongs to a daemon
 /// this sweep cannot see, and an unreadable descriptor names no owner at all;
-/// both are left alone. Files that are not `*.json` are never touched.
+/// both are left alone. Diagnostic descriptors also stay until their exact
+/// instance is stopped; sweeping them must not permit a normal worker startup.
+/// Files that are not `*.json` are never touched.
 ///
 /// A missing `daemon_dir` is not an error — there is simply nothing to sweep.
 pub fn sweep_dead_endpoints<F, G>(
@@ -843,7 +855,10 @@ where
         let Ok(endpoint) = load_endpoint(&path) else {
             continue;
         };
-        if endpoint.has_live_owner(&is_process_alive) || is_bind_serving(endpoint.bind.trim()) {
+        if endpoint.diagnostic_only
+            || endpoint.has_live_owner(&is_process_alive)
+            || is_bind_serving(endpoint.bind.trim())
+        {
             continue;
         }
         remove_endpoint_file(&path)?;

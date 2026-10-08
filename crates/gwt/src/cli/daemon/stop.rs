@@ -11,7 +11,7 @@ use super::{client::DaemonClient, config_error};
 
 pub(super) const STOP_CONTACT_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn exact_endpoint(
+pub(super) fn exact_endpoint(
     scope: &RuntimeScope,
     home: &Path,
     pid: u32,

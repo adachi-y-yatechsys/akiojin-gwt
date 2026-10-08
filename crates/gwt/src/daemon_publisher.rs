@@ -134,6 +134,7 @@ fn authority_owned_endpoint(
             }
         };
         if endpoint.pid != fence.pid
+            || endpoint.diagnostic_only
             || endpoint.scope.repo_hash != requested_scope.repo_hash
             || endpoint.scope.target != requested_scope.target
             || endpoint.scope.endpoint_path(gwt_home) != path
@@ -295,6 +296,12 @@ pub(crate) fn resolve_project_daemon_bootstrap(
         AuthorityResolutionPurpose::RecoverUnderLease,
     )? {
         ProjectAuthorityResolution::Live(endpoint) => {
+            if endpoint.diagnostic_only {
+                return Err(
+                    "diagnostic-only endpoint cannot be adopted or retired as a work runtime"
+                        .into(),
+                );
+            }
             return Ok(
                 if expected_version.is_some_and(|version| endpoint.daemon_version != version) {
                     DaemonBootstrapAction::RetireStaleVersion { endpoint }
