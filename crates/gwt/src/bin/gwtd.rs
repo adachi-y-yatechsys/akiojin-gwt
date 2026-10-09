@@ -74,7 +74,11 @@ fn main() -> ExitCode {
     // daily log there would be exactly the read-repair that contract forbids.
     // Fail-open besides: a disabled kill switch or an unwritable log leaves
     // every later `record_*` call a no-op.
-    gwt::perf::install_appending_to_established_log_from_settings();
+    // Stdin operations install collection after parsing, so transport-only
+    // probes and exact cleanup never housekeep or append performance logs.
+    if argv.get(1).is_some() {
+        gwt::perf::install_appending_to_established_log_from_settings();
+    }
 
     // PM agent instruction discovery remains in runtime; this short-lived
     // gateway resolves all operations and legacy cwd-based hooks in its
@@ -269,10 +273,20 @@ fn format_daemon_help() -> String {
         "",
         "Operations:",
         "  daemon.start                            Bootstrap and serve the runtime daemon",
+        "  daemon.recover                          Recover a stale v2 authority without starting work",
+        "  daemon.stop                             Request cooperative stop of one exact instance",
+        "  daemon.start_without_cleanup            Start worker without automatic branch/cache cleanup",
+        "  daemon.probe.start                      Start transport only; no worker or background work",
+        "  daemon.probe.status                     Read one exact diagnostic-only instance",
         "  daemon.status                           Probe the daemon endpoint",
         "  daemon.subscribe                         Subscribe to daemon broadcast channels",
         "",
         "Key params:",
+        "  project_root, project_store_hash        Required absolute root and exact store for daemon.recover",
+        "  expected_epoch, expected_fence          Required observed epoch and exact v2 fence for daemon.recover",
+        "  expected_pid, expected_instance_id      Required exact PID and opaque instance digest for daemon.stop",
+        "  request_id                              Required bounded request identity for daemon.stop",
+        "  - daemon.stop requires absolute project_root; accepted never proves process exit. Do not resend an unknown outcome.",
         "  channels                                Required for daemon.subscribe",
         "  project_root                            Optional for daemon.subscribe; selects the",
         "                                          project authority instead of caller cwd",
@@ -280,6 +294,9 @@ fn format_daemon_help() -> String {
         "                                          stream so a loop can reconcile and resume",
         "",
         "Notes:",
+        "  - daemon.recover requires disabled monitor/autonomy, no pending effects, and a free authority lease.",
+        "    It preserves launch/claim records; success keeps runtime_clear_verified=false and work_resumed=false.",
+        "    Persistence failure is outcome unknown; inspect both records before any retry.",
         "  - Listens on a Unix domain socket (Unix) or a named pipe (Windows) per RuntimeScope.",
         "  - Endpoint metadata is persisted under ~/.gwt/projects/<repo>/runtime/daemon/.",
         "  - An explicit project_root must resolve to an existing directory; invalid roots",
@@ -1200,6 +1217,9 @@ mod tests {
             "existing directory",
             "fail closed",
             "Omitting it preserves cwd resolution",
+            "daemon.recover",
+            "expected_epoch, expected_fence",
+            "work_resumed=false",
         ] {
             assert!(
                 help.contains(expected),

@@ -2128,12 +2128,13 @@ fn commit_local_issue_monitor_effect_result(
                 ) => {
                     latest.complete_pending_effect(&key);
                     if current {
-                        latest.apply_confirmed_claim(
+                        latest.apply_confirmed_claim_for_trial(
                             *issue_number,
                             claim.claim_id,
                             owner,
                             &effect.effect_id,
                             now_text,
+                            effect.launch_budget_trial_id.clone(),
                         );
                     }
                     1

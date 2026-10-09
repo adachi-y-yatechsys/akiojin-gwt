@@ -138,8 +138,32 @@ pub enum CliCommand {
 pub enum DaemonCommand {
     /// `daemon.start` — bootstrap and serve the runtime daemon.
     Start,
+    /// JSON-only normal worker startup without automatic destructive cleanup.
+    StartWithoutCleanup { project_root: PathBuf },
+    /// JSON-only transport probe, without the Issue Monitor worker.
+    ProbeStart { project_root: PathBuf },
+    /// Read the exact diagnostic-only instance; never discover or bootstrap.
+    ProbeStatus {
+        project_root: PathBuf,
+        expected_pid: u32,
+        expected_instance_id: String,
+    },
+    /// `daemon.recover` — revoke a stale v2 authority without starting work.
+    Recover {
+        project_root: PathBuf,
+        project_store_hash: String,
+        expected_fence: crate::IssueMonitorAuthorityFence,
+        expected_epoch: u64,
+    },
     /// `daemon.status` — print whether a daemon is registered for cwd scope.
     Status,
+    /// JSON-only exact-instance cooperative stop; no discovery or retry.
+    Stop {
+        project_root: PathBuf,
+        expected_pid: u32,
+        expected_instance_id: String,
+        request_id: String,
+    },
     /// `daemon.subscribe` — connect to the running daemon,
     /// subscribe to one or more broadcast channels, and print received events
     /// to stdout one JSON line at a time. Useful for debugging the Phase H1+

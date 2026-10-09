@@ -26,6 +26,7 @@ pub fn initialize_launch_session(
     session.docker_service = config.docker_service.clone();
     session.docker_lifecycle_intent = config.docker_lifecycle_intent;
     session.linked_issue_number = config.linked_issue_number;
+    session.launch_budget_trial_id = config.launch_budget_trial_id.clone();
     session.launch_route = config.launch_route;
     session.launch_command = durable_command.unwrap_or_else(|| config.command.clone());
     session.launch_args = config.args.clone();
@@ -191,6 +192,7 @@ mod tests {
         config.session_mode = gwt_agent::SessionMode::Resume;
         config.resume_session_id = Some("conversation".to_string());
         config.branch = Some("work/example".to_string());
+        config.launch_budget_trial_id = Some("saved-bounded-trial".to_string());
         let project = tmp.path().join("project");
         let worktree = tmp.path().join("worktree");
         let mut session = initialize_launch_session(
@@ -208,6 +210,10 @@ mod tests {
             .expect("persist launch");
         let saved = gwt_agent::Session::load(&sessions.join(format!("{}.toml", session.id)))
             .expect("load session");
+        assert_eq!(
+            saved.launch_budget_trial_id.as_deref(),
+            Some("saved-bounded-trial")
+        );
         assert_eq!(saved.status, gwt_agent::AgentStatus::Running);
         assert_eq!(saved.exact_resume_session_id(), Some("conversation"));
         assert_eq!(saved.tool_version.as_deref(), Some("2.1.156"));

@@ -982,6 +982,14 @@ pub fn scan_loaded_issue_monitor_candidates_for_project_tab(
     expected_project_tab_id: Option<&str>,
     now: &str,
 ) -> IssueMonitorScanSummary {
+    let budget_scope = crate::launch_budget::BudgetStore::for_project(repo_path)
+        .status()
+        .ok()
+        .flatten()
+        .map(|status| status.scope);
+    monitor.set_launch_budget_scope(budget_scope);
+    // Unknown budgets cannot acquire an identity here; the physical start gate
+    // independently refuses unreadable records.
     // Reconcile local credentials before this scan plans claims. No network
     // request is made here; Claude credential access remains opt-in.
     let usage_config = gwt_config::Settings::load().unwrap_or_default().usage;
@@ -1424,8 +1432,13 @@ pub fn prune_delivered_work_branches(
     repo_path: &Path,
     base_branch: &str,
     reconciliation: &IssueMonitorMergeReconciliation,
+    background_cleanup_allowed: bool,
 ) -> gwt_git::merged_branch_prune::PruneReport {
     let mut report = gwt_git::merged_branch_prune::PruneReport::default();
+    if !background_cleanup_allowed {
+        report.skipped_reason = Some("automatic cleanup disabled for this daemon".to_string());
+        return report;
+    }
     if reconciliation.merged.is_empty() {
         return report;
     }
@@ -2061,6 +2074,7 @@ fn advance_one_autonomous_issue(
                     // the remote mutation and result reconciliation.
                     let epoch = monitor.effect_authority_epoch();
                     monitor.prepare_effect(crate::PendingIssueMonitorEffect {
+                        launch_budget_trial_id: None,
                         effect_id: format!(
                             "arm:{issue_number}:{pr}:{}:{epoch}",
                             inputs.reviewed_sha
@@ -2427,6 +2441,23 @@ mod tests {
         UpdatedAt,
     };
     use std::path::PathBuf;
+
+    #[test]
+    fn disabled_cleanup_refuses_pruning_before_git_even_after_delivery() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let missing_repo = tmp.path().join("missing-repository");
+        let reconciliation = IssueMonitorMergeReconciliation {
+            merged: vec![1],
+            ..Default::default()
+        };
+        let report =
+            prune_delivered_work_branches(&missing_repo, "develop", &reconciliation, false);
+        assert_eq!(
+            report.skipped_reason.as_deref(),
+            Some("automatic cleanup disabled for this daemon")
+        );
+        assert!(!missing_repo.exists());
+    }
 
     fn issue(number: u64) -> IssueMonitorIssue {
         IssueMonitorIssue {

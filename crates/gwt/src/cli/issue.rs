@@ -218,6 +218,41 @@ pub(super) fn run<E: CliEnv>(
         IssueCommand::MonitorStatus { project_root } => {
             run_monitor_status(env, project_root.as_deref(), out)?
         }
+        IssueCommand::MonitorLaunchBudgetArm {
+            project_root,
+            trial_id,
+            issue_number,
+            max_starts,
+        } => {
+            let root = issue_monitor_project_root(env, Some(&project_root))?;
+            let scope = crate::launch_budget::BudgetScope {
+                project_root: dunce::canonicalize(&root).map_err(io_as_api_error)?,
+                trial_id,
+                issue_number,
+                max_starts,
+            };
+            let status = crate::launch_budget::BudgetStore::for_project(&root)
+                .arm(&scope)
+                .map_err(io_as_api_error)?;
+            out.push_str(
+                &serde_json::to_string(&serde_json::json!({"launch_budget":status}))
+                    .map_err(|e| io_as_api_error(io::Error::other(e)))?,
+            );
+            out.push('\n');
+            0
+        }
+        IssueCommand::MonitorLaunchBudgetStatus { project_root } => {
+            let root = issue_monitor_project_root(env, Some(&project_root))?;
+            let status = crate::launch_budget::BudgetStore::for_project(&root)
+                .status()
+                .map_err(io_as_api_error)?;
+            out.push_str(
+                &serde_json::to_string(&serde_json::json!({"launch_budget":status}))
+                    .map_err(|e| io_as_api_error(io::Error::other(e)))?,
+            );
+            out.push('\n');
+            0
+        }
         IssueCommand::MonitorPriorityMove {
             project_root,
             number,
@@ -1171,11 +1206,11 @@ fn run_monitor_queue_list<E: CliEnv>(
 /// It now reports one result per number and refuses the call as a whole when
 /// any of them is declined:
 ///
-/// - `claimed_by_other_owner` — another owner holds a live `Active` / `Queued`
-///   claim on the Issue. `force: true` takes it over.
-/// - `not_in_queue_after_write` — the number was accepted but is absent from
-///   the queue that was written. Nothing is known to produce this; it exists so
-///   a future silent drop is named rather than swallowed.
+/// The CLI creates no remote claim. The Monitor confirms the queue request
+/// durably and acquires execution authority separately. `force: true` only
+/// bypasses the preflight queue refusal; it does not transfer a remote claim.
+/// Failed observations, control refusals and unknown outcomes are named per
+/// Issue. Only an unavailable transport permits a fenced local fallback.
 ///
 /// `launch_now` deliberately does not apply the claim guard: it is the explicit
 /// "do this now" override, and the Issue it is pointed at is named by a person.
@@ -1190,230 +1225,262 @@ fn run_monitor_queue_push<E: CliEnv>(
     force: bool,
     out: &mut String,
 ) -> Result<i32, SpecOpsError> {
+    run_monitor_queue_push_with_publisher(
+        env,
+        project_root,
+        numbers,
+        position,
+        force,
+        out,
+        publish_monitor_config_set,
+    )
+}
+
+fn run_monitor_queue_push_with_publisher<E: CliEnv>(
+    env: &E,
+    project_root: Option<&std::path::Path>,
+    numbers: &[u64],
+    position: Option<usize>,
+    force: bool,
+    out: &mut String,
+    publish: impl FnOnce(
+        &std::path::Path,
+        serde_json::Value,
+    )
+        -> Result<(), crate::runtime_daemon_events::IssueMonitorControlPublishError>,
+) -> Result<i32, SpecOpsError> {
     let root = issue_monitor_project_root(env, project_root)?;
     let path = crate::issue_monitor_prefs_path_for_repo_path(&root);
+    let confirmed_claims = crate::load_issue_monitor_prefs(&path)
+        .map_err(io_as_api_error)?
+        .claim_identities;
     let now = chrono::Utc::now().to_rfc3339();
-    let queued_expires_at = (chrono::Utc::now() + chrono::Duration::minutes(15)).to_rfc3339();
     let mut accepted_numbers = Vec::new();
     let mut outcomes: Vec<QueuePushOutcome> = Vec::new();
     let mut urgent_observations = Vec::new();
-    // Queue claims are advisory: a GitHub outage must not make the local
-    // queue unusable. Active claims remain authoritative and are left alone.
+    // This is a queue request, not a remote execution claim. Only the Monitor
+    // acquires an Active claim using its own identity when it takes the work.
     for number in numbers {
-        if let Ok(gwt_github::client::FetchResult::Updated(snapshot)) =
-            env.client().fetch(IssueNumber(*number), None)
-        {
-            let claims =
-                if snapshot.labels.iter().any(|label| {
-                    label.eq_ignore_ascii_case(gwt_github::issue_auto_claim::QUEUED_LABEL)
-                }) {
-                    gwt_github::issue_auto_claim::extract_claim_comments(&snapshot.comments)
-                } else {
-                    Vec::new()
+        let snapshot = match env.client().fetch(IssueNumber(*number), None) {
+            Ok(gwt_github::client::FetchResult::Updated(snapshot)) => snapshot,
+            other => {
+                let detail = match other {
+                    Err(error) => error.to_string(),
+                    _ => "fetch returned no Issue snapshot".to_string(),
                 };
-            // Issue #4819: a live claim from another owner is a real refusal,
-            // so it is named instead of skipped. A bare `continue` here dropped
-            // the number from `accepted_numbers` while the operation still
-            // answered `ok: true` with the whole queue, so three retries looked
-            // exactly like three successes.
-            //
-            // An *expired* claim is not a refusal. The queue claim carries the
-            // 15-minute lease written as `queued_expires_at` below, and a lease
-            // nobody renewed used to block `queue.push` forever while
-            // `launch_now` kept admitting the same Issue — the asymmetry that
-            // made this look like a defect in the queue store.
-            let blocking = if force {
-                None
-            } else {
-                claims.iter().find(|claim| {
-                    claim.issue_number == *number
-                        && matches!(
-                            claim.status,
-                            gwt_github::issue_auto_claim::ClaimStatus::Active
-                                | gwt_github::issue_auto_claim::ClaimStatus::Queued
-                        )
-                        && claim.owner != crate::process::current_claim_owner()
-                        && !queue_claim_lease_expired(&claim.expires_at, &now)
-                })
-            };
-            if let Some(blocking) = blocking {
                 outcomes.push(QueuePushOutcome {
                     number: *number,
                     accepted: false,
-                    refusal_code: Some(QUEUE_PUSH_REFUSAL_CLAIMED_BY_OTHER_OWNER),
+                    refusal_code: Some("remote_claim_observation_failed"),
                     refusal_detail: Some(format!(
-                        "issue #{number} is claimed by {} ({} claim, lease expires {}); \
-                         pass force: true to take it over",
-                        blocking.owner,
-                        claim_status_word(&blocking.status),
-                        blocking.expires_at
+                        "issue #{number} claim state could not be checked: {detail}"
                     )),
                 });
                 continue;
             }
-            if snapshot
-                .labels
-                .iter()
-                .any(|label| label.eq_ignore_ascii_case("urgent"))
-            {
-                let assignment = env.client().fetch_label_assignment(IssueNumber(*number), "urgent")
-                    .unwrap_or_else(|error| {
-                        tracing::warn!(issue = *number, %error, "urgent label assignment unavailable");
-                        None
-                    });
-                urgent_observations.push((snapshot.clone(), assignment));
-            }
-            let claim = gwt_github::issue_auto_claim::ClaimComment {
-                comment_id: None,
-                claim_id: format!("gwt-queue:{}:{}", number, uuid::Uuid::new_v4()),
-                owner: crate::process::current_hostname(),
-                issue_number: *number,
-                status: gwt_github::issue_auto_claim::ClaimStatus::Queued,
-                heartbeat_at: now.clone(),
-                expires_at: queued_expires_at.clone(),
-                launched_work_id: None,
-            };
-            let _ = env.client().create_comment(
-                IssueNumber(*number),
-                &gwt_github::issue_auto_claim::render_claim_comment(&claim),
-            );
-            let mut labels = snapshot.labels.clone();
-            if !labels
-                .iter()
-                .any(|label| label.eq_ignore_ascii_case(gwt_github::issue_auto_claim::QUEUED_LABEL))
-            {
-                labels.push(gwt_github::issue_auto_claim::QUEUED_LABEL.to_string());
-                let _ = env.client().patch_issue_fields(
-                    IssueNumber(*number),
-                    &gwt_github::client::IssueFieldsPatch {
-                        labels: Some(labels),
-                        ..Default::default()
-                    },
-                );
-            }
-            accepted_numbers.push(*number);
-            outcomes.push(QueuePushOutcome::accepted(*number));
+        };
+        let claims = gwt_github::issue_auto_claim::extract_claim_comments(&snapshot.comments);
+        let blocking = if force {
+            None
         } else {
-            accepted_numbers.push(*number);
-            outcomes.push(QueuePushOutcome::accepted(*number));
+            claims.iter().find(|claim| {
+                claim.issue_number == *number
+                    && matches!(
+                        claim.status,
+                        gwt_github::issue_auto_claim::ClaimStatus::Active
+                            | gwt_github::issue_auto_claim::ClaimStatus::Queued
+                    )
+                    && !confirmed_claims.iter().any(|identity| {
+                        identity.issue_number == claim.issue_number
+                            && identity.claim_id == claim.claim_id
+                            && identity.owner == claim.owner
+                    })
+                    && !queue_claim_lease_expired(&claim.expires_at, &now)
+            })
+        };
+        if let Some(blocking) = blocking {
+            outcomes.push(QueuePushOutcome {
+                number: *number,
+                accepted: false,
+                refusal_code: Some(QUEUE_PUSH_REFUSAL_CLAIMED_BY_OTHER_OWNER),
+                refusal_detail: Some(format!(
+                    "issue #{number} is claimed by {} ({} claim, lease expires {}); \
+                     pass force: true to queue the request anyway; this does not take over the claim",
+                    blocking.owner,
+                    claim_status_word(&blocking.status),
+                    blocking.expires_at
+                )),
+            });
+            continue;
         }
-    }
-    let (prefs, _) = crate::try_mutate_issue_monitor_prefs(&path, |prefs| {
-        let mut monitor = crate::IssueMonitorState::with_prefs(
-            crate::IssueMonitorConfig::default(),
-            prefs.clone(),
-        );
-        monitor.terminal_queue_push(&accepted_numbers, "operation", &now);
-        for (snapshot, assignment) in &urgent_observations {
-            let observed = crate::IssueMonitorIssue {
-                number: snapshot.number.0,
-                title: snapshot.title.clone(),
-                labels: snapshot.labels.clone(),
-                state: match snapshot.state {
-                    IssueState::Open => crate::IssueMonitorIssueState::Open,
-                    IssueState::Closed => crate::IssueMonitorIssueState::Closed,
+        if snapshot
+            .labels
+            .iter()
+            .any(|label| label.eq_ignore_ascii_case("urgent"))
+        {
+            let assignment = env
+                .client()
+                .fetch_label_assignment(IssueNumber(*number), "urgent")
+                .unwrap_or_else(|error| {
+                    tracing::warn!(issue = *number, %error, "urgent label assignment unavailable");
+                    None
+                });
+            urgent_observations.push(crate::issue_monitor::IssueMonitorUrgentQueueObservation {
+                issue: crate::IssueMonitorIssue {
+                    number: snapshot.number.0,
+                    title: snapshot.title,
+                    labels: snapshot.labels,
+                    state: match snapshot.state {
+                        IssueState::Open => crate::IssueMonitorIssueState::Open,
+                        IssueState::Closed => crate::IssueMonitorIssueState::Closed,
+                    },
+                    body: None,
+                    url: None,
+                    readiness: crate::IssueMonitorReadiness::NotApplicable,
+                    updated_at: Some(snapshot.updated_at.0),
                 },
-                body: None,
-                url: None,
-                readiness: crate::IssueMonitorReadiness::NotApplicable,
-                updated_at: Some(snapshot.updated_at.0.clone()),
-            };
-            monitor.observe_urgent_issue(&observed, &now);
-            if let Some(assignment) = assignment {
-                monitor.record_urgent_assignment(
-                    snapshot.number.0,
-                    observed.updated_at.as_deref(),
-                    assignment,
-                );
-            }
+                assignment,
+                observed_at: now.clone(),
+            });
         }
-        if let Some(position) = position {
-            let current = monitor.prefs();
-            let queue = &current.terminal_queues[&crate::process::current_hostname()];
-            let mut order: Vec<_> = queue
-                .entries
-                .iter()
-                .map(|entry| entry.number)
-                .filter(|number| !accepted_numbers.contains(number))
-                .collect();
-            let mut selected = Vec::new();
-            for number in &accepted_numbers {
-                if !selected.contains(number) {
-                    selected.push(*number);
+        accepted_numbers.push(*number);
+        outcomes.push(QueuePushOutcome::accepted(*number));
+    }
+
+    let mut delivery = "none";
+    let mut request_status = "not_submitted";
+    let mut written = None;
+    if !accepted_numbers.is_empty() {
+        let push = if !urgent_observations.is_empty() {
+            serde_json::json!({"terminal_queue_push_observed": {
+                "issue_numbers": accepted_numbers, "position": position,
+                "urgent_observations": urgent_observations,
+            }})
+        } else {
+            match position {
+                Some(position) => serde_json::json!({"terminal_queue_push_at_position": {
+                    "issue_numbers": accepted_numbers, "position": position,
+                }}),
+                None => {
+                    serde_json::json!({"terminal_queue_push": {"issue_numbers": accepted_numbers}})
                 }
             }
-            let at = position.min(order.len());
-            order.splice(at..at, selected);
-            // This is a complete stored-order edit, not a displayed row move.
-            // Replaying displayed indexes would subtract the urgent head twice.
-            let mut priority = order.clone();
-            priority.extend(
-                current
-                    .priority_order
-                    .into_iter()
-                    .filter(|number| !order.contains(number)),
-            );
-            monitor.set_priority_order(priority);
-        }
-        *prefs = monitor.prefs();
-        Ok(())
-    })
-    .map_err(io_as_api_error)?;
-    // Issue #4819 AC-1: the written queue is the only proof that a number was
-    // added, so every accepted number is read back out of it. This keeps the
-    // invariant a property of the operation rather than a patch over the one
-    // guard that was known to drop silently.
-    let written = prefs
-        .terminal_queues
-        .get(&crate::process::current_hostname())
-        .map(|queue| {
-            queue
-                .entries
-                .iter()
-                .map(|entry| entry.number)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    for outcome in outcomes.iter_mut().filter(|outcome| outcome.accepted) {
-        if !written.contains(&outcome.number) {
-            outcome.accepted = false;
-            outcome.refusal_code = Some(QUEUE_PUSH_REFUSAL_NOT_IN_QUEUE_AFTER_WRITE);
-            outcome.refusal_detail = Some(format!(
-                "issue #{} was accepted but is absent from the {} queue after the write",
-                outcome.number,
-                crate::process::current_hostname()
-            ));
+        };
+        let payload = crate::runtime_daemon_events::issue_monitor_payload(
+            "control",
+            push,
+            std::process::id(),
+        );
+        let result = match publish(&root, payload) {
+            Ok(()) => {
+                delivery = "daemon";
+                // The existing control ACK is sent after the durable commit. A
+                // later queue read may already reflect a scan consuming this work.
+                request_status = "committed";
+                Ok(())
+            }
+            Err(error) if error.allows_local_fallback() => {
+                crate::try_mutate_issue_monitor_prefs_without_authority_fence(&path, |prefs| {
+                    let mut monitor = crate::IssueMonitorState::with_prefs(
+                        crate::IssueMonitorConfig::default(),
+                        prefs.clone(),
+                    );
+                    match position {
+                        Some(position) => monitor.terminal_queue_push_at_position(
+                            &accepted_numbers,
+                            position,
+                            "operation",
+                            &now,
+                        ),
+                        None => monitor.terminal_queue_push(&accepted_numbers, "operation", &now),
+                    }
+                    monitor.apply_urgent_queue_observations(&urgent_observations);
+                    *prefs = monitor.prefs();
+                    Ok(())
+                })
+                .map(|(prefs, _)| {
+                    delivery = "durable_prefs";
+                    request_status = "committed";
+                    written = Some(prefs);
+                })
+                .map_err(|error| {
+                    let code = if error.kind() == std::io::ErrorKind::WouldBlock {
+                        "durable_write_refused"
+                    } else {
+                        // The storage API may fail after the canonical rename.
+                        // Without a committed receipt, do not assume nothing was saved.
+                        "durable_write_outcome_unknown"
+                    };
+                    (code, error.to_string())
+                })
+            }
+            Err(error) => {
+                use crate::runtime_daemon_events::IssueMonitorControlPublishError;
+                let code = match &error {
+                    IssueMonitorControlPublishError::OutcomeUnknown(_) => "control_outcome_unknown",
+                    IssueMonitorControlPublishError::Busy(_) => "control_busy",
+                    IssueMonitorControlPublishError::Rejected(_) => "control_rejected",
+                    IssueMonitorControlPublishError::RecoveryBlocked => "control_recovery_blocked",
+                    IssueMonitorControlPublishError::TransportUnavailable(_) => unreachable!(),
+                };
+                Err((code, error.to_string()))
+            }
+        };
+        if let Err((code, detail)) = result {
+            request_status = if matches!(
+                code,
+                "control_outcome_unknown" | "durable_write_outcome_unknown"
+            ) {
+                "outcome_unknown"
+            } else {
+                "rejected"
+            };
+            for outcome in outcomes.iter_mut().filter(|outcome| outcome.accepted) {
+                outcome.accepted = false;
+                outcome.refusal_code = Some(code);
+                outcome.refusal_detail = Some(detail.clone());
+            }
         }
     }
+
+    // A projection read failure does not undo a confirmed durable commit or
+    // justify replay. Report it separately so callers can reconcile safely.
+    let (prefs, projection_error) = match written {
+        Some(prefs) => (Some(prefs), None),
+        None => match crate::load_issue_monitor_prefs(&path) {
+            Ok(prefs) => (Some(prefs), None),
+            Err(error) => (None, Some(error.to_string())),
+        },
+    };
+    let projected = prefs.map(|prefs| {
+        prefs
+            .terminal_queues
+            .iter()
+            .map(|(host, queue)| (host.clone(), prefs.urgent_queue.projection(queue)))
+            .collect::<std::collections::BTreeMap<_, _>>()
+    });
     let refused = outcomes
         .iter()
         .filter(|outcome| !outcome.accepted)
         .map(|outcome| outcome.number)
         .collect::<Vec<_>>();
-    let projected = prefs
-        .terminal_queues
-        .iter()
-        .map(|(host, queue)| (host.clone(), prefs.urgent_queue.projection(queue)))
-        .collect::<std::collections::BTreeMap<_, _>>();
     let payload = serde_json::json!({
         "terminal_queues": projected,
         "results": outcomes,
-        "accepted": outcomes
-            .iter()
-            .filter(|outcome| outcome.accepted)
-            .map(|outcome| outcome.number)
-            .collect::<Vec<_>>(),
+        "accepted": outcomes.iter().filter(|outcome| outcome.accepted)
+            .map(|outcome| outcome.number).collect::<Vec<_>>(),
         "refused": refused,
+        "delivery": delivery,
+        "request_status": request_status,
+        "requires_reconciliation": request_status == "outcome_unknown",
+        "queue_request_only": true,
+        "remote_claim_acquired": false,
+        "launch_verified": false,
+        "projection_error": projection_error,
     });
     out.push_str(&serde_json::to_string(&payload).expect("queue push result serializes"));
     out.push('\n');
-    // Issue #4819 AC-3: one refused number means the call did not do what it
-    // was asked, so the envelope must not report `ok: true`.
-    if refused.is_empty() {
-        Ok(0)
-    } else {
-        Ok(1)
-    }
+    Ok(if refused.is_empty() { 0 } else { 1 })
 }
 
 /// Per-number outcome of `issue.monitor.queue.push` (Issue #4819).
@@ -1441,7 +1508,6 @@ impl QueuePushOutcome {
 /// Refusal codes `issue.monitor.queue.push` can return, one per branch that
 /// declines a number (Issue #4819 AC-2).
 const QUEUE_PUSH_REFUSAL_CLAIMED_BY_OTHER_OWNER: &str = "claimed_by_other_owner";
-const QUEUE_PUSH_REFUSAL_NOT_IN_QUEUE_AFTER_WRITE: &str = "not_in_queue_after_write";
 
 /// Render a claim status as the word the refusal detail names it by.
 fn claim_status_word(status: &gwt_github::issue_auto_claim::ClaimStatus) -> &'static str {
@@ -4296,8 +4362,16 @@ fn run_issue_label<E: CliEnv>(
         let (queue_code, queue_result) = enqueue_urgent_after_mutation(env, number);
         let mut result: serde_json::Value =
             serde_json::from_str(out.trim()).expect("label lifecycle emits JSON");
+        let unknown = queue_result["request_status"] == "outcome_unknown";
         result["urgent_queue"] = queue_result;
-        if queue_code != 0 {
+        if unknown {
+            result["status"] = serde_json::json!("queue_outcome_unknown");
+            result["requires_reconciliation"] = serde_json::json!(true);
+            result
+                .as_object_mut()
+                .expect("label result is an object")
+                .remove("retry_operation");
+        } else if queue_code != 0 {
             result["status"] = serde_json::json!("queue_refused");
             result["retry_operation"] = serde_json::json!("issue.monitor.queue.push");
         }
@@ -4918,7 +4992,11 @@ fn finish_urgent_issue_mutation<E: CliEnv>(
     }
     let (queue_code, result) = enqueue_urgent_after_mutation(env, snapshot.number.0);
     out.push_str(&format!("urgent queue: {result}\n"));
-    if queue_code != 0 {
+    if result["request_status"] == "outcome_unknown" {
+        out.push_str(
+            "The Issue exists; reconcile the queue outcome before retrying any operation.\n",
+        );
+    } else if queue_code != 0 {
         out.push_str("The Issue exists; retry issue.monitor.queue.push, not issue.create.\n");
     }
     queue_code
@@ -7314,6 +7392,7 @@ mod tests {
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         let mut env = crate::cli::TestEnv::new(repo.clone());
+        queue_push_issue(&mut env, 4, None);
         let mut monitor = crate::IssueMonitorState::new(Default::default());
         monitor.terminal_queue_push(&[1, 2, 3], "operator", "2026-10-03T00:00:00Z");
         let mut prefs = serde_json::to_value(monitor.prefs()).unwrap();
@@ -7515,6 +7594,431 @@ mod tests {
     /// not, and the operation answered `ok: true` with no reason either time.
     /// Before the fix this test sees exit code 0 and no mention of #4812.
     #[test]
+    fn queue_push_never_mints_a_remote_claim_for_the_cli_process() {
+        let tmp = TempDir::new().expect("tempdir");
+        let _home = ScopedGwtHome::set(tmp.path().join("home"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        let mut env = crate::cli::TestEnv::new(repo.clone());
+        queue_push_issue(&mut env, 42, None);
+        let (code, payload) = run_queue_push(&mut env, vec![42], false);
+        assert_eq!(code, 0);
+        assert_eq!(queued_numbers(&repo), vec![42]);
+        assert!(
+            env.client.comments(IssueNumber(42)).is_empty(),
+            "the CLI cannot reserve work with an identity the Monitor does not own"
+        );
+        assert_eq!(payload["queue_request_only"], true);
+        assert_eq!(payload["remote_claim_acquired"], false);
+        assert_eq!(payload["launch_verified"], false);
+    }
+
+    #[test]
+    fn queue_push_monitor_identity_requires_exact_persisted_claim_match() {
+        let tmp = TempDir::new().unwrap();
+        let _home = ScopedGwtHome::set(tmp.path().join("home"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let mut env = crate::cli::TestEnv::new(repo.clone());
+        queue_push_issue(&mut env, 42, Some("2999-01-01T00:00:00Z"));
+        let path = crate::issue_monitor_prefs_path_for_repo_path(&repo);
+        let remote = gwt_github::issue_auto_claim::extract_claim_comments(
+            &env.client.comments(IssueNumber(42)),
+        )
+        .remove(0);
+        let mut prefs = crate::IssueMonitorPrefs::default();
+        prefs
+            .claim_identities
+            .push(crate::issue_monitor::IssueMonitorClaimIdentity {
+                issue_number: 42,
+                claim_id: remote.claim_id.clone(),
+                owner: remote.owner.clone(),
+            });
+        crate::save_issue_monitor_prefs(&path, &prefs).unwrap();
+        assert_eq!(run_queue_push(&mut env, vec![42], false).0, 0);
+        prefs.claim_identities[0].claim_id.push_str("-different");
+        crate::save_issue_monitor_prefs(&path, &prefs).unwrap();
+        let (code, payload) = run_queue_push(&mut env, vec![42], false);
+        assert_eq!(code, 1);
+        assert_eq!(
+            payload["results"][0]["refusal_code"],
+            "claimed_by_other_owner"
+        );
+        assert_eq!(env.client.comments(IssueNumber(42)).len(), 1);
+    }
+
+    #[test]
+    fn queue_push_control_failures_never_replay_to_local_prefs() {
+        use crate::runtime_daemon_events::IssueMonitorControlPublishError as Error;
+        let tmp = TempDir::new().unwrap();
+        let _home = ScopedGwtHome::set(tmp.path().join("home"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let mut env = crate::cli::TestEnv::new(repo.clone());
+        queue_push_issue(&mut env, 42, None);
+        let path = crate::issue_monitor_prefs_path_for_repo_path(&repo);
+        crate::save_issue_monitor_prefs(&path, &crate::IssueMonitorPrefs::default()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        for (error, code) in [
+            (Error::Busy("busy".into()), "control_busy"),
+            (Error::Rejected("reject".into()), "control_rejected"),
+            (
+                Error::OutcomeUnknown("lost ACK".into()),
+                "control_outcome_unknown",
+            ),
+            (Error::RecoveryBlocked, "control_recovery_blocked"),
+        ] {
+            let mut out = String::new();
+            let result = super::run_monitor_queue_push_with_publisher(
+                &env,
+                None,
+                &[42],
+                None,
+                false,
+                &mut out,
+                |_, _| Err(error),
+            )
+            .unwrap();
+            let payload: serde_json::Value = serde_json::from_str(&out).unwrap();
+            assert_eq!(result, 1);
+            assert_eq!(payload["results"][0]["refusal_code"], code);
+            assert_eq!(payload["delivery"], "none");
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert!(env.client.comments(IssueNumber(42)).is_empty());
+        }
+    }
+
+    #[test]
+    fn queue_push_durable_ack_survives_queue_consumption_without_replay() {
+        let tmp = TempDir::new().unwrap();
+        let _home = ScopedGwtHome::set(tmp.path().join("home"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let mut env = crate::cli::TestEnv::new(repo.clone());
+        queue_push_issue(&mut env, 42, None);
+        let path = crate::issue_monitor_prefs_path_for_repo_path(&repo);
+        let mut out = String::new();
+        let code = super::run_monitor_queue_push_with_publisher(
+            &env,
+            None,
+            &[42],
+            None,
+            false,
+            &mut out,
+            |root, payload| {
+                assert_eq!(root, repo.canonicalize().unwrap());
+                assert!(payload.to_string().contains("terminal_queue_push"));
+                // Simulate a durable ACK followed by a scan consuming the entry.
+                crate::save_issue_monitor_prefs(&path, &crate::IssueMonitorPrefs::default())
+                    .unwrap();
+                Ok(())
+            },
+        )
+        .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(payload["accepted"], serde_json::json!([42]));
+        assert_eq!(payload["request_status"], "committed");
+        assert_eq!(payload["delivery"], "daemon");
+        assert!(queued_numbers(&repo).is_empty());
+        assert!(env.client.comments(IssueNumber(42)).is_empty());
+    }
+
+    #[test]
+    fn queue_push_partial_observation_failure_names_both_results() {
+        let tmp = TempDir::new().unwrap();
+        let _home = ScopedGwtHome::set(tmp.path().join("home"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let mut env = crate::cli::TestEnv::new(repo.clone());
+        queue_push_issue(&mut env, 42, None);
+        let (code, payload) = run_queue_push(&mut env, vec![42, 43], false);
+        assert_eq!(code, 1);
+        assert_eq!(payload["accepted"], serde_json::json!([42]));
+        assert_eq!(payload["refused"], serde_json::json!([43]));
+        assert_eq!(queued_numbers(&repo), vec![42]);
+        assert!(env.client.comments(IssueNumber(42)).is_empty());
+    }
+
+    #[test]
+    fn queue_push_position_uses_atomic_control_and_keeps_unknown_result() {
+        let tmp = TempDir::new().unwrap();
+        let _home = ScopedGwtHome::set(tmp.path().join("home"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let mut env = crate::cli::TestEnv::new(repo.clone());
+        queue_push_issue(&mut env, 42, None);
+        let mut out = String::new();
+        let code = super::run_monitor_queue_push_with_publisher(
+            &env,
+            None,
+            &[42],
+            Some(0),
+            false,
+            &mut out,
+            |_, payload| {
+                assert_eq!(
+                    payload["payload"],
+                    serde_json::json!({
+                        "terminal_queue_push_at_position": {"issue_numbers": [42], "position": 0}
+                    })
+                );
+                // The daemon committed but its reply was lost: never replay locally.
+                let mut monitor = crate::IssueMonitorState::new(Default::default());
+                monitor.terminal_queue_push_at_position(&[42], 0, "daemon", "2026-10-08T00:00:00Z");
+                crate::save_issue_monitor_prefs(
+                    &crate::issue_monitor_prefs_path_for_repo_path(&repo),
+                    &monitor.prefs(),
+                )
+                .unwrap();
+                Err(
+                    crate::runtime_daemon_events::IssueMonitorControlPublishError::OutcomeUnknown(
+                        "lost ACK".into(),
+                    ),
+                )
+            },
+        )
+        .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(code, 1);
+        assert_eq!(payload["request_status"], "outcome_unknown");
+        assert_eq!(payload["accepted"], serde_json::json!([]));
+        assert_eq!(queued_numbers(&repo), vec![42]);
+        let prefs =
+            crate::load_issue_monitor_prefs(&crate::issue_monitor_prefs_path_for_repo_path(&repo))
+                .unwrap();
+        assert_eq!(
+            prefs.terminal_queues[&crate::process::current_hostname()].entries[0].queued_by,
+            "daemon"
+        );
+    }
+
+    #[test]
+    fn queue_push_malformed_foreign_lease_is_still_refused() {
+        let tmp = TempDir::new().unwrap();
+        let _home = ScopedGwtHome::set(tmp.path().join("home"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let mut env = crate::cli::TestEnv::new(repo.clone());
+        queue_push_issue(&mut env, 42, Some("invalid-time"));
+        assert_eq!(run_queue_push(&mut env, vec![42], false).0, 1);
+        assert!(queued_numbers(&repo).is_empty());
+    }
+
+    #[test]
+    fn queue_push_failed_sync_after_visible_save_is_outcome_unknown() {
+        let tmp = TempDir::new().unwrap();
+        let _home = ScopedGwtHome::set(tmp.path().join("home"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let mut env = crate::cli::TestEnv::new(repo.clone());
+        queue_push_issue(&mut env, 42, None);
+        let path = crate::issue_monitor_prefs_path_for_repo_path(&repo);
+        crate::save_issue_monitor_prefs(&path, &crate::IssueMonitorPrefs::default()).unwrap();
+        std::fs::write(path.with_extension("parent-sync-fail-once"), b"fail once").unwrap();
+        let _failure = gwt_core::test_support::ScopedEnvVar::set(
+            "GWT_TEST_FAIL_ISSUE_MONITOR_PREFS_PARENT_SYNC_ONCE",
+            &path,
+        );
+        let (code, payload) = run_queue_push(&mut env, vec![42], false);
+        assert_eq!(code, 1);
+        assert_eq!(
+            queued_numbers(&repo),
+            vec![42],
+            "the write became visible before sync failed"
+        );
+        assert_eq!(payload["request_status"], "outcome_unknown");
+        assert_eq!(
+            payload["results"][0]["refusal_code"],
+            "durable_write_outcome_unknown"
+        );
+        assert!(env.client.comments(IssueNumber(42)).is_empty());
+    }
+
+    #[test]
+    fn queue_push_label_mutation_preserves_unknown_enqueue_outcome() {
+        let tmp = TempDir::new().unwrap();
+        let _home = ScopedGwtHome::set(tmp.path().join("home"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let mut env = crate::cli::TestEnv::new(repo.clone());
+        queue_push_issue(&mut env, 42, None);
+        let path = crate::issue_monitor_prefs_path_for_repo_path(&repo);
+        crate::save_issue_monitor_prefs(&path, &crate::IssueMonitorPrefs::default()).unwrap();
+        std::fs::write(path.with_extension("parent-sync-fail-once"), b"fail once").unwrap();
+        let _failure = gwt_core::test_support::ScopedEnvVar::set(
+            "GWT_TEST_FAIL_ISSUE_MONITOR_PREFS_PARENT_SYNC_ONCE",
+            &path,
+        );
+        let mut out = String::new();
+        assert_eq!(
+            run(
+                &mut env,
+                IssueCommand::Label {
+                    number: 42,
+                    action: IssueLabelAction::Add,
+                    labels: vec!["urgent".into()],
+                    confirm_queue: false,
+                    confirm_design_gate: false,
+                    confirm_auto_merge: false,
+                },
+                &mut out
+            )
+            .unwrap(),
+            1
+        );
+        let payload: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(payload["status"], "queue_outcome_unknown");
+        assert!(payload.get("retry_operation").is_none());
+        assert_eq!(queued_numbers(&repo), vec![42]);
+    }
+
+    #[test]
+    fn queue_push_urgent_finish_does_not_prompt_retry_for_unknown_save() {
+        let tmp = TempDir::new().unwrap();
+        let _home = ScopedGwtHome::set(tmp.path().join("home"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let mut env = crate::cli::TestEnv::new(repo.clone());
+        queue_push_issue(&mut env, 42, None);
+        env.client
+            .set_labels(IssueNumber(42), &["urgent".into()])
+            .unwrap();
+        let snapshot = match env.client.fetch(IssueNumber(42), None).unwrap() {
+            gwt_github::client::FetchResult::Updated(snapshot) => snapshot,
+            _ => panic!("snapshot"),
+        };
+        let path = crate::issue_monitor_prefs_path_for_repo_path(&repo);
+        crate::save_issue_monitor_prefs(&path, &crate::IssueMonitorPrefs::default()).unwrap();
+        std::fs::write(path.with_extension("parent-sync-fail-once"), b"fail once").unwrap();
+        let _failure = gwt_core::test_support::ScopedEnvVar::set(
+            "GWT_TEST_FAIL_ISSUE_MONITOR_PREFS_PARENT_SYNC_ONCE",
+            &path,
+        );
+        let mut out = String::new();
+        assert_eq!(
+            super::finish_urgent_issue_mutation(&env, &snapshot, 0, &mut out),
+            1
+        );
+        assert!(!out.contains("retry issue.monitor.queue.push"));
+        assert!(out.contains("reconcile"));
+        assert_eq!(queued_numbers(&repo), vec![42]);
+    }
+
+    #[test]
+    fn queue_push_daemon_receives_observed_urgent_assignment() {
+        let tmp = TempDir::new().unwrap();
+        let _home = ScopedGwtHome::set(tmp.path().join("home"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let mut env = crate::cli::TestEnv::new(repo);
+        queue_push_issue(&mut env, 42, None);
+        env.client
+            .set_labels(IssueNumber(42), &["urgent".into()])
+            .unwrap();
+        env.client.set_label_assignment(
+            IssueNumber(42),
+            "urgent",
+            Some(gwt_github::client::LabelAssignment {
+                actor: Some("alice".into()),
+                created_at: "2026-10-08T00:00:00Z".into(),
+            }),
+        );
+        let mut out = String::new();
+        assert_eq!(
+            super::run_monitor_queue_push_with_publisher(
+                &env,
+                None,
+                &[42],
+                Some(0),
+                false,
+                &mut out,
+                |_, payload| {
+                    let push = &payload["payload"]["terminal_queue_push_observed"];
+                    assert_eq!(
+                        push["urgent_observations"][0]["assignment"]["actor"],
+                        "alice"
+                    );
+                    assert_eq!(push["position"], 0);
+                    Ok(())
+                },
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn queue_push_unknown_remote_claim_state_is_not_success() {
+        let tmp = TempDir::new().expect("tempdir");
+        let _home = ScopedGwtHome::set(tmp.path().join("home"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        let mut env = crate::cli::TestEnv::new(repo.clone());
+        let (code, payload) = run_queue_push(&mut env, vec![42], false);
+        assert_eq!(code, 1);
+        assert_eq!(
+            payload["results"][0]["refusal_code"],
+            "remote_claim_observation_failed"
+        );
+        assert!(queued_numbers(&repo).is_empty());
+        assert!(env.client.comments(IssueNumber(42)).is_empty());
+    }
+
+    #[test]
+    fn queue_push_live_authority_excludes_local_fallback() {
+        let tmp = TempDir::new().expect("tempdir");
+        let _home = ScopedGwtHome::set(tmp.path().join("home"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        let path = crate::issue_monitor_prefs_path_for_repo_path(&repo);
+        crate::save_issue_monitor_prefs(&path, &crate::IssueMonitorPrefs::default()).unwrap();
+        crate::issue_monitor::persist_issue_monitor_authority_fence(
+            &path,
+            &crate::IssueMonitorAuthorityFence::current_process(),
+        )
+        .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mut env = crate::cli::TestEnv::new(repo.clone());
+        queue_push_issue(&mut env, 42, None);
+        let (code, payload) = run_queue_push(&mut env, vec![42], false);
+        assert_eq!(code, 1);
+        assert_eq!(payload["accepted"], serde_json::json!([]));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(env.client.comments(IssueNumber(42)).is_empty());
+        let mut out = String::new();
+        assert_eq!(super::run_monitor_queue_push_with_publisher(
+            &env, None, &[42], None, false, &mut out,
+            |_, _| Err(crate::runtime_daemon_events::IssueMonitorControlPublishError::TransportUnavailable("no transport".into())),
+        ).unwrap(), 1);
+        let payload: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(
+            payload["results"][0]["refusal_code"],
+            "durable_write_refused"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn queue_push_foreign_claim_is_checked_without_a_queue_label() {
+        let tmp = TempDir::new().expect("tempdir");
+        let _home = ScopedGwtHome::set(tmp.path().join("home"));
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        let mut env = crate::cli::TestEnv::new(repo.clone());
+        queue_push_issue(&mut env, 42, Some("2999-01-01T00:00:00Z"));
+        env.client.set_labels(IssueNumber(42), &[]).unwrap();
+        let (code, payload) = run_queue_push(&mut env, vec![42], false);
+        assert_eq!(code, 1);
+        assert_eq!(
+            payload["results"][0]["refusal_code"],
+            "claimed_by_other_owner"
+        );
+        assert!(queued_numbers(&repo).is_empty());
+        assert_eq!(env.client.comments(IssueNumber(42)).len(), 1);
+    }
+
+    #[test]
     fn queue_push_names_the_issue_a_live_foreign_claim_refused() {
         let tmp = TempDir::new().expect("tempdir");
         let _home = ScopedGwtHome::set(tmp.path().join("home"));
@@ -7601,7 +8105,7 @@ mod tests {
     /// Issue #4819 AC-2: `force` is the documented override, and taking the
     /// Issue over is an acceptance, not a refusal.
     #[test]
-    fn queue_push_with_force_takes_over_a_live_foreign_claim() {
+    fn queue_push_with_force_only_bypasses_preflight_for_a_live_foreign_claim() {
         let tmp = TempDir::new().expect("tempdir");
         let _home = ScopedGwtHome::set(tmp.path().join("home"));
         let repo = tmp.path().join("repo");

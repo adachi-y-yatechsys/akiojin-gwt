@@ -426,6 +426,8 @@ pub struct Session {
     pub docker_lifecycle_intent: DockerLifecycleIntent,
     #[serde(default)]
     pub linked_issue_number: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_budget_trial_id: Option<String>,
     /// Issue #4217 FR-002: who started this session. Stamped by the launcher,
     /// which is the only party that knows; every gate that used to sniff
     /// `GWT_AUTONOMOUS_EXECUTION` reads this instead. Absent in legacy records,
@@ -626,6 +628,7 @@ impl Session {
             execution_binding: None,
             docker_lifecycle_intent: DockerLifecycleIntent::Connect,
             linked_issue_number: None,
+            launch_budget_trial_id: None,
             launch_route: LaunchRoute::Manual,
             launch_origin: SessionLaunchOrigin::Launch,
             restore_source_session_id: None,
@@ -677,6 +680,7 @@ impl Session {
         session.docker_service = config.docker_service.clone();
         session.docker_lifecycle_intent = config.docker_lifecycle_intent;
         session.linked_issue_number = config.linked_issue_number;
+        session.launch_budget_trial_id = config.launch_budget_trial_id.clone();
         session.launch_route = config.launch_route;
         session.launch_command = durable_session_launch_command(config);
         session.launch_args = config.args.clone();

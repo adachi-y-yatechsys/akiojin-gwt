@@ -422,6 +422,14 @@ Agents and automation can inspect the queue with `issue.monitor.status` and
 change membership/order with `issue.monitor.queue.push`,
 `issue.monitor.queue.remove`, and `issue.monitor.queue.move`. The
 `issue.monitor.queue.auto_refill` operation sets opt-in refill and its limit.
+Successful `issue.monitor.queue.push` confirms durable request storage, not a
+remote claim or launch. The CLI creates no remote reservation comment and uses
+the existing Monitor control lane. Failed claim reads, rejection, busy and unknown
+outcomes are not reported as full success. Only an unavailable transport permits
+local storage, guarded by the absence of Monitor authority. Existing confirmed
+claims match the issue number, claim ID and owner exactly. `force` bypasses the
+queue preflight only; it does not transfer claim authority. Positioned pushes use
+an atomic insertion/order control that older daemons reject.
 `issue.monitor.launch_now` explicitly adds the Issue at the front of the terminal
 queue and requests a scan. Existing `issue.monitor.priority.move` and
 `issue.monitor.priority.set` operations remain available. The
@@ -1422,3 +1430,123 @@ JSON operation `issue.spec.read` to inspect them locally through the cache-backe
 ## License
 
 MIT
+
+## Fork: one-shot authority recovery
+
+This fork adds the JSON-only `daemon.recover` operation. It changes a stale
+Issue Monitor authority record without starting a daemon, scan, GUI, agent,
+queue action, remote claim action, or branch pruning. Installation and a real
+recovery trial require a separate operator decision.
+
+```json
+{"operation":"daemon.recover","params":{"project_root":"/absolute/project/root","project_store_hash":"expected-store-hash","expected_epoch":17,"expected_fence":{"version":2,"pid":77,"instance_id":"exact-saved-instance"}}}
+```
+
+Pass the envelope on standard input to `gwtd`, with no command-line arguments. `project_root`
+must be an existing absolute directory whose repository identity resolves
+to the expected store; the current working directory is never a fallback.
+All four parameters are required. Unknown parameters and unknown fence
+fields are rejected. Use the exact observed epoch and version-2 fence
+identity; PID absence alone does not authorize recovery.
+
+Under the stable preferences lock, recovery obtains the matching nonblocking
+kernel authority lease and reads the current files. It refuses missing or
+invalid preferences, active authority, legacy or changed fences, enabled
+monitor/autonomy, pending effects, changed epoch, and overflow. It preserves
+all other preference fields, including launch/claim records and unknown
+fields, advances only the authority epoch, then removes the matching fence.
+The committed-generation sidecar is written best effort, following existing
+preferences persistence. Directory sync remains a compatibility no-op on
+Windows, as in the existing writer; power-loss durability is not established
+by the artificial tests.
+
+Success reports `status=authority_recovered`, `previous_epoch`, `new_epoch`,
+`runtime_clear_verified=false`, and `work_resumed=false`. It does not prove
+that agents have exited, slots are free, or remote claims are released.
+Persistence/removal errors after a write begins report `recovery outcome
+unknown`; inspect both files before deciding what to do. There is no automatic
+retry. Replaying the same guards after recovery is refused without another
+epoch advance. Never restore an old authority epoch from a backup.
+
+The command sets a cooperative five-second deadline for scope/lock/write
+checks; this is not a hard process termination guarantee. The scoped tests
+use temporary repositories and files and do not run a real `gwtd` process.
+Full canonical CI, global coverage, and operational recovery remain unverified.
+
+## Fork addition: one managed-agent start per bounded trial
+
+The opt-in JSON operations `issue.monitor.launch_budget.arm` and
+`issue.monitor.launch_budget.status` take an explicit absolute `project_root`.
+Arming additionally requires an ASCII `trial_id`, a positive `issue_number`,
+and `max_starts: 1`. It writes an immutable scope and uses a shared physical
+start gate for bound and unbound managed agents. Status only reads records;
+neither operation starts the daemon, GUI, or an agent.
+
+The gate saves and flushes a spent marker **before** process creation. Failure,
+unknown outcome, panic, retry, review, and restore never replenish that start.
+Arming the same scope returns its saved status; changing scope is refused.
+There is no reset, refund, or remove operation. An unreadable or partial record
+refuses starts. The stable location-derived store is
+`~/.gwt/launch-budgets/<canonical-path-hash>/launch-budget.json`; Git origin
+changes do not select another allowance. A common lock orders arming against
+physical creation, including creation while unarmed.
+
+New durable Monitor claim proposals capture the trial ID before dispatch.
+Saved effects, deliveries, and Sessions retain it across retries and restart.
+An armed gate refuses missing/old IDs, a different Issue/project, direct Agent
+presets, and non-durable or review requests lacking an exact saved delivery.
+Shell panes remain available. With no scope configured, existing launches
+continue, while taking the same ordering lock.
+
+Activate only after confirming there are no running agents or outstanding
+old launch requests and reviewing the exact runtime, target, and budget.
+The cap covers gwt-managed task starts, not provider API calls or agent-created
+children, probes, external programs, another gwt home, or another project
+location. It is an operational limit, not a security boundary against an actor
+who can rewrite these files. Temporary-file/callback tests do not establish
+actual daemon/GUI/PTY operation, power-loss durability, full CI, or acceptance.
+
+
+### Exact-instance cooperative daemon stop (fork preparation)
+
+`daemon.start_without_cleanup` starts the normal Issue Monitor worker with
+automatic remote branch pruning and build-cache GC disabled for this instance.
+Pass an absolute `project_root`; existing endpoints or authority fences are
+refused. The descriptor and status report `background_cleanup_allowed: false`.
+GitHub reads, local monitor/fence updates and claim/auto-merge release
+compensations remain enabled. This is not a read-only worker or an AI launch.
+Ordinary startup retains its existing cleanup behavior.
+
+`daemon.probe.start` provides a separate transport diagnostic. Pass an absolute
+`project_root`. It creates no Issue Monitor worker, scan, GitHub mutation,
+artifact cleanup, GUI materializer or verification child. Existing descriptors,
+authority fences and unknown runtime entries are refused without cleanup;
+existing regular supervisor stderr logs are preserved. The descriptor and
+status identify `diagnostic_only`, and normal bootstrap refuses this endpoint.
+
+Read this exact diagnostic instance with `daemon.probe.status`, using
+`project_root`, `expected_pid` and `expected_instance_id`. Stop it with the
+existing exact-instance `daemon.stop`. A successful probe confirms transport
+only; it does not verify normal background work, PM proposals or human acceptance.
+Probe and stop operations skip performance-log collection and automatic error
+or Board recording. The ordinary startup and work runtime remain separate.
+
+The JSON-only `daemon.stop` operation requires an absolute `project_root`,
+a positive u32 `expected_pid`, a lowercase 64-character `expected_instance_id`,
+and an ASCII alphanumeric/hyphen/underscore `request_id` of 1–128 characters.
+The instance identity is the SHA-256 digest of the exact endpoint authentication
+token; it is evidence, not a credential. Keep the token private.
+
+The operation reads only the exact endpoint, authenticates the existing scope
+handshake, and sends one stop frame on a fresh connection. It never bootstraps,
+deletes a refused endpoint, discovers another instance, retries, or files Board
+work on refusal. The server writes and flushes `stop_accepted` before requesting
+existing cooperative shutdown. If the receipt cannot be delivered within five
+seconds, accepted shutdown still proceeds and the caller has an unknown outcome.
+
+A successful receipt always has `process_exit_verified: false`. The operator
+must separately wait for its own child to exit and verify descriptor and authority
+cleanup. Existing protocol-v4 daemons do not implement stop and may refuse it;
+a new trial must first prove no daemon is running and start the reviewed fork.
+This source addition does not prove actual lifecycle cleanup, enable AI work,
+or change installed binaries.

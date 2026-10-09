@@ -269,6 +269,7 @@ async fn run_session(
             }
             DaemonFrame::Status(_)
             | DaemonFrame::VerificationAccepted(_)
+            | DaemonFrame::StopAccepted { .. }
             | DaemonFrame::VerificationFinished(_) => {
                 // The daemon does not currently emit these before an Ack, and
                 // verification frames belong to a different connection
@@ -302,6 +303,7 @@ async fn run_session(
                     DaemonFrame::Ack
                     | DaemonFrame::Status(_)
                     | DaemonFrame::VerificationAccepted(_)
+                    | DaemonFrame::StopAccepted { .. }
                     | DaemonFrame::VerificationFinished(_) => {
                         // ignore stray non-event frames; daemon may emit
                         // them for unrelated control flow.

@@ -10,6 +10,68 @@ use serde_json::json;
 use tempfile::tempdir;
 
 #[test]
+fn diagnostic_descriptor_is_preserved_and_never_adopted_or_retired() {
+    let root = tempdir().unwrap();
+    let home = tempdir().unwrap();
+    let scope = RuntimeScope::new(
+        "probe-repo",
+        "probe-root",
+        root.path().to_owned(),
+        RuntimeTarget::Host,
+    )
+    .unwrap();
+    let mut endpoint = DaemonEndpoint::new(
+        scope.clone(),
+        4242,
+        "test-bind".into(),
+        "test-token".into(),
+        "test-version".into(),
+    );
+    let path = scope.endpoint_path(home.path());
+    let mut legacy = serde_json::to_value(&endpoint).unwrap();
+    legacy.as_object_mut().unwrap().remove("diagnostic_only");
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("background_cleanup_allowed");
+    assert!(
+        serde_json::from_value::<DaemonEndpoint>(legacy.clone())
+            .unwrap()
+            .background_cleanup_allowed
+    );
+    assert!(
+        !serde_json::from_value::<DaemonEndpoint>(legacy)
+            .unwrap()
+            .diagnostic_only
+    );
+    endpoint.diagnostic_only = true;
+    persist_endpoint(&path, &endpoint).unwrap();
+    let original = std::fs::read(&path).unwrap();
+    for alive in [true, false] {
+        assert!(gwt_core::daemon::sweep_dead_endpoints(
+            &scope.daemon_dir(home.path()),
+            |_| alive,
+            |_| false,
+        )
+        .unwrap()
+        .is_empty());
+        assert!(
+            resolve_bootstrap_action(home.path(), &scope, DAEMON_PROTOCOL_VERSION, |_| alive)
+                .is_err()
+        );
+        assert!(gwt_core::daemon::resolve_bootstrap_action_for_version(
+            home.path(),
+            &scope,
+            DAEMON_PROTOCOL_VERSION,
+            "other-version",
+            |_| alive
+        )
+        .is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+}
+
+#[test]
 fn daemon_endpoint_path_is_scoped_by_repo_and_worktree() {
     let project_root = tempdir().unwrap();
     let scope = RuntimeScope::new(
@@ -811,6 +873,8 @@ fn client_frame_status_serializes_to_canonical_shape() {
 #[test]
 fn daemon_frame_status_carries_uptime_and_channel_count() {
     let frame = DaemonFrame::Status(DaemonStatus {
+        background_cleanup_allowed: true,
+        diagnostic_only: false,
         protocol_version: DAEMON_PROTOCOL_VERSION,
         daemon_version: "9.14.0".to_string(),
         uptime_seconds: 42,

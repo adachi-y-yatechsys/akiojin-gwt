@@ -2023,6 +2023,7 @@ pub(super) fn launch_config_from_persisted_session(
     }
 
     let mut config = builder.build();
+    config.launch_budget_trial_id = session.launch_budget_trial_id.clone();
     if let Some(version) = session.launch_tool_version() {
         config.tool_version = Some(version);
     }
@@ -4446,11 +4447,12 @@ impl AppRuntime {
                     "prepare_env",
                     &launch_argv_summary(&process_launch.args),
                 );
-                match self.spawn_process_window_with_console_kind(
+                match self.spawn_process_window_with_budget_scope(
                     &window_id,
                     geometry,
                     process_launch,
                     Some(gwt_core::process_console::ProcessKind::AgentBootstrap),
+                    false,
                 ) {
                     Ok(()) => {
                         emit_agent_launch_stage(stage_id, "ready", "PTY handoff complete");
@@ -4665,8 +4667,41 @@ impl AppRuntime {
         launch: ProcessLaunch,
         console_kind: Option<gwt_core::process_console::ProcessKind>,
     ) -> Result<(), String> {
+        let is_agent_launch =
+            console_kind == Some(gwt_core::process_console::ProcessKind::AgentBootstrap);
+        self.spawn_process_window_with_budget_scope(
+            id,
+            geometry,
+            launch,
+            console_kind,
+            is_agent_launch,
+        )
+    }
+
+    fn spawn_process_window_with_budget_scope(
+        &mut self,
+        id: &str,
+        geometry: WindowGeometry,
+        launch: ProcessLaunch,
+        console_kind: Option<gwt_core::process_console::ProcessKind>,
+        is_agent_launch: bool,
+    ) -> Result<(), String> {
         let (cols, rows) = geometry_to_pty_size(&geometry);
         let resource_policy = launch.resource_policy;
+        let budget_root = if is_agent_launch {
+            let address = self
+                .window_lookup
+                .get(id)
+                .ok_or("Agent launch window is missing")?;
+            Some(
+                self.tab(&address.tab_id)
+                    .ok_or("Agent launch project is missing")?
+                    .project_root
+                    .clone(),
+            )
+        } else {
+            None
+        };
         let spawn_config = gwt_terminal::pty::SpawnConfig {
             command: launch.command,
             args: launch.args,
@@ -4690,6 +4725,7 @@ impl AppRuntime {
             policy_gate,
             incarnation,
             observation,
+            budget_root.as_deref(),
         )?;
         self.install_process_window(
             id,
@@ -4711,6 +4747,15 @@ impl AppRuntime {
         handshake_cleanup: &mut ActiveLaunchHandshakeCleanup,
     ) -> Result<(), String> {
         let (cols, rows) = geometry_to_pty_size(&geometry);
+        let address = self
+            .window_lookup
+            .get(id)
+            .ok_or("Bound agent launch window is missing")?;
+        let budget_root = self
+            .tab(&address.tab_id)
+            .ok_or("Bound agent launch project is missing")?
+            .project_root
+            .clone();
         let spawn_config = gwt_terminal::pty::SpawnConfig {
             command: launch.command,
             args: launch.args,
@@ -4730,6 +4775,7 @@ impl AppRuntime {
             incarnation,
             expected,
             handshake_cleanup,
+            &budget_root,
         )?;
         self.install_process_window(
             id,

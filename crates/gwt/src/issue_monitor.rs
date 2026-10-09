@@ -436,6 +436,8 @@ pub struct IssueMonitorEffectAttemptKey {
 /// One durable side-effect proposal or in-flight delivery.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingIssueMonitorEffect {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_budget_trial_id: Option<String>,
     pub effect_id: String,
     pub authority_epoch: u64,
     pub attempt: u32,
@@ -451,6 +453,7 @@ impl PendingIssueMonitorEffect {
     ) -> Self {
         Self {
             effect_id: effect_id.into(),
+            launch_budget_trial_id: None,
             authority_epoch,
             attempt: 0,
             state: IssueMonitorEffectState::Prepared,
@@ -1614,6 +1617,8 @@ pub enum IssueMonitorProviderUsageLimitOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingIssueMonitorLaunchDelivery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_budget_trial_id: Option<String>,
     pub delivery_id: String,
     pub issue_number: u64,
     pub branch_name: String,
@@ -2317,6 +2322,14 @@ pub struct IssueMonitorIssue {
     /// is fail-closed for ordinary linked-PR completion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub updated_at: Option<String>,
+}
+
+/// An urgent label observation carried with an accepted queue request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssueMonitorUrgentQueueObservation {
+    pub issue: IssueMonitorIssue,
+    pub assignment: Option<gwt_github::client::LabelAssignment>,
+    pub observed_at: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -4204,6 +4217,8 @@ pub struct AutonomousIssueSummary {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssueMonitorState {
+    #[serde(skip)]
+    launch_budget_scope: Option<crate::launch_budget::BudgetScope>,
     pub config: IssueMonitorConfig,
     pub gui_connected: bool,
     pub inbox: Vec<IssueMonitorInboxItem>,
@@ -5386,6 +5401,24 @@ pub fn issue_monitor_launch_delivery_requeue_reason(
         .requeue_reason
 }
 
+/// Only the exact saved delivery may identify a bounded trial. Legacy records
+/// and non-durable/review requests stay absent rather than using today's scope.
+pub fn issue_monitor_launch_delivery_budget_trial(
+    prefs_path: &Path,
+    issue_number: u64,
+    delivery_id: Option<&str>,
+) -> Option<String> {
+    let delivery_id = delivery_id?;
+    load_issue_monitor_prefs(prefs_path)
+        .ok()?
+        .pending_launch_deliveries
+        .into_iter()
+        .find(|delivery| {
+            delivery.issue_number == issue_number && delivery.delivery_id == delivery_id
+        })?
+        .launch_budget_trial_id
+}
+
 pub fn issue_monitor_launch_plan(issue: &IssueMonitorIssue) -> IssueMonitorLaunchPlan {
     let linked_issue_kind = issue_monitor_linked_issue_kind(issue);
     IssueMonitorLaunchPlan {
@@ -5513,7 +5546,11 @@ fn durable_atomic_write(path: &Path, content: &[u8]) -> io::Result<()> {
 
 fn save_issue_monitor_prefs_unlocked(path: &Path, prefs: &IssueMonitorPrefs) -> io::Result<()> {
     let content = serde_json::to_string_pretty(prefs).map_err(io::Error::other)?;
-    durable_atomic_write(path, content.as_bytes())?;
+    save_issue_monitor_prefs_content_unlocked(path, content.as_bytes())
+}
+
+fn save_issue_monitor_prefs_content_unlocked(path: &Path, content: &[u8]) -> io::Result<()> {
+    durable_atomic_write(path, content)?;
     // Issue #3883 AC-2: keep the generation this commit just made readable from
     // somewhere the canonical file's own corruption cannot reach. The recovery
     // below needs a floor, and without one it resets to `Default` — losing
@@ -5523,7 +5560,7 @@ fn save_issue_monitor_prefs_unlocked(path: &Path, prefs: &IssueMonitorPrefs) -> 
     // Written after the canonical rename and never allowed to fail the commit:
     // a missing sidecar only costs the recovery its floor, whereas failing here
     // would lose a write that already succeeded.
-    let _ = durable_atomic_write(&committed_prefs_generation_path(path), content.as_bytes());
+    let _ = durable_atomic_write(&committed_prefs_generation_path(path), content);
     Ok(())
 }
 
@@ -5648,25 +5685,27 @@ pub fn persist_legacy_issue_monitor_shutdown_revoke_fence(prefs_path: &Path) -> 
 pub(crate) fn acquire_issue_monitor_daemon_lease(
     prefs_path: &Path,
 ) -> io::Result<IssueMonitorAuthorityLease> {
-    with_issue_monitor_prefs_lock(prefs_path, || {
-        let authority_lock = fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(issue_monitor_authority_lock_path(prefs_path))?;
-        if let Err(error) = FileExt::try_lock_exclusive(&authority_lock) {
-            if gwt_core::operation_deadline::is_lock_contended(&error) {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "Issue Monitor authority lifetime lease is already held by another daemon",
-                ));
-            }
-            return Err(error);
+    with_issue_monitor_prefs_lock(prefs_path, || acquire_authority_lease_unlocked(prefs_path))
+}
+
+fn acquire_authority_lease_unlocked(prefs_path: &Path) -> io::Result<IssueMonitorAuthorityLease> {
+    let authority_lock = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(issue_monitor_authority_lock_path(prefs_path))?;
+    if let Err(error) = FileExt::try_lock_exclusive(&authority_lock) {
+        if gwt_core::operation_deadline::is_lock_contended(&error) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Issue Monitor authority lifetime lease is already held by another daemon",
+            ));
         }
-        Ok(IssueMonitorAuthorityLease {
-            lock: authority_lock,
-        })
+        return Err(error);
+    }
+    Ok(IssueMonitorAuthorityLease {
+        lock: authority_lock,
     })
 }
 
@@ -5804,36 +5843,132 @@ pub fn try_acquire_issue_monitor_local_fallback_lease(
     })
 }
 
+#[derive(Debug)]
+pub(crate) struct IssueMonitorRecoveryReport {
+    pub previous_epoch: u64,
+    pub new_epoch: u64,
+}
+
+/// Record-only recovery. The matching kernel lease proves a v2 owner is stale;
+/// it says nothing about running agents, remote claims, or free runtime slots.
+pub(crate) fn recover_issue_monitor_authority(
+    prefs_path: &Path,
+    expected_fence: &IssueMonitorAuthorityFence,
+    expected_epoch: u64,
+) -> io::Result<IssueMonitorRecoveryReport> {
+    if expected_fence.version != ISSUE_MONITOR_AUTHORITY_FENCE_VERSION
+        || expected_fence.pid == 0
+        || expected_fence.instance_id.trim().is_empty()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "recovery requires a valid v2 fence",
+        ));
+    }
+    let persistence_started = std::cell::Cell::new(false);
+    let result = with_issue_monitor_prefs_lock(prefs_path, || {
+        let _lease = acquire_authority_lease_unlocked(prefs_path)?;
+        // Missing/corrupt prefs must not silently fall back to Default.
+        let content = fs::read(prefs_path)?;
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&content).map_err(io::Error::other)?;
+        let prefs: IssueMonitorPrefs =
+            serde_json::from_slice(&content).map_err(io::Error::other)?;
+        if prefs.enabled || prefs.autonomous_mode || !prefs.pending_effects.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "recovery requires disabled monitor/autonomy and no pending effects",
+            ));
+        }
+        if prefs.effect_authority_epoch != expected_epoch {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "recovery authority epoch changed",
+            ));
+        }
+        if load_issue_monitor_authority_fence(prefs_path)?
+            != IssueMonitorAuthorityFenceState::Active(expected_fence.clone())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "recovery fence is missing or changed",
+            ));
+        }
+        let new_epoch = expected_epoch.checked_add(1).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "recovery authority epoch exhausted",
+            )
+        })?;
+        // Preserve every other known and unknown field; do not rebuild monitor state.
+        raw["effect_authority_epoch"] = serde_json::json!(new_epoch);
+        let updated = serde_json::to_vec_pretty(&raw).map_err(io::Error::other)?;
+        gwt_core::operation_deadline::ensure_remaining("Issue Monitor authority recovery")?;
+        persistence_started.set(true);
+        save_issue_monitor_prefs_content_unlocked(prefs_path, &updated)?;
+        clear_authority_fence_unlocked(prefs_path, expected_fence)?;
+        Ok(IssueMonitorRecoveryReport {
+            previous_epoch: expected_epoch,
+            new_epoch,
+        })
+    });
+    result.map_err(|error| {
+        if persistence_started.get() {
+            io::Error::other(format!(
+                "recovery outcome unknown; inspect prefs and fence before retrying: {error}"
+            ))
+        } else {
+            error
+        }
+    })
+}
+
 pub fn clear_issue_monitor_authority_fence(
     prefs_path: &Path,
     expected: &IssueMonitorAuthorityFence,
 ) -> io::Result<()> {
     with_issue_monitor_prefs_lock(prefs_path, || {
-        match load_issue_monitor_authority_fence(prefs_path)? {
-            IssueMonitorAuthorityFenceState::Active(current) if current == *expected => {}
-            _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "Issue Monitor authority fence identity changed before clear",
-                ));
-            }
-        }
-        let path = issue_monitor_authority_fence_path(prefs_path);
-        fs::remove_file(&path)?;
-        #[cfg(test)]
-        if let Some(fail_once) =
-            std::env::var_os("GWT_TEST_FAIL_ISSUE_MONITOR_FENCE_PARENT_SYNC_ONCE")
-        {
-            let fail_once = std::path::PathBuf::from(fail_once);
-            if fail_once.exists() {
-                fs::remove_file(fail_once)?;
-                return Err(io::Error::other(
-                    "injected Issue Monitor authority fence parent sync failure",
-                ));
-            }
-        }
-        sync_parent_directory(&path)
+        clear_authority_fence_unlocked(prefs_path, expected)
     })
+}
+
+fn clear_authority_fence_unlocked(
+    prefs_path: &Path,
+    expected: &IssueMonitorAuthorityFence,
+) -> io::Result<()> {
+    match load_issue_monitor_authority_fence(prefs_path)? {
+        IssueMonitorAuthorityFenceState::Active(current) if current == *expected => {}
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Issue Monitor authority fence identity changed before clear",
+            ));
+        }
+    }
+    let path = issue_monitor_authority_fence_path(prefs_path);
+    #[cfg(test)]
+    if let Some(marker) = std::env::var_os("GWT_TEST_FAIL_ISSUE_MONITOR_FENCE_REMOVE_ONCE") {
+        let marker = std::path::PathBuf::from(marker);
+        if marker.exists() {
+            fs::remove_file(marker)?;
+            return Err(io::Error::other(
+                "injected Issue Monitor fence remove failure",
+            ));
+        }
+    }
+    fs::remove_file(&path)?;
+    #[cfg(test)]
+    if let Some(fail_once) = std::env::var_os("GWT_TEST_FAIL_ISSUE_MONITOR_FENCE_PARENT_SYNC_ONCE")
+    {
+        let fail_once = std::path::PathBuf::from(fail_once);
+        if fail_once.exists() {
+            fs::remove_file(fail_once)?;
+            return Err(io::Error::other(
+                "injected Issue Monitor authority fence parent sync failure",
+            ));
+        }
+    }
+    sync_parent_directory(&path)
 }
 
 fn with_issue_monitor_prefs_lock<T>(
@@ -6550,6 +6685,7 @@ impl IssueMonitorState {
             requeue_audit: Vec::new(),
             failure_release_version: 0,
             queue: VecDeque::new(),
+            launch_budget_scope: None,
             pending_launches: VecDeque::new(),
             pending_launch_deliveries: VecDeque::new(),
             queued_launch_session_strategies: BTreeMap::new(),
@@ -12057,6 +12193,17 @@ impl IssueMonitorState {
 
     /// Add one Prepared effect under the current authority. An empty or reused
     /// stable id is rejected without changing the journal.
+    pub fn set_launch_budget_scope(&mut self, scope: Option<crate::launch_budget::BudgetScope>) {
+        self.launch_budget_scope = scope;
+    }
+
+    fn launch_budget_trial_for_issue(&self, issue_number: u64) -> Option<String> {
+        self.launch_budget_scope
+            .as_ref()
+            .filter(|scope| scope.issue_number == issue_number)
+            .map(|scope| scope.trial_id.clone())
+    }
+
     pub fn prepare_pending_effect(
         &mut self,
         effect_id: impl Into<String>,
@@ -12073,8 +12220,15 @@ impl IssueMonitorState {
         {
             return None;
         }
-        let effect =
+        let launch_budget_trial_id = match &payload {
+            IssueMonitorEffectPayload::AcquireClaim { issue_number, .. } => {
+                self.launch_budget_trial_for_issue(*issue_number)
+            }
+            _ => None,
+        };
+        let mut effect =
             PendingIssueMonitorEffect::prepared(effect_id, self.effect_authority_epoch, payload);
+        effect.launch_budget_trial_id = launch_budget_trial_id;
         let key = effect.attempt_key();
         self.pending_effects.push(effect);
         Some(key)
@@ -13434,6 +13588,58 @@ impl IssueMonitorState {
         self.apply_priority_order_to_queue();
     }
 
+    /// Push and move the selected issues in stored order in one control transaction.
+    pub fn terminal_queue_push_at_position(
+        &mut self,
+        issue_numbers: &[u64],
+        position: usize,
+        queued_by: &str,
+        now: &str,
+    ) {
+        self.terminal_queue_push(issue_numbers, queued_by, now);
+        let current = self.prefs();
+        let queue = &current.terminal_queues[&crate::process::current_hostname()];
+        let mut order: Vec<_> = queue
+            .entries
+            .iter()
+            .map(|entry| entry.number)
+            .filter(|number| !issue_numbers.contains(number))
+            .collect();
+        let mut selected = Vec::new();
+        for number in issue_numbers {
+            if !selected.contains(number) {
+                selected.push(*number);
+            }
+        }
+        let at = position.min(order.len());
+        order.splice(at..at, selected);
+        // These are stored positions; urgent projection must not be subtracted twice.
+        let mut priority = order.clone();
+        priority.extend(
+            current
+                .priority_order
+                .into_iter()
+                .filter(|number| !order.contains(number)),
+        );
+        self.set_priority_order(priority);
+    }
+
+    pub fn apply_urgent_queue_observations(
+        &mut self,
+        observations: &[IssueMonitorUrgentQueueObservation],
+    ) {
+        for observation in observations {
+            self.observe_urgent_issue(&observation.issue, &observation.observed_at);
+            if let Some(assignment) = &observation.assignment {
+                self.record_urgent_assignment(
+                    observation.issue.number,
+                    observation.issue.updated_at.as_deref(),
+                    assignment,
+                );
+            }
+        }
+    }
+
     pub fn terminal_queue_remove(&mut self, issue_numbers: &[u64], now: &str) {
         let host = crate::process::current_hostname();
         self.terminal_queue_exclusions
@@ -14239,6 +14445,26 @@ impl IssueMonitorState {
         claim_effect_id: &str,
         now: &str,
     ) -> bool {
+        let trial_id = self.launch_budget_trial_for_issue(issue_number);
+        self.apply_confirmed_claim_for_trial(
+            issue_number,
+            claim_id,
+            claim_owner,
+            claim_effect_id,
+            now,
+            trial_id,
+        )
+    }
+
+    pub fn apply_confirmed_claim_for_trial(
+        &mut self,
+        issue_number: u64,
+        claim_id: impl Into<String>,
+        claim_owner: impl Into<String>,
+        claim_effect_id: &str,
+        now: &str,
+        launch_budget_trial_id: Option<String>,
+    ) -> bool {
         let claim_id = claim_id.into();
         let claim_owner = claim_owner.into();
         // An exact ReleaseClaim is the durable compensation written when this
@@ -14318,6 +14544,7 @@ impl IssueMonitorState {
         {
             self.pending_launch_deliveries
                 .push_back(PendingIssueMonitorLaunchDelivery {
+                    launch_budget_trial_id,
                     delivery_id,
                     issue_number,
                     branch_name,
@@ -19180,6 +19407,7 @@ mod tests {
         state: IssueMonitorEffectState,
     ) -> PendingIssueMonitorEffect {
         PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: effect_id.to_string(),
             authority_epoch,
             attempt,
@@ -27533,6 +27761,7 @@ mod tests {
             IssueMonitorEffectState::Attempting,
         );
         let attempting_claim = PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "claim:7:attempting".to_string(),
             authority_epoch: 4,
             attempt: 1,
@@ -27547,6 +27776,7 @@ mod tests {
             },
         };
         let unrelated = PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "arm:8:100:prepared".to_string(),
             authority_epoch: 4,
             attempt: 0,
@@ -28469,6 +28699,7 @@ mod tests {
         let prepared =
             pending_arm_effect("arm:7:99:abc123:4", 4, 0, IssueMonitorEffectState::Prepared);
         let attempting = PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "disarm:arm:7:99:abc123:4".to_string(),
             authority_epoch: 5,
             attempt: 3,
@@ -28586,6 +28817,7 @@ mod tests {
         assert_eq!(autonomous, autonomous_before);
 
         let claim = PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "claim-max".to_string(),
             authority_epoch: u64::MAX,
             attempt: 2,
@@ -29716,6 +29948,132 @@ mod tests {
         assert_eq!(
             identity(&restored.pending_effects()[0]),
             (first_effect_id, first_claim_id)
+        );
+    }
+
+    #[test]
+    fn launch_budget_claim_snapshot_survives_retry_restart_and_scope_change() {
+        let mut monitor = IssueMonitorState::new(IssueMonitorConfig {
+            enabled: true,
+            max_active: 1,
+            ..IssueMonitorConfig::default()
+        });
+        monitor.set_gui_connected(true);
+        scan_queued_candidates(&mut monitor, &[issue(42)], "2026-10-08T00:00:00Z");
+        let scope = crate::launch_budget::BudgetScope {
+            trial_id: "original-trial".to_string(),
+            project_root: std::path::PathBuf::from("/artificial-project"),
+            issue_number: 42,
+            max_starts: 1,
+        };
+        monitor.set_launch_budget_scope(Some(scope.clone()));
+        assert_eq!(
+            monitor.prepare_claim_effects_with_probe(
+                "host/session",
+                "2026-10-08T00:00:01Z",
+                1,
+                |_| false
+            ),
+            1
+        );
+        let effect = monitor.pending_effects()[0].clone();
+        assert_eq!(
+            effect.launch_budget_trial_id.as_deref(),
+            Some("original-trial")
+        );
+        let key = effect.attempt_key();
+        assert!(monitor.mark_pending_effect_attempting(&key));
+        assert!(monitor.retry_pending_effect(&key));
+        let encoded = serde_json::to_string(&monitor.prefs()).unwrap();
+        let prefs: IssueMonitorPrefs = serde_json::from_str(&encoded).unwrap();
+        let mut restored = IssueMonitorState::with_prefs(IssueMonitorConfig::default(), prefs);
+        restored.set_gui_connected(true);
+        scan_queued_candidates(&mut restored, &[issue(42)], "2026-10-08T00:00:02Z");
+        restored.set_launch_budget_scope(Some(crate::launch_budget::BudgetScope {
+            trial_id: "new-trial".to_string(),
+            ..scope
+        }));
+        let saved = restored.pending_effects()[0].clone();
+        assert_eq!(
+            saved.launch_budget_trial_id.as_deref(),
+            Some("original-trial")
+        );
+        assert!(restored.apply_confirmed_claim_for_trial(
+            42,
+            "claim-42",
+            "host/session",
+            &saved.effect_id,
+            "2026-10-08T00:00:02Z",
+            saved.launch_budget_trial_id
+        ));
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("prefs.json");
+        save_issue_monitor_prefs(&path, &restored.prefs()).unwrap();
+        let delivery = restored.pending_launch_deliveries.front().unwrap();
+        assert_eq!(
+            issue_monitor_launch_delivery_budget_trial(&path, 42, Some(&delivery.delivery_id))
+                .as_deref(),
+            Some("original-trial")
+        );
+        assert_eq!(
+            issue_monitor_launch_delivery_budget_trial(&path, 43, Some(&delivery.delivery_id)),
+            None
+        );
+        assert_eq!(
+            issue_monitor_launch_delivery_budget_trial(&path, 42, Some("different-delivery")),
+            None
+        );
+        assert_eq!(
+            issue_monitor_launch_delivery_budget_trial(&path, 42, None),
+            None
+        );
+    }
+
+    #[test]
+    fn launch_budget_legacy_claim_does_not_receive_current_trial_at_completion() {
+        let mut monitor = IssueMonitorState::new(IssueMonitorConfig {
+            enabled: true,
+            max_active: 1,
+            ..IssueMonitorConfig::default()
+        });
+        monitor.set_gui_connected(true);
+        scan_queued_candidates(&mut monitor, &[issue(42)], "2026-10-08T00:00:00Z");
+        assert_eq!(
+            monitor.prepare_claim_effects_with_probe(
+                "host/session",
+                "2026-10-08T00:00:01Z",
+                1,
+                |_| false
+            ),
+            1
+        );
+        let mut serialized = serde_json::to_value(&monitor.pending_effects()[0]).unwrap();
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .remove("launch_budget_trial_id");
+        let old: PendingIssueMonitorEffect = serde_json::from_value(serialized).unwrap();
+        monitor.set_launch_budget_scope(Some(crate::launch_budget::BudgetScope {
+            trial_id: "new-trial".to_string(),
+            project_root: std::path::PathBuf::from("/artificial-project"),
+            issue_number: 42,
+            max_starts: 1,
+        }));
+        assert!(monitor.apply_confirmed_claim_for_trial(
+            42,
+            "claim-42",
+            "host/session",
+            &old.effect_id,
+            "2026-10-08T00:00:02Z",
+            old.launch_budget_trial_id
+        ));
+        assert_eq!(
+            monitor
+                .pending_launch_deliveries
+                .front()
+                .unwrap()
+                .launch_budget_trial_id,
+            None
         );
     }
 
@@ -37791,6 +38149,234 @@ mod tests {
                     "{window_id}"
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod inert_recovery_tests {
+    use super::*;
+    use gwt_core::test_support::ScopedEnvVar;
+
+    fn seed(path: &Path, epoch: u64) -> IssueMonitorAuthorityFence {
+        let prefs = IssueMonitorPrefs {
+            enabled: false,
+            autonomous_mode: false,
+            effect_authority_epoch: epoch,
+            launch_bindings: BTreeMap::from([("saved-window".into(), 41)]),
+            claim_identities: vec![IssueMonitorClaimIdentity {
+                issue_number: 41,
+                claim_id: "saved-claim".into(),
+                owner: "saved-owner".into(),
+            }],
+            ..IssueMonitorPrefs::default()
+        };
+        let mut raw = serde_json::to_value(prefs).unwrap();
+        raw["extra_record"] = serde_json::json!({"must_keep":[1,2,3]});
+        fs::write(path, serde_json::to_vec(&raw).unwrap()).unwrap();
+        let fence = IssueMonitorAuthorityFence {
+            version: 2,
+            pid: std::process::id(),
+            instance_id: "stale-owner".into(),
+        };
+        persist_issue_monitor_authority_fence(path, &fence).unwrap();
+        fence
+    }
+    fn snapshot(path: &Path) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
+        (
+            fs::read(path).ok(),
+            fs::read(issue_monitor_authority_fence_path(path)).ok(),
+        )
+    }
+    fn rejects_unchanged(path: &Path, fence: &IssueMonitorAuthorityFence, epoch: u64) {
+        let before = snapshot(path);
+        assert!(recover_issue_monitor_authority(path, fence, epoch).is_err());
+        assert_eq!(before, snapshot(path));
+    }
+
+    #[test]
+    fn recovery_preserves_records_and_rejects_a_replayed_request() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("prefs.json");
+        let fence = seed(&path, 17);
+        let mut expected: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        expected["effect_authority_epoch"] = serde_json::json!(18);
+        let report = recover_issue_monitor_authority(&path, &fence, 17).unwrap();
+        assert_eq!((report.previous_epoch, report.new_epoch), (17, 18));
+        let actual: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(actual, expected);
+        assert!(!issue_monitor_authority_fence_path(&path).exists());
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            fs::read(committed_prefs_generation_path(&path)).unwrap()
+        );
+        rejects_unchanged(&path, &fence, 17);
+        rejects_unchanged(&path, &fence, 18);
+        drop(acquire_issue_monitor_daemon_lease(&path).unwrap());
+    }
+
+    #[test]
+    fn recovery_refuses_a_busy_lifetime_lease_even_with_a_stale_fence() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("prefs.json");
+        let fence = seed(&path, 17);
+        let lease = acquire_issue_monitor_daemon_lease(&path).unwrap();
+        rejects_unchanged(&path, &fence, 17);
+        drop(lease);
+        recover_issue_monitor_authority(&path, &fence, 17).unwrap();
+    }
+
+    #[test]
+    fn recovery_refuses_enabled_autonomy_and_prepared_or_attempting_effects() {
+        for variant in 0..4 {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("prefs.json");
+            let fence = seed(&path, 17);
+            let mut prefs: IssueMonitorPrefs =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            match variant {
+                0 => prefs.enabled = true,
+                1 => prefs.autonomous_mode = true,
+                _ => {
+                    let mut effect = PendingIssueMonitorEffect::prepared(
+                        "pending",
+                        17,
+                        IssueMonitorEffectPayload::ReleaseClaim {
+                            issue_number: 41,
+                            claim_id: "saved-claim".into(),
+                            owner: "saved-owner".into(),
+                        },
+                    );
+                    if variant == 3 {
+                        effect.state = IssueMonitorEffectState::Attempting;
+                    }
+                    prefs.pending_effects.push(effect);
+                }
+            }
+            fs::write(&path, serde_json::to_vec(&prefs).unwrap()).unwrap();
+            rejects_unchanged(&path, &fence, 17);
+        }
+    }
+
+    #[test]
+    fn recovery_refuses_missing_corrupt_or_wrong_schema_preferences() {
+        for bytes in [None, Some(b"not json".as_slice()), Some(b"{}".as_slice())] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("prefs.json");
+            let fence = seed(&path, 17);
+            if let Some(bytes) = bytes {
+                fs::write(&path, bytes).unwrap();
+            } else {
+                fs::remove_file(&path).unwrap();
+            }
+            rejects_unchanged(&path, &fence, 17);
+        }
+    }
+
+    #[test]
+    fn recovery_refuses_duplicate_known_preference_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("prefs.json");
+        let fence = seed(&path, 17);
+        let original = fs::read_to_string(&path).unwrap();
+        let duplicate = format!("{{\"enabled\":true,{}", &original[1..]);
+        fs::write(&path, duplicate).unwrap();
+        rejects_unchanged(&path, &fence, 17);
+    }
+
+    #[test]
+    fn recovery_refuses_legacy_missing_malformed_or_changed_fences() {
+        for bytes in [
+            None,
+            Some(b"not json".as_slice()),
+            Some(b"{\"version\":1,\"pid\":77,\"instance_id\":\"legacy\"}".as_slice()),
+            Some(b"{\"version\":2,\"pid\":77,\"instance_id\":\"different\"}".as_slice()),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("prefs.json");
+            let fence = seed(&path, 17);
+            let fpath = issue_monitor_authority_fence_path(&path);
+            if let Some(bytes) = bytes {
+                fs::write(&fpath, bytes).unwrap();
+            } else {
+                fs::remove_file(&fpath).unwrap();
+            }
+            rejects_unchanged(&path, &fence, 17);
+        }
+    }
+
+    #[test]
+    fn recovery_refuses_epoch_changes_and_overflow() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("prefs.json");
+        let fence = seed(&path, 17);
+        rejects_unchanged(&path, &fence, 16);
+        let fence = seed(&path, u64::MAX);
+        rejects_unchanged(&path, &fence, u64::MAX);
+    }
+
+    #[test]
+    fn recovery_expired_before_commit_changes_no_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("prefs.json");
+        let fence = seed(&path, 17);
+        let _deadline = gwt_core::operation_deadline::ScopedOperationDeadline::enter(
+            gwt_core::operation_deadline::now() - std::time::Duration::from_secs(1),
+        );
+        rejects_unchanged(&path, &fence, 17);
+    }
+
+    #[test]
+    fn recovery_save_sync_failure_retains_fence_and_reports_unknown() {
+        let _env_lock = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("prefs.json");
+        let fence = seed(&path, 17);
+        fs::write(path.with_extension("parent-sync-fail-once"), b"fail").unwrap();
+        let _hook = ScopedEnvVar::set("GWT_TEST_FAIL_ISSUE_MONITOR_PREFS_PARENT_SYNC_ONCE", &path);
+        let error = recover_issue_monitor_authority(&path, &fence, 17).unwrap_err();
+        assert!(error.to_string().contains("outcome unknown"));
+        assert_eq!(
+            load_issue_monitor_prefs(&path)
+                .unwrap()
+                .effect_authority_epoch,
+            18
+        );
+        assert_eq!(
+            load_issue_monitor_authority_fence(&path).unwrap(),
+            IssueMonitorAuthorityFenceState::Active(fence.clone())
+        );
+        rejects_unchanged(&path, &fence, 17);
+    }
+
+    #[test]
+    fn recovery_fence_remove_and_sync_failures_report_unknown_without_retry() {
+        let _env_lock = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (hook, remains) in [
+            ("GWT_TEST_FAIL_ISSUE_MONITOR_FENCE_REMOVE_ONCE", true),
+            ("GWT_TEST_FAIL_ISSUE_MONITOR_FENCE_PARENT_SYNC_ONCE", false),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("prefs.json");
+            let fence = seed(&path, 17);
+            let marker = temp.path().join("fail-once");
+            fs::write(&marker, b"fail").unwrap();
+            let _hook = ScopedEnvVar::set(hook, &marker);
+            let error = recover_issue_monitor_authority(&path, &fence, 17).unwrap_err();
+            assert!(error.to_string().contains("outcome unknown"));
+            assert_eq!(
+                load_issue_monitor_prefs(&path)
+                    .unwrap()
+                    .effect_authority_epoch,
+                18
+            );
+            assert_eq!(issue_monitor_authority_fence_path(&path).exists(), remains);
+            rejects_unchanged(&path, &fence, 17);
         }
     }
 }

@@ -178,6 +178,15 @@ pub enum IssueCommand {
     MonitorStatus {
         project_root: Option<std::path::PathBuf>,
     },
+    MonitorLaunchBudgetArm {
+        project_root: std::path::PathBuf,
+        trial_id: String,
+        issue_number: u64,
+        max_starts: u32,
+    },
+    MonitorLaunchBudgetStatus {
+        project_root: std::path::PathBuf,
+    },
     MonitorPriorityMove {
         project_root: Option<std::path::PathBuf>,
         number: u64,

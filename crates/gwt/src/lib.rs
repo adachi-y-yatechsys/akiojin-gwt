@@ -41,6 +41,9 @@ pub mod issue_monitor_review;
 pub mod issue_monitor_settlement;
 pub mod issue_monitor_worker;
 pub mod knowledge_bridge;
+pub mod launch_budget;
+#[cfg(test)]
+mod launch_budget_tests;
 pub mod launch_wizard;
 pub mod managed_assets;
 pub mod memory_pressure;

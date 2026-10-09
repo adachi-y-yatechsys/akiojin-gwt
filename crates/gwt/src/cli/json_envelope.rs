@@ -1,4 +1,230 @@
 use gwt_agent::session::GWT_SESSION_ID_ENV;
+use std::path::PathBuf;
+
+fn minimal_daemon_operation(operation: &str) -> bool {
+    matches!(operation, "daemon.stop" | "daemon.start_without_cleanup")
+        || operation.starts_with("daemon.probe.")
+}
+
+#[cfg(test)]
+mod daemon_probe_operation_tests {
+    use super::*;
+    #[test]
+    fn worker_without_cleanup_requires_explicit_project_and_refuses_extra_scope() {
+        let input = |p: Value| {
+            serde_json::json!({"operation":"daemon.start_without_cleanup","params":p}).to_string()
+        };
+        assert!(matches!(
+            parse(&input(
+                serde_json::json!({"project_root":std::env::temp_dir()})
+            ))
+            .unwrap()
+            .command,
+            CliCommand::Daemon(DaemonCommand::StartWithoutCleanup { .. })
+        ));
+        for params in [
+            serde_json::json!({}),
+            serde_json::json!({"project_root":"relative"}),
+            serde_json::json!({"project_root":std::env::temp_dir(),"allow_background_cleanup":true}),
+        ] {
+            assert!(parse(&input(params)).is_err());
+        }
+    }
+    #[test]
+    fn diagnostic_start_and_status_require_explicit_exact_scope() {
+        for operation in ["daemon.probe.start", "daemon.probe.status"] {
+            let mut params = serde_json::json!({"project_root":std::env::temp_dir()});
+            if operation.ends_with("status") {
+                params["expected_pid"] = serde_json::json!(77);
+                params["expected_instance_id"] = serde_json::json!("a".repeat(64));
+            }
+            let input =
+                |p: Value| serde_json::json!({"operation":operation,"params":p}).to_string();
+            assert!(parse(&input(params.clone())).is_ok());
+            for key in params.as_object().unwrap().keys() {
+                let mut missing = params.clone();
+                missing.as_object_mut().unwrap().remove(key);
+                assert!(parse(&input(missing)).is_err());
+            }
+            for (key, value) in [
+                ("project_root", serde_json::json!("relative")),
+                ("force", serde_json::json!(true)),
+            ] {
+                let mut bad = params.clone();
+                bad[key] = value;
+                assert!(parse(&input(bad)).is_err());
+            }
+            if operation.ends_with("status") {
+                for (key, value) in [
+                    ("expected_pid", serde_json::json!(true)),
+                    ("expected_pid", serde_json::json!(0)),
+                    ("expected_instance_id", serde_json::json!("A".repeat(64))),
+                ] {
+                    let mut bad = params.clone();
+                    bad[key] = value;
+                    assert!(parse(&input(bad)).is_err());
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod daemon_stop_operation_tests {
+    use super::*;
+    fn params() -> Value {
+        serde_json::json!({"project_root":std::env::temp_dir(), "expected_pid":77,
+            "expected_instance_id":"a".repeat(64), "request_id":"stop-1"})
+    }
+    fn input(p: Value) -> String {
+        serde_json::json!({"operation":"daemon.stop", "params":p}).to_string()
+    }
+    #[test]
+    fn daemon_stop_requires_all_guards_and_refuses_mutation_fields() {
+        assert!(parse(&input(params())).is_ok());
+        for key in [
+            "project_root",
+            "expected_pid",
+            "expected_instance_id",
+            "request_id",
+        ] {
+            let mut p = params();
+            p.as_object_mut().unwrap().remove(key);
+            assert!(parse(&input(p)).is_err(), "missing {key}");
+        }
+        for (key, value) in [
+            ("project_root", serde_json::json!("relative")),
+            ("expected_pid", serde_json::json!(0)),
+            ("expected_pid", serde_json::json!(true)),
+            ("expected_pid", serde_json::json!(4294967296_u64)),
+            ("expected_instance_id", serde_json::json!("A".repeat(64))),
+            ("expected_instance_id", serde_json::json!("a".repeat(63))),
+            ("request_id", serde_json::json!(" ")),
+            ("request_id", serde_json::json!("x".repeat(129))),
+            ("force", serde_json::json!(true)),
+        ] {
+            let mut p = params();
+            p[key] = value;
+            assert!(parse(&input(p)).is_err(), "invalid {key}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod launch_budget_operation_tests {
+    use super::*;
+    fn params() -> Value {
+        serde_json::json!({"project_root":std::env::temp_dir(),"trial_id":"trial-1","issue_number":6,"max_starts":1})
+    }
+    #[test]
+    fn launch_budget_arm_requires_exact_bounded_fields() {
+        let input = |p| {
+            serde_json::json!({"operation":"issue.monitor.launch_budget.arm","params":p})
+                .to_string()
+        };
+        assert!(parse(&input(params())).is_ok());
+        for key in ["project_root", "trial_id", "issue_number", "max_starts"] {
+            let mut p = params();
+            p.as_object_mut().unwrap().remove(key);
+            assert!(parse(&input(p)).is_err());
+        }
+        for (key, value) in [
+            ("project_root", serde_json::json!("relative")),
+            ("trial_id", serde_json::json!(" ")),
+            ("issue_number", serde_json::json!(0)),
+            ("max_starts", serde_json::json!(2)),
+            ("force", serde_json::json!(true)),
+        ] {
+            let mut p = params();
+            p[key] = value;
+            assert!(parse(&input(p)).is_err());
+        }
+    }
+    #[test]
+    fn launch_budget_status_requires_explicit_project_and_refuses_mutation_fields() {
+        let input = |p| {
+            serde_json::json!({"operation":"issue.monitor.launch_budget.status","params":p})
+                .to_string()
+        };
+        assert!(parse(&input(
+            serde_json::json!({"project_root":std::env::temp_dir()})
+        ))
+        .is_ok());
+        assert!(parse(&input(serde_json::json!({}))).is_err());
+        assert!(parse(&input(
+            serde_json::json!({"project_root":std::env::temp_dir(),"reset":true})
+        ))
+        .is_err());
+    }
+}
+
+#[cfg(test)]
+mod recovery_operation_tests {
+    use super::*;
+
+    fn params() -> Value {
+        serde_json::json!({"project_root": std::env::temp_dir(),
+            "project_store_hash": "0123456789abcdef", "expected_epoch": 17,
+            "expected_fence": {"version": 2, "pid": 77, "instance_id": "old-owner"}})
+    }
+
+    #[test]
+    fn daemon_recover_decodes_an_explicit_one_shot_request() {
+        let input =
+            serde_json::json!({"operation":"daemon.recover", "params":params()}).to_string();
+        assert!(
+            parse(&input).is_ok(),
+            "the approved recovery operation is missing"
+        );
+    }
+
+    #[test]
+    fn daemon_recover_requires_all_guards_and_rejects_unknown_fields() {
+        for key in [
+            "project_root",
+            "project_store_hash",
+            "expected_epoch",
+            "expected_fence",
+        ] {
+            let mut value = params();
+            value.as_object_mut().unwrap().remove(key);
+            assert!(parse(
+                &serde_json::json!({"operation":"daemon.recover","params":value}).to_string()
+            )
+            .is_err());
+        }
+        for (key, value) in [
+            ("project_root", serde_json::json!("relative")),
+            ("expected_epoch", serde_json::json!("17")),
+            ("expected_epoch", serde_json::json!(-1)),
+            ("unexpected", serde_json::json!(true)),
+        ] {
+            let mut p = params();
+            p[key] = value;
+            assert!(parse(
+                &serde_json::json!({"operation":"daemon.recover","params":p}).to_string()
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn daemon_recover_rejects_invalid_or_extended_fence_identities() {
+        for (key, value) in [
+            ("version", serde_json::json!(1)),
+            ("pid", serde_json::json!(0)),
+            ("instance_id", serde_json::json!(" ")),
+            ("extra", serde_json::json!(1)),
+        ] {
+            let mut p = params();
+            p["expected_fence"][key] = value;
+            assert!(parse(
+                &serde_json::json!({"operation":"daemon.recover","params":p}).to_string()
+            )
+            .is_err());
+        }
+    }
+}
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
@@ -88,6 +314,10 @@ pub(crate) fn dispatch<E: CliEnv>(env: &mut E, prog: &str) -> i32 {
             return 2;
         }
     };
+    #[cfg(not(test))]
+    if !minimal_daemon_operation(&parsed.operation) {
+        crate::perf::install_appending_to_established_log_from_settings();
+    }
     let operation = parsed.operation.clone();
     let declared_block = parsed.declared_block;
     let requested_project_root = parsed.requested_project_root;
@@ -133,6 +363,7 @@ pub(crate) fn dispatch<E: CliEnv>(env: &mut E, prog: &str) -> i32 {
             match (code, declared_block) {
                 (0, Some(block)) => super::board::auto_file_declared_block(env, &block),
                 (0, None) => {}
+                _ if minimal_daemon_operation(&operation) => {}
                 _ => {
                     report_operation_refusal(
                         &operation,
@@ -175,8 +406,13 @@ pub(crate) fn dispatch<E: CliEnv>(env: &mut E, prog: &str) -> i32 {
             // depending on the agent noticing it is stuck. Answering the caller
             // comes first — the escalation must never delay or replace the
             // operation's own reply.
-            report_operation_refusal(&operation, &message, requested_project_root.as_deref());
-            if let Some(refusal) = failure.refusal.as_ref() {
+            // Exact stop is a cleanup boundary. A lost receipt or identity
+            // refusal must not create Board work or write an error ledger.
+            if !minimal_daemon_operation(&operation) {
+                report_operation_refusal(&operation, &message, requested_project_root.as_deref());
+            }
+            if minimal_daemon_operation(&operation) {
+            } else if let Some(refusal) = failure.refusal.as_ref() {
                 super::board::auto_file_structured_operation_refusal(
                     env, &operation, &message, refusal,
                 );
@@ -574,6 +810,51 @@ fn parse(input: &str) -> Result<ParsedEnvelope, CliParseError> {
         "issue.monitor.status" => CliCommand::Issue(IssueCommand::MonitorStatus {
             project_root: optional_path(params, "project_root")?,
         }),
+        "issue.monitor.launch_budget.arm" => {
+            reject_unknown_params(
+                params,
+                &["project_root", "trial_id", "issue_number", "max_starts"],
+                "issue.monitor.launch_budget.arm",
+            )?;
+            let project_root = PathBuf::from(required_string(params, "project_root")?);
+            let trial_id = required_string(params, "trial_id")?;
+            let issue_number = required_u64(params, "issue_number")?;
+            let max_starts = required_u64(params, "max_starts")?;
+            if !project_root.is_absolute()
+                || issue_number == 0
+                || max_starts != 1
+                || trial_id.is_empty()
+                || trial_id.len() > 128
+                || !trial_id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+            {
+                return Err(CliParseError::InvalidJson(
+                    "launch budget requires an absolute project, Issue, trial ID and max_starts=1"
+                        .to_string(),
+                ));
+            }
+            CliCommand::Issue(IssueCommand::MonitorLaunchBudgetArm {
+                project_root,
+                trial_id,
+                issue_number,
+                max_starts: 1,
+            })
+        }
+        "issue.monitor.launch_budget.status" => {
+            reject_unknown_params(
+                params,
+                &["project_root"],
+                "issue.monitor.launch_budget.status",
+            )?;
+            let project_root = PathBuf::from(required_string(params, "project_root")?);
+            if !project_root.is_absolute() {
+                return Err(CliParseError::InvalidJson(
+                    "launch budget status requires an absolute project".to_string(),
+                ));
+            }
+            CliCommand::Issue(IssueCommand::MonitorLaunchBudgetStatus { project_root })
+        }
         "issue.monitor.questions" => CliCommand::Issue(IssueCommand::MonitorQuestions {
             project_root: optional_path(params, "project_root")?,
         }),
@@ -967,7 +1248,21 @@ fn parse(input: &str) -> Result<ParsedEnvelope, CliParseError> {
                 .unwrap_or(IndexScope::All),
         }),
         "diagnostics.cpu" => CliCommand::Diagnostics(DiagnosticsCommand::Cpu { json: true }),
+        "daemon.recover" => daemon_recover(params)?,
         "daemon.start" => CliCommand::Daemon(DaemonCommand::Start),
+        "daemon.start_without_cleanup" => {
+            reject_unknown_params(params, &["project_root"], "daemon.start_without_cleanup")?;
+            let project_root = PathBuf::from(required_string(params, "project_root")?);
+            if !project_root.is_absolute() {
+                return Err(CliParseError::InvalidJson(
+                    "daemon start requires an absolute project_root".into(),
+                ));
+            }
+            CliCommand::Daemon(DaemonCommand::StartWithoutCleanup { project_root })
+        }
+        "daemon.probe.start" => daemon_probe(params, false)?,
+        "daemon.probe.status" => daemon_probe(params, true)?,
+        "daemon.stop" => daemon_stop(params)?,
         "daemon.status" => CliCommand::Daemon(DaemonCommand::Status),
         "daemon.subscribe" => daemon_subscribe(params)?,
         "hook.register_codex_managed_hook_trust" | "hook.register-codex-managed-hook-trust" => {
@@ -1581,6 +1876,144 @@ fn memory_add(params: &Map<String, Value>) -> Result<CliCommand, CliParseError> 
         learning: required_string(params, "learning")?,
         future_action: required_string(params, "future_action")?,
     })))
+}
+
+fn daemon_probe(params: &Map<String, Value>, status: bool) -> Result<CliCommand, CliParseError> {
+    let operation = if status {
+        "daemon.probe.status"
+    } else {
+        "daemon.probe.start"
+    };
+    let keys: &[&str] = if status {
+        &["project_root", "expected_pid", "expected_instance_id"]
+    } else {
+        &["project_root"]
+    };
+    reject_unknown_params(params, keys, operation)?;
+    let project_root = PathBuf::from(required_string(params, "project_root")?);
+    if !project_root.is_absolute() {
+        return Err(CliParseError::InvalidJson(
+            "daemon probe requires an absolute project_root".into(),
+        ));
+    }
+    if !status {
+        return Ok(CliCommand::Daemon(DaemonCommand::ProbeStart {
+            project_root,
+        }));
+    }
+    let expected_pid = lookup(params, "expected_pid")
+        .and_then(Value::as_u64)
+        .and_then(|v| u32::try_from(v).ok())
+        .ok_or_else(|| {
+            CliParseError::InvalidJson("daemon probe requires a positive u32 expected_pid".into())
+        })?;
+    let expected_instance_id = required_string(params, "expected_instance_id")?;
+    if !gwt_core::daemon::is_valid_daemon_stop_identity(
+        expected_pid,
+        &expected_instance_id,
+        "probe-status",
+    ) {
+        return Err(CliParseError::InvalidJson(
+            "daemon probe requires exact instance identity".into(),
+        ));
+    }
+    Ok(CliCommand::Daemon(DaemonCommand::ProbeStatus {
+        project_root,
+        expected_pid,
+        expected_instance_id,
+    }))
+}
+
+fn daemon_stop(params: &Map<String, Value>) -> Result<CliCommand, CliParseError> {
+    reject_unknown_params(
+        params,
+        &[
+            "project_root",
+            "expected_pid",
+            "expected_instance_id",
+            "request_id",
+        ],
+        "daemon.stop",
+    )?;
+    let project_root = PathBuf::from(required_string(params, "project_root")?);
+    let expected_pid = lookup(params, "expected_pid")
+        .and_then(Value::as_u64)
+        .and_then(|pid| u32::try_from(pid).ok())
+        .ok_or_else(|| {
+            CliParseError::InvalidJson("daemon.stop requires a positive u32 expected_pid".into())
+        })?;
+    let expected_instance_id = required_string(params, "expected_instance_id")?;
+    let request_id = required_string(params, "request_id")?;
+    if !project_root.is_absolute()
+        || !gwt_core::daemon::is_valid_daemon_stop_identity(
+            expected_pid,
+            &expected_instance_id,
+            &request_id,
+        )
+    {
+        return Err(CliParseError::InvalidJson("daemon.stop requires an absolute project, exact instance identity and bounded request_id".into()));
+    }
+    Ok(CliCommand::Daemon(DaemonCommand::Stop {
+        project_root,
+        expected_pid,
+        expected_instance_id,
+        request_id,
+    }))
+}
+
+fn daemon_recover(params: &Map<String, Value>) -> Result<CliCommand, CliParseError> {
+    reject_unknown_params(
+        params,
+        &[
+            "project_root",
+            "project_store_hash",
+            "expected_epoch",
+            "expected_fence",
+        ],
+        "daemon.recover",
+    )?;
+    let project_root = PathBuf::from(required_string(params, "project_root")?);
+    if !project_root.is_absolute() {
+        return Err(CliParseError::InvalidJson(
+            "daemon.recover requires an absolute project_root".into(),
+        ));
+    }
+    let project_store_hash = required_string(params, "project_store_hash")?;
+    let epoch =
+        lookup(params, "expected_epoch").ok_or(CliParseError::MissingFlag("expected_epoch"))?;
+    let expected_epoch = epoch.as_u64().ok_or_else(|| {
+        CliParseError::InvalidJson("expected_epoch must be an unsigned integer".into())
+    })?;
+    let value =
+        lookup(params, "expected_fence").ok_or(CliParseError::MissingFlag("expected_fence"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| CliParseError::InvalidJson("expected_fence must be an object".into()))?;
+    if object
+        .keys()
+        .any(|key| !["version", "pid", "instance_id"].contains(&key.as_str()))
+    {
+        return Err(CliParseError::InvalidJson(
+            "unknown expected_fence field".into(),
+        ));
+    }
+    let expected_fence: crate::IssueMonitorAuthorityFence =
+        serde_json::from_value(value.clone())
+            .map_err(|error| CliParseError::InvalidJson(error.to_string()))?;
+    if expected_fence.version != 2
+        || expected_fence.pid == 0
+        || expected_fence.instance_id.trim().is_empty()
+    {
+        return Err(CliParseError::InvalidJson(
+            "expected_fence requires a valid version-2 identity".into(),
+        ));
+    }
+    Ok(CliCommand::Daemon(DaemonCommand::Recover {
+        project_root,
+        project_store_hash,
+        expected_fence,
+        expected_epoch,
+    }))
 }
 
 fn daemon_subscribe(params: &Map<String, Value>) -> Result<CliCommand, CliParseError> {

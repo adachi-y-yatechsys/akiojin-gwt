@@ -94,11 +94,31 @@ pub const OPERATIONS: &[Operation] = &[
         aliases: &[],
     },
     Operation {
+        name: "daemon.recover",
+        aliases: &[],
+    },
+    Operation {
         name: "daemon.start",
         aliases: &[],
     },
     Operation {
+        name: "daemon.start_without_cleanup",
+        aliases: &[],
+    },
+    Operation {
+        name: "daemon.probe.start",
+        aliases: &[],
+    },
+    Operation {
+        name: "daemon.probe.status",
+        aliases: &[],
+    },
+    Operation {
         name: "daemon.status",
+        aliases: &[],
+    },
+    Operation {
+        name: "daemon.stop",
         aliases: &[],
     },
     Operation {
@@ -361,6 +381,14 @@ pub const OPERATIONS: &[Operation] = &[
     },
     Operation {
         name: "issue.monitor.status",
+        aliases: &[],
+    },
+    Operation {
+        name: "issue.monitor.launch_budget.arm",
+        aliases: &[],
+    },
+    Operation {
+        name: "issue.monitor.launch_budget.status",
         aliases: &[],
     },
     Operation {

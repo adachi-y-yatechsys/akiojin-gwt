@@ -17,7 +17,9 @@
 
 pub(crate) mod broadcast;
 pub mod client;
+mod probe;
 pub(crate) mod server;
+mod stop;
 mod subscribe_resolver;
 pub(crate) mod transport;
 pub(crate) mod verification_host;
@@ -102,13 +104,90 @@ pub(super) fn run<E: CliEnv>(
 ) -> Result<i32, SpecOpsError> {
     match cmd {
         DaemonCommand::Start => start_daemon(env, out),
+        DaemonCommand::StartWithoutCleanup { project_root } => {
+            probe::start_without_cleanup(&project_root, env.stdout())
+        }
+        DaemonCommand::ProbeStart { project_root } => probe::start(&project_root, env.stdout()),
+        DaemonCommand::ProbeStatus {
+            project_root,
+            expected_pid,
+            expected_instance_id,
+        } => probe::status(&project_root, expected_pid, &expected_instance_id, out),
         DaemonCommand::Status => report_status(env, out),
+        DaemonCommand::Stop {
+            project_root,
+            expected_pid,
+            expected_instance_id,
+            request_id,
+        } => stop::run(
+            &project_root,
+            expected_pid,
+            &expected_instance_id,
+            &request_id,
+            out,
+        ),
+        DaemonCommand::Recover {
+            project_root,
+            project_store_hash,
+            expected_fence,
+            expected_epoch,
+        } => recover_command(
+            &project_root,
+            &project_store_hash,
+            &expected_fence,
+            expected_epoch,
+            out,
+        ),
         DaemonCommand::Subscribe {
             channels,
             project_root,
             timeout_seconds,
         } => subscribe_command(env, project_root.as_deref(), channels, timeout_seconds, out),
     }
+}
+
+fn recover_command(
+    project_root: &Path,
+    expected_store_hash: &str,
+    expected_fence: &crate::IssueMonitorAuthorityFence,
+    expected_epoch: u64,
+    out: &mut String,
+) -> Result<i32, SpecOpsError> {
+    let _deadline = gwt_core::operation_deadline::ScopedOperationDeadline::enter(
+        gwt_core::operation_deadline::now() + Duration::from_secs(5),
+    );
+    if !project_root.is_absolute() {
+        return Err(config_error(
+            "daemon.recover requires an absolute project_root",
+        ));
+    }
+    let root =
+        dunce::canonicalize(project_root).map_err(|error| config_error(error.to_string()))?;
+    if !root.is_dir() {
+        return Err(config_error(
+            "daemon.recover project_root is not a directory",
+        ));
+    }
+    let scope = gwt_core::paths::resolve_project_scope(&root);
+    if !scope.source.identity_resolved() || scope.hash.as_str() != expected_store_hash {
+        return Err(config_error(
+            "daemon.recover project store identity is unresolved or mismatched",
+        ));
+    }
+    // Use the identity just checked, without resolving it a second time.
+    let prefs_path = gwt_core::paths::gwt_projects_dir()
+        .join(scope.hash.as_str())
+        .join("project-state/issue-monitor.json");
+    let report = crate::issue_monitor::recover_issue_monitor_authority(
+        &prefs_path,
+        expected_fence,
+        expected_epoch,
+    )
+    .map_err(|error| config_error(error.to_string()))?;
+    *out = serde_json::json!({"status":"authority_recovered", "project_store_hash":scope.hash.as_str(),
+        "previous_epoch":report.previous_epoch, "new_epoch":report.new_epoch,
+        "runtime_clear_verified":false, "work_resumed":false}).to_string();
+    Ok(0)
 }
 
 fn config_error(message: impl Into<String>) -> SpecOpsError {
@@ -810,6 +889,8 @@ mod tests {
     #[test]
     fn format_probe_result_ok_includes_uptime_and_channels() {
         let status = DaemonStatus {
+            background_cleanup_allowed: true,
+            diagnostic_only: false,
             protocol_version: DAEMON_PROTOCOL_VERSION,
             daemon_version: "9.14.0".to_string(),
             uptime_seconds: 12,
@@ -1047,5 +1128,118 @@ mod tests {
     #[test]
     fn subscribe_run_rejects_file_project_root_without_contacting_cwd() {
         assert_invalid_explicit_project_root_is_rejected("file");
+    }
+}
+
+#[cfg(test)]
+mod inert_recovery_cli_tests {
+    use super::*;
+    use gwt_core::test_support::ScopedGwtHome;
+
+    fn repo(root: &Path) {
+        let mut cmd = gwt_core::process::hidden_command("git");
+        gwt_core::process::scrub_git_env(&mut cmd);
+        assert!(cmd
+            .args(["init"])
+            .current_dir(root)
+            .output()
+            .unwrap()
+            .status
+            .success());
+        let mut cmd = gwt_core::process::hidden_command("git");
+        gwt_core::process::scrub_git_env(&mut cmd);
+        assert!(cmd
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/artificial/recovery.git"
+            ])
+            .current_dir(root)
+            .output()
+            .unwrap()
+            .status
+            .success());
+    }
+
+    #[test]
+    fn recovery_cli_uses_explicit_store_and_creates_no_endpoint_or_remote_calls() {
+        let _env_lock = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = tempfile::tempdir().unwrap();
+        let _home = ScopedGwtHome::set(temp.path().join("home"));
+        let root = temp.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        repo(&root);
+        let scope = gwt_core::paths::resolve_project_scope(&root);
+        assert!(scope.source.identity_resolved());
+        let path = crate::issue_monitor_prefs_path_for_repo_path(&root);
+        let prefs = crate::IssueMonitorPrefs {
+            enabled: false,
+            autonomous_mode: false,
+            effect_authority_epoch: 17,
+            ..Default::default()
+        };
+        crate::save_issue_monitor_prefs(&path, &prefs).unwrap();
+        let fence = crate::IssueMonitorAuthorityFence::current_process();
+        crate::issue_monitor::persist_issue_monitor_authority_fence(&path, &fence).unwrap();
+        let mut env = crate::cli::TestEnv::new(temp.path().join("different-cwd"));
+        env.stdin=serde_json::json!({"operation":"daemon.recover","params":{
+            "project_root":root,"project_store_hash":scope.hash.as_str(),"expected_fence":fence,"expected_epoch":17}}).to_string();
+        let request = env.stdin.clone();
+        assert_eq!(crate::cli::json_envelope::dispatch(&mut env, "gwtd"), 0);
+        let envelope: serde_json::Value = serde_json::from_slice(&env.stdout).unwrap();
+        assert_eq!(envelope["ok"], true);
+        let output: serde_json::Value =
+            serde_json::from_str(envelope["output"].as_str().unwrap()).unwrap();
+        assert_eq!(output["new_epoch"], 18);
+        assert_eq!(output["runtime_clear_verified"], false);
+        assert_eq!(output["work_resumed"], false);
+        let runtime = RuntimeScope::from_project_root(&root, RuntimeTarget::Host).unwrap();
+        assert!(!runtime.endpoint_path(&gwt_core::paths::gwt_home()).exists());
+        assert!(env.client.call_log().is_empty());
+        env.stdout.clear();
+        env.stdin = request;
+        assert_eq!(crate::cli::json_envelope::dispatch(&mut env, "gwtd"), 1);
+        let envelope: serde_json::Value = serde_json::from_slice(&env.stdout).unwrap();
+        assert_eq!(envelope["ok"], false);
+        assert!(env.client.call_log().is_empty());
+    }
+
+    #[test]
+    fn recovery_cli_refuses_foreign_unresolved_relative_and_unavailable_targets() {
+        let _env_lock = crate::env_test_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let temp = tempfile::tempdir().unwrap();
+        let _home = ScopedGwtHome::set(temp.path().join("home"));
+        let root = temp.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        repo(&root);
+        let unresolved = temp.path().join("unresolved");
+        std::fs::create_dir(&unresolved).unwrap();
+        let scope = gwt_core::paths::resolve_project_scope(&root);
+        let file = temp.path().join("file");
+        std::fs::write(&file, b"file").unwrap();
+        for (target, hash) in [
+            (root.clone(), "foreign".to_owned()),
+            (unresolved, scope.hash.as_str().into()),
+            (PathBuf::from("relative"), scope.hash.as_str().into()),
+            (temp.path().join("missing"), scope.hash.as_str().into()),
+            (file, scope.hash.as_str().into()),
+        ] {
+            let mut out = String::new();
+            assert!(recover_command(
+                &target,
+                &hash,
+                &crate::IssueMonitorAuthorityFence::current_process(),
+                17,
+                &mut out
+            )
+            .is_err());
+            assert!(out.is_empty());
+        }
+        assert!(!crate::issue_monitor_prefs_path_for_repo_path(&root).exists());
     }
 }

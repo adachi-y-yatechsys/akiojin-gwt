@@ -53,7 +53,8 @@ use super::broadcast::{
     IssueMonitorControlRequest,
 };
 use super::transport::{
-    bind_is_served, cleanup_stale_bind, prepare_bind_parent, IpcListener, IpcReadHalf, IpcStream,
+    bind_is_present, bind_is_served, cleanup_stale_bind, prepare_bind_parent, IpcListener,
+    IpcReadHalf, IpcStream,
 };
 
 const ACCEPT_BACKOFF_MS: u64 = 50;
@@ -152,6 +153,31 @@ pub(super) fn serve_blocking<W: std::io::Write + ?Sized>(
     endpoint_path: PathBuf,
     writer: &mut W,
 ) -> Result<i32, SpecOpsError> {
+    serve_blocking_with_mode(scope, endpoint_path, writer, false)
+}
+
+pub(super) fn serve_blocking_with_mode<W: std::io::Write + ?Sized>(
+    scope: RuntimeScope,
+    endpoint_path: PathBuf,
+    writer: &mut W,
+    diagnostic_only: bool,
+) -> Result<i32, SpecOpsError> {
+    serve_blocking_with_options(
+        scope,
+        endpoint_path,
+        writer,
+        diagnostic_only,
+        !diagnostic_only,
+    )
+}
+
+pub(super) fn serve_blocking_with_options<W: std::io::Write + ?Sized>(
+    scope: RuntimeScope,
+    endpoint_path: PathBuf,
+    writer: &mut W,
+    diagnostic_only: bool,
+    background_cleanup_allowed: bool,
+) -> Result<i32, SpecOpsError> {
     // Resolve before anything is persisted or announced: a runtime root
     // longer than `sun_path` must surface as a diagnosis here rather than
     // as a bare bind failure after the endpoint file already advertised an
@@ -160,6 +186,20 @@ pub(super) fn serve_blocking<W: std::io::Write + ?Sized>(
         resolve_daemon_socket_path(&endpoint_path).map_err(|err| config_error(err.to_string()))?;
     let socket_path = socket.path;
     let authority_lease = acquire_daemon_startup_lease(&scope)?;
+    if diagnostic_only || !background_cleanup_allowed {
+        let prefs = crate::issue_monitor_prefs_path_for_repo_path(&scope.project_root);
+        if !matches!(
+            crate::load_issue_monitor_authority_fence(&prefs),
+            Ok(crate::IssueMonitorAuthorityFenceState::Missing)
+        ) {
+            return Err(config_error(
+                "daemon probe requires missing authority fence; existing state preserved",
+            ));
+        }
+        super::probe::require_empty_endpoint_directory(
+            &scope.daemon_dir(&gwt_core::paths::gwt_home()),
+        )?;
+    }
     if let Err(err) = ensure_socket_parent(&socket_path) {
         return Err(config_error(format!(
             "failed to prepare daemon socket directory: {err}"
@@ -170,16 +210,26 @@ pub(super) fn serve_blocking<W: std::io::Write + ?Sized>(
     // stranded the live daemon on an unlinked inode, and the loser's exit
     // cleanup then deleted the live daemon's endpoint descriptor, leaving
     // every CLI caller on "authority fence ... has no usable endpoint".
-    ensure_socket_not_served(&socket_path)?;
+    if diagnostic_only || !background_cleanup_allowed {
+        if bind_is_present(&socket_path) || bind_is_served(&socket_path.to_string_lossy()) {
+            return Err(config_error(
+                "daemon probe bind already exists; no cleanup or adoption",
+            ));
+        }
+    } else {
+        ensure_socket_not_served(&socket_path)?;
+    }
 
     let auth_token = uuid::Uuid::new_v4().to_string();
-    let endpoint = DaemonEndpoint::new(
+    let mut endpoint = DaemonEndpoint::new(
         scope,
         std::process::id(),
         socket_path.to_string_lossy().to_string(),
         auth_token,
         env!("CARGO_PKG_VERSION").to_string(),
     );
+    endpoint.diagnostic_only = diagnostic_only;
+    endpoint.background_cleanup_allowed = background_cleanup_allowed;
 
     let runtime = Builder::new_multi_thread()
         .enable_all()
@@ -351,6 +401,15 @@ fn bind_daemon(
     endpoint_path: &Path,
     authority_lease: crate::IssueMonitorAuthorityLease,
 ) -> Result<BoundDaemon, SpecOpsError> {
+    if endpoint.diagnostic_only || !endpoint.background_cleanup_allowed {
+        // Recheck under the project lifetime lease. No stale-file sweep,
+        // replacement, or adoption belongs to this diagnostic operation.
+        super::probe::require_empty_endpoint_directory(
+            endpoint_path
+                .parent()
+                .ok_or_else(|| config_error("diagnostic endpoint directory unavailable"))?,
+        )?;
+    }
     let listener = IpcListener::bind(socket_path).map_err(|err| {
         config_error(format!(
             "failed to bind daemon socket {}: {err}",
@@ -389,15 +448,21 @@ async fn run_bound_server(
     // Keep one handle through listener and worker shutdown: a failed worker
     // must not admit a second daemon while this server still answers IPC.
     let authority_lease = Arc::new(authority_lease);
-    let mut issue_monitor_worker = spawn_issue_monitor_worker_with_lease(
-        endpoint.scope.clone(),
-        hub.clone(),
-        Arc::clone(&shutdown),
-        monitor_config,
-        operation_timeout,
-        IssueMonitorWorkerTestHooks::default(),
-        Some(Arc::clone(&authority_lease)),
-    );
+    let mut issue_monitor_worker = if endpoint.diagnostic_only {
+        hub.close_issue_monitor_controls();
+        None
+    } else {
+        Some(spawn_issue_monitor_worker_with_lease(
+            endpoint.scope.clone(),
+            hub.clone(),
+            Arc::clone(&shutdown),
+            monitor_config,
+            operation_timeout,
+            IssueMonitorWorkerTestHooks::default(),
+            Some(Arc::clone(&authority_lease)),
+            endpoint.background_cleanup_allowed,
+        ))
+    };
 
     let endpoint = Arc::new(endpoint);
     let started_at = Instant::now();
@@ -426,10 +491,11 @@ async fn run_bound_server(
                         let endpoint = Arc::clone(&endpoint);
                         let hub = hub.clone();
                         let connections = Arc::clone(&connections);
+                        let shutdown = Arc::clone(&shutdown);
                         tokio::spawn(async move {
                             let guard = ConnectionGuard::new(connections);
                             if let Err(err) =
-                                handle_connection(stream, endpoint, hub, started_at, &guard).await
+                                handle_connection(stream, endpoint, hub, started_at, &guard, shutdown).await
                             {
                                 tracing::warn!("gwtd daemon: connection error: {err}");
                             }
@@ -464,14 +530,16 @@ async fn run_bound_server(
         .max(ISSUE_MONITOR_SCAN_BUDGET_CEILING)
         .saturating_add(issue_monitor_prefs_timeout())
         .saturating_add(issue_monitor_prefs_timeout());
-    match tokio::time::timeout(worker_grace, &mut issue_monitor_worker).await {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
-            tracing::warn!(error = %error, "issue monitor worker failed during daemon shutdown");
-        }
-        Err(_) => {
-            tracing::error!("issue monitor worker exceeded daemon shutdown grace");
-            issue_monitor_worker.abort();
+    if let Some(worker) = issue_monitor_worker.as_mut() {
+        match tokio::time::timeout(worker_grace, &mut *worker).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(error = %error, "issue monitor worker failed during daemon shutdown");
+            }
+            Err(_) => {
+                tracing::error!("issue monitor worker exceeded daemon shutdown grace");
+                worker.abort();
+            }
         }
     }
 
@@ -690,9 +758,11 @@ fn spawn_issue_monitor_worker_with_config_timeout_and_hooks(
         operation_timeout,
         test_hooks,
         None,
+        true,
     )
 }
 
+#[allow(clippy::too_many_arguments)] // Immutable per-instance cleanup policy travels with the lifetime lease.
 fn spawn_issue_monitor_worker_with_lease(
     scope: RuntimeScope,
     hub: BroadcastHub,
@@ -701,6 +771,7 @@ fn spawn_issue_monitor_worker_with_lease(
     operation_timeout: Duration,
     test_hooks: IssueMonitorWorkerTestHooks,
     authority_lease: Option<Arc<crate::IssueMonitorAuthorityLease>>,
+    background_cleanup_allowed: bool,
 ) -> tokio::task::JoinHandle<()> {
     // Establish the control-lane state from the durable snapshot before the
     // server can accept a publisher connection. Starting publishers wait on
@@ -1343,6 +1414,7 @@ fn spawn_issue_monitor_worker_with_lease(
                         issue_monitor_gui_connected(&hub),
                         deadline,
                         test_hooks.clone(),
+                        background_cleanup_allowed,
                     ),
                     deadline,
                     watchdog_fired: false,
@@ -1838,6 +1910,15 @@ enum IssueMonitorControl {
     /// SPEC #3165 TQ-9: put Issues into this terminal's explicit queue. This is
     /// the user's own act, so the entries are attributed to the operator.
     TerminalQueuePush(Vec<u64>),
+    TerminalQueuePushAtPosition {
+        issue_numbers: Vec<u64>,
+        position: usize,
+    },
+    TerminalQueuePushObserved {
+        issue_numbers: Vec<u64>,
+        position: Option<usize>,
+        urgent_observations: Vec<crate::issue_monitor::IssueMonitorUrgentQueueObservation>,
+    },
     /// SPEC #3165 TQ-9: remove Issues from this terminal's explicit queue.
     TerminalQueueRemove(Vec<u64>),
     TerminalQueueMove {
@@ -2575,11 +2656,31 @@ fn apply_routine_issue_monitor_control(
             true
         }
         IssueMonitorControl::TerminalQueuePush(issue_numbers) => {
-            monitor.terminal_queue_push(
-                &issue_numbers,
-                "operator",
-                &chrono::Utc::now().to_rfc3339(),
-            );
+            monitor.terminal_queue_push(&issue_numbers, "operator", now);
+            true
+        }
+        IssueMonitorControl::TerminalQueuePushAtPosition {
+            issue_numbers,
+            position,
+        } => {
+            monitor.terminal_queue_push_at_position(&issue_numbers, position, "operator", now);
+            true
+        }
+        IssueMonitorControl::TerminalQueuePushObserved {
+            issue_numbers,
+            position,
+            urgent_observations,
+        } => {
+            match position {
+                Some(position) => monitor.terminal_queue_push_at_position(
+                    &issue_numbers,
+                    position,
+                    "operator",
+                    now,
+                ),
+                None => monitor.terminal_queue_push(&issue_numbers, "operator", now),
+            }
+            monitor.apply_urgent_queue_observations(&urgent_observations);
             true
         }
         IssueMonitorControl::TerminalQueueMove {
@@ -3502,6 +3603,47 @@ fn decode_issue_monitor_control_in_repo(
                     .collect::<Option<Vec<_>>>()?;
                 return Some(IssueMonitorControl::TerminalQueuePush(issue_numbers));
             }
+            // A separate control name makes old daemons reject positioned pushes
+            // instead of accepting the issues while silently ignoring their order.
+            if let Some(push) = payload.get("terminal_queue_push_at_position") {
+                let issue_numbers = push
+                    .get("issue_numbers")?
+                    .as_array()?
+                    .iter()
+                    .map(serde_json::Value::as_u64)
+                    .collect::<Option<Vec<_>>>()?;
+                let position = usize::try_from(push.get("position")?.as_u64()?).ok()?;
+                return Some(IssueMonitorControl::TerminalQueuePushAtPosition {
+                    issue_numbers,
+                    position,
+                });
+            }
+            if let Some(push) = payload.get("terminal_queue_push_observed") {
+                let issue_numbers = push
+                    .get("issue_numbers")?
+                    .as_array()?
+                    .iter()
+                    .map(serde_json::Value::as_u64)
+                    .collect::<Option<Vec<_>>>()?;
+                let position = match push.get("position").filter(|value| !value.is_null()) {
+                    Some(value) => Some(usize::try_from(value.as_u64()?).ok()?),
+                    None => None,
+                };
+                let urgent_observations: Vec<
+                    crate::issue_monitor::IssueMonitorUrgentQueueObservation,
+                > = serde_json::from_value(push.get("urgent_observations")?.clone()).ok()?;
+                if urgent_observations
+                    .iter()
+                    .any(|observation| !issue_numbers.contains(&observation.issue.number))
+                {
+                    return None;
+                }
+                return Some(IssueMonitorControl::TerminalQueuePushObserved {
+                    issue_numbers,
+                    position,
+                    urgent_observations,
+                });
+            }
             if let Some(move_entry) = payload.get("terminal_queue_move") {
                 return Some(IssueMonitorControl::TerminalQueueMove {
                     issue_number: move_entry.get("issue_number")?.as_u64()?,
@@ -3585,6 +3727,7 @@ fn spawn_issue_monitor_scan(
         gui_connected,
         deadline,
         IssueMonitorWorkerTestHooks::default(),
+        true,
     )
 }
 
@@ -3608,6 +3751,7 @@ fn spawn_issue_monitor_scan_with_deadline(
     gui_connected: bool,
     deadline: Instant,
     test_hooks: IssueMonitorWorkerTestHooks,
+    background_cleanup_allowed: bool,
 ) -> tokio::task::JoinHandle<
     Result<crate::IssueMonitorState, crate::issue_monitor_worker::IssueMonitorScanFailure>,
 > {
@@ -3626,8 +3770,13 @@ fn spawn_issue_monitor_scan_with_deadline(
         // scan. Unit tests drive this worker against scratch repositories and
         // must not start a host-wide sweep on a CI runner that is low on disk.
         #[cfg(not(test))]
-        crate::worktree::gc::maybe_spawn(&scope.project_root);
-        scan_issue_monitor_once_blocking(scope, monitor, gui_connected)
+        crate::worktree::gc::maybe_spawn(&scope.project_root, background_cleanup_allowed);
+        scan_issue_monitor_once_blocking_with_cleanup_policy(
+            scope,
+            monitor,
+            gui_connected,
+            background_cleanup_allowed,
+        )
     })
 }
 
@@ -4345,12 +4494,13 @@ fn try_commit_issue_monitor_effect_result(
                 ) => {
                     let _ = candidate.complete_pending_effect(&key);
                     if current_authority && candidate.config.enabled {
-                        let _ = candidate.apply_confirmed_claim(
+                        let _ = candidate.apply_confirmed_claim_for_trial(
                             *issue_number,
                             claim.claim_id,
                             owner,
                             &completed.effect.effect_id,
                             &completed.completed_at,
+                            completed.effect.launch_budget_trial_id.clone(),
                         );
                     }
                     settled = true;
@@ -4658,10 +4808,20 @@ fn daemon_run_secret() -> &'static [u8] {
         .as_slice()
 }
 
+#[cfg(all(test, unix))]
 fn scan_issue_monitor_once_blocking(
+    scope: RuntimeScope,
+    monitor: crate::IssueMonitorState,
+    gui_connected: bool,
+) -> Result<crate::IssueMonitorState, crate::issue_monitor_worker::IssueMonitorScanFailure> {
+    scan_issue_monitor_once_blocking_with_cleanup_policy(scope, monitor, gui_connected, true)
+}
+
+fn scan_issue_monitor_once_blocking_with_cleanup_policy(
     scope: RuntimeScope,
     mut monitor: crate::IssueMonitorState,
     gui_connected: bool,
+    background_cleanup_allowed: bool,
 ) -> Result<crate::IssueMonitorState, crate::issue_monitor_worker::IssueMonitorScanFailure> {
     use crate::issue_monitor_worker::IssueMonitorScanStage;
 
@@ -4883,6 +5043,7 @@ fn scan_issue_monitor_once_blocking(
     for (issue_number, pr_number) in monitor.kill_switch_disarm_targets() {
         let epoch = monitor.effect_authority_epoch();
         monitor.prepare_effect(crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: format!("disarm:kill-switch:{issue_number}:{pr_number}:{epoch}"),
             authority_epoch: epoch,
             attempt: 0,
@@ -4915,6 +5076,7 @@ fn scan_issue_monitor_once_blocking(
             &scope.project_root,
             gwt_git::pr_status::SETTLEMENT_BASE_BRANCH,
             &merge_reconciliation,
+            background_cleanup_allowed,
         );
         for line in prune.log_lines() {
             tracing::info!("{line}");
@@ -5117,6 +5279,7 @@ async fn handle_connection(
     hub: BroadcastHub,
     started_at: Instant,
     connection_guard: &ConnectionGuard,
+    shutdown: Arc<DaemonShutdown>,
 ) -> Result<(), String> {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
@@ -5150,8 +5313,13 @@ async fn handle_connection(
     // is checked at the top of each iteration to close that race.
     let forwarder_cancel = Arc::new(AtomicBool::new(false));
     let forwarder_notify = Arc::new(Notify::new());
+    let writer_shutdown = Arc::clone(&shutdown);
     let writer = tokio::spawn(async move {
         while let Some(frame) = out_rx.recv().await {
+            if matches!(frame, DaemonFrame::StopAccepted { .. }) {
+                write_stop_receipt(&mut write_half, &frame, &writer_shutdown).await;
+                break;
+            }
             if let Err(err) = write_json_line(&mut write_half, &frame).await {
                 tracing::warn!(target: "gwtd::daemon", error = %err, "writer task failed");
                 break;
@@ -5166,6 +5334,7 @@ async fn handle_connection(
     // reclaim its workload instead of orphaning it (Issue #4409 AC-2).
     let mut verification_reclaim: Option<super::verification_spawn::VerificationReclaim> = None;
     let mut subscribed_channels = HashSet::new();
+    let mut first_frame = true;
     loop {
         line.clear();
         let n = match reader.read_line(&mut line).await {
@@ -5182,7 +5351,53 @@ async fn handle_connection(
         if trimmed.is_empty() {
             continue;
         }
-        match serde_json::from_str::<ClientFrame>(trimmed) {
+        let is_first_frame = std::mem::replace(&mut first_frame, false);
+        let frame = serde_json::from_str::<ClientFrame>(trimmed);
+        if endpoint.diagnostic_only
+            && !matches!(&frame, Ok(ClientFrame::Status | ClientFrame::Stop { .. }))
+        {
+            let _ = out_tx.send(DaemonFrame::Error {
+                message: "diagnostic-only daemon admits Status and exact Stop only".into(),
+            });
+            break;
+        }
+        match frame {
+            Ok(ClientFrame::Stop {
+                expected_scope,
+                expected_pid,
+                expected_instance_id,
+                request_id,
+            }) => {
+                // A dedicated connection keeps the receipt behind no other work
+                // or event writes. The handshake has already authenticated it.
+                if !is_first_frame
+                    || expected_scope != endpoint.scope
+                    || expected_pid != endpoint.pid
+                    || expected_instance_id != endpoint.instance_id()
+                    || !gwt_core::daemon::is_valid_daemon_stop_identity(
+                        expected_pid,
+                        &expected_instance_id,
+                        &request_id,
+                    )
+                {
+                    let _ = out_tx.send(DaemonFrame::Error {
+                        message:
+                            "daemon.stop requires a fresh connection and exact instance identity"
+                                .into(),
+                    });
+                } else if out_tx
+                    .send(DaemonFrame::StopAccepted {
+                        pid: endpoint.pid,
+                        instance_id: endpoint.instance_id(),
+                        request_id,
+                    })
+                    .is_err()
+                {
+                    // The accepted intent still stands when the receipt is lost.
+                    shutdown.request();
+                }
+                break;
+            }
             Ok(ClientFrame::Hook(envelope)) => {
                 // Hook envelope routing into real GUI-side handlers is
                 // gated on Phase H3 (handle_runtime_hook_event daemon
@@ -5347,6 +5562,8 @@ async fn handle_connection(
                 let snapshot = DaemonStatus {
                     protocol_version: endpoint.protocol_version,
                     daemon_version: endpoint.daemon_version.clone(),
+                    diagnostic_only: endpoint.diagnostic_only,
+                    background_cleanup_allowed: endpoint.background_cleanup_allowed,
                     uptime_seconds: started_at.elapsed().as_secs(),
                     broadcast_channels: hub.channel_count(),
                     connections: connection_guard.snapshot(),
@@ -5437,6 +5654,29 @@ async fn handle_connection(
     Ok(())
 }
 
+/// Write and flush the accepted receipt before cooperative shutdown. A failed
+/// or blocked writer cannot keep an accepted stop running indefinitely; the
+/// caller then has an unknown outcome and must independently inspect exit.
+async fn write_stop_receipt<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    receipt: &DaemonFrame,
+    shutdown: &DaemonShutdown,
+) {
+    let result = tokio::time::timeout(super::stop::STOP_CONTACT_TIMEOUT, async {
+        write_json_line(writer, receipt).await?;
+        writer.flush().await.map_err(|error| error.to_string())
+    })
+    .await;
+    if !matches!(result, Ok(Ok(()))) {
+        tracing::warn!(target: "gwtd::daemon", "stop receipt undelivered; accepted shutdown proceeds");
+    }
+    shutdown.request();
+}
+
+#[cfg(test)]
+#[path = "server_stop_tests.rs"]
+mod stop_tests;
+
 async fn enqueue_issue_monitor_control(
     hub: &BroadcastHub,
     channel: &str,
@@ -5474,7 +5714,7 @@ async fn read_handshake(
     serde_json::from_str(line.trim_end()).map_err(|err| format!("handshake parse failed: {err}"))
 }
 
-fn build_handshake_response(
+pub(super) fn build_handshake_response(
     endpoint: &DaemonEndpoint,
     request: &IpcHandshakeRequest,
 ) -> IpcHandshakeResponse {
@@ -5572,7 +5812,10 @@ fn heal_endpoint_descriptor(
             Ok(existing)
                 if existing.pid == endpoint.pid
                     && existing.auth_token == endpoint.auth_token
-                    && existing.bind == endpoint.bind =>
+                    && existing.bind == endpoint.bind
+                    && existing.diagnostic_only == endpoint.diagnostic_only
+                    && existing.background_cleanup_allowed
+                        == endpoint.background_cleanup_allowed =>
             {
                 return EndpointDescriptorHeal::Intact;
             }
@@ -5599,13 +5842,15 @@ fn heal_endpoint_descriptor(
             );
         }
     }
-    let refreshed = DaemonEndpoint::new(
+    let mut refreshed = DaemonEndpoint::new(
         endpoint.scope.clone(),
         endpoint.pid,
         endpoint.bind.clone(),
         endpoint.auth_token.clone(),
         endpoint.daemon_version.clone(),
     );
+    refreshed.diagnostic_only = endpoint.diagnostic_only;
+    refreshed.background_cleanup_allowed = endpoint.background_cleanup_allowed;
     match persist_endpoint(endpoint_path, &refreshed) {
         Ok(()) => {
             tracing::warn!(
@@ -6009,6 +6254,157 @@ mod terminal_delivery_control_tests {
             0,
             "successful delivery does not requeue work"
         );
+    }
+}
+
+#[cfg(test)]
+mod queue_push_control_tests {
+    #[test]
+    fn issue_monitor_queue_push_position_control_decodes_and_applies_atomically() {
+        let control = super::decode_issue_monitor_control(
+            crate::runtime_daemon_events::issue_monitor_payload(
+                "control",
+                serde_json::json!({"terminal_queue_push_at_position": {
+                    "issue_numbers": [43, 44, 43], "position": 0
+                }}),
+                std::process::id() + 1,
+            ),
+        )
+        .expect("positioned queue push decodes");
+        let mut monitor = crate::IssueMonitorState::new(Default::default());
+        monitor.terminal_queue_push(&[42, 43], "operator", "2026-10-08T00:00:00Z");
+        assert!(super::try_apply_issue_monitor_control(
+            &mut monitor,
+            control,
+            "2026-10-08T00:00:00Z"
+        )
+        .unwrap());
+        let prefs = monitor.prefs();
+        assert_eq!(
+            prefs.terminal_queues[&crate::process::current_hostname()]
+                .last_seen_at
+                .as_deref(),
+            Some("2026-10-08T00:00:00Z")
+        );
+        assert_eq!(
+            prefs.terminal_queues[&crate::process::current_hostname()]
+                .entries
+                .iter()
+                .map(|entry| entry.number)
+                .collect::<Vec<_>>(),
+            vec![43, 44, 42]
+        );
+        assert!(prefs.claim_identities.is_empty());
+        assert!(prefs.launching_issues.is_empty());
+    }
+
+    #[test]
+    fn issue_monitor_queue_push_position_control_rejects_invalid_positions() {
+        for push in [
+            serde_json::json!({"issue_numbers": [42]}),
+            serde_json::json!({"issue_numbers": [42], "position": -1}),
+            serde_json::json!({"issue_numbers": ["42"], "position": 0}),
+        ] {
+            assert!(super::decode_issue_monitor_control(
+                crate::runtime_daemon_events::issue_monitor_payload(
+                    "control",
+                    serde_json::json!({"terminal_queue_push_at_position": push}),
+                    std::process::id() + 1,
+                ),
+            )
+            .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_monitor_queue_push_ack_follows_durable_commit_without_launch() {
+        let _budget = super::pin_prefs_hang_guard();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("issue-monitor.json");
+        let mut monitor = crate::IssueMonitorState::new(Default::default());
+        crate::save_issue_monitor_prefs(&path, &monitor.prefs()).unwrap();
+        let hub = super::BroadcastHub::new();
+        let mut receiver = hub.take_issue_monitor_control_receiver().unwrap();
+        let publisher = tokio::spawn({
+            let hub = hub.clone();
+            async move {
+                hub.publish_issue_monitor_control(gwt_core::daemon::DaemonFrame::Event {
+                    channel: crate::runtime_daemon_events::ISSUE_MONITOR_CONTROL_CHANNEL
+                        .to_string(),
+                    payload: crate::runtime_daemon_events::issue_monitor_payload(
+                        "control",
+                        serde_json::json!({"terminal_queue_push_observed": {
+                            "issue_numbers": [42], "position": 0,
+                            "urgent_observations": [{
+                                "issue": {"number":42, "title":"Issue 42", "labels":["urgent"], "state":"open", "updated_at":"2026-10-08T00:00:00Z"},
+                                "assignment": {"actor":"alice", "created_at":"2026-10-08T00:00:00Z"},
+                                "observed_at":"2026-10-08T00:00:00Z"
+                            }]
+                        }}),
+                        std::process::id().wrapping_add(1),
+                    ),
+                })
+                .await
+            }
+        });
+        let (frame, completion) = receiver.recv().await.unwrap().into_parts();
+        assert!(
+            !publisher.is_finished(),
+            "acceptance alone is not a committed receipt"
+        );
+        let gwt_core::daemon::DaemonFrame::Event { payload, .. } = frame else {
+            panic!("event")
+        };
+        let control = super::decode_issue_monitor_control(payload).unwrap();
+        let mut permit = super::IssueMonitorEffectPermit::new();
+        let mut pending = None;
+        assert!(super::apply_or_queue_issue_monitor_control(
+            &hub,
+            &path,
+            &mut monitor,
+            control,
+            &mut permit,
+            &mut pending,
+            Some(completion),
+        ));
+        assert!(pending.is_none());
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), publisher)
+                .await
+                .unwrap()
+                .unwrap(),
+            Ok(())
+        );
+        let saved = crate::load_issue_monitor_prefs(&path).unwrap();
+        assert_eq!(
+            saved.terminal_queues[&crate::process::current_hostname()].entries[0].number,
+            42
+        );
+        assert!(saved.last_control_receipt.is_some());
+        assert_eq!(
+            saved
+                .urgent_queue
+                .projection(&saved.terminal_queues[&crate::process::current_hostname()])
+                .entries[0]
+                .assigned_by
+                .as_deref(),
+            Some("alice")
+        );
+        assert!(saved.claim_identities.is_empty());
+        assert!(saved.launching_issues.is_empty());
+        assert!(!saved.autonomous_mode);
+    }
+
+    #[test]
+    fn issue_monitor_queue_push_observation_cannot_mutate_an_unrequested_issue() {
+        assert!(super::decode_issue_monitor_control(crate::runtime_daemon_events::issue_monitor_payload(
+            "control", serde_json::json!({"terminal_queue_push_observed": {
+                "issue_numbers":[42], "urgent_observations":[{
+                    "issue":{"number":43,"title":"Other Issue","labels":["urgent"],"state":"open"},
+                    "assignment":null, "observed_at":"2026-10-08T00:00:00Z"
+                }]
+            }}), std::process::id().wrapping_add(1),
+        )).is_none());
     }
 }
 
@@ -7570,6 +7966,7 @@ exit 0
                 server_hub,
                 Instant::now(),
                 &guard,
+                Arc::new(DaemonShutdown::new()),
             )
             .await
         });
@@ -7640,6 +8037,7 @@ exit 0
                         hub,
                         Instant::now(),
                         &guard,
+                        Arc::new(DaemonShutdown::new()),
                     )
                     .await
                 });
@@ -9312,6 +9710,7 @@ exit 0
     #[test]
     fn routine_controls_invalidate_scan_without_revoking_effects() {
         let attempting = crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "claim:42:stable".to_string(),
             authority_epoch: 7,
             attempt: 2,
@@ -9425,6 +9824,7 @@ exit 0
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let attempting = crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "claim:77:sc34-review".to_string(),
             authority_epoch: 7,
             attempt: 3,
@@ -9510,6 +9910,7 @@ exit 0
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let attempting = crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "claim:77:sc34-launched".to_string(),
             authority_epoch: 11,
             attempt: 4,
@@ -14061,6 +14462,7 @@ exit 0
                 autonomous_mode: true,
                 effect_authority_epoch: 7,
                 pending_effects: vec![crate::PendingIssueMonitorEffect {
+                    launch_budget_trial_id: None,
                     effect_id: "arm:42:99:abc:7".to_string(),
                     authority_epoch: 7,
                     attempt: 1,
@@ -14223,6 +14625,7 @@ exit 1
         .expect("scope");
         let prefs_path = crate::issue_monitor_prefs_path_for_repo_path(&scope.project_root);
         let arm = crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "arm:42:99:abc:7".to_string(),
             authority_epoch: 7,
             attempt: 1,
@@ -15541,6 +15944,7 @@ exit 1
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let arm = crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "arm:42:99:abc:7".to_string(),
             authority_epoch: 7,
             attempt: 1,
@@ -16058,6 +16462,7 @@ exit 1
     #[tokio::test]
     async fn outer_effect_watchdog_retains_exact_attempt_until_started_executor_joins() {
         let effect = crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "arm:42:99:abc:7".to_string(),
             authority_epoch: 7,
             attempt: 1,
@@ -16351,6 +16756,7 @@ exit 1
 
             let permit = super::IssueMonitorEffectPermit::new();
             let effect = crate::PendingIssueMonitorEffect {
+                launch_budget_trial_id: None,
                 effect_id: "claim:42:queued".to_string(),
                 authority_epoch: 7,
                 attempt: 1,
@@ -16467,6 +16873,7 @@ exit 1
             crate::IssueMonitorState::with_prefs(crate::IssueMonitorConfig::default(), initial);
         let mut stale_scan = canonical.clone();
         stale_scan.prepare_effect(crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "arm:42:99:abc123:7".to_string(),
             authority_epoch: 7,
             attempt: 0,
@@ -17002,6 +17409,7 @@ exit 1
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let effect = crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "arm:42:99:abc123:4".to_string(),
             authority_epoch: 4,
             attempt: 0,
@@ -17040,6 +17448,7 @@ exit 1
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let arm = crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "arm:42:99:abc:7".to_string(),
             authority_epoch: 7,
             attempt: 0,
@@ -17119,6 +17528,7 @@ exit 1
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let release = crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "release:77:claim-77:7".to_string(),
             authority_epoch: 7,
             attempt: 1,
@@ -17193,6 +17603,7 @@ exit 1
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let release = crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "release:77:claim-77:7".to_string(),
             authority_epoch: 7,
             attempt: 1,
@@ -17431,6 +17842,7 @@ exit 1
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let effect = crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "claim:42:mismatch:7".to_string(),
             authority_epoch: 7,
             attempt: 1,
@@ -18066,6 +18478,7 @@ exit 1
         .expect("scope");
         let prefs_path = crate::issue_monitor_prefs_path_for_repo_path(&scope.project_root);
         let arm = crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "arm:42:99:sha-a:7".to_string(),
             authority_epoch: 7,
             attempt: 1,
@@ -18169,6 +18582,7 @@ exit 1
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let disarm = crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "disarm:arm:42:99:abc:7:8".to_string(),
             authority_epoch: 8,
             attempt: 0,
@@ -18215,6 +18629,7 @@ exit 1
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let disarm = crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "disarm:arm:42:99:abc:7:8".to_string(),
             authority_epoch: 8,
             attempt: 0,
@@ -18298,6 +18713,7 @@ exit 1
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let claim = crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "claim:42:7".to_string(),
             authority_epoch: 7,
             attempt: 0,
@@ -18357,6 +18773,7 @@ exit 1
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let arm = crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "arm:42:99:abc:7".to_string(),
             authority_epoch: 7,
             attempt: 2,
@@ -19272,6 +19689,7 @@ exit 1
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let old_grant = crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "claim:42:before-overflow".to_string(),
             authority_epoch: u64::MAX - 1,
             attempt: 1,
@@ -19352,6 +19770,7 @@ exit 1
         let temp = TempDir::new().expect("tempdir");
         let prefs_path = temp.path().join("issue-monitor.json");
         let arm = crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "arm:42:99:no-op-drain".to_string(),
             authority_epoch: 7,
             attempt: 1,
@@ -19485,6 +19904,7 @@ exit 1
         .expect("scope");
         let prefs_path = crate::issue_monitor_prefs_path_for_repo_path(&scope.project_root);
         let arm = crate::PendingIssueMonitorEffect {
+            launch_budget_trial_id: None,
             effect_id: "arm:42:99:abc:7".to_string(),
             authority_epoch: 7,
             attempt: 1,

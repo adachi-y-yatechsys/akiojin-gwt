@@ -119,7 +119,11 @@ pub fn spawn_unbound_pane(
     policy_gate: Option<(ProcessPolicy, PathBuf, Vec<String>)>,
     incarnation: u64,
     observation: Option<(&Path, &str)>,
+    agent_project_root: Option<&Path>,
 ) -> Result<Pane, String> {
+    let _budget_admission = agent_project_root
+        .map(|root| crate::launch_budget::admit_saved_agent(root, observation))
+        .transpose()?;
     // SPEC #1921 Phase 86 (#3813): a policy-bearing AgentBootstrap launch
     // goes through the start gate so priority / Job limits exist before
     // the target can create its first descendant. Shell panes stay direct.
@@ -184,6 +188,9 @@ pub fn spawn_unbound_pane(
 }
 
 /// Publish exact Session proof before releasing the gated producing child.
+// Preserve the existing explicit handshake inputs; the extra project root is
+// the exact budget scope and must not be inferred from a Session's worktree.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_bound_pane(
     id: &str,
     spawn_config: SpawnConfig,
@@ -192,7 +199,12 @@ pub fn spawn_bound_pane(
     incarnation: u64,
     expected: &gwt_agent::SessionExecutionIdentity,
     handshake_cleanup: &mut ActiveLaunchHandshakeCleanup,
+    agent_project_root: &Path,
 ) -> Result<Pane, String> {
+    let _budget_admission = crate::launch_budget::admit_saved_agent(
+        agent_project_root,
+        Some((&handshake_cleanup.sessions_dir, &expected.session_id)),
+    )?;
     let (gate_program, gate_args) = gate;
     let pending = Pane::new_pending_with_spawn_config(
         id.to_string(),
@@ -267,7 +279,7 @@ mod tests {
             remove_env: Vec::new(),
             cwd: None,
         };
-        let mut pane = super::spawn_unbound_pane("shared-spawn", config, None, 1, None)
+        let mut pane = super::spawn_unbound_pane("shared-spawn", config, None, 1, None, None)
             .expect("spawn without AppRuntime or event loop");
         assert!(pane.pty().process_id().is_some());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);

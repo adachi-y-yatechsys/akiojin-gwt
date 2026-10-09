@@ -232,6 +232,7 @@ fn prepare_agent_launch_composes_session_env_without_spawning() {
         docker_service: None,
         docker_lifecycle_intent: DockerLifecycleIntent::Connect,
         linked_issue_number: None,
+        launch_budget_trial_id: None,
         windows_shell: None,
         suppress_execution_control: false,
         explicit_follow_up: false,

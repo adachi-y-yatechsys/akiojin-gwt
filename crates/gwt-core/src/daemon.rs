@@ -400,9 +400,26 @@ pub struct DaemonEndpoint {
     pub bind: String,
     pub auth_token: String,
     pub updated_at_unix_ms: i64,
+    /// Transport diagnostics only; never adopt as a work runtime.
+    #[serde(default)]
+    pub diagnostic_only: bool,
+    /// Per-instance permission for automatic branch and build-cache cleanup.
+    #[serde(default = "default_background_cleanup_allowed")]
+    pub background_cleanup_allowed: bool,
+}
+
+fn default_background_cleanup_allowed() -> bool {
+    true
 }
 
 impl DaemonEndpoint {
+    /// Opaque identity for this exact daemon instance. The authentication token
+    /// stays private; this digest is evidence, never an authentication credential.
+    pub fn instance_id(&self) -> String {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(self.auth_token.as_bytes()))
+    }
+
     pub fn new(
         scope: RuntimeScope,
         pid: u32,
@@ -418,6 +435,8 @@ impl DaemonEndpoint {
             bind,
             auth_token,
             updated_at_unix_ms: chrono::Utc::now().timestamp_millis(),
+            diagnostic_only: false,
+            background_cleanup_allowed: true,
         }
     }
 
@@ -431,6 +450,7 @@ impl DaemonEndpoint {
         F: Fn(u32) -> bool,
     {
         self.protocol_version == expected_protocol_version
+            && !self.diagnostic_only
             && self.scope == *expected_scope
             && self.pid > 0
             && !self.bind.trim().is_empty()
@@ -506,6 +526,13 @@ pub enum ClientFrame {
     Publish { channel: String, payload: Value },
     /// Request a snapshot of the daemon's current runtime stats.
     Status,
+    /// Cooperatively stop this exact instance on a fresh authenticated connection.
+    Stop {
+        expected_scope: RuntimeScope,
+        expected_pid: u32,
+        expected_instance_id: String,
+        request_id: String,
+    },
     /// Launch one verification command from the daemon instead of from the
     /// caller's process tree (Issue #4409).
     ///
@@ -597,6 +624,12 @@ pub enum DaemonFrame {
     /// Snapshot of daemon runtime stats, returned in response to a
     /// [`ClientFrame::Status`] request.
     Status(DaemonStatus),
+    /// The stop was accepted. This receipt does not prove that the process exited.
+    StopAccepted {
+        pid: u32,
+        instance_id: String,
+        request_id: String,
+    },
     /// A [`ClientFrame::SpawnVerification`] child is running.
     VerificationAccepted(VerificationSpawnAccepted),
     /// That child exited.
@@ -608,6 +641,10 @@ pub enum DaemonFrame {
 pub struct DaemonStatus {
     pub protocol_version: u32,
     pub daemon_version: String,
+    #[serde(default)]
+    pub diagnostic_only: bool,
+    #[serde(default = "default_background_cleanup_allowed")]
+    pub background_cleanup_allowed: bool,
     pub uptime_seconds: u64,
     pub broadcast_channels: usize,
     /// Number of currently-connected IPC clients, including the one
@@ -751,6 +788,9 @@ where
 {
     let endpoint_path = scope.endpoint_path(gwt_home);
     match load_endpoint(&endpoint_path) {
+        Ok(endpoint) if endpoint.diagnostic_only => Err(GwtError::Config(
+            "diagnostic-only daemon cannot be adopted as a work runtime; stop its exact instance first".into(),
+        )),
         Ok(endpoint) if endpoint.is_usable(scope, expected_protocol_version, &is_process_alive) => {
             match expected_daemon_version {
                 Some(expected) if !daemon_versions_match(&endpoint.daemon_version, expected) => {
@@ -796,7 +836,9 @@ where
 /// zero) *and* nothing answers on its bind address (`is_bind_serving`). A
 /// descriptor whose pid died but whose socket still serves belongs to a daemon
 /// this sweep cannot see, and an unreadable descriptor names no owner at all;
-/// both are left alone. Files that are not `*.json` are never touched.
+/// both are left alone. Diagnostic descriptors also stay until their exact
+/// instance is stopped; sweeping them must not permit a normal worker startup.
+/// Files that are not `*.json` are never touched.
 ///
 /// A missing `daemon_dir` is not an error — there is simply nothing to sweep.
 pub fn sweep_dead_endpoints<F, G>(
@@ -823,7 +865,10 @@ where
         let Ok(endpoint) = load_endpoint(&path) else {
             continue;
         };
-        if endpoint.has_live_owner(&is_process_alive) || is_bind_serving(endpoint.bind.trim()) {
+        if endpoint.diagnostic_only
+            || endpoint.has_live_owner(&is_process_alive)
+            || is_bind_serving(endpoint.bind.trim())
+        {
             continue;
         }
         remove_endpoint_file(&path)?;
@@ -832,7 +877,23 @@ where
     Ok(removed)
 }
 
-fn load_endpoint(path: &Path) -> Result<DaemonEndpoint> {
+/// Shape guard shared by the JSON caller and the authenticated server.
+pub fn is_valid_daemon_stop_identity(pid: u32, instance_id: &str, request_id: &str) -> bool {
+    pid > 0
+        && instance_id.len() == 64
+        && instance_id
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        && !request_id.is_empty()
+        && request_id.len() <= 128
+        && request_id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+}
+
+/// Read only this descriptor. Unlike bootstrap resolution, never clean it up,
+/// choose another instance, or spawn a daemon when it is absent or malformed.
+pub fn load_endpoint(path: &Path) -> Result<DaemonEndpoint> {
     let payload = fs::read(path)?;
     serde_json::from_slice(&payload)
         .map_err(|e| GwtError::Other(format!("parse daemon endpoint failed: {e}")))
